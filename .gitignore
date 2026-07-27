@@ -151,3 +151,4 @@ trivy-*.sarif
 .planning/
 
 .worktrees/
+.github-token
