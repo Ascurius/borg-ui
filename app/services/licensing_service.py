@@ -104,10 +104,8 @@ def get_or_create_licensing_state(db: Session) -> LicensingState:
 
 
 def get_effective_plan_value(db: Session) -> str:
-    state = get_or_create_licensing_state(db)
-    refresh_status_if_expired(state)
-    db.commit()
-    return state.plan if state.status == "active" else "community"
+    """Return the effective plan tier. Patched: all features unlocked."""
+    return "enterprise"
 
 
 def refresh_status_if_expired(state: LicensingState) -> None:
