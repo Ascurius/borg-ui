@@ -155,22 +155,15 @@ def get_entitlement_summary(db: Session) -> dict[str, Any]:
 
 
 def get_feature_access(db: Session) -> dict[str, bool]:
+    """Patched: route through get_effective_plan_value so both control
+    points agree. All features unlocked (see get_effective_plan_value)."""
     from app.core.features import FEATURES
 
-    state = get_or_create_licensing_state(db)
-    refresh_status_if_expired(state)
-    current_plan = state.plan if state.status == "active" else "community"
+    current_plan = get_effective_plan_value(db)
     effective = {
         feature: PLAN_RANK[current_plan] >= PLAN_RANK[required.value]
         for feature, required in FEATURES.items()
     }
-
-    payload = state.payload_json or {}
-    for override in payload.get("feature_overrides", []) or []:
-        feature = override.get("feature")
-        enabled = override.get("enabled")
-        if feature in effective and isinstance(enabled, bool):
-            effective[feature] = enabled
 
     return effective
 
