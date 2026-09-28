@@ -59,3 +59,43 @@ export const AwaitingAgentListing: Story = {
   },
   render: (args) => <AwaitingAgentStory {...args} />,
 }
+
+// The embedded variant the archive Files tab mounts: a folder filter in the
+// header and the keyboard cursor resting on a row, so both read the way the
+// keyboard shortcuts leave them.
+function EmbeddedStory(args: ComponentProps<typeof ArchivePathSelector>) {
+  useEffect(() => {
+    const mock = new MockAdapter(httpClient, { onNoMatch: 'passthrough' })
+    mock.onGet(/\/browse\//).reply(200, {
+      items: [
+        { name: 'contracts', path: 'home/alex/contracts', type: 'directory', size: 1_200_000_000 },
+        { name: 'photos', path: 'home/alex/photos', type: 'directory', size: 8_400_000_000 },
+        { name: 'invoices.xlsx', path: 'home/alex/invoices.xlsx', type: 'file', size: 412_000 },
+        { name: 'notes.md', path: 'home/alex/notes.md', type: 'file', size: 12_000 },
+        { name: 'taxes.pdf', path: 'home/alex/taxes.pdf', type: 'file', size: 2_100_000 },
+      ],
+    })
+    return () => {
+      mock.restore()
+    }
+  }, [])
+  return (
+    <Box sx={{ p: 3, maxWidth: 720 }}>
+      <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 2, overflow: 'hidden' }}>
+        <ArchivePathSelector {...args} />
+      </Box>
+    </Box>
+  )
+}
+
+export const EmbeddedWithKeyboardCursor: Story = {
+  args: {
+    repository,
+    archive,
+    variant: 'embedded',
+    activeIndex: 2,
+    data: { selectedPaths: [] },
+    onChange: () => {},
+  },
+  render: (args) => <EmbeddedStory {...args} />,
+}

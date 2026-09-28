@@ -25,6 +25,7 @@ interface RepositoryGroupsProps {
   onCheck: (repository: Repository) => void
   onCompact: (repository: Repository) => void
   onPrune: (repository: Repository) => void
+  onPrunePreview: (repository: Repository) => void
   onWipeContents: (repository: Repository) => void
   onBreakLock: (repository: Repository) => void
   onEdit: (repository: Repository) => void
@@ -56,6 +57,7 @@ export function RepositoryGroups({
   onCheck,
   onCompact,
   onPrune,
+  onPrunePreview,
   onWipeContents,
   onBreakLock,
   onEdit,
@@ -92,7 +94,13 @@ export function RepositoryGroups({
         secondaryDescription={t('repositories.empty.hint')}
         actions={
           canManageRepositoriesGlobally && (
-            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} justifyContent="center">
+            <Stack
+              direction={{ xs: 'column', sm: 'row' }}
+              spacing={1.5}
+              sx={{
+                justifyContent: 'center',
+              }}
+            >
               <Button
                 variant="contained"
                 startIcon={<Add />}
@@ -180,6 +188,7 @@ export function RepositoryGroups({
                 onCheck={() => onCheck(repository)}
                 onCompact={() => onCompact(repository)}
                 onPrune={() => onPrune(repository)}
+                onPrunePreview={() => onPrunePreview(repository)}
                 onWipeContents={() => onWipeContents(repository)}
                 onBreakLock={() => onBreakLock(repository)}
                 onEdit={() => onEdit(repository)}

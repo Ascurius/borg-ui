@@ -2,7 +2,7 @@ import { Box, Chip, Stack, Tooltip, Typography } from '@mui/material'
 import { useTranslation } from 'react-i18next'
 import { formatDistanceToNow } from 'date-fns'
 import { RotateCw } from 'lucide-react'
-import { formatDateTimeFull } from '../../utils/dateUtils'
+import { formatDateTimeFull, parseBackendDate } from '../../utils/dateUtils'
 import { useT } from './tokens'
 import type { UpcomingTask } from './types'
 
@@ -32,7 +32,14 @@ export function UpcomingBackupsPanel({ tasks }: { tasks: UpcomingTask[] }) {
         '&:hover': { borderColor: T.borderHover },
       }}
     >
-      <Stack direction="row" spacing={0.75} alignItems="center" sx={{ mb: 1.75 }}>
+      <Stack
+        direction="row"
+        spacing={0.75}
+        sx={{
+          alignItems: 'center',
+          mb: 1.75,
+        }}
+      >
         <RotateCw size={14} color={T.textMuted} />
         <Typography
           sx={{
@@ -52,7 +59,7 @@ export function UpcomingBackupsPanel({ tasks }: { tasks: UpcomingTask[] }) {
             : task.repository
               ? 1
               : 0
-          const nextRunDate = task.next_run ? new Date(task.next_run) : null
+          const nextRunDate = task.next_run ? parseBackendDate(task.next_run) : null
           const hasValidNextRun = nextRunDate != null && !Number.isNaN(nextRunDate.getTime())
           const nextRunLabel = hasValidNextRun
             ? formatDistanceToNow(nextRunDate, { addSuffix: true })
@@ -68,7 +75,14 @@ export function UpcomingBackupsPanel({ tasks }: { tasks: UpcomingTask[] }) {
                 bgcolor: T.bgCard,
               }}
             >
-              <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1}>
+              <Stack
+                direction="row"
+                sx={{
+                  justifyContent: 'space-between',
+                  alignItems: 'flex-start',
+                  gap: 1,
+                }}
+              >
                 <Box sx={{ minWidth: 0 }}>
                   <Chip
                     label={typeLabel(task.type)}

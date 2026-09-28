@@ -1,45 +1,27 @@
 import React, { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
-  Alert,
   Box,
-  Button,
   Card,
   CardContent,
   Chip,
-  CircularProgress,
   LinearProgress,
   Stack,
   Tooltip,
   Typography,
 } from '@mui/material'
-import {
-  Activity,
-  Clock,
-  Eye,
-  FileText,
-  ListChecks,
-  RefreshCw,
-  RotateCcw,
-  Square,
-} from 'lucide-react'
+import { Clock, Eye, ListChecks, RefreshCw, RotateCcw, Square } from 'lucide-react'
 import ActiveBackupPlanRunCard from './ActiveBackupPlanRunCard'
 import DataTable, { type ActionButton, type Column } from './DataTable'
 import RepositoryCell from './RepositoryCell'
 import RetryJobDialog from './RetryJobDialog'
 import StatusBadge from './StatusBadge'
 import type { BackupPlan, BackupPlanRun, BackupPlanRunRepository } from '../types'
-import {
-  formatBytes as formatBytesUtil,
-  formatDate,
-  formatDateTimeFull,
-  formatTimeRange,
-} from '../utils/dateUtils'
+import { formatDate, formatDateTimeFull, formatTimeRange } from '../utils/dateUtils'
 import {
   getBackupPlanRunRetryDisabledReason,
   shouldShowBackupPlanRunRetryAction,
 } from './backupPlanRunRetry'
-import { PlanRunScriptsSection } from './PlanRunScripts'
 import {
   canViewBackupJobLogs as canViewLogs,
   canViewScriptLogs,
@@ -50,20 +32,6 @@ export type { BackupPlanRunLogJob } from './planRunScriptLogs'
 
 function isActiveRun(status?: string): boolean {
   return status === 'pending' || status === 'running'
-}
-
-function runStatusColor(status?: string): 'default' | 'primary' | 'success' | 'warning' | 'error' {
-  if (status === 'completed') return 'success'
-  if (status === 'completed_with_warnings' || status === 'partial' || status === 'skipped')
-    return 'warning'
-  if (status === 'failed' || status === 'cancelled') return 'error'
-  if (isActiveRun(status)) return 'primary'
-  return 'default'
-}
-
-function formatRunStatus(status?: string): string {
-  if (!status) return 'Unknown'
-  return status.replace(/_/g, ' ')
 }
 
 function isFinishedRepositoryRun(runRepository: BackupPlanRunRepository): boolean {
@@ -92,8 +60,8 @@ function getTransportLabel(
   return null
 }
 
-function getRepositoryLabel(runRepository: BackupPlanRunRepository): string {
-  return runRepository.repository?.name || runRepository.backup_job?.repository || 'Repository'
+function getRepositoryLabel(runRepository: BackupPlanRunRepository, fallback: string): string {
+  return runRepository.repository?.name || runRepository.backup_job?.repository || fallback
 }
 
 function getRepositoryPath(runRepository: BackupPlanRunRepository): string {
@@ -132,10 +100,10 @@ function getStartedAt(run: BackupPlanRun): string | null {
   return run.started_at || run.created_at || null
 }
 
-function getPrimaryRepositoryName(run: BackupPlanRun): string {
+function getPrimaryRepositoryName(run: BackupPlanRun, fallback: string): string {
   const firstRepository = run.repositories[0]
   if (!firstRepository) return '-'
-  return getRepositoryLabel(firstRepository)
+  return getRepositoryLabel(firstRepository, fallback)
 }
 
 function getPrimaryRepositoryPath(run: BackupPlanRun): string {
@@ -154,307 +122,6 @@ function getCurrentFile(run: BackupPlanRun): string | null {
     run.repositories.find(
       (runRepository) => runRepository.backup_job?.progress_details?.current_file
     )?.backup_job?.progress_details?.current_file ?? null
-  )
-}
-
-function RepositoryRunRow({
-  runRepository,
-  onViewLogs,
-}: {
-  runRepository: BackupPlanRunRepository
-  onViewLogs: (job: BackupPlanRunLogJob) => void
-}) {
-  const { t } = useTranslation()
-  const job = runRepository.backup_job
-  const progress = job?.progress ?? 0
-  const progressDetails = job?.progress_details
-  const maintenanceStatus = job?.maintenance_status
-  const statusLabel = t(`backupPlans.statuses.${runRepository.status}`, {
-    defaultValue: formatRunStatus(runRepository.status),
-  })
-  const transportLabel = getTransportLabel(runRepository, t)
-
-  return (
-    <Box
-      sx={{
-        border: 1,
-        borderColor: 'divider',
-        borderRadius: 1,
-        p: 1.5,
-        bgcolor: 'background.paper',
-      }}
-    >
-      <Stack spacing={1.25}>
-        <Stack
-          direction={{ xs: 'column', sm: 'row' }}
-          spacing={1}
-          alignItems={{ xs: 'flex-start', sm: 'center' }}
-          justifyContent="space-between"
-        >
-          <Box sx={{ minWidth: 0 }}>
-            <Typography variant="subtitle2">{getRepositoryLabel(runRepository)}</Typography>
-            <Typography variant="caption" color="text.secondary" noWrap component="div">
-              {getRepositoryPath(runRepository)}
-            </Typography>
-          </Box>
-          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
-            <Chip size="small" label={statusLabel} color={runStatusColor(runRepository.status)} />
-            {transportLabel && <Chip size="small" variant="outlined" label={transportLabel} />}
-            {job && (
-              <Typography variant="caption" color="text.secondary">
-                {t('backupPlans.runsDialog.jobNumber', { id: job.id })}
-              </Typography>
-            )}
-            {maintenanceStatus && (
-              <Chip
-                size="small"
-                variant="outlined"
-                color={maintenanceStatus.includes('failed') ? 'warning' : 'default'}
-                label={t('backupPlans.runsDialog.maintenanceStatus', {
-                  status: t(`backupPlans.statuses.${maintenanceStatus}`, {
-                    defaultValue: formatRunStatus(maintenanceStatus),
-                  }),
-                })}
-              />
-            )}
-          </Stack>
-        </Stack>
-
-        {job?.status === 'running' && (
-          <LinearProgress
-            variant={progress > 0 ? 'determinate' : 'indeterminate'}
-            value={progress}
-          />
-        )}
-
-        <Stack
-          direction={{ xs: 'column', md: 'row' }}
-          spacing={1}
-          alignItems={{ xs: 'flex-start', md: 'center' }}
-          justifyContent="space-between"
-        >
-          <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap>
-            {progressDetails?.nfiles !== undefined && (
-              <InlineMetric
-                icon={<FileText size={13} />}
-                label={t('backup.runningJobs.progress.filesProcessed')}
-                value={progressDetails.nfiles.toLocaleString()}
-              />
-            )}
-            {progressDetails?.original_size !== undefined && (
-              <InlineMetric
-                icon={<Activity size={13} />}
-                label={t('backup.runningJobs.progress.originalSize')}
-                value={formatBytesUtil(progressDetails.original_size)}
-              />
-            )}
-            {job?.status === 'running' && progressDetails?.backup_speed !== undefined && (
-              <InlineMetric
-                icon={<RefreshCw size={13} />}
-                label={t('backup.runningJobs.progress.speed')}
-                value={`${progressDetails.backup_speed.toFixed(2)} MB/s`}
-              />
-            )}
-          </Stack>
-
-          <Stack direction="row" spacing={1} alignItems="center">
-            <Typography variant="caption" color="text.secondary">
-              {job?.archive_name
-                ? t('backupPlans.runsDialog.archiveName', { name: job.archive_name })
-                : t('backupPlans.runsDialog.archivePending')}
-            </Typography>
-            {canViewLogs(job) && (
-              <Button
-                size="small"
-                variant="text"
-                startIcon={<Eye size={14} />}
-                onClick={() => onViewLogs(job)}
-              >
-                {t('backupPlans.runsDialog.viewLogs')}
-              </Button>
-            )}
-          </Stack>
-        </Stack>
-
-        {progressDetails?.current_file && (
-          <Typography
-            variant="caption"
-            color="text.secondary"
-            sx={{
-              display: 'block',
-              fontFamily: '"JetBrains Mono","Fira Code",ui-monospace,monospace',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }}
-          >
-            {progressDetails.current_file}
-          </Typography>
-        )}
-
-        {(runRepository.error_message || job?.error_message) && (
-          <Typography variant="caption" color="error">
-            {runRepository.error_message || job?.error_message}
-          </Typography>
-        )}
-      </Stack>
-    </Box>
-  )
-}
-
-function InlineMetric({
-  icon,
-  label,
-  value,
-}: {
-  icon: React.ReactNode
-  label: string
-  value: React.ReactNode
-}) {
-  return (
-    <Stack direction="row" spacing={0.5} alignItems="center" sx={{ minWidth: 0 }}>
-      <Box sx={{ color: 'text.secondary', display: 'flex', flexShrink: 0 }}>{icon}</Box>
-      <Typography variant="caption" color="text.secondary">
-        {label}
-      </Typography>
-      <Typography variant="caption" fontWeight={600}>
-        {value}
-      </Typography>
-    </Stack>
-  )
-}
-
-function SummaryPill({ label, value }: { label: string; value: React.ReactNode }) {
-  return (
-    <Box
-      sx={{
-        minWidth: 0,
-        flex: 1,
-        border: 1,
-        borderColor: 'divider',
-        borderRadius: 1,
-        px: 1.5,
-        py: 1,
-      }}
-    >
-      <Typography variant="caption" color="text.secondary">
-        {label}
-      </Typography>
-      <Typography variant="body2" fontWeight={600} noWrap>
-        {value}
-      </Typography>
-    </Box>
-  )
-}
-
-export function BackupPlanRunCard({
-  run,
-  plan,
-  cancelling,
-  onCancel,
-  onViewLogs,
-}: {
-  run: BackupPlanRun
-  plan?: BackupPlan | null
-  cancelling?: boolean
-  onCancel: (runId: number) => void
-  onViewLogs: (job: BackupPlanRunLogJob) => void
-}) {
-  const { t } = useTranslation()
-  const active = isActiveRun(run.status)
-  const progress = getRunProgress(run)
-  const statusLabel = t(`backupPlans.statuses.${run.status}`, {
-    defaultValue: formatRunStatus(run.status),
-  })
-  const planName =
-    plan?.name ||
-    (run.backup_plan_id
-      ? t('backupPlans.runsPanel.planFallback', { id: run.backup_plan_id })
-      : t('backupPlans.runsPanel.unknownPlan'))
-
-  return (
-    <Card variant="outlined">
-      <CardContent>
-        <Stack spacing={2.5}>
-          <Stack
-            direction={{ xs: 'column', sm: 'row' }}
-            spacing={1.5}
-            alignItems={{ xs: 'flex-start', sm: 'center' }}
-            justifyContent="space-between"
-          >
-            <Box sx={{ minWidth: 0 }}>
-              <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
-                {active && <RefreshCw size={16} className="animate-spin" />}
-                <Typography variant="subtitle1" fontWeight={700} noWrap>
-                  {planName}
-                </Typography>
-                <Chip size="small" label={t('backupPlans.runsDialog.runNumber', { id: run.id })} />
-                <Chip size="small" label={statusLabel} color={runStatusColor(run.status)} />
-              </Stack>
-              <Typography variant="caption" color="text.secondary">
-                {t('backupPlans.runsPanel.repositoryProgress', {
-                  completed: getFinishedCount(run),
-                  total: run.repositories.length,
-                })}
-              </Typography>
-            </Box>
-            {active && (
-              <Button
-                color="warning"
-                size="small"
-                variant="outlined"
-                disabled={cancelling}
-                onClick={() => onCancel(run.id)}
-                startIcon={
-                  cancelling ? <CircularProgress size={14} color="inherit" /> : <Square size={14} />
-                }
-              >
-                {t('backupPlans.runsPanel.cancelRun')}
-              </Button>
-            )}
-          </Stack>
-
-          <LinearProgress
-            variant={active && progress === 0 ? 'indeterminate' : 'determinate'}
-            value={progress}
-          />
-
-          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
-            <SummaryPill label={t('backupPlans.runsDialog.trigger')} value={run.trigger} />
-            <SummaryPill
-              label={t('backupPlans.runsDialog.started')}
-              value={run.started_at ? new Date(run.started_at).toLocaleString() : '-'}
-            />
-            <SummaryPill
-              label={t('backupPlans.runsPanel.duration')}
-              value={formatTimeRange(run.started_at, run.completed_at, run.status)}
-            />
-          </Stack>
-
-          {run.error_message && (
-            <Alert severity={run.status === 'cancelled' ? 'warning' : 'error'}>
-              {run.error_message}
-            </Alert>
-          )}
-
-          <PlanRunScriptsSection run={run} onViewLogs={onViewLogs} />
-
-          {run.repositories.length === 0 ? (
-            <Alert severity="info">{t('backupPlans.runsPanel.noRepositories')}</Alert>
-          ) : (
-            <Stack spacing={1.25}>
-              {run.repositories.map((runRepository) => (
-                <RepositoryRunRow
-                  key={runRepository.id}
-                  runRepository={runRepository}
-                  onViewLogs={onViewLogs}
-                />
-              ))}
-            </Stack>
-          )}
-        </Stack>
-      </CardContent>
-    </Card>
   )
 }
 
@@ -536,10 +203,23 @@ export default function BackupPlanRunsPanel({
       width: '90px',
       render: (run) => (
         <Box sx={{ minWidth: 0 }}>
-          <Typography variant="body2" fontWeight={700} color="primary">
+          <Typography
+            variant="body2"
+            color="primary"
+            sx={{
+              fontWeight: 700,
+            }}
+          >
             #{run.id}
           </Typography>
-          <Typography variant="caption" color="text.secondary" noWrap component="div">
+          <Typography
+            variant="caption"
+            noWrap
+            component="div"
+            sx={{
+              color: 'text.secondary',
+            }}
+          >
             {run.trigger}
           </Typography>
         </Box>
@@ -552,11 +232,20 @@ export default function BackupPlanRunsPanel({
       mobileFullWidth: true,
       render: (run) => (
         <Box sx={{ minWidth: 0 }}>
-          <Typography variant="body2" fontWeight={700} noWrap>
+          <Typography
+            variant="body2"
+            noWrap
+            sx={{
+              fontWeight: 700,
+            }}
+          >
             {getPlanName(run)}
           </Typography>
           <RepositoryCell
-            repositoryName={getPrimaryRepositoryName(run)}
+            repositoryName={getPrimaryRepositoryName(
+              run,
+              t('backupPlans.status.repositoryFallback')
+            )}
             repositoryPath={getPrimaryRepositoryPath(run)}
             withIcon={false}
           />
@@ -568,7 +257,13 @@ export default function BackupPlanRunsPanel({
               sx={{ mt: 0.5 }}
             />
           )}
-          <Typography variant="caption" color="text.secondary" component="div">
+          <Typography
+            variant="caption"
+            component="div"
+            sx={{
+              color: 'text.secondary',
+            }}
+          >
             {t('backupPlans.runsPanel.repositoryProgress', {
               completed: getFinishedCount(run),
               total: run.repositories.length,
@@ -577,9 +272,9 @@ export default function BackupPlanRunsPanel({
           {getCurrentFile(run) && (
             <Typography
               variant="caption"
-              color="text.secondary"
               component="div"
               sx={{
+                color: 'text.secondary',
                 fontFamily: '"JetBrains Mono","Fira Code",ui-monospace,monospace',
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
@@ -598,7 +293,16 @@ export default function BackupPlanRunsPanel({
       width: '160px',
       render: (run) => (
         <Stack spacing={0.75}>
-          <StatusBadge status={run.status} />
+          <StatusBadge
+            status={run.status}
+            tooltip={
+              run.skip_reason === 'minimum_interval_not_elapsed'
+                ? t('availabilitySchedule.skipReasons.minimumIntervalNotElapsed')
+                : run.skip_reason === 'source_unavailable'
+                  ? t('availabilitySchedule.skipReasons.sourceUnavailable')
+                  : undefined
+            }
+          />
           {isActiveRun(run.status) && (
             <LinearProgress
               variant={getRunProgress(run) === 0 ? 'indeterminate' : 'determinate'}
@@ -620,8 +324,11 @@ export default function BackupPlanRunsPanel({
         >
           <Typography
             variant="body2"
-            color="text.secondary"
-            sx={{ cursor: getStartedAt(run) ? 'help' : 'default', display: 'inline-block' }}
+            sx={{
+              color: 'text.secondary',
+              cursor: getStartedAt(run) ? 'help' : 'default',
+              display: 'inline-block',
+            }}
           >
             {getStartedAt(run) ? formatDate(getStartedAt(run) as string) : '-'}
           </Typography>
@@ -633,7 +340,13 @@ export default function BackupPlanRunsPanel({
       label: t('backupPlans.runsPanel.columns.duration'),
       width: '140px',
       render: (run) => (
-        <Typography variant="body2" color="text.secondary" noWrap>
+        <Typography
+          variant="body2"
+          noWrap
+          sx={{
+            color: 'text.secondary',
+          }}
+        >
           {formatTimeRange(run.started_at, run.completed_at, run.status)}
         </Typography>
       ),
@@ -691,8 +404,11 @@ export default function BackupPlanRunsPanel({
         <Stack
           direction="row"
           spacing={1.5}
-          alignItems="center"
-          sx={{ mb: 1, color: 'text.secondary' }}
+          sx={{
+            alignItems: 'center',
+            mb: 1,
+            color: 'text.secondary',
+          }}
         >
           <Box
             sx={{
@@ -704,12 +420,24 @@ export default function BackupPlanRunsPanel({
           >
             {icon}
           </Box>
-          <Typography id={sectionId} variant="h6" fontWeight={600}>
+          <Typography
+            id={sectionId}
+            variant="h6"
+            sx={{
+              fontWeight: 600,
+            }}
+          >
             {title}
           </Typography>
           {countChip}
         </Stack>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+        <Typography
+          variant="body2"
+          sx={{
+            color: 'text.secondary',
+            mb: 3,
+          }}
+        >
           {subtitle}
         </Typography>
 
@@ -745,13 +473,22 @@ export default function BackupPlanRunsPanel({
           <Stack
             direction="row"
             spacing={1.5}
-            alignItems="center"
-            sx={{ mb: 1, color: 'text.secondary' }}
+            sx={{
+              alignItems: 'center',
+              mb: 1,
+              color: 'text.secondary',
+            }}
           >
             <Box sx={{ display: 'flex', color: 'success.main' }}>
               <RefreshCw size={20} className="animate-spin" />
             </Box>
-            <Typography id="backup-plan-active-runs-heading" variant="h6" fontWeight={600}>
+            <Typography
+              id="backup-plan-active-runs-heading"
+              variant="h6"
+              sx={{
+                fontWeight: 600,
+              }}
+            >
               {t('backupPlans.runsPanel.activeTitle')}
             </Typography>
             <Chip
@@ -760,7 +497,13 @@ export default function BackupPlanRunsPanel({
               label={t('backupPlans.runsPanel.activeCount', { count: activeRuns.length })}
             />
           </Stack>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2.5 }}>
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+              mb: 2.5,
+            }}
+          >
             {t('backupPlans.runsPanel.activeSubtitle')}
           </Typography>
 

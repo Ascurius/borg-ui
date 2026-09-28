@@ -4,6 +4,8 @@ Unit tests for activity API - log buffer functionality.
 
 import pytest
 from datetime import datetime, timedelta
+from app.database.models import Operation
+from tests.utils.operations import seed_job_operation
 
 
 def _set_log_save_policy(test_db, policy: str) -> None:
@@ -31,6 +33,20 @@ def _create_activity_repository(test_db, name: str = "Policy Repo"):
     test_db.commit()
     test_db.refresh(repo)
     return repo
+
+
+def _create_agent_machine(test_db, agent_id: str = "agent-activity"):
+    from app.database.models import AgentMachine
+
+    machine = AgentMachine(
+        agent_id=agent_id,
+        name=agent_id,
+        token_hash="hash",
+        token_prefix="prefix",
+    )
+    test_db.add(machine)
+    test_db.flush()
+    return machine
 
 
 class TestBackupServiceLogBuffer:
@@ -110,16 +126,16 @@ class TestActivityLogDownloads:
         self, test_client, admin_headers, test_db
     ):
         """Activity log download should reuse standard bearer auth."""
-        from app.database.models import BackupJob
 
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/test/repo",
             status="failed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
             logs="line 1\nline 2",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -135,19 +151,78 @@ class TestActivityLogDownloads:
 class TestRecentActivityEndpoint:
     """Test the aggregated recent activity feed."""
 
+    def test_recent_activity_includes_durable_availability_skips(
+        self, test_client, admin_headers, test_db
+    ):
+        from app.database.models import (
+            AvailabilityScheduleSkip,
+            BackupPlan,
+            BackupPlanRun,
+            ScheduledJob,
+        )
+
+        occurred_at = datetime(2026, 8, 13, 12, 0, 0)
+        plan = BackupPlan(
+            name="Availability plan",
+            source_directories='["/srv/availability"]',
+            schedule_enabled=True,
+            schedule_mode="availability",
+        )
+        automation = ScheduledJob(
+            name="Availability automation",
+            schedule_mode="availability",
+            enabled=True,
+        )
+        test_db.add_all([plan, automation])
+        test_db.flush()
+        test_db.add_all(
+            [
+                BackupPlanRun(
+                    backup_plan_id=plan.id,
+                    trigger="availability",
+                    status="skipped",
+                    skip_reason="minimum_interval_not_elapsed",
+                    error_message="Minimum interval after the last successful backup has not elapsed.",
+                    started_at=occurred_at,
+                    completed_at=occurred_at,
+                    created_at=occurred_at,
+                ),
+                AvailabilityScheduleSkip(
+                    scheduled_job_id=automation.id,
+                    reason="source_unavailable",
+                    detail="The backup source is unavailable.",
+                    occurred_at=occurred_at + timedelta(minutes=1),
+                ),
+            ]
+        )
+        test_db.commit()
+
+        response = test_client.get(
+            "/api/activity/recent?job_type=availability_check&status=skipped",
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 200
+        activity = response.json()
+        assert len(activity) == 2
+        assert all(item["type"] == "availability_check" for item in activity)
+        assert all(item["status"] == "skipped" for item in activity)
+        assert all(item["has_logs"] is False for item in activity)
+        assert {item["skip_reason"] for item in activity} == {
+            "minimum_interval_not_elapsed",
+            "source_unavailable",
+        }
+        assert {item["repository"] for item in activity} == {
+            plan.name,
+            automation.name,
+        }
+
     def test_recent_activity_aggregates_job_types_and_schedule_metadata(
         self, test_client, admin_headers, test_db
     ):
         from app.database.models import (
-            BackupJob,
-            CheckJob,
-            CompactJob,
             InstalledPackage,
-            PackageInstallJob,
-            PruneJob,
             Repository,
-            RestoreCheckJob,
-            RestoreJob,
             ScheduledJob,
         )
 
@@ -185,14 +260,20 @@ class TestRecentActivityEndpoint:
         test_db.refresh(package)
 
         jobs = [
-            BackupJob(
+            seed_job_operation(
+                test_db,
+                "backup",
                 repository=repository.path,
                 status="completed",
                 started_at=base + timedelta(minutes=5),
                 completed_at=base + timedelta(minutes=6),
                 scheduled_job_id=schedule.id,
+                archive_name="archive-pruned-since",
+                archive_pruned_at=base + timedelta(minutes=30),
             ),
-            RestoreJob(
+            seed_job_operation(
+                test_db,
+                "restore",
                 repository=repository.path,
                 archive="archive-1",
                 destination="/restore",
@@ -200,7 +281,9 @@ class TestRecentActivityEndpoint:
                 started_at=base + timedelta(minutes=4),
                 completed_at=base + timedelta(minutes=5),
             ),
-            CheckJob(
+            seed_job_operation(
+                test_db,
+                "check",
                 repository_id=repository.id,
                 repository_path=repository.path,
                 status="completed",
@@ -208,7 +291,9 @@ class TestRecentActivityEndpoint:
                 completed_at=base + timedelta(minutes=4),
                 scheduled_check=True,
             ),
-            RestoreCheckJob(
+            seed_job_operation(
+                test_db,
+                "restore_check",
                 repository_id=repository.id,
                 repository_path=repository.path,
                 archive_name="archive-restore-check",
@@ -218,14 +303,18 @@ class TestRecentActivityEndpoint:
                 scheduled_restore_check=True,
                 logs="restore check complete",
             ),
-            CompactJob(
+            seed_job_operation(
+                test_db,
+                "compact",
                 repository_id=repository.id,
                 repository_path=repository.path,
                 status="completed",
                 started_at=base + timedelta(minutes=2),
                 completed_at=base + timedelta(minutes=3),
             ),
-            PruneJob(
+            seed_job_operation(
+                test_db,
+                "prune",
                 repository_id=repository.id,
                 repository_path=repository.path,
                 status="completed",
@@ -233,7 +322,9 @@ class TestRecentActivityEndpoint:
                 completed_at=base + timedelta(minutes=2),
                 logs="prune complete",
             ),
-            PackageInstallJob(
+            seed_job_operation(
+                test_db,
+                "package_install",
                 package_id=package.id,
                 status="completed",
                 started_at=base,
@@ -254,8 +345,11 @@ class TestRecentActivityEndpoint:
         assert activity[0]["schedule_id"] == schedule.id
         assert activity[0]["schedule_name"] == schedule.name
         assert activity[0]["repository"] == repository.name
+        # the run outlives its archive and says so
+        assert activity[0]["archive_pruned_at"] is not None
         check_activity = next(item for item in activity if item["type"] == "check")
         assert check_activity["triggered_by"] == "schedule"
+        assert check_activity["archive_pruned_at"] is None
         restore_check_activity = next(
             item for item in activity if item["type"] == "restore_check"
         )
@@ -268,7 +362,7 @@ class TestRecentActivityEndpoint:
     def test_recent_activity_includes_rclone_sync_and_hydrate_jobs(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import Repository, RcloneSyncJob
+        from app.database.models import Repository
 
         base = datetime(2024, 1, 1, 12, 0, 0)
         repository = Repository(
@@ -281,7 +375,9 @@ class TestRecentActivityEndpoint:
         test_db.add(repository)
         test_db.commit()
         test_db.refresh(repository)
-        sync_job = RcloneSyncJob(
+        sync_job = seed_job_operation(
+            test_db,
+            "rclone_sync",
             repository_id=repository.id,
             direction="primary_to_remote",
             operation="sync",
@@ -290,7 +386,9 @@ class TestRecentActivityEndpoint:
             started_at=base + timedelta(minutes=1),
             log_text="syncing repository",
         )
-        hydrate_job = RcloneSyncJob(
+        hydrate_job = seed_job_operation(
+            test_db,
+            "rclone_sync",
             repository_id=repository.id,
             direction="remote_to_cache",
             operation="hydrate",
@@ -408,7 +506,7 @@ class TestRecentActivityEndpoint:
     def test_recent_activity_marks_file_backed_rclone_logs_available(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import Repository, RcloneSyncJob
+        from app.database.models import Repository
 
         _set_log_save_policy(test_db, "all_jobs")
         repository = Repository(
@@ -420,7 +518,9 @@ class TestRecentActivityEndpoint:
         test_db.add(repository)
         test_db.commit()
         test_db.refresh(repository)
-        job = RcloneSyncJob(
+        job = seed_job_operation(
+            test_db,
+            "rclone_sync",
             repository_id=repository.id,
             direction="primary_to_remote",
             operation="sync",
@@ -430,7 +530,6 @@ class TestRecentActivityEndpoint:
             completed_at=datetime.now(),
             log_path="/tmp/rclone-sync.log",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -446,7 +545,7 @@ class TestRecentActivityEndpoint:
     def test_recent_activity_uses_check_creation_time_when_start_time_is_missing(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import CheckJob, Repository
+        from app.database.models import Repository
 
         repository = Repository(
             name="Pending Check Repo",
@@ -459,7 +558,9 @@ class TestRecentActivityEndpoint:
         test_db.commit()
         test_db.refresh(repository)
 
-        completed_job = CheckJob(
+        completed_job = seed_job_operation(
+            test_db,
+            "check",
             repository_id=repository.id,
             repository_path=repository.path,
             status="completed",
@@ -467,7 +568,9 @@ class TestRecentActivityEndpoint:
             completed_at=datetime(2024, 1, 1, 10, 5, 0),
             created_at=datetime(2024, 1, 1, 9, 59, 0),
         )
-        pending_job = CheckJob(
+        pending_job = seed_job_operation(
+            test_db,
+            "check",
             repository_id=repository.id,
             repository_path=repository.path,
             status="pending",
@@ -488,7 +591,7 @@ class TestRecentActivityEndpoint:
         activity = response.json()
         assert len(activity) == 1
         assert activity[0]["id"] == pending_job.id
-        assert activity[0]["status"] == "pending"
+        assert activity[0]["status"] == "queued"
         assert activity[0]["started_at"] is None
         assert activity[0]["triggered_by"] == "schedule"
 
@@ -496,14 +599,8 @@ class TestRecentActivityEndpoint:
         self, test_client, admin_headers, test_db
     ):
         from app.database.models import (
-            BackupJob,
-            CheckJob,
-            CompactJob,
             InstalledPackage,
-            PackageInstallJob,
-            PruneJob,
             Repository,
-            RestoreJob,
         )
 
         repository = Repository(
@@ -517,37 +614,49 @@ class TestRecentActivityEndpoint:
         test_db.commit()
         test_db.refresh(repository)
 
-        completed_job = BackupJob(
+        completed_job = seed_job_operation(
+            test_db,
+            "backup",
             repository=repository.path,
             status="completed",
             started_at=datetime(2024, 1, 1, 10, 0, 0),
             completed_at=datetime(2024, 1, 1, 10, 1, 0),
         )
-        pending_job = BackupJob(
+        pending_job = seed_job_operation(
+            test_db,
+            "backup",
             repository=repository.path,
             status="pending",
             started_at=datetime(2024, 1, 1, 11, 0, 0),
         )
-        restore_pending = RestoreJob(
+        restore_pending = seed_job_operation(
+            test_db,
+            "restore",
             repository=repository.path,
             archive="archive-1",
             destination="/restore",
             status="pending",
             started_at=datetime(2024, 1, 1, 9, 0, 0),
         )
-        check_pending = CheckJob(
+        check_pending = seed_job_operation(
+            test_db,
+            "check",
             repository_id=repository.id,
             repository_path=repository.path,
             status="pending",
             started_at=datetime(2024, 1, 1, 9, 5, 0),
         )
-        compact_pending = CompactJob(
+        compact_pending = seed_job_operation(
+            test_db,
+            "compact",
             repository_id=repository.id,
             repository_path=repository.path,
             status="pending",
             started_at=datetime(2024, 1, 1, 9, 10, 0),
         )
-        prune_pending = PruneJob(
+        prune_pending = seed_job_operation(
+            test_db,
+            "prune",
             repository_id=repository.id,
             repository_path=repository.path,
             status="pending",
@@ -561,7 +670,9 @@ class TestRecentActivityEndpoint:
         test_db.add(package)
         test_db.commit()
         test_db.refresh(package)
-        package_pending = PackageInstallJob(
+        package_pending = seed_job_operation(
+            test_db,
+            "package_install",
             package_id=package.id,
             status="pending",
             started_at=datetime(2024, 1, 1, 9, 20, 0),
@@ -593,6 +704,357 @@ class TestRecentActivityEndpoint:
 
 
 @pytest.mark.unit
+class TestActivityDryRunFlag:
+    def test_a_prune_dry_run_is_flagged(self, test_client, admin_headers, test_db):
+        from app.database.models import Repository
+
+        repo = Repository(
+            name="Repo", path="/tmp/repo", encryption="none", repository_type="local"
+        )
+        test_db.add(repo)
+        test_db.flush()
+        rehearsal = Operation(
+            repository_id=repo.id,
+            kind="prune",
+            category="maintenance",
+            status="completed",
+            trigger="manual",
+            priority=0,
+            run_id="run-rehearsal",
+            params={"keep_daily": 7, "dry_run": True},
+            started_at=datetime.now() - timedelta(minutes=2),
+            completed_at=datetime.now(),
+        )
+        real = Operation(
+            repository_id=repo.id,
+            kind="prune",
+            category="maintenance",
+            status="completed",
+            trigger="manual",
+            priority=0,
+            run_id="run-real",
+            params={"keep_daily": 7, "dry_run": False},
+            started_at=datetime.now() - timedelta(minutes=1),
+            completed_at=datetime.now(),
+        )
+        test_db.add_all([rehearsal, real])
+        test_db.commit()
+        response = test_client.get("/api/activity/recent", headers=admin_headers)
+        assert response.status_code == 200
+        by_id = {item["id"]: item["dry_run"] for item in response.json()}
+        assert by_id == {rehearsal.id: True, real.id: False}
+        retention = {item["id"]: item["prune_retention"] for item in response.json()}
+        assert retention[rehearsal.id] == {"keep_daily": 7}
+
+
+@pytest.mark.unit
+class TestRecentActivityPlanRunTrigger:
+    def _seed(self, test_db, *, run_trigger):
+        from app.database.models import BackupPlanRun, Repository
+
+        repo = Repository(
+            name="Repo", path="/tmp/repo", encryption="none", repository_type="local"
+        )
+        run = BackupPlanRun(trigger=run_trigger, status="completed")
+        test_db.add_all([repo, run])
+        test_db.flush()
+        backup = Operation(
+            repository_id=repo.id,
+            kind="backup",
+            category="backup",
+            status="completed",
+            trigger="plan",
+            priority=0,
+            run_id=f"run-{run.id}",
+            backup_plan_run_id=run.id,
+            started_at=datetime.now() - timedelta(minutes=2),
+            completed_at=datetime.now(),
+        )
+        test_db.add(backup)
+        test_db.commit()
+        return backup
+
+    def test_names_how_the_plan_run_started(self, test_client, admin_headers, test_db):
+        backup = self._seed(test_db, run_trigger="schedule")
+        response = test_client.get("/api/activity/recent", headers=admin_headers)
+        assert response.status_code == 200
+        (item,) = response.json()
+        assert item["id"] == backup.id
+        assert item["trigger"] == "plan"
+        assert item["backup_plan_run_trigger"] == "schedule"
+
+    def test_trigger_filter_reaches_through_to_the_plan_run(
+        self, test_client, admin_headers, test_db
+    ):
+        """Asking for scheduled runs finds the plan the scheduler fired; asking
+        for manual ones does not."""
+        backup = self._seed(test_db, run_trigger="schedule")
+        found = test_client.get(
+            "/api/activity/recent?trigger=schedule", headers=admin_headers
+        )
+        assert [a["id"] for a in found.json()] == [backup.id]
+        missed = test_client.get(
+            "/api/activity/recent?trigger=manual", headers=admin_headers
+        )
+        assert missed.json() == []
+
+
+@pytest.mark.unit
+class TestRecentActivityHooks:
+    def _seed(self, test_db):
+        from app.database.models import Repository, Script, ScriptExecution
+
+        repo = Repository(
+            name="Repo", path="/tmp/repo", encryption="none", repository_type="local"
+        )
+        script = Script(
+            name="Default vars",
+            file_path="library/default-vars.sh",
+            category="custom",
+            timeout=300,
+        )
+        test_db.add_all([repo, script])
+        test_db.flush()
+        backup = Operation(
+            repository_id=repo.id,
+            kind="backup",
+            category="backup",
+            status="completed",
+            trigger="plan",
+            priority=0,
+            run_id="run-hooks",
+            started_at=datetime.now() - timedelta(minutes=2),
+            completed_at=datetime.now(),
+        )
+        test_db.add(backup)
+        test_db.flush()
+        hooks = [
+            ScriptExecution(
+                script_id=script.id,
+                hook_type=hook,
+                status="completed",
+                started_at=datetime.now() - timedelta(minutes=2),
+                completed_at=datetime.now() - timedelta(minutes=2),
+                exit_code=0,
+                stdout="",
+                stderr="",
+                triggered_by="backup",
+                repository_id=repo.id,
+                operation_id=backup.id,
+            )
+            for hook in ("pre-backup", "post-backup")
+        ]
+        test_db.add_all(hooks)
+        test_db.commit()
+        return backup, hooks
+
+    def test_hook_scripts_ride_under_the_backup_they_ran_around(
+        self, test_client, admin_headers, test_db
+    ):
+        backup, hooks = self._seed(test_db)
+        response = test_client.get("/api/activity/recent", headers=admin_headers)
+        assert response.status_code == 200
+        activity = response.json()
+        assert [a["id"] for a in activity] == [backup.id]
+        nested = activity[0]["followups"]
+        assert {n["id"] for n in nested} == {h.id for h in hooks}
+        assert {n["hook_type"] for n in nested} == {"pre-backup", "post-backup"}
+        assert all(n["type"] == "script_execution" for n in nested)
+        assert all(n["operation_id"] == backup.id for n in nested)
+        # The hook belongs to the plan run, not to a manual click.
+        assert all(n["trigger"] == "plan" for n in nested)
+
+    def test_hook_scripts_ride_under_a_backup_selected_by_category(
+        self, test_client, admin_headers, test_db
+    ):
+        """A hook is a system row, so a category filter must not drop it
+        before it can join the backup that the filter selected."""
+        backup, hooks = self._seed(test_db)
+        response = test_client.get(
+            "/api/activity/recent?category=backup&trigger=plan", headers=admin_headers
+        )
+        assert response.status_code == 200
+        activity = response.json()
+        assert [a["id"] for a in activity] == [backup.id]
+        assert {n["id"] for n in activity[0]["followups"]} == {h.id for h in hooks}
+
+    def test_script_executions_are_scoped_to_accessible_repositories(
+        self, test_client, auth_headers, test_db
+    ):
+        """A viewer without a grant on the repository learns nothing about
+        the scripts that ran against it."""
+        self._seed(test_db)
+        response = test_client.get(
+            "/api/activity/recent?job_type=script_execution", headers=auth_headers
+        )
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_operations_window_is_by_time_not_id(
+        self, test_client, admin_headers, test_db
+    ):
+        """Rows backfilled from the legacy job tables have ids above the
+        backups they followed. A window on the newest ids kept them and
+        dropped the backup, so the window is on time instead."""
+        backup, hooks = self._seed(test_db)
+        old = [
+            Operation(
+                repository_id=backup.repository_id,
+                kind="prune",
+                category="maintenance",
+                status="completed",
+                trigger="manual",
+                priority=0,
+                run_id=f"legacy-{i}",
+                started_at=datetime.now() - timedelta(days=30, minutes=i),
+                completed_at=datetime.now() - timedelta(days=30, minutes=i),
+            )
+            for i in range(8)
+        ]
+        test_db.add_all(old)
+        test_db.commit()
+        # limit=2 windows 8 operations: with an id window, the backup would
+        # lose to the eight legacy rows above it.
+        response = test_client.get(
+            "/api/activity/recent?limit=2", headers=admin_headers
+        )
+        assert response.status_code == 200
+        activity = response.json()
+        assert [a["id"] for a in activity] == [backup.id, old[0].id]
+        assert {n["id"] for n in activity[0]["followups"]} == {h.id for h in hooks}
+
+    def test_hidden_reconcile_rows_do_not_use_up_the_window(
+        self, test_client, admin_headers, test_db
+    ):
+        """Reconcile chains are hidden index rows, and there are thousands
+        of them; the window must be spent on the runs the page shows."""
+        backup, hooks = self._seed(test_db)
+        newer = [
+            Operation(
+                repository_id=backup.repository_id,
+                kind="archive_sync",
+                category="index",
+                status="completed",
+                trigger="reconcile",
+                priority=0,
+                run_id=f"reconcile-{i}",
+                started_at=datetime.now() + timedelta(minutes=i + 1),
+                completed_at=datetime.now() + timedelta(minutes=i + 1),
+            )
+            for i in range(8)
+        ]
+        test_db.add_all(newer)
+        test_db.commit()
+        response = test_client.get(
+            "/api/activity/recent?limit=2", headers=admin_headers
+        )
+        assert response.status_code == 200
+        activity = response.json()
+        assert [a["id"] for a in activity] == [backup.id]
+        assert {n["id"] for n in activity[0]["followups"]} == {h.id for h in hooks}
+        # Asked for, the reconcile rows are still there.
+        response = test_client.get(
+            "/api/activity/recent?category=index&limit=2", headers=admin_headers
+        )
+        assert [a["kind"] for a in response.json()] == ["archive_sync", "archive_sync"]
+
+    def test_chain_head_outside_the_window_is_pulled_in(
+        self, test_client, admin_headers, test_db
+    ):
+        """A follow-up is newer than the backup it follows, so the window's
+        oldest edge can hold the chain without its head. The head is
+        fetched so the chain rides under it."""
+        backup, hooks = self._seed(test_db)
+
+        def op(kind, category, trigger, minutes, run_id, depends_on_id=None):
+            row = Operation(
+                repository_id=backup.repository_id,
+                kind=kind,
+                category=category,
+                status="completed",
+                trigger=trigger,
+                priority=0,
+                run_id=run_id,
+                depends_on_id=depends_on_id,
+                started_at=datetime.now() + timedelta(minutes=minutes),
+                completed_at=datetime.now() + timedelta(minutes=minutes),
+            )
+            test_db.add(row)
+            test_db.flush()
+            return row
+
+        # Three newer backups with four follow-ups each: fifteen rows that
+        # fill a window of sixteen without filling a page of four.
+        newer = []
+        for i in range(3):
+            head = op("backup", "backup", "plan", 10 * (i + 1), f"newer-{i}")
+            newer.append(head)
+            for j, kind in enumerate(
+                ("archive_sync", "history_merge", "history_index", "stats")
+            ):
+                op(
+                    kind,
+                    "index",
+                    "followup",
+                    10 * (i + 1) + j + 1,
+                    head.run_id,
+                    head.id,
+                )
+        stats = op("stats", "index", "followup", 60, backup.run_id, backup.id)
+        test_db.commit()
+
+        # limit=4 windows 16 operations: the 16 newest exclude the backup.
+        response = test_client.get(
+            "/api/activity/recent?limit=4", headers=admin_headers
+        )
+        assert response.status_code == 200
+        activity = response.json()
+        assert [a["id"] for a in activity] == [
+            *[b.id for b in reversed(newer)],
+            backup.id,
+        ]
+        nested = {n["id"] for n in activity[-1]["followups"]}
+        assert stats.id in nested
+        assert {h.id for h in hooks} <= nested
+
+    def test_ancestor_fetch_stops_when_the_filter_excludes_the_head(
+        self, test_client, admin_headers, test_db
+    ):
+        """A job_type filter that selects a follow-up but not its head must
+        return, with the follow-up hidden as before, not loop on the
+        parent it cannot load."""
+        backup, _hooks = self._seed(test_db)
+        stats = Operation(
+            repository_id=backup.repository_id,
+            kind="stats",
+            category="index",
+            status="completed",
+            trigger="followup",
+            priority=0,
+            run_id=backup.run_id,
+            depends_on_id=backup.id,
+            started_at=datetime.now(),
+            completed_at=datetime.now(),
+        )
+        test_db.add(stats)
+        test_db.commit()
+        response = test_client.get(
+            "/api/activity/recent?job_type=stats", headers=admin_headers
+        )
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_hook_scripts_stay_top_level_when_their_backup_is_not_listed(
+        self, test_client, admin_headers, test_db
+    ):
+        backup, hooks = self._seed(test_db)
+        response = test_client.get(
+            "/api/activity/recent?job_type=script_execution", headers=admin_headers
+        )
+        assert response.status_code == 200
+        assert {a["id"] for a in response.json()} == {h.id for h in hooks}
+
+
 class TestRecentActivityLogPolicy:
     """Test Activity has_logs serialization against SystemSettings.log_save_policy."""
 
@@ -618,11 +1080,11 @@ class TestRecentActivityLogPolicy:
     def test_quiet_successful_backup_db_logs_hidden_under_failed_only(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import BackupJob
-
         _set_log_save_policy(test_db, "failed_only")
         repo = _create_activity_repository(test_db, "Policy Backup Repo")
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository=repo.path,
             repository_id=repo.id,
             status="completed",
@@ -630,7 +1092,6 @@ class TestRecentActivityLogPolicy:
             completed_at=datetime.now(),
             logs="quiet successful transcript",
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get(
@@ -645,11 +1106,11 @@ class TestRecentActivityLogPolicy:
     def test_quiet_successful_file_backed_check_hidden_under_failed_and_warnings(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import CheckJob
-
         _set_log_save_policy(test_db, "failed_and_warnings")
         repo = _create_activity_repository(test_db, "Policy Check Repo")
-        job = CheckJob(
+        job = seed_job_operation(
+            test_db,
+            "check",
             repository_id=repo.id,
             repository_path=repo.path,
             status="completed",
@@ -657,7 +1118,6 @@ class TestRecentActivityLogPolicy:
             completed_at=datetime.now(),
             log_file_path="/tmp/check-policy.log",
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get(
@@ -672,11 +1132,11 @@ class TestRecentActivityLogPolicy:
     def test_quiet_successful_file_backed_check_visible_under_all_jobs(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import CheckJob
-
         _set_log_save_policy(test_db, "all_jobs")
         repo = _create_activity_repository(test_db, "All Jobs Check Repo")
-        job = CheckJob(
+        job = seed_job_operation(
+            test_db,
+            "check",
             repository_id=repo.id,
             repository_path=repo.path,
             status="completed",
@@ -684,7 +1144,6 @@ class TestRecentActivityLogPolicy:
             completed_at=datetime.now(),
             log_file_path="/tmp/check-all-jobs.log",
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get(
@@ -702,11 +1161,11 @@ class TestRecentActivityLogPolicy:
     def test_failed_restore_visible_under_all_policies(
         self, test_client, admin_headers, test_db, policy
     ):
-        from app.database.models import RestoreJob
-
         _set_log_save_policy(test_db, policy)
         repo = _create_activity_repository(test_db, f"Failed Restore {policy}")
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository=repo.path,
             archive="archive-1",
             destination="/restore",
@@ -715,7 +1174,6 @@ class TestRecentActivityLogPolicy:
             completed_at=datetime.now(),
             error_message="restore failed",
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get(
@@ -726,6 +1184,53 @@ class TestRecentActivityLogPolicy:
         activity = response.json()
         assert activity[0]["id"] == job.id
         assert activity[0]["has_logs"] is True
+
+    def test_restore_operation_appears_in_activity_with_its_archive_and_log(
+        self, test_client, admin_headers, test_db, tmp_path
+    ):
+        from app.database.models import Operation
+        from app.services.operations.details import restore_details
+
+        _set_log_save_policy(test_db, "all_jobs")
+        repo = _create_activity_repository(test_db, "Restore Ops")
+        log_path = tmp_path / "operation_restore.log"
+        log_path.write_text("STDOUT:\nrestored\n\nSTDERR:\n(no output)")
+        op = Operation(
+            repository_id=repo.id,
+            kind="restore",
+            category="restore",
+            status="completed",
+            trigger="manual",
+            priority=0,
+            run_id="run-activity",
+            started_at=datetime.now(),
+            completed_at=datetime.now(),
+            log_file_path=str(log_path),
+            params={"archive_name": "archive-1"},
+        )
+        test_db.add(op)
+        test_db.flush()
+        restore_details(test_db, op).archive = "archive-1"
+        test_db.commit()
+
+        response = test_client.get(
+            "/api/activity/recent?job_type=restore", headers=admin_headers
+        )
+        assert response.status_code == 200
+        item = next(i for i in response.json() if i["id"] == op.id)
+        assert item["type"] == "restore"
+        assert item["status"] == "completed"
+        assert item["archive_name"] == "archive-1"
+        assert item["repository"] == repo.name
+        assert item["repository_path"] == repo.path
+        assert item["triggered_by"] == "manual"
+        assert item["has_logs"] is True
+
+        logs = test_client.get(
+            f"/api/activity/restore/{op.id}/logs", headers=admin_headers
+        )
+        assert logs.status_code == 200
+        assert logs.json()["lines"][0]["content"] == "STDOUT:"
 
     def test_quiet_successful_script_hidden_but_warning_visible_under_failed_and_warnings(
         self, test_client, admin_headers, test_db
@@ -785,7 +1290,7 @@ class TestRecentActivityLogPolicy:
     def test_warning_package_output_visible_under_failed_and_warnings(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import InstalledPackage, PackageInstallJob
+        from app.database.models import InstalledPackage
 
         _set_log_save_policy(test_db, "failed_and_warnings")
         package = InstalledPackage(
@@ -795,7 +1300,9 @@ class TestRecentActivityLogPolicy:
         )
         test_db.add(package)
         test_db.flush()
-        job = PackageInstallJob(
+        job = seed_job_operation(
+            test_db,
+            "package_install",
             package_id=package.id,
             status="completed",
             started_at=datetime.now(),
@@ -803,7 +1310,6 @@ class TestRecentActivityLogPolicy:
             exit_code=0,
             stdout="WARNING: package already installed",
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get(
@@ -818,11 +1324,11 @@ class TestRecentActivityLogPolicy:
     def test_quiet_successful_rclone_logs_hidden_under_failed_only(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import RcloneSyncJob
-
         _set_log_save_policy(test_db, "failed_only")
         repo = _create_activity_repository(test_db, "Policy Rclone Repo")
-        job = RcloneSyncJob(
+        job = seed_job_operation(
+            test_db,
+            "rclone_sync",
             repository_id=repo.id,
             direction="primary_to_remote",
             operation="sync",
@@ -832,7 +1338,6 @@ class TestRecentActivityLogPolicy:
             completed_at=datetime.now(),
             log_text="sync completed quietly",
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get(
@@ -847,11 +1352,11 @@ class TestRecentActivityLogPolicy:
     def test_running_log_capable_rclone_visible_under_failed_only(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import RcloneSyncJob
-
         _set_log_save_policy(test_db, "failed_only")
         repo = _create_activity_repository(test_db, "Running Rclone Repo")
-        job = RcloneSyncJob(
+        job = seed_job_operation(
+            test_db,
+            "rclone_sync",
             repository_id=repo.id,
             direction="primary_to_remote",
             operation="sync",
@@ -860,7 +1365,6 @@ class TestRecentActivityLogPolicy:
             started_at=datetime.now(),
             log_path="/tmp/rclone-running.log",
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get(
@@ -875,18 +1379,17 @@ class TestRecentActivityLogPolicy:
     def test_pending_log_capable_check_hidden_under_all_jobs(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import CheckJob
-
         _set_log_save_policy(test_db, "all_jobs")
         repo = _create_activity_repository(test_db, "Pending Policy Check Repo")
-        job = CheckJob(
+        job = seed_job_operation(
+            test_db,
+            "check",
             repository_id=repo.id,
             repository_path=repo.path,
             status="pending",
             started_at=None,
             log_file_path="/tmp/check-pending.log",
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get(
@@ -917,20 +1420,19 @@ class TestActivityLogContracts:
     def test_get_job_logs_uses_file_backed_pagination(
         self, test_client, admin_headers, test_db, tmp_path
     ):
-        from app.database.models import BackupJob
-
         _set_log_save_policy(test_db, "all_jobs")
         log_file = tmp_path / "activity-log.txt"
         log_file.write_text("line-1\nline-2\nline-3\nline-4\n")
 
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/tmp/repo",
             status="completed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
             log_file_path=str(log_file),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -949,19 +1451,18 @@ class TestActivityLogContracts:
     def test_get_job_logs_hides_successful_file_logs_when_policy_skips_success(
         self, test_client, admin_headers, test_db, tmp_path
     ):
-        from app.database.models import BackupJob
-
         _set_log_save_policy(test_db, "failed_only")
         log_file = tmp_path / "hidden-success.log"
         log_file.write_text("successful backup log\n", encoding="utf-8")
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/tmp/repo",
             status="completed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
             log_file_path=str(log_file),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -979,19 +1480,18 @@ class TestActivityLogContracts:
     def test_download_job_logs_hides_successful_file_logs_when_policy_skips_success(
         self, test_client, admin_headers, test_db, tmp_path
     ):
-        from app.database.models import BackupJob
-
         _set_log_save_policy(test_db, "failed_only")
         log_file = tmp_path / "hidden-download.log"
         log_file.write_text("successful backup log\n", encoding="utf-8")
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/tmp/repo",
             status="completed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
             log_file_path=str(log_file),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1005,19 +1505,52 @@ class TestActivityLogContracts:
             response.json()["detail"]["key"]
             == "backend.errors.activity.noLogsAvailableForJob"
         )
+
+    def test_get_job_logs_falls_back_to_the_error_of_a_run_that_wrote_none(
+        self, test_client, admin_headers, test_db
+    ):
+        # An index step that dies on a locked repository never opens a log
+        # file, and its error message is the only account of what happened.
+        # The legacy job branch has always answered this way.
+        from app.database.models import Operation
+
+        repo = _create_activity_repository(test_db, "Errored Index Repo")
+        op = Operation(
+            repository_id=repo.id,
+            kind="archive_sync",
+            category="index",
+            status="failed",
+            trigger="followup",
+            priority=10,
+            run_id="run-errored-index",
+            started_at=datetime.now(),
+            completed_at=datetime.now(),
+            error_message="Failed to acquire the repository lock",
+        )
+        test_db.add(op)
+        test_db.commit()
+
+        response = test_client.get(
+            f"/api/activity/archive_sync/{op.id}/logs", headers=admin_headers
+        )
+
+        assert response.status_code == 200
+        assert [line["content"] for line in response.json()["lines"]] == [
+            "ERROR:",
+            "Failed to acquire the repository lock",
+        ]
 
     def test_download_job_logs_without_logs_returns_404(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import BackupJob
-
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/tmp/repo",
             status="completed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1031,34 +1564,6 @@ class TestActivityLogContracts:
             response.json()["detail"]["key"]
             == "backend.errors.activity.noLogsAvailableForJob"
         )
-
-    def test_get_job_logs_uses_database_log_fallback(
-        self, test_client, admin_headers, test_db
-    ):
-        from app.database.models import BackupJob
-
-        _set_log_save_policy(test_db, "all_jobs")
-        job = BackupJob(
-            repository="/tmp/repo",
-            status="completed",
-            started_at=datetime.now(),
-            completed_at=datetime.now(),
-            logs="db line 1\ndb line 2\ndb line 3",
-        )
-        test_db.add(job)
-        test_db.commit()
-        test_db.refresh(job)
-
-        response = test_client.get(
-            f"/api/activity/backup/{job.id}/logs?offset=1&limit=1",
-            headers=admin_headers,
-        )
-
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload["total_lines"] == 3
-        assert payload["has_more"] is True
-        assert payload["lines"][0]["content"] == "db line 2"
 
     def test_get_script_execution_logs_uses_stdout_and_stderr(
         self, test_client, admin_headers, test_db
@@ -1109,8 +1614,8 @@ class TestActivityLogContracts:
         from app.database.models import AgentJob, AgentJobLog, ScriptExecution
 
         agent_job = AgentJob(
-            agent_machine_id=1,
-            job_type="script.run",
+            agent_machine_id=_create_agent_machine(test_db).id,
+            job_type="script",
             status="running",
             payload={},
         )
@@ -1201,7 +1706,7 @@ class TestActivityLogContracts:
     def test_get_package_job_logs_allows_warning_output_under_warning_policy(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import InstalledPackage, PackageInstallJob
+        from app.database.models import InstalledPackage
 
         _set_log_save_policy(test_db, "failed_and_warnings")
         package = InstalledPackage(
@@ -1211,7 +1716,9 @@ class TestActivityLogContracts:
         )
         test_db.add(package)
         test_db.flush()
-        job = PackageInstallJob(
+        job = seed_job_operation(
+            test_db,
+            "package_install",
             package_id=package.id,
             status="completed",
             started_at=datetime.now(),
@@ -1220,7 +1727,6 @@ class TestActivityLogContracts:
             stdout="WARNING: package already installed",
             stderr="",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1236,7 +1742,7 @@ class TestActivityLogContracts:
     def test_download_package_job_logs_hides_quiet_success_under_warning_policy(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import InstalledPackage, PackageInstallJob
+        from app.database.models import InstalledPackage
 
         _set_log_save_policy(test_db, "failed_and_warnings")
         package = InstalledPackage(
@@ -1246,7 +1752,9 @@ class TestActivityLogContracts:
         )
         test_db.add(package)
         test_db.flush()
-        job = PackageInstallJob(
+        job = seed_job_operation(
+            test_db,
+            "package_install",
             package_id=package.id,
             status="completed",
             started_at=datetime.now(),
@@ -1255,7 +1763,6 @@ class TestActivityLogContracts:
             stdout="installed cleanly",
             stderr="",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1273,7 +1780,7 @@ class TestActivityLogContracts:
     def test_get_restore_check_job_logs_uses_activity_log_contract(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import Repository, RestoreCheckJob
+        from app.database.models import Repository
 
         _set_log_save_policy(test_db, "all_jobs")
         repository = Repository(
@@ -1286,7 +1793,9 @@ class TestActivityLogContracts:
         test_db.commit()
         test_db.refresh(repository)
 
-        job = RestoreCheckJob(
+        job = seed_job_operation(
+            test_db,
+            "restore_check",
             repository_id=repository.id,
             repository_path=repository.path,
             status="completed",
@@ -1294,7 +1803,6 @@ class TestActivityLogContracts:
             completed_at=datetime.now(),
             logs="restore check line 1\nrestore check line 2",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1312,7 +1820,7 @@ class TestActivityLogContracts:
     def test_get_rclone_sync_job_logs_uses_log_text_and_error_text(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import Repository, RcloneSyncJob
+        from app.database.models import Repository
 
         repository = Repository(
             name="Cloud Logs Repo",
@@ -1323,7 +1831,9 @@ class TestActivityLogContracts:
         test_db.add(repository)
         test_db.commit()
         test_db.refresh(repository)
-        job = RcloneSyncJob(
+        job = seed_job_operation(
+            test_db,
+            "rclone_sync",
             repository_id=repository.id,
             direction="primary_to_remote",
             operation="sync",
@@ -1334,7 +1844,6 @@ class TestActivityLogContracts:
             log_text="sync line 1\nsync line 2",
             error_text="remote unavailable",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1352,7 +1861,7 @@ class TestActivityLogContracts:
     def test_get_rclone_job_logs_hides_quiet_success_under_failed_only(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import Repository, RcloneSyncJob
+        from app.database.models import Repository
 
         _set_log_save_policy(test_db, "failed_only")
         repository = Repository(
@@ -1364,7 +1873,9 @@ class TestActivityLogContracts:
         test_db.add(repository)
         test_db.commit()
         test_db.refresh(repository)
-        job = RcloneSyncJob(
+        job = seed_job_operation(
+            test_db,
+            "rclone_sync",
             repository_id=repository.id,
             direction="primary_to_remote",
             operation="sync",
@@ -1374,7 +1885,6 @@ class TestActivityLogContracts:
             completed_at=datetime.now(),
             log_text="sync completed quietly",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1392,7 +1902,7 @@ class TestActivityLogContracts:
     def test_download_rclone_hydrate_job_logs_uses_database_text(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import Repository, RcloneSyncJob
+        from app.database.models import Repository
 
         _set_log_save_policy(test_db, "all_jobs")
         repository = Repository(
@@ -1404,7 +1914,9 @@ class TestActivityLogContracts:
         test_db.add(repository)
         test_db.commit()
         test_db.refresh(repository)
-        job = RcloneSyncJob(
+        job = seed_job_operation(
+            test_db,
+            "rclone_sync",
             repository_id=repository.id,
             direction="remote_to_cache",
             operation="hydrate",
@@ -1414,7 +1926,6 @@ class TestActivityLogContracts:
             completed_at=datetime.now(),
             log_text="hydrated repository",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1430,21 +1941,22 @@ class TestActivityLogContracts:
     def test_get_agent_backup_logs_hides_success_under_failed_only(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import AgentJob, AgentJobLog, BackupJob
+        from app.database.models import AgentJob, AgentJobLog
 
         _set_log_save_policy(test_db, "failed_only")
-        backup_job = BackupJob(
+        backup_job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/tmp/repo",
             status="completed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
             execution_mode="agent",
         )
-        test_db.add(backup_job)
         test_db.flush()
         agent_job = AgentJob(
-            agent_machine_id=1,
-            backup_job_id=backup_job.id,
+            agent_machine_id=_create_agent_machine(test_db).id,
+            operation_id=backup_job.id,
             job_type="backup",
             status="completed",
             payload={},
@@ -1477,7 +1989,7 @@ class TestActivityLogContracts:
     def test_delete_rclone_sync_job_removes_log_path(
         self, test_client, admin_headers, test_db, tmp_path
     ):
-        from app.database.models import Repository, RcloneSyncJob
+        from app.database.models import Repository
 
         repository = Repository(
             name="Cloud Delete Logs Repo",
@@ -1490,7 +2002,9 @@ class TestActivityLogContracts:
         test_db.add(repository)
         test_db.commit()
         test_db.refresh(repository)
-        job = RcloneSyncJob(
+        job = seed_job_operation(
+            test_db,
+            "rclone_sync",
             repository_id=repository.id,
             direction="primary_to_remote",
             operation="sync",
@@ -1500,7 +2014,6 @@ class TestActivityLogContracts:
             completed_at=datetime.now(),
             log_path=str(log_path),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1510,52 +2023,63 @@ class TestActivityLogContracts:
 
         assert response.status_code == 200
         assert not log_path.exists()
-        assert (
-            test_db.query(RcloneSyncJob).filter(RcloneSyncJob.id == job.id).first()
-            is None
-        )
+        assert test_db.get(Operation, job.id) is None
 
-    def test_download_job_logs_uses_database_logs_when_no_file(
+    def test_download_job_logs_for_running_operation_returns_cannot_download_error(
         self, test_client, admin_headers, test_db
     ):
-        from app.database.models import BackupJob
+        """A running operation-only job (check/prune/compact/...) must reject
+        the download the same way every other job type does: 400 with
+        `cannotDownloadLogsForRunningJob`, not the unrelated 404 for a
+        completed job with no logs at all."""
+        from app.database.models import Operation, Repository
 
-        job = BackupJob(
-            repository="/tmp/repo",
-            status="failed",
-            started_at=datetime.now(),
-            completed_at=datetime.now(),
-            logs="download me",
+        repo = Repository(
+            name="Repo", path="/tmp/repo", encryption="none", repository_type="local"
         )
-        test_db.add(job)
+        test_db.add(repo)
         test_db.commit()
-        test_db.refresh(job)
+        op = Operation(
+            repository_id=repo.id,
+            kind="check",
+            category="maintenance",
+            status="running",
+            trigger="manual",
+            priority=0,
+            run_id="run-1",
+        )
+        test_db.add(op)
+        test_db.commit()
+        test_db.refresh(op)
 
         response = test_client.get(
-            f"/api/activity/backup/{job.id}/logs/download",
+            f"/api/activity/check/{op.id}/logs/download",
             headers=admin_headers,
         )
 
-        assert response.status_code == 200
-        assert "text/plain" in response.headers.get("content-type", "")
+        assert response.status_code == 400
+        assert (
+            response.json()["detail"]["key"]
+            == "backend.errors.activity.cannotDownloadLogsForRunningJob"
+        )
 
     def test_activity_log_download_accepts_proxy_auth(
         self, test_client, test_db, monkeypatch
     ):
         """Activity log download should work in proxy-auth mode without a token query param."""
         from app import config
-        from app.database.models import BackupJob
 
         monkeypatch.setattr(config.settings, "disable_authentication", True)
 
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/test/repo",
             status="failed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
             logs="proxy log output",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1574,17 +2098,17 @@ class TestDeleteJobEndpoint:
 
     def test_delete_backup_job_success_admin(self, test_client, admin_headers, test_db):
         """Test admin can successfully delete a completed backup job"""
-        from app.database.models import BackupJob
         from datetime import datetime
 
         # Create a completed backup job
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/test/repo",
             status="completed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
         job_id = job.id
@@ -1602,22 +2126,22 @@ class TestDeleteJobEndpoint:
         assert data["message"] == "backend.success.activity.jobDeleted"
 
         # Verify job is deleted from database
-        deleted_job = test_db.query(BackupJob).filter(BackupJob.id == job_id).first()
+        deleted_job = test_db.get(Operation, job_id)
         assert deleted_job is None
 
     def test_delete_job_non_admin_forbidden(self, test_client, auth_headers, test_db):
         """Test non-admin user cannot delete jobs"""
-        from app.database.models import BackupJob
         from datetime import datetime
 
         # Create a completed backup job
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/test/repo",
             status="completed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1631,21 +2155,21 @@ class TestDeleteJobEndpoint:
         assert data["detail"]["key"] == "backend.errors.activity.adminOnlyDelete"
 
         # Verify job is NOT deleted
-        job_still_exists = (
-            test_db.query(BackupJob).filter(BackupJob.id == job.id).first()
-        )
+        job_still_exists = test_db.get(Operation, job.id)
         assert job_still_exists is not None
 
     def test_delete_running_job_fails(self, test_client, admin_headers, test_db):
         """Test cannot delete running job"""
-        from app.database.models import BackupJob
         from datetime import datetime
 
         # Create a running backup job
-        job = BackupJob(
-            repository="/test/repo", status="running", started_at=datetime.now()
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository="/test/repo",
+            status="running",
+            started_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1659,21 +2183,21 @@ class TestDeleteJobEndpoint:
         assert data["detail"]["key"] == "backend.errors.activity.cannotDeleteRunningJob"
 
         # Verify job is NOT deleted
-        job_still_exists = (
-            test_db.query(BackupJob).filter(BackupJob.id == job.id).first()
-        )
+        job_still_exists = test_db.get(Operation, job.id)
         assert job_still_exists is not None
 
     def test_delete_pending_job_succeeds(self, test_client, admin_headers, test_db):
         """Test can delete pending job (useful for cleaning up stuck jobs)"""
-        from app.database.models import BackupJob
         from datetime import datetime
 
         # Create a pending backup job
-        job = BackupJob(
-            repository="/test/repo", status="pending", started_at=datetime.now()
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository="/test/repo",
+            status="pending",
+            started_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1687,23 +2211,23 @@ class TestDeleteJobEndpoint:
         assert data["message"] == "backend.success.activity.jobDeleted"
 
         # Verify job IS deleted
-        job_deleted = test_db.query(BackupJob).filter(BackupJob.id == job.id).first()
+        job_deleted = test_db.get(Operation, job.id)
         assert job_deleted is None
 
     def test_delete_failed_job_success(self, test_client, admin_headers, test_db):
         """Test admin can delete failed job"""
-        from app.database.models import BackupJob
         from datetime import datetime
 
         # Create a failed backup job
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/test/repo",
             status="failed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
             error_message="Backup failed",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
         job_id = job.id
@@ -1716,7 +2240,7 @@ class TestDeleteJobEndpoint:
         assert response.status_code == 200
 
         # Verify job is deleted
-        deleted_job = test_db.query(BackupJob).filter(BackupJob.id == job_id).first()
+        deleted_job = test_db.get(Operation, job_id)
         assert deleted_job is None
 
     def test_delete_nonexistent_job_fails(self, test_client, admin_headers):
@@ -1741,11 +2265,12 @@ class TestDeleteJobEndpoint:
 
     def test_delete_restore_job_success(self, test_client, admin_headers, test_db):
         """Test admin can delete completed restore job"""
-        from app.database.models import RestoreJob
         from datetime import datetime
 
         # Create a completed restore job
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository="/test/repo",
             archive="test-archive",
             destination="/restore/path",
@@ -1753,7 +2278,6 @@ class TestDeleteJobEndpoint:
             started_at=datetime.now(),
             completed_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
         job_id = job.id
@@ -1766,22 +2290,23 @@ class TestDeleteJobEndpoint:
         assert response.status_code == 200
 
         # Verify job is deleted
-        deleted_job = test_db.query(RestoreJob).filter(RestoreJob.id == job_id).first()
+        deleted_job = test_db.get(Operation, job_id)
         assert deleted_job is None
 
     def test_delete_check_job_success(self, test_client, admin_headers, test_db):
         """Test admin can delete completed check job"""
-        from app.database.models import CheckJob
         from datetime import datetime
 
         # Create a completed check job
-        job = CheckJob(
-            repository_id=1,
+        repo = _create_activity_repository(test_db)
+        job = seed_job_operation(
+            test_db,
+            "check",
+            repository_id=repo.id,
             status="completed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
         job_id = job.id
@@ -1794,22 +2319,23 @@ class TestDeleteJobEndpoint:
         assert response.status_code == 200
 
         # Verify job is deleted
-        deleted_job = test_db.query(CheckJob).filter(CheckJob.id == job_id).first()
+        deleted_job = test_db.get(Operation, job_id)
         assert deleted_job is None
 
     def test_delete_compact_job_success(self, test_client, admin_headers, test_db):
         """Test admin can delete completed compact job"""
-        from app.database.models import CompactJob
         from datetime import datetime
 
         # Create a completed compact job
-        job = CompactJob(
-            repository_id=1,
+        repo = _create_activity_repository(test_db)
+        job = seed_job_operation(
+            test_db,
+            "compact",
+            repository_id=repo.id,
             status="completed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
         job_id = job.id
@@ -1822,22 +2348,23 @@ class TestDeleteJobEndpoint:
         assert response.status_code == 200
 
         # Verify job is deleted
-        deleted_job = test_db.query(CompactJob).filter(CompactJob.id == job_id).first()
+        deleted_job = test_db.get(Operation, job_id)
         assert deleted_job is None
 
     def test_delete_prune_job_success(self, test_client, admin_headers, test_db):
         """Test admin can delete completed prune job"""
-        from app.database.models import PruneJob
         from datetime import datetime
 
         # Create a completed prune job
-        job = PruneJob(
-            repository_id=1,
+        repo = _create_activity_repository(test_db)
+        job = seed_job_operation(
+            test_db,
+            "prune",
+            repository_id=repo.id,
             status="completed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
         job_id = job.id
@@ -1850,14 +2377,13 @@ class TestDeleteJobEndpoint:
         assert response.status_code == 200
 
         # Verify job is deleted
-        deleted_job = test_db.query(PruneJob).filter(PruneJob.id == job_id).first()
+        deleted_job = test_db.get(Operation, job_id)
         assert deleted_job is None
 
     def test_delete_job_with_log_file(
         self, test_client, admin_headers, test_db, tmp_path
     ):
         """Test deleting job also deletes log file"""
-        from app.database.models import BackupJob
         from datetime import datetime
 
         # Create a temporary log file
@@ -1866,14 +2392,15 @@ class TestDeleteJobEndpoint:
         assert log_file.exists()
 
         # Create a completed backup job with log file
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/test/repo",
             status="completed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
             log_file_path=str(log_file),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
         job_id = job.id
@@ -1886,7 +2413,7 @@ class TestDeleteJobEndpoint:
         assert response.status_code == 200
 
         # Verify job is deleted
-        deleted_job = test_db.query(BackupJob).filter(BackupJob.id == job_id).first()
+        deleted_job = test_db.get(Operation, job_id)
         assert deleted_job is None
 
         # Verify log file is deleted
@@ -1894,17 +2421,17 @@ class TestDeleteJobEndpoint:
 
     def test_delete_cancelled_job_success(self, test_client, admin_headers, test_db):
         """Test admin can delete cancelled job"""
-        from app.database.models import BackupJob
         from datetime import datetime
 
         # Create a cancelled backup job
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/test/repo",
             status="cancelled",
             started_at=datetime.now(),
             completed_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
         job_id = job.id
@@ -1917,22 +2444,22 @@ class TestDeleteJobEndpoint:
         assert response.status_code == 200
 
         # Verify job is deleted
-        deleted_job = test_db.query(BackupJob).filter(BackupJob.id == job_id).first()
+        deleted_job = test_db.get(Operation, job_id)
         assert deleted_job is None
 
     def test_delete_job_unauthenticated(self, test_client, test_db):
         """Test deleting job without authentication fails"""
-        from app.database.models import BackupJob
         from datetime import datetime
 
         # Create a completed backup job
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/test/repo",
             status="completed",
             started_at=datetime.now(),
             completed_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1942,9 +2469,7 @@ class TestDeleteJobEndpoint:
         assert response.status_code == 401  # No authentication provided
 
         # Verify job is NOT deleted
-        job_still_exists = (
-            test_db.query(BackupJob).filter(BackupJob.id == job.id).first()
-        )
+        job_still_exists = test_db.get(Operation, job.id)
         assert job_still_exists is not None
 
 
@@ -1967,13 +2492,17 @@ class TestGetJobLogsPlaceholderOffset:
     ):
         """Test A: buffer_exists=False, offset=0 -> returns 5-line placeholder."""
         from unittest.mock import patch
-        from app.database.models import BackupJob
         from datetime import datetime
 
-        job = BackupJob(
-            repository="/test/repo", status="running", started_at=datetime.now()
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            # No repository: these cases are about the log placeholder, and a
+            # viewer has no grant on one.
+            repository_id=None,
+            status="running",
+            started_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1994,13 +2523,17 @@ class TestGetJobLogsPlaceholderOffset:
     ):
         """Test B: buffer_exists=False, offset=5 -> returns empty response."""
         from unittest.mock import patch
-        from app.database.models import BackupJob
         from datetime import datetime
 
-        job = BackupJob(
-            repository="/test/repo", status="running", started_at=datetime.now()
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            # No repository: these cases are about the log placeholder, and a
+            # viewer has no grant on one.
+            repository_id=None,
+            status="running",
+            started_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -2022,13 +2555,17 @@ class TestGetJobLogsPlaceholderOffset:
     ):
         """Test C: buffer_exists=True but empty, offset=0 -> returns 5-line placeholder."""
         from unittest.mock import patch
-        from app.database.models import BackupJob
         from datetime import datetime
 
-        job = BackupJob(
-            repository="/test/repo", status="running", started_at=datetime.now()
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            # No repository: these cases are about the log placeholder, and a
+            # viewer has no grant on one.
+            repository_id=None,
+            status="running",
+            started_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -2049,13 +2586,17 @@ class TestGetJobLogsPlaceholderOffset:
     ):
         """Test D: buffer_exists=True but empty, offset=5 -> returns empty response."""
         from unittest.mock import patch
-        from app.database.models import BackupJob
         from datetime import datetime
 
-        job = BackupJob(
-            repository="/test/repo", status="running", started_at=datetime.now()
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            # No repository: these cases are about the log placeholder, and a
+            # viewer has no grant on one.
+            repository_id=None,
+            status="running",
+            started_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -2077,13 +2618,17 @@ class TestGetJobLogsPlaceholderOffset:
     ):
         """Test E: buffer_exists=True, buffer has lines, offset=0 -> returns those lines."""
         from unittest.mock import patch
-        from app.database.models import BackupJob
         from datetime import datetime
 
-        job = BackupJob(
-            repository="/test/repo", status="running", started_at=datetime.now()
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            # No repository: these cases are about the log placeholder, and a
+            # viewer has no grant on one.
+            repository_id=None,
+            status="running",
+            started_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -2107,3 +2652,1179 @@ class TestGetJobLogsPlaceholderOffset:
         assert data["lines"][0]["content"] == "Creating archive..."
         assert data["lines"][1]["content"] == "Files: 100 new, 0 changed"
         assert data["lines"][2]["content"] == "Duration: 2.34 seconds"
+
+
+@pytest.mark.unit
+class TestRecentActivityStatusFilter:
+    def test_status_filter_reaches_past_the_row_limit(
+        self, test_client, admin_headers, test_db
+    ):
+        """status=failed must return the newest FAILED jobs, not the failed
+        jobs among the newest rows: a failure buried under more than `limit`
+        newer successes has to stay findable."""
+
+        base = datetime(2026, 9, 1, 12, 0, 0)
+        failed = seed_job_operation(
+            test_db,
+            "backup",
+            repository="/repo/buried",
+            status="failed",
+            error_message="borg create exited with code 2",
+            started_at=base,
+        )
+        test_db.add_all(
+            seed_job_operation(
+                test_db,
+                "backup",
+                repository="/repo/busy",
+                status="completed",
+                started_at=base + timedelta(minutes=i + 1),
+            )
+            for i in range(6)
+        )
+        test_db.commit()
+
+        response = test_client.get(
+            "/api/activity/recent?status=failed&limit=5", headers=admin_headers
+        )
+
+        assert response.status_code == 200
+        items = response.json()
+        assert [item["status"] for item in items] == ["failed"]
+        assert items[0]["error_message"] == "borg create exited with code 2"
+
+    def test_skipped_filter_still_returns_availability_skips(
+        self, test_client, admin_headers, test_db
+    ):
+        from app.database.models import BackupPlan, BackupPlanRun
+
+        occurred_at = datetime(2026, 9, 1, 12, 0, 0)
+        plan = BackupPlan(
+            name="Skip filter plan",
+            source_directories='["/srv/skip"]',
+            schedule_enabled=True,
+            schedule_mode="availability",
+        )
+        test_db.add(plan)
+        test_db.flush()
+        test_db.add(
+            BackupPlanRun(
+                backup_plan_id=plan.id,
+                trigger="availability",
+                status="skipped",
+                skip_reason="source_unavailable",
+                started_at=occurred_at,
+                completed_at=occurred_at,
+                created_at=occurred_at,
+            )
+        )
+        test_db.commit()
+
+        response = test_client.get(
+            "/api/activity/recent?status=skipped", headers=admin_headers
+        )
+
+        assert response.status_code == 200
+        items = response.json()
+        assert items and all(item["status"] == "skipped" for item in items)
+
+
+@pytest.mark.unit
+class TestActivityRcloneOperations:
+    """Phase 6: mirror work reads from `operations` (spec 6.2, 9.3)."""
+
+    def _repository(self, test_db):
+        from app.database.models import Repository
+
+        repo = Repository(
+            name="App", path="/repos/app", encryption="none", repository_type="local"
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        return repo
+
+    def _mirror_operation(self, test_db, repo, *, operation, trigger="manual"):
+        from app.database.models import Operation
+        from app.services.operations.details import rclone_details
+
+        op = Operation(
+            repository_id=repo.id,
+            kind="rclone_sync",
+            category="mirror",
+            status="completed",
+            trigger=trigger,
+            priority=0,
+            run_id=f"run-{operation}-{trigger}",
+        )
+        test_db.add(op)
+        test_db.commit()
+        details = rclone_details(test_db, op)
+        details.operation = operation
+        details.log_text = "copied 2 files"
+        test_db.commit()
+        return op
+
+    def test_a_hydrate_operation_reads_as_the_hydrate_activity_type(
+        self, test_client, admin_headers, test_db
+    ):
+        repo = self._repository(test_db)
+        self._mirror_operation(test_db, repo, operation="hydrate")
+
+        response = test_client.get(
+            "/api/activity/recent?category=mirror", headers=admin_headers
+        )
+
+        types = [item["type"] for item in response.json()]
+        assert response.status_code == 200
+        assert types == ["rclone_hydrate"]
+
+    def test_filtering_by_hydrate_hides_the_sync_operation(
+        self, test_client, admin_headers, test_db
+    ):
+        repo = self._repository(test_db)
+        self._mirror_operation(test_db, repo, operation="sync")
+        hydrate = self._mirror_operation(test_db, repo, operation="hydrate")
+
+        response = test_client.get(
+            "/api/activity/recent?job_type=rclone_hydrate&category=mirror",
+            headers=admin_headers,
+        )
+
+        items = response.json()
+        assert response.status_code == 200
+        assert [(item["id"], item["type"]) for item in items] == [
+            (hydrate.id, "rclone_hydrate")
+        ]
+
+    def test_an_initial_sync_keeps_the_legacy_triggered_by_word(
+        self, test_client, admin_headers, test_db
+    ):
+        repo = self._repository(test_db)
+        self._mirror_operation(test_db, repo, operation="sync", trigger="import")
+
+        response = test_client.get(
+            "/api/activity/recent?category=mirror", headers=admin_headers
+        )
+
+        items = response.json()
+        assert response.status_code == 200
+        assert items[0]["triggered_by"] == "initial"
+
+    def test_logs_route_serves_a_mirror_operation(
+        self, test_client, admin_headers, test_db
+    ):
+        from app.services.operations.details import rclone_details
+
+        repo = self._repository(test_db)
+        op = self._mirror_operation(test_db, repo, operation="sync")
+        # The default policy (failed_and_warnings) shows logs for a failed run,
+        # exactly as it did for the legacy row.
+        op.status = "failed"
+        rclone_details(test_db, op).error_text = "remote unavailable"
+        test_db.commit()
+
+        response = test_client.get(
+            f"/api/activity/rclone_sync/{op.id}/logs", headers=admin_headers
+        )
+
+        assert response.status_code == 200, response.json()
+        assert "copied 2 files" in "".join(
+            line["content"] for line in response.json()["lines"]
+        )
+
+
+@pytest.mark.unit
+class TestActivityPackageOperations:
+    """Phase 6: package installs read from `operations` (spec 6.2, 9.3)."""
+
+    def _package_operation(self, test_db, *, status="completed", stdout="installed"):
+        from app.database.models import InstalledPackage, Operation
+        from app.services.operations.package_facade import PackageInstallFacade
+
+        package = InstalledPackage(
+            name="ripgrep", install_command="apt-get install -y ripgrep"
+        )
+        test_db.add(package)
+        test_db.flush()
+        op = Operation(
+            repository_id=None,
+            kind="package_install",
+            category="system",
+            status=status,
+            trigger="manual",
+            priority=0,
+            run_id="run-package",
+            params={"package_id": package.id},
+        )
+        test_db.add(op)
+        test_db.commit()
+        job = PackageInstallFacade(test_db, op)
+        job.exit_code = 0
+        job.write_output(stdout, "")
+        test_db.commit()
+        return package, op
+
+    def test_an_install_operation_reads_as_the_package_activity_type(
+        self, test_client, admin_headers, test_db
+    ):
+        package, op = self._package_operation(test_db)
+
+        response = test_client.get(
+            "/api/activity/recent?category=system", headers=admin_headers
+        )
+
+        items = [item for item in response.json() if item["id"] == op.id]
+        assert response.status_code == 200
+        assert items[0]["type"] == "package"
+        assert items[0]["package_name"] == package.name
+
+    def test_filtering_by_package_returns_the_operation(
+        self, test_client, admin_headers, test_db
+    ):
+        package, op = self._package_operation(test_db)
+
+        response = test_client.get(
+            "/api/activity/recent?job_type=package", headers=admin_headers
+        )
+
+        assert response.status_code == 200
+        assert [item["id"] for item in response.json()] == [op.id]
+
+    def test_logs_route_serves_both_streams_of_an_install_operation(
+        self, test_client, admin_headers, test_db
+    ):
+        _set_log_save_policy(test_db, "all_jobs")
+        package, op = self._package_operation(
+            test_db, stdout="WARNING: already installed"
+        )
+
+        response = test_client.get(
+            f"/api/activity/package/{op.id}/logs", headers=admin_headers
+        )
+
+        body = "".join(line["content"] for line in response.json()["lines"])
+        assert response.status_code == 200, response.json()
+        assert "WARNING: already installed" in body
+        assert "EXIT CODE: 0" in body
+
+
+class TestRunningAgentBackupLogs:
+    """A running agent backup streams its `agent_job_logs` lines (phase 8)."""
+
+    def test_running_agent_backup_returns_agent_log_lines(
+        self, test_client, admin_headers, test_db
+    ):
+        from app.database.models import (
+            AgentJob,
+            AgentJobLog,
+            AgentMachine,
+            Operation,
+            OperationBackupDetails,
+            Repository,
+        )
+
+        _set_log_save_policy(test_db, "all_jobs")
+        repository = Repository(
+            name="Running Agent Backup Repo",
+            path="/tmp/running-agent-backup-repo",
+            encryption="none",
+            repository_type="local",
+        )
+        test_db.add(repository)
+        test_db.flush()
+        operation = Operation(
+            repository_id=repository.id,
+            kind="backup",
+            category="backup",
+            status="running",
+            trigger="manual",
+            priority=0,
+            run_id="run-agent-1",
+            execution_mode="agent",
+            started_at=datetime.now(),
+        )
+        test_db.add(operation)
+        test_db.flush()
+        test_db.add(OperationBackupDetails(operation_id=operation.id))
+        machine = AgentMachine(
+            agent_id="agent-running-1",
+            name="agent-running",
+            token_hash="hash",
+            token_prefix="prefix",
+            status="online",
+        )
+        test_db.add(machine)
+        test_db.flush()
+        agent_job = AgentJob(
+            agent_machine_id=machine.id,
+            operation_id=operation.id,
+            job_type="backup",
+            status="running",
+            payload={},
+        )
+        test_db.add(agent_job)
+        test_db.flush()
+        test_db.add(
+            AgentJobLog(
+                agent_job_id=agent_job.id,
+                sequence=1,
+                stream="stdout",
+                message="agent backup in progress",
+                created_at=datetime.now(),
+            )
+        )
+        test_db.commit()
+
+        response = test_client.get(
+            f"/api/activity/backup/{operation.id}/logs",
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 200
+        contents = [line["content"] for line in response.json()["lines"]]
+        assert "agent backup in progress" in contents
+
+
+class TestBackupArchiveBorgId:
+    def test_backup_item_carries_the_borg_id_of_its_archive(
+        self, test_client, admin_headers, test_db
+    ):
+        """A Borg 2 series repeats archive names, so the stored row nearest
+        the backup's start wins; the frontend needs the id, not the name."""
+        from app.database.models import Archive
+
+        repo = _create_activity_repository(test_db, "Borg Id Repo")
+        started = datetime(2026, 9, 1, 10, 0, 0)
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository=repo.path,
+            status="completed",
+            started_at=started,
+            completed_at=started + timedelta(minutes=2),
+            archive_name="daily",
+        )
+        for borg_id, start in (
+            ("aaaa1111aaaa1111", started - timedelta(days=1)),
+            ("bbbb2222bbbb2222", started + timedelta(seconds=20)),
+            ("cccc3333cccc3333", started + timedelta(days=1)),
+        ):
+            test_db.add(
+                Archive(
+                    repository_id=repo.id,
+                    borg_id=borg_id,
+                    name="daily",
+                    series="daily",
+                    start=start,
+                )
+            )
+        test_db.commit()
+
+        response = test_client.get(
+            "/api/activity/recent?job_type=backup", headers=admin_headers
+        )
+
+        assert response.status_code == 200
+        item = next(i for i in response.json() if i["id"] == job.id)
+        assert item["archive_borg_id"] == "bbbb2222bbbb2222"
+
+    def test_backup_item_prefers_the_archive_linked_to_it(
+        self, test_client, admin_headers, test_db
+    ):
+        from app.database.models import Archive
+
+        repo = _create_activity_repository(test_db, "Linked Repo")
+        started = datetime(2026, 9, 1, 10, 0, 0)
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository=repo.path,
+            status="completed",
+            started_at=started,
+            completed_at=started + timedelta(minutes=2),
+            archive_name="daily",
+        )
+        # Nearest by time, but unlinked: the sync recorded the other one.
+        test_db.add(
+            Archive(
+                repository_id=repo.id,
+                borg_id="near0000near0000",
+                name="daily",
+                series="daily",
+                start=started + timedelta(seconds=5),
+            )
+        )
+        test_db.add(
+            Archive(
+                repository_id=repo.id,
+                borg_id="link0000link0000",
+                name="daily",
+                series="daily",
+                start=started + timedelta(hours=3),
+                backup_operation_id=job.id,
+            )
+        )
+        test_db.commit()
+
+        response = test_client.get(
+            "/api/activity/recent?job_type=backup", headers=admin_headers
+        )
+
+        item = next(i for i in response.json() if i["id"] == job.id)
+        assert item["archive_borg_id"] == "link0000link0000"
+
+    def test_backup_item_without_a_stored_archive_has_no_borg_id(
+        self, test_client, admin_headers, test_db
+    ):
+        repo = _create_activity_repository(test_db, "No Row Repo")
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository=repo.path,
+            status="completed",
+            started_at=datetime.now(),
+            completed_at=datetime.now(),
+            archive_name="orphan",
+        )
+        test_db.commit()
+
+        response = test_client.get(
+            "/api/activity/recent?job_type=backup", headers=admin_headers
+        )
+
+        item = next(i for i in response.json() if i["id"] == job.id)
+        assert item["archive_borg_id"] is None
+
+
+@pytest.mark.unit
+class TestCancelFromActivity:
+    """`POST /api/activity/{job_type}/{job_id}/cancel`, the route the job
+    lists call when their caller passes no cancel handler (#1078)."""
+
+    @staticmethod
+    def _repo(test_db, name="cancel-repo"):
+        from app.database.models import Repository
+
+        repo = Repository(
+            name=name, path=f"/tmp/{name}", encryption="none", compression="lz4"
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        return repo
+
+    def test_a_queued_check_is_cancelled(self, test_client, test_db, admin_headers):
+        from app.services.operations.enqueue import enqueue
+
+        op = enqueue(test_db, "check", repository_id=self._repo(test_db).id)
+
+        response = test_client.post(
+            f"/api/activity/check/{op.id}/cancel", headers=admin_headers
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"status": "cancel_requested"}
+        test_db.expire_all()
+        assert test_db.get(Operation, op.id).status == "cancelled"
+
+    def test_a_running_check_asks_the_runner(self, test_client, test_db, admin_headers):
+        from unittest.mock import AsyncMock, patch
+
+        from app.services.operations.enqueue import enqueue
+        from app.services.operations.runner import operation_runner
+
+        op = enqueue(test_db, "check", repository_id=self._repo(test_db).id)
+        op.status = "running"
+        test_db.commit()
+
+        with (
+            patch.dict(operation_runner.running_tasks, {op.id: object()}),
+            patch(
+                "app.api.operations.operation_runner.request_cancel",
+                new=AsyncMock(return_value=True),
+            ) as request_cancel,
+        ):
+            response = test_client.post(
+                f"/api/activity/check/{op.id}/cancel", headers=admin_headers
+            )
+
+        assert response.status_code == 200, response.text
+        request_cancel.assert_awaited_once_with(op.id)
+
+    @pytest.mark.parametrize("kind", ["prune", "backup"])
+    def test_a_finished_job_is_409_whatever_its_kind(
+        self, test_client, test_db, admin_headers, kind
+    ):
+        from app.services.operations.enqueue import enqueue
+
+        op = enqueue(test_db, kind, repository_id=self._repo(test_db).id)
+        op.status = "completed"
+        test_db.commit()
+
+        response = test_client.post(
+            f"/api/activity/{kind}/{op.id}/cancel", headers=admin_headers
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "key": "backend.errors.operations.alreadyFinished"
+        }
+
+    def test_a_running_job_that_cannot_be_stopped_is_refused(
+        self, test_client, test_db, admin_headers
+    ):
+        """A stats run does not watch the cancel flag: it would keep running
+        while the runner records it as cancelled."""
+        from app.services.operations.enqueue import enqueue
+
+        op = enqueue(test_db, "stats", repository_id=self._repo(test_db).id)
+        op.status = "running"
+        test_db.commit()
+
+        response = test_client.post(
+            f"/api/activity/stats/{op.id}/cancel", headers=admin_headers
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "key": "backend.errors.activity.cannotCancelWhileRunning",
+            "params": {"jobType": "stats"},
+        }
+        test_db.expire_all()
+        assert test_db.get(Operation, op.id).status == "running"
+
+    def test_a_running_step_the_runner_does_not_run_is_refused(
+        self, test_client, test_db, admin_headers
+    ):
+        """A prune a backup runs inline has no runner task: the runner's
+        flag would reach nothing, so the answer is not `alreadyFinished`."""
+        from unittest.mock import AsyncMock, patch
+
+        from app.services.operations.enqueue import enqueue
+
+        op = enqueue(test_db, "prune", repository_id=self._repo(test_db).id)
+        op.status = "running"
+        test_db.commit()
+
+        with patch(
+            "app.api.operations.operation_runner.request_cancel",
+            new=AsyncMock(return_value=False),
+        ) as request_cancel:
+            response = test_client.post(
+                f"/api/activity/prune/{op.id}/cancel", headers=admin_headers
+            )
+
+        assert response.status_code == 409
+        assert (
+            response.json()["detail"]["key"]
+            == "backend.errors.activity.cannotCancelWhileRunning"
+        )
+        request_cancel.assert_not_awaited()
+
+    def test_a_running_history_index_is_refused(
+        self, test_client, test_db, admin_headers
+    ):
+        """It reads the cancel flag per line of Borg's diff, and a diff of
+        two large archives can be silent for a long time."""
+        from unittest.mock import AsyncMock, patch
+
+        from app.services.operations.enqueue import enqueue
+        from app.services.operations.runner import operation_runner
+
+        op = enqueue(test_db, "history_index", repository_id=self._repo(test_db).id)
+        op.status = "running"
+        test_db.commit()
+
+        with (
+            patch.dict(operation_runner.running_tasks, {op.id: object()}),
+            patch(
+                "app.api.operations.operation_runner.request_cancel",
+                new=AsyncMock(return_value=True),
+            ) as request_cancel,
+        ):
+            response = test_client.post(
+                f"/api/activity/history_index/{op.id}/cancel", headers=admin_headers
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "key": "backend.errors.activity.cannotCancelWhileRunning",
+            "params": {"jobType": "history_index"},
+        }
+        request_cancel.assert_not_awaited()
+
+    def test_a_queued_job_of_any_kind_is_taken_off_the_queue(
+        self, test_client, test_db, admin_headers
+    ):
+        from app.services.operations.enqueue import enqueue
+
+        op = enqueue(test_db, "stats", repository_id=self._repo(test_db).id)
+
+        response = test_client.post(
+            f"/api/activity/stats/{op.id}/cancel", headers=admin_headers
+        )
+
+        assert response.status_code == 200, response.text
+        test_db.expire_all()
+        assert test_db.get(Operation, op.id).status == "cancelled"
+
+    def test_a_script_execution_is_refused(self, test_client, admin_headers):
+        response = test_client.post(
+            "/api/activity/script_execution/1/cancel", headers=admin_headers
+        )
+
+        assert response.status_code == 409
+        assert (
+            response.json()["detail"]["key"]
+            == "backend.errors.activity.cannotCancelWhileRunning"
+        )
+
+    def test_mirror_rows_are_found_by_their_sub_type(
+        self, test_client, test_db, admin_headers
+    ):
+        """Both mirror names share the `rclone_sync` kind; the row's sub-type
+        decides which name finds it."""
+        repo = self._repo(test_db)
+        hydrate = seed_job_operation(
+            test_db,
+            "rclone_sync",
+            repository_id=repo.id,
+            direction="remote_to_cache",
+            operation="hydrate",
+            status="pending",
+        )
+        test_db.commit()
+
+        wrong_name = test_client.post(
+            f"/api/activity/rclone_sync/{hydrate.id}/cancel", headers=admin_headers
+        )
+        right_name = test_client.post(
+            f"/api/activity/rclone_hydrate/{hydrate.id}/cancel", headers=admin_headers
+        )
+
+        assert wrong_name.status_code == 404
+        assert right_name.status_code == 200, right_name.text
+        test_db.expire_all()
+        assert test_db.get(Operation, hydrate.id).status == "cancelled"
+
+    def test_a_running_mirror_sync_is_refused(
+        self, test_client, test_db, admin_headers
+    ):
+        repo = self._repo(test_db)
+        sync = seed_job_operation(
+            test_db,
+            "rclone_sync",
+            repository_id=repo.id,
+            direction="primary_to_remote",
+            operation="sync",
+            status="running",
+            started_at=datetime.utcnow(),
+        )
+        test_db.commit()
+
+        response = test_client.post(
+            f"/api/activity/rclone_sync/{sync.id}/cancel", headers=admin_headers
+        )
+
+        assert response.status_code == 409
+        test_db.expire_all()
+        assert test_db.get(Operation, sync.id).status == "running"
+
+    def test_cancel_requires_the_operator_role(
+        self, test_client, test_db, auth_headers
+    ):
+        from app.services.operations.enqueue import enqueue
+
+        op = enqueue(test_db, "check", repository_id=self._repo(test_db).id)
+
+        response = test_client.post(
+            f"/api/activity/check/{op.id}/cancel", headers=auth_headers
+        )
+
+        assert response.status_code == 403
+        test_db.expire_all()
+        assert test_db.get(Operation, op.id).status == "queued"
+
+    def test_a_queued_backup_goes_through_the_backup_cancel(
+        self, test_client, test_db, admin_headers
+    ):
+        repo = self._repo(test_db)
+        job = seed_job_operation(
+            test_db, "backup", repository_id=repo.id, status="pending"
+        )
+        test_db.commit()
+
+        response = test_client.post(
+            f"/api/activity/backup/{job.id}/cancel", headers=admin_headers
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["message"] == "backend.success.backup.backupCancelled"
+        test_db.expire_all()
+        assert test_db.get(Operation, job.id).status == "cancelled"
+
+    def test_a_queued_agent_backup_is_taken_off_the_queue(
+        self, test_client, test_db, admin_headers
+    ):
+        """No agent job exists while the backup waits for its lane; the
+        runner cancels it like a server backup instead of a 400."""
+        repo = self._repo(test_db)
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository_id=repo.id,
+            status="pending",
+            execution_mode="agent",
+        )
+        test_db.commit()
+
+        response = test_client.post(
+            f"/api/activity/backup/{job.id}/cancel", headers=admin_headers
+        )
+
+        assert response.status_code == 200, response.text
+        test_db.expire_all()
+        assert test_db.get(Operation, job.id).status == "cancelled"
+
+    def test_a_mirror_job_is_not_described_to_a_user_without_the_role(
+        self, test_client, test_db, auth_headers
+    ):
+        """The role is checked before the job's state answers."""
+        repo = self._repo(test_db)
+        sync = seed_job_operation(
+            test_db,
+            "rclone_sync",
+            repository_id=repo.id,
+            direction="primary_to_remote",
+            operation="sync",
+            status="completed",
+        )
+        test_db.commit()
+
+        response = test_client.post(
+            f"/api/activity/rclone_sync/{sync.id}/cancel", headers=auth_headers
+        )
+
+        assert response.status_code == 403
+
+    def test_a_running_server_backup_stops_its_process(
+        self, test_client, test_db, admin_headers
+    ):
+        from unittest.mock import AsyncMock, patch
+
+        repo = self._repo(test_db)
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository_id=repo.id,
+            status="running",
+            started_at=datetime.utcnow(),
+        )
+        test_db.commit()
+
+        with (
+            patch(
+                "app.api.backup.operation_runner.request_cancel",
+                new=AsyncMock(return_value=True),
+            ) as request_cancel,
+            patch(
+                "app.api.backup.backup_service.cancel_backup",
+                new=AsyncMock(return_value=True),
+            ) as kill,
+        ):
+            response = test_client.post(
+                f"/api/activity/backup/{job.id}/cancel", headers=admin_headers
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["process_terminated"] is True
+        request_cancel.assert_awaited_once_with(job.id)
+        kill.assert_awaited_once_with(job.id)
+        test_db.expire_all()
+        assert test_db.get(Operation, job.id).status == "cancelled"
+
+    def test_an_unknown_job_or_a_mismatched_type_is_404(
+        self, test_client, test_db, admin_headers
+    ):
+        from app.services.operations.enqueue import enqueue
+
+        op = enqueue(test_db, "check", repository_id=self._repo(test_db).id)
+
+        missing = test_client.post(
+            "/api/activity/check/999999/cancel", headers=admin_headers
+        )
+        mismatched = test_client.post(
+            f"/api/activity/backup/{op.id}/cancel", headers=admin_headers
+        )
+
+        assert missing.status_code == 404
+        assert mismatched.status_code == 404
+        test_db.expire_all()
+        assert test_db.get(Operation, op.id).status == "queued"
+
+    @staticmethod
+    def _agent_repo(test_db, capabilities, name="agent-cancel-repo"):
+        from app.core.security import get_password_hash
+        from app.database.models import AgentMachine, Repository
+
+        agent = AgentMachine(
+            name=f"{name}-agent",
+            agent_id=f"agt_{name}",
+            token_hash=get_password_hash("secret"),
+            token_prefix="secret",
+            status="online",
+            capabilities=capabilities,
+        )
+        test_db.add(agent)
+        test_db.commit()
+        repo = Repository(
+            name=name,
+            path=f"/agent/{name}",
+            encryption="none",
+            compression="lz4",
+            executor_type="agent",
+            execution_target="agent",
+            agent_machine_id=agent.id,
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        return repo
+
+    @pytest.mark.parametrize("capabilities", [["repository.check"], None])
+    def test_a_running_agent_check_is_refused_when_the_agent_cannot_stop_it(
+        self, test_client, test_db, admin_headers, capabilities
+    ):
+        """An agent before 0.1.7 finishes a silent Borg although the job was
+        cancelled; the row would say cancelled while the agent runs on."""
+        from unittest.mock import AsyncMock, patch
+
+        from app.services.operations.enqueue import enqueue
+
+        from app.services.operations.runner import operation_runner
+
+        repo = self._agent_repo(test_db, capabilities)
+        op = enqueue(test_db, "check", repository_id=repo.id)
+        op.status = "running"
+        test_db.commit()
+
+        with (
+            patch.dict(operation_runner.running_tasks, {op.id: object()}),
+            patch(
+                "app.api.operations.operation_runner.request_cancel",
+                new=AsyncMock(return_value=True),
+            ) as request_cancel,
+        ):
+            response = test_client.post(
+                f"/api/activity/check/{op.id}/cancel", headers=admin_headers
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "key": "backend.errors.activity.cannotCancelWhileRunning",
+            "params": {"jobType": "check"},
+        }
+        request_cancel.assert_not_awaited()
+        test_db.expire_all()
+        assert test_db.get(Operation, op.id).status == "running"
+
+    def test_a_running_agent_check_is_cancelled_when_the_agent_can_stop_it(
+        self, test_client, test_db, admin_headers
+    ):
+        from unittest.mock import AsyncMock, patch
+
+        from app.services.operations.enqueue import enqueue
+        from app.services.operations.runner import operation_runner
+
+        repo = self._agent_repo(test_db, ["repository.check", "jobs.cancel"])
+        op = enqueue(test_db, "check", repository_id=repo.id)
+        op.status = "running"
+        test_db.commit()
+
+        with (
+            patch.dict(operation_runner.running_tasks, {op.id: object()}),
+            patch(
+                "app.api.operations.operation_runner.request_cancel",
+                new=AsyncMock(return_value=True),
+            ) as request_cancel,
+        ):
+            response = test_client.post(
+                f"/api/activity/check/{op.id}/cancel", headers=admin_headers
+            )
+
+        assert response.status_code == 200, response.text
+        request_cancel.assert_awaited_once_with(op.id)
+
+    @staticmethod
+    def _agent_job(test_db, repo, op, *, status, kind="check", link=True):
+        from datetime import datetime
+
+        from app.database.models import AgentJob
+
+        operation = (
+            {
+                "maintenance_job": {
+                    "kind": kind,
+                    "id": op.id,
+                    "table": "operations",
+                }
+            }
+            if link
+            else {"archive": "a"}
+        )
+        job = AgentJob(
+            agent_machine_id=repo.agent_machine_id,
+            job_type="repository",
+            status=status,
+            payload={"job_kind": f"repository.{kind}", "operation": operation},
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        test_db.add(job)
+        test_db.commit()
+        return job
+
+    def _post_running_cancel(self, test_client, admin_headers, op, job_type):
+        from unittest.mock import AsyncMock, patch
+
+        from app.services.operations.runner import operation_runner
+
+        with (
+            patch.dict(operation_runner.running_tasks, {op.id: object()}),
+            patch(
+                "app.api.operations.operation_runner.request_cancel",
+                new=AsyncMock(return_value=True),
+            ) as request_cancel,
+        ):
+            response = test_client.post(
+                f"/api/activity/{job_type}/{op.id}/cancel", headers=admin_headers
+            )
+        return response, request_cancel
+
+    def test_a_running_check_whose_agent_job_waits_is_cancelled_on_an_old_agent(
+        self, test_client, test_db, admin_headers
+    ):
+        """The runner started the check but no agent took its job (the agent
+        is offline): the route takes the job off the queue itself, so an
+        agent that connects a moment later cannot run it."""
+        from app.database.models import AgentJob
+        from app.services.operations.enqueue import enqueue
+
+        repo = self._agent_repo(test_db, ["repository.check"])
+        op = enqueue(test_db, "check", repository_id=repo.id)
+        op.status = "running"
+        test_db.commit()
+        job = self._agent_job(test_db, repo, op, status="queued")
+
+        response, request_cancel = self._post_running_cancel(
+            test_client, admin_headers, op, "check"
+        )
+
+        assert response.status_code == 200, response.text
+        request_cancel.assert_awaited_once_with(op.id)
+        test_db.expire_all()
+        assert test_db.get(AgentJob, job.id).status == "canceled"
+
+    def test_an_old_agent_that_took_the_job_first_keeps_it(
+        self, test_client, test_db, admin_headers
+    ):
+        from app.database.models import AgentJob
+        from app.services.operations.enqueue import enqueue
+
+        repo = self._agent_repo(test_db, ["repository.check"])
+        op = enqueue(test_db, "check", repository_id=repo.id)
+        op.status = "running"
+        test_db.commit()
+        job = self._agent_job(test_db, repo, op, status="claimed")
+
+        response, request_cancel = self._post_running_cancel(
+            test_client, admin_headers, op, "check"
+        )
+
+        assert response.status_code == 409
+        request_cancel.assert_not_awaited()
+        test_db.expire_all()
+        assert test_db.get(AgentJob, job.id).status == "claimed"
+
+    def test_a_restore_waiting_for_an_old_agent_is_found_by_its_job_map(
+        self, test_client, test_db, admin_headers
+    ):
+        """A restore's agent job carries no link to its operation; the
+        restore service's map names it."""
+        from unittest.mock import patch
+
+        from app.database.models import AgentJob
+        from app.services.operations.enqueue import enqueue
+        from app.services.restore_service import restore_service
+
+        repo = self._agent_repo(test_db, ["repository.restore"])
+        op = enqueue(test_db, "restore", repository_id=repo.id)
+        op.status = "running"
+        test_db.commit()
+        job = self._agent_job(
+            test_db, repo, op, status="queued", kind="restore", link=False
+        )
+
+        with patch.dict(restore_service.agent_restore_jobs, {op.id: job.id}):
+            response, _ = self._post_running_cancel(
+                test_client, admin_headers, op, "restore"
+            )
+
+        assert response.status_code == 200, response.text
+        test_db.expire_all()
+        assert test_db.get(AgentJob, job.id).status == "canceled"
+
+    def _running_agent_backup(self, test_db, capabilities, agent_job_status):
+        from datetime import datetime
+
+        from app.database.models import AgentJob
+
+        repo = self._agent_repo(test_db, capabilities, name="agent-backup-repo")
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository_id=repo.id,
+            status="running",
+            started_at=datetime.utcnow(),
+            execution_mode="agent",
+        )
+        test_db.commit()
+        agent_job = AgentJob(
+            agent_machine_id=repo.agent_machine_id,
+            job_type="backup",
+            operation_id=job.id,
+            status=agent_job_status,
+            payload={"job_kind": "backup.create"},
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        test_db.add(agent_job)
+        test_db.commit()
+        return job, agent_job
+
+    def test_a_running_agent_backup_is_refused_when_the_agent_cannot_stop_it(
+        self, test_client, test_db, admin_headers
+    ):
+        """An agent before 0.1.7 checks the cancel only between lines of
+        borg create's output; a silent one runs on."""
+        from unittest.mock import AsyncMock, patch
+
+        from app.database.models import AgentJob
+
+        job, agent_job = self._running_agent_backup(
+            test_db, ["backup.create"], "running"
+        )
+
+        with patch(
+            "app.api.backup.operation_runner.request_cancel",
+            new=AsyncMock(return_value=True),
+        ) as request_cancel:
+            response = test_client.post(
+                f"/api/activity/backup/{job.id}/cancel", headers=admin_headers
+            )
+
+        assert response.status_code == 409
+        assert (
+            response.json()["detail"]["key"]
+            == "backend.errors.activity.cannotCancelWhileRunning"
+        )
+        request_cancel.assert_not_awaited()
+        test_db.expire_all()
+        assert test_db.get(AgentJob, agent_job.id).status == "running"
+
+    def test_an_agent_backup_no_old_agent_took_is_taken_off_the_queue(
+        self, test_client, test_db, admin_headers
+    ):
+        from unittest.mock import AsyncMock, patch
+
+        from app.database.models import AgentJob
+
+        job, agent_job = self._running_agent_backup(
+            test_db, ["backup.create"], "queued"
+        )
+
+        with patch(
+            "app.api.backup.operation_runner.request_cancel",
+            new=AsyncMock(return_value=True),
+        ) as request_cancel:
+            response = test_client.post(
+                f"/api/activity/backup/{job.id}/cancel", headers=admin_headers
+            )
+
+        assert response.status_code == 200, response.text
+        request_cancel.assert_awaited_once_with(job.id)
+        test_db.expire_all()
+        assert test_db.get(AgentJob, agent_job.id).status == "canceled"
+        assert test_db.get(Operation, job.id).status == "cancelled"
+
+    def test_a_requeued_agent_backup_is_cancelled_without_a_lock_wait(
+        self, test_client, test_db, admin_headers
+    ):
+        """A backup put back on the queue with its agent job (a lost agent's
+        work) is cancelled by the runner in its own session: the agent job's
+        cancel is committed first, or that write waits on this one."""
+        from app.database.models import AgentJob
+
+        job, agent_job = self._running_agent_backup(
+            test_db, ["backup.create"], "queued"
+        )
+        test_db.get(Operation, job.id).status = "queued"
+        test_db.commit()
+
+        response = test_client.post(
+            f"/api/activity/backup/{job.id}/cancel", headers=admin_headers
+        )
+
+        assert response.status_code == 200, response.text
+        test_db.expire_all()
+        assert test_db.get(AgentJob, agent_job.id).status == "canceled"
+        assert test_db.get(Operation, job.id).status == "cancelled"
+
+    def test_a_running_agent_backup_is_cancelled_when_the_agent_can_stop_it(
+        self, test_client, test_db, admin_headers
+    ):
+        from unittest.mock import AsyncMock, patch
+
+        from app.database.models import AgentJob
+
+        job, agent_job = self._running_agent_backup(
+            test_db, ["backup.create", "jobs.cancel"], "running"
+        )
+
+        with (
+            patch(
+                "app.api.backup.operation_runner.request_cancel",
+                new=AsyncMock(return_value=False),  # not this process's task
+            ),
+            patch(
+                "app.services.agent_job_dispatcher.dispatch_agent_cancel_if_connected",
+                new=AsyncMock(return_value=True),
+            ) as dispatch,
+        ):
+            response = test_client.post(
+                f"/api/activity/backup/{job.id}/cancel", headers=admin_headers
+            )
+
+        assert response.status_code == 200, response.text
+        test_db.expire_all()
+        assert test_db.get(AgentJob, agent_job.id).status == "cancel_requested"
+        # the command reaches the agent from the route, not only the watcher
+        dispatch.assert_awaited_once()
+
+    def test_a_queued_agent_check_is_cancelled_whatever_the_agent_version(
+        self, test_client, test_db, admin_headers
+    ):
+        """Nothing runs yet: the queued row is taken off the queue."""
+        from app.services.operations.enqueue import enqueue
+
+        repo = self._agent_repo(test_db, ["repository.check"])
+        op = enqueue(test_db, "check", repository_id=repo.id)
+
+        response = test_client.post(
+            f"/api/activity/check/{op.id}/cancel", headers=admin_headers
+        )
+
+        assert response.status_code == 200, response.text
+        test_db.expire_all()
+        assert test_db.get(Operation, op.id).status == "cancelled"

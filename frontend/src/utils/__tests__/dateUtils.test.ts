@@ -1,5 +1,6 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
 import {
+  formatCalendarDay,
   formatDate,
   formatDateShort,
   formatCronHuman,
@@ -11,7 +12,10 @@ import {
   parseBytes,
   formatDateTimeFull,
   formatDateCompact,
+  formatDateCompactInTimeZone,
+  formatDateTimeFullInTimeZone,
   formatScheduledInstantDisplay,
+  parseBackendDate,
   convertCronToUTC,
   convertCronToLocal,
 } from '../dateUtils'
@@ -406,5 +410,88 @@ describe('convertCronToLocal', () => {
     const result = convertCronToLocal('0 2 * * 0') // UTC Sun 2 AM → local Sat 8 PM
     // (0 - 1 + 7) % 7 = 6 (Saturday)
     expect(result).toBe('0 20 * * 6')
+  })
+})
+
+describe('formatCalendarDay', () => {
+  it('reads a date-only string as the calendar day it names', () => {
+    // not UTC midnight, which is the day before west of Greenwich
+    expect(formatCalendarDay('2026-09-01')).toBe(
+      new Date(2026, 8, 1).toLocaleDateString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      })
+    )
+  })
+
+  it('hands back a day that never existed rather than rolling it over', () => {
+    expect(formatCalendarDay('2026-02-30')).toBe('2026-02-30')
+  })
+
+  it('has a fallback for nothing at all', () => {
+    expect(formatCalendarDay(null)).toBe('Never')
+  })
+})
+
+// #1221: backend datetimes are UTC, and some routes emit them without an
+// offset. Every formatter must read such a value as UTC, not browser-local.
+describe('offset-less backend datetimes', () => {
+  const originalTz = process.env.TZ
+  beforeEach(() => {
+    process.env.TZ = 'America/New_York'
+  })
+  afterEach(() => {
+    // assigning undefined would store the string "undefined"
+    if (originalTz === undefined) delete process.env.TZ
+    else process.env.TZ = originalTz
+  })
+
+  const naive = '2026-09-28T02:01:47'
+  const utc = `${naive}Z`
+
+  it('parseBackendDate reads a naive datetime as UTC', () => {
+    expect(parseBackendDate(naive).toISOString()).toBe('2026-09-28T02:01:47.000Z')
+    expect(parseBackendDate('2026-09-28 02:01:47.123456').toISOString()).toBe(
+      '2026-09-28T02:01:47.123Z'
+    )
+  })
+
+  it('parseBackendDate leaves offsets and non-datetime strings alone', () => {
+    expect(parseBackendDate('2026-09-28T02:01:47+05:30').toISOString()).toBe(
+      '2026-09-27T20:31:47.000Z'
+    )
+    expect(parseBackendDate('2026-09-01').toISOString()).toBe('2026-09-01T00:00:00.000Z')
+  })
+
+  it.each([
+    ['formatDate', formatDate],
+    ['formatDateShort', formatDateShort],
+    ['formatDateTimeFull', formatDateTimeFull],
+    ['formatDateCompact', formatDateCompact],
+  ])('%s renders a naive value as UTC', (_name, format) => {
+    expect(format(naive)).toBe(format(utc))
+  })
+
+  it('the local formatters really run in the pinned zone', () => {
+    // guards the guard: without this, a runner ignoring TZ makes the
+    // comparisons above pass vacuously
+    expect(formatDate(utc)).toMatch(/Sep 27, 2026/)
+  })
+
+  it('formats in an explicit zone as UTC too', () => {
+    expect(formatDateCompactInTimeZone(naive, 'America/New_York')).toMatch(/10:01/)
+    expect(formatDateTimeFullInTimeZone(naive, 'America/New_York')).toMatch(/10:01:47/)
+  })
+
+  it('measures relative time and ranges from UTC', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-28T02:31:47Z'))
+    try {
+      expect(formatRelativeTime(naive)).toBe('30 minutes ago')
+      expect(formatTimeRange(naive, '2026-09-28T02:06:47Z')).toBe('5 min')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

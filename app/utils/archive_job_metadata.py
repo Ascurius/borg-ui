@@ -4,10 +4,11 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app.database.models import BackupJob, BackupPlanRun, Repository
+from app.database.models import BackupPlanRun, Repository
+from app.services.operations.backup_facade import backup_jobs_for_archive_names
+from app.utils.datetime_utils import parse_borg_archive_time
 
 
 def _archive_name(archive: Any) -> Optional[str]:
@@ -25,20 +26,21 @@ def _coerce_naive_utc(value: datetime) -> datetime:
 
 
 def _parse_archive_time(archive: dict) -> Optional[datetime]:
-    value = archive.get("start") or archive.get("time")
+    # Select on None, not truthiness - the epoch 0 is a valid time.
+    value = archive.get("start")
+    if value is None:
+        value = archive.get("time")
     if isinstance(value, datetime):
         return _coerce_naive_utc(value)
-    if not isinstance(value, str) or not value:
-        return None
-
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return _coerce_naive_utc(parsed)
+    # The shared parser is the single choke point for borg-rendered
+    # timestamps. The listing endpoints normalize these values to
+    # offset-carrying strings before enrichment; "UTC" names the render zone
+    # of any raw machine-parsed listing (TZ=UTC is pinned at the source), so
+    # a naive value that does slip through still parses correctly.
+    return parse_borg_archive_time(value, timezone_name="UTC")
 
 
-def _job_times(job: BackupJob) -> list[datetime]:
+def _job_times(job) -> list[datetime]:
     times = []
     for value in (job.started_at, job.completed_at, job.created_at):
         if isinstance(value, datetime):
@@ -46,15 +48,13 @@ def _job_times(job: BackupJob) -> list[datetime]:
     return times
 
 
-def _select_job_for_archive(
-    jobs: list[BackupJob], archive_time: Optional[datetime]
-) -> Optional[BackupJob]:
+def _select_job_for_archive(jobs: list, archive_time: Optional[datetime]):
     if not jobs:
         return None
     if archive_time is None:
         return jobs[0]
 
-    def sort_key(job: BackupJob) -> tuple[float, int]:
+    def sort_key(job) -> tuple[float, int]:
         times = _job_times(job)
         if not times:
             return (float("inf"), -(job.id or 0))
@@ -66,7 +66,7 @@ def _select_job_for_archive(
     return min(jobs, key=sort_key)
 
 
-def _trigger_for_job(job: BackupJob, plan_runs_by_id: dict[int, BackupPlanRun]) -> str:
+def _trigger_for_job(job, plan_runs_by_id: dict[int, BackupPlanRun]) -> str:
     if job.backup_plan_run_id:
         plan_run = plan_runs_by_id.get(job.backup_plan_run_id)
         if plan_run and plan_run.trigger:
@@ -85,17 +85,7 @@ def enrich_archives_with_backup_metadata(
     if not archive_names:
         return archives
 
-    repository_filters = []
-    if getattr(repository, "id", None) is not None:
-        repository_filters.append(BackupJob.repository_id == repository.id)
-    if getattr(repository, "path", None):
-        repository_filters.append(BackupJob.repository == repository.path)
-
-    query = db.query(BackupJob).filter(BackupJob.archive_name.in_(archive_names))
-    if repository_filters:
-        query = query.filter(or_(*repository_filters))
-
-    jobs = query.order_by(BackupJob.id.desc()).all()
+    jobs = backup_jobs_for_archive_names(db, repository, archive_names)
     if not jobs:
         return archives
 

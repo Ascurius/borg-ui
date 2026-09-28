@@ -1,10 +1,18 @@
 from unittest.mock import AsyncMock, Mock, patch
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app.api import settings as settings_api
-from app.database.models import LicensingState, Repository, SystemSettings, User
+from app.database.models import (
+    LicensingState,
+    Operation,
+    Repository,
+    SystemSettings,
+    User,
+)
 
 
 def _set_plan(test_db, plan: str) -> None:
@@ -75,20 +83,38 @@ class TestSystemSettingsContracts:
         assert settings["lock_breaking_enabled"] is True
         assert test_db.query(SystemSettings).count() == 1
 
-    def test_get_system_settings_falls_back_when_log_storage_lookup_fails(
+    def test_get_system_settings_does_not_read_the_log_directory(
         self, test_client: TestClient, admin_headers
     ):
-        fake_log_manager = Mock()
-        fake_log_manager.calculate_log_storage.side_effect = RuntimeError("boom")
-
-        with patch("app.services.log_manager.log_manager", fake_log_manager):
+        """The shell requests this route on every page; the log storage
+        figures (a stat of every log file) come from /system/logs/storage."""
+        # patched on the class, so any binding of the instance (module-level
+        # or local) hits it; a call would fail the request, not just the
+        # assertion below
+        with patch(
+            "app.services.log_manager.LogManager.calculate_log_storage",
+            side_effect=RuntimeError("boom"),
+        ) as calculate:
             response = test_client.get("/api/settings/system", headers=admin_headers)
 
         assert response.status_code == 200
-        log_storage = response.json()["log_storage"]
-        assert log_storage["total_size_mb"] == 0
-        assert log_storage["file_count"] == 0
-        assert log_storage["files_by_type"] == {}
+        payload = response.json()
+        assert "log_storage" not in payload
+        assert "log_storage" not in payload["settings"]
+        calculate.assert_not_called()
+
+    def test_get_system_settings_starts_no_process(
+        self, test_client: TestClient, admin_headers
+    ):
+        """No `borg --version` per call (#1092): the shell requests this route
+        on every page, and the sidebar reads the Borg version from
+        /api/system/info, which caches it."""
+        with patch("subprocess.run", side_effect=RuntimeError("boom")) as run:
+            response = test_client.get("/api/settings/system", headers=admin_headers)
+
+        assert response.status_code == 200
+        assert "borg_version" not in response.json()["settings"]
+        run.assert_not_called()
 
     def test_update_system_settings_rejects_invalid_log_save_policy(
         self, test_client: TestClient, admin_headers
@@ -121,6 +147,23 @@ class TestSystemSettingsContracts:
         readback = test_client.get("/api/settings/system", headers=admin_headers)
         assert readback.status_code == 200
         assert readback.json()["settings"]["lock_breaking_enabled"] is False
+
+    def test_update_system_settings_persists_auto_prune_preview(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        before = test_client.get("/api/settings/system", headers=admin_headers)
+        assert before.json()["settings"]["auto_prune_preview"] is True
+
+        response = test_client.put(
+            "/api/settings/system",
+            json={"auto_prune_preview": False},
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 200
+        assert test_db.query(SystemSettings).first().auto_prune_preview is False
+        readback = test_client.get("/api/settings/system", headers=admin_headers)
+        assert readback.json()["settings"]["auto_prune_preview"] is False
 
     def test_update_system_settings_rejects_too_small_log_limit(
         self, test_client: TestClient, admin_headers
@@ -383,6 +426,7 @@ class TestSystemSettingsContracts:
 
         with (
             patch("app.services.log_manager.log_manager", fake_log_manager),
+            patch("app.api.settings._off_loop", wraps=asyncio.to_thread) as off_loop,
             patch("app.services.mqtt_service.mqtt_service.configure"),
             patch(
                 "app.services.mqtt_service.build_mqtt_runtime_config",
@@ -397,6 +441,8 @@ class TestSystemSettingsContracts:
 
         assert response.status_code == 200
         body = response.json()
+        # the scan went through the off-loop hop
+        off_loop.assert_any_call(fake_log_manager.calculate_log_storage)
         assert body["success"] is True
         assert len(body["warnings"]) == 1
         assert "exceeds new limit" in body["warnings"][0]
@@ -631,6 +677,27 @@ class TestCacheSettingsContracts:
         assert settings.cache_max_size_mb == 256
         assert settings.redis_url == "disabled"
 
+    def test_update_cache_settings_reads_json_body_and_redacts_log(
+        self, test_client: TestClient, admin_headers, test_db, caplog
+    ):
+        url = "redis://:hunter2@cache.internal:6379/0"
+        caplog.set_level("INFO")
+        with patch(
+            "app.api.settings.archive_cache.reconfigure",
+            return_value={"success": True, "backend": "redis"},
+        ) as mock_reconfigure:
+            response = test_client.put(
+                "/api/settings/cache/settings",
+                json={"cache_max_size_mb": 256, "redis_url": url},
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        mock_reconfigure.assert_called_once_with(redis_url=url, cache_max_size_mb=256)
+        assert test_db.query(SystemSettings).first().redis_url == url
+        assert "Cache settings updated" in caplog.text
+        assert "hunter2" not in caplog.text
+
     def test_get_log_storage_stats_reports_usage_percent(
         self, test_client: TestClient, admin_headers, test_db
     ):
@@ -647,13 +714,89 @@ class TestCacheSettingsContracts:
             "files_by_type": {"backup": 2, "restore": 2},
         }
 
-        with patch("app.services.log_manager.log_manager", fake_log_manager):
+        with (
+            patch("app.services.log_manager.log_manager", fake_log_manager),
+            patch("app.api.settings._off_loop", wraps=asyncio.to_thread) as off_loop,
+        ):
             response = test_client.get(
                 "/api/settings/system/logs/storage", headers=admin_headers
             )
 
         assert response.status_code == 200
+        # the scan of the log directory went through the off-loop hop
+        off_loop.assert_any_call(fake_log_manager.calculate_log_storage)
         log_storage = response.json()["storage"]
         assert log_storage["usage_percent"] == 25
         assert log_storage["file_count"] == 4
         assert log_storage["files_by_type"] == {"backup": 2, "restore": 2}
+
+
+class TestBackgroundStatsRefresh:
+    @pytest.mark.asyncio
+    async def test_one_failed_enqueue_does_not_stop_the_rest(self, test_db):
+        """`enqueue_chain` commits, so a failure leaves the session unusable
+        until it is rolled back. Without that, the next repository's query
+        raises and every repository after the first is silently skipped."""
+        repos = []
+        for name in ("first", "second"):
+            repo = Repository(
+                name=f"Stats {name}",
+                path=f"/repos/stats-{name}",
+                encryption="none",
+                compression="lz4",
+                repository_type="local",
+            )
+            test_db.add(repo)
+            repos.append(repo)
+        test_db.commit()
+        ids = [repo.id for repo in repos]
+        enqueued: list[int] = []
+
+        def enqueue_chain(db, kinds, *, repository_id, trigger):
+            if repository_id == ids[0]:
+                # A doomed transaction, which is what a failed commit inside
+                # `enqueue_chain` leaves behind (`kind` is NOT NULL).
+                db.add(Operation(category="maintenance", run_id="doomed"))
+                db.flush()
+            enqueued.append(repository_id)
+
+        with (
+            patch("app.database.database.SessionLocal", return_value=test_db),
+            patch(
+                "app.services.operations.enqueue.enqueue_chain",
+                side_effect=enqueue_chain,
+            ),
+            patch.object(test_db, "close"),
+        ):
+            await settings_api._run_stats_refresh_background(ids, "tester")
+
+        assert enqueued == [ids[1]]
+
+    @pytest.mark.asyncio
+    async def test_the_refresh_timestamp_is_left_to_the_stats_executor(self, test_db):
+        """The frontend reads `last_stats_refresh` as the signal that the
+        statistics themselves are new, so enqueueing must not write it."""
+        repo = Repository(
+            name="Stats timestamp",
+            path="/repos/stats-timestamp",
+            encryption="none",
+            compression="lz4",
+            repository_type="local",
+        )
+        test_db.add(repo)
+        settings_row = test_db.query(SystemSettings).first()
+        if settings_row is None:
+            settings_row = SystemSettings()
+            test_db.add(settings_row)
+        settings_row.last_stats_refresh = None
+        test_db.commit()
+
+        with (
+            patch("app.database.database.SessionLocal", return_value=test_db),
+            patch("app.services.operations.enqueue.enqueue_chain"),
+            patch.object(test_db, "close"),
+        ):
+            await settings_api._run_stats_refresh_background([repo.id], "tester")
+
+        test_db.refresh(settings_row)
+        assert settings_row.last_stats_refresh is None

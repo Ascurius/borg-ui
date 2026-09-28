@@ -1,6 +1,9 @@
 import axios from 'axios'
+import type { RepositoryStorage } from '../types'
+import type { SyncState } from '../types/archives'
 import { toast } from 'react-hot-toast'
 import { BASE_PATH } from '@/utils/basePath'
+import { getBrowserTimeZone } from '@/utils/dateUtils'
 import {
   API_BASE_URL,
   buildApiUrl,
@@ -25,6 +28,30 @@ import type {
   RcloneStorage,
   SourceLocation,
 } from '../types'
+import type {
+  HubRepositoryDetail,
+  HubResponse,
+  OperationItem,
+  PausableStage,
+  QueueResponse,
+  QueueLimits,
+  RebuildStage,
+  RebuildResponse,
+} from '../types/operations'
+import type {
+  ArchiveListResponse,
+  HeatmapResponse,
+  GrowthResponse,
+  ArchiveDetailResponse,
+  ChangesResponse,
+  ChangeType,
+  PathHistoryResponse,
+  SearchResponse,
+  PruneRetention,
+  PrunePreviewResponse,
+  PruneRetentionDefaults,
+  PruneComparison,
+} from '../types/archives'
 
 export type AuthTransportMode = 'jwt' | 'proxy' | 'insecure-no-auth'
 
@@ -248,6 +275,14 @@ export interface RcloneOAuthSession {
   error?: string | null
 }
 
+export interface RepositoryStorageResponse {
+  repository_id: number
+  storage: RepositoryStorage | null
+  index_pending_kinds: string[]
+  sync_state?: SyncState
+  last_synced_at?: string | null
+}
+
 export interface RcloneRemoteStorage {
   total: number
   total_formatted: string
@@ -292,6 +327,7 @@ export interface SystemSettings {
   max_concurrent_scheduled_backups?: number
   max_concurrent_scheduled_checks?: number
   stats_refresh_interval_minutes?: number
+  auto_prune_preview?: boolean
   dashboard_backup_warning_days?: number
   dashboard_backup_critical_days?: number
   dashboard_check_warning_days?: number
@@ -645,7 +681,10 @@ export const dashboardAPI = {
   getStatus: () => api.get('/dashboard/status'),
   getMetrics: () => api.get('/dashboard/metrics'),
   getSchedule: () => api.get('/dashboard/schedule'),
-  getOverview: () => api.get('/dashboard/overview'),
+  // The timeline is bucketed by day in the viewer's time zone; the server
+  // falls back to UTC for a zone it does not know.
+  getOverview: (timezone?: string) =>
+    api.get('/dashboard/overview', { params: timezone ? { timezone } : undefined }),
 }
 
 export const licensingAPI = {
@@ -653,6 +692,13 @@ export const licensingAPI = {
   activate: (licenseKey: string) =>
     api.post('/system/licensing/activate', { license_key: licenseKey }),
   deactivate: () => api.post('/system/licensing/deactivate'),
+  featureTrial: (feature: string) =>
+    api.post<{ result: string; reason?: string }>('/system/licensing/feature-trial', {
+      feature,
+    }),
+  seats: () => api.get('/system/licensing/seats'),
+  releaseSeat: (instanceId: string) =>
+    api.post('/system/licensing/seats/release', { instance_id: instanceId }),
 }
 
 export const backupAPI = {
@@ -692,6 +738,78 @@ export const archivesAPI = {
         file_path: filePath,
       })
     ),
+  rebuild: (repositoryId: number, from: RebuildStage) =>
+    api.post<RebuildResponse>(`/repositories/${repositoryId}/rebuild`, { from }),
+  // After work that removed archives (delete, prune, wipe): reconcile the
+  // stored list the Archives page reads, without invalidating anything.
+  resync: (repositoryId: number) =>
+    api.post<RebuildResponse>(`/repositories/${repositoryId}/resync`),
+  listStored: (
+    repositoryId: number,
+    params?: { series?: string; since?: string; until?: string }
+  ) => api.get<ArchiveListResponse>(`/repositories/${repositoryId}/archives`, { params }),
+  // Days are bucketed in the viewer's time zone, the one the grid draws.
+  getHeatmap: (repositoryId: number, params?: { since?: string; until?: string }) =>
+    api.get<HeatmapResponse>(`/repositories/${repositoryId}/archives/heatmap`, {
+      params: { ...params, timezone: getBrowserTimeZone() },
+    }),
+  getGrowth: (repositoryId: number, params?: { series?: string }) =>
+    api.get<GrowthResponse>(`/repositories/${repositoryId}/archives/growth`, { params }),
+  getArchive: (repositoryId: number, archiveId: number) =>
+    api.get<ArchiveDetailResponse>(`/repositories/${repositoryId}/archives/${archiveId}`),
+  getChanges: (
+    repositoryId: number,
+    archiveId: number,
+    params?: {
+      compare_to?: number
+      path_prefix?: string
+      change?: ChangeType[]
+      limit?: number
+      cursor?: string
+    }
+  ) =>
+    api.get<ChangesResponse>(`/repositories/${repositoryId}/archives/${archiveId}/changes`, {
+      params,
+      paramsSerializer: { indexes: null },
+    }),
+  getPathHistory: (repositoryId: number, path: string) =>
+    api.get<PathHistoryResponse>(`/repositories/${repositoryId}/history`, { params: { path } }),
+  search: (repositoryId: number, q: string, limit?: number) =>
+    api.get<SearchResponse>(`/repositories/${repositoryId}/search`, { params: { q, limit } }),
+}
+
+export const operationsAPI = {
+  getQueue: () => api.get<QueueResponse>('/operations/queue'),
+  getRepositories: () => api.get<HubResponse>('/operations/repositories'),
+  getRepositoryDetail: (repositoryId: number) =>
+    api.get<HubRepositoryDetail>(`/operations/repositories/${repositoryId}`),
+  reconcileNow: () => api.post<{ repositories: number }>('/operations/reconcile'),
+  list: (params?: {
+    repository_id?: number
+    category?: string[]
+    kind?: string[]
+    status?: string[]
+    trigger?: string[]
+    run_id?: string
+    since?: string
+    limit?: number
+    cursor?: number
+  }) =>
+    api.get<{ items: OperationItem[]; next_cursor: number | null }>('/operations/', {
+      params,
+      // FastAPI's `Query(list[str])` reads repeated keys (`kind=a&kind=b`);
+      // axios's default serializer would emit `kind[]=a`, which the route
+      // ignores, silently returning unfiltered results.
+      paramsSerializer: { indexes: null },
+    }),
+  pause: () => api.post('/operations/pause'),
+  resume: () => api.post('/operations/resume'),
+  pauseStage: (stage: PausableStage) => api.post(`/operations/stages/${stage}/pause`),
+  resumeStage: (stage: PausableStage) => api.post(`/operations/stages/${stage}/resume`),
+  updateLimits: (indexWorkers: number) =>
+    api.put<QueueLimits>('/operations/limits', { index_workers: indexWorkers }),
+  cancel: (operationId: number) => api.post(`/operations/${operationId}/cancel`),
+  get: (operationId: number) => api.get<OperationItem>(`/operations/${operationId}`),
 }
 
 export const restoreAPI = {
@@ -780,7 +898,8 @@ export const settingsAPI = {
     if (browseMaxMemoryMb !== undefined) {
       params.browse_max_memory_mb = browseMaxMemoryMb
     }
-    return api.put('/settings/cache/settings', null, { params })
+    // Body, not query params: redis_url can carry a password
+    return api.put('/settings/cache/settings', params)
   },
 }
 
@@ -857,6 +976,8 @@ export const authAPIAdmin = {
 // Repositories API
 export const repositoriesAPI = {
   getRepositories: () => api.get('/repositories/'),
+  // Per-category health from repository evidence (spec 9.2).
+  getStatus: (id: number) => api.get(`/repositories/${id}/status`),
   createRepository: (data: RepositoryData) => api.post('/repositories/', data),
   importRepository: (data: RepositoryData) => api.post('/repositories/import', data),
   uploadKeyfile: (id: number, keyfile: File) => {
@@ -870,6 +991,9 @@ export const repositoriesAPI = {
   },
   downloadKeyfile: (id: number) => api.get(`/repositories/${id}/keyfile`, { responseType: 'blob' }),
   getRepository: (id: number) => api.get(`/repositories/${id}`),
+  // The stored size figures and pending index kinds alone (#981, #1063):
+  // no live Borg call, unlike the detail.
+  getStorage: (id: number) => api.get<RepositoryStorageResponse>(`/repositories/${id}/storage`),
   updateRepository: (id: number, data: RepositoryData) => api.put(`/repositories/${id}`, data),
   deleteRepository: (id: number) => api.delete(`/repositories/${id}`),
   permanentlyDeleteRepository: (id: number, data: RepositoryPermanentDeleteRequest) =>
@@ -885,6 +1009,22 @@ export const repositoriesAPI = {
   ) => api.post(`/repositories/${id}/restore-check`, data || {}),
   compactRepository: (id: number) => api.post(`/repositories/${id}/compact`),
   pruneRepository: (id: number, data: ApiData) => api.post(`/repositories/${id}/prune`, data),
+  prunePreview: (id: number, data: PruneRetention, previewRunId?: string) =>
+    api.post<PrunePreviewResponse>(`/repositories/${id}/prune/preview`, {
+      ...data,
+      ...(previewRunId ? { preview_run_id: previewRunId } : {}),
+    }),
+  pruneRetentionDefaults: (id: number) =>
+    api.get<PruneRetentionDefaults>(`/repositories/${id}/prune/retention-defaults`),
+  pruneComparison: (id: number) => api.get<PruneComparison>(`/repositories/${id}/prune/comparison`),
+  pruneCandidatePreview: (id: number, candidate: string) =>
+    api.get<PrunePreviewResponse>(
+      `/repositories/${id}/prune/comparison/${encodeURIComponent(candidate)}/preview`
+    ),
+  pruneComparisonRefresh: (id: number, auto = false) =>
+    api.post<{ operation_id: number }>(
+      `/repositories/${id}/prune/comparison/refresh${auto ? '?auto=true' : ''}`
+    ),
   previewRepositoryWipe: (id: number, data: RepositoryWipePreviewRequest) =>
     api.post<RepositoryWipeJob>(`/repositories/${id}/wipe-preview`, data),
   executeRepositoryWipe: (id: number, data: RepositoryWipeExecuteRequest) =>
@@ -895,8 +1035,7 @@ export const repositoriesAPI = {
     api.post<RepositoryWipeJob>(`/repositories/${id}/wipe-jobs/${jobId}/cancel`),
   breakLock: (id: number) => api.post(`/repositories/${id}/break-lock`),
   getRepositoryStats: (id: number) => api.get(`/repositories/${id}/stats`),
-  listRepositoryArchives: (id: number) => api.get(`/repositories/${id}/archives`),
-  getRepositoryInfo: (id: number) => api.get(`/repositories/${id}/info`),
+  listRepositoryArchives: (id: number) => api.get(`/repositories/${id}/archives/live`),
   syncRcloneRepository: (id: number) => api.post(`/repositories/${id}/rclone/sync`),
   hydrateRcloneRepository: (id: number) => api.post(`/repositories/${id}/rclone/hydrate`),
   getRcloneStatus: (id: number) => api.get(`/repositories/${id}/rclone/status`),
@@ -980,6 +1119,8 @@ export const backupPlansAPI = {
   update: (id: number, data: BackupPlanData) => api.put(`/backup-plans/${id}`, data),
   delete: (id: number) => api.delete(`/backup-plans/${id}`),
   toggle: (id: number) => api.post(`/backup-plans/${id}/toggle`),
+  toggleRepository: (id: number, repositoryId: number) =>
+    api.post(`/backup-plans/${id}/repositories/${repositoryId}/toggle`),
   run: (id: number) => api.post(`/backup-plans/${id}/run`),
   listRuns: () => api.get('/backup-plans/runs'),
   getRun: (id: number) => api.get(`/backup-plans/runs/${id}`),
@@ -1076,8 +1217,30 @@ export const sshKeysAPI = {
     ),
   redeployKeyToConnection: (connectionId: number, password: string) =>
     api.post(`/ssh-keys/connections/${connectionId}/redeploy`, { password }),
+  getConnectionHostKey: (connectionId: number) =>
+    api.get<SSHHostKeyResponse>(`/ssh-keys/connections/${connectionId}/host-key`),
+  trustConnectionHostKey: (connectionId: number, key: string) =>
+    api.post<SSHHostKeyResponse>(`/ssh-keys/connections/${connectionId}/host-key/trust`, {
+      key,
+    }),
+  forgetConnectionHostKey: (connectionId: number) =>
+    api.delete(`/ssh-keys/connections/${connectionId}/host-key`),
   importSSHKey: (data: ApiData) => api.post('/ssh-keys/import', data),
 }
+
+export type SSHHostKeyStatus = 'trusted' | 'unknown' | 'changed' | 'unreachable'
+
+export interface SSHHostKeyResponse {
+  connection_id: number
+  host: string
+  port: number
+  status: SSHHostKeyStatus
+  trusted_fingerprint: string | null
+  observed_fingerprint: string | null
+  observed_key: string | null
+}
+
+export type AgentUpgradeStatus = 'up_to_date' | 'outdated' | 'ahead' | 'pinned' | 'unknown'
 
 export interface AgentMachineResponse {
   id: number
@@ -1087,6 +1250,14 @@ export interface AgentMachineResponse {
   os?: string | null
   arch?: string | null
   agent_version?: string | null
+  desired_agent_version?: string | null
+  desired_borg_version?: string | null
+  available_agent_version?: string | null
+  upgrade_status?: AgentUpgradeStatus
+  self_upgrade_supported?: boolean
+  upgrade_state?: string | null
+  upgrade_requested_at?: string | null
+  upgrade_error?: string | null
   default_path?: string | null
   borg_versions?: Array<Record<string, unknown>> | null
   capabilities?: string[] | null
@@ -1097,6 +1268,21 @@ export interface AgentMachineResponse {
   deleted_at?: string | null
   created_at: string
   updated_at: string
+}
+
+export interface AgentUpgradeResult {
+  agent_machine_id: number
+  job_id: number | null
+  state: string
+}
+
+export interface AgentUpgradeResponse {
+  results: AgentUpgradeResult[]
+}
+
+export interface AgentDesiredVersionRequest {
+  desired_agent_version: string | null
+  desired_borg_version: '1' | '2' | null
 }
 
 export interface AgentEnrollmentTokenSummary {
@@ -1283,6 +1469,12 @@ export const managedAgentsAPI = {
     ),
   listAgentScripts: (agentId: number) =>
     api.get<AgentScriptsResponse>(`/managed-machines/agents/${agentId}/scripts`),
+  upgradeAgents: (agentIds: number[]) =>
+    api.post<AgentUpgradeResponse>('/managed-machines/agents/upgrade', {
+      agent_machine_ids: agentIds,
+    }),
+  setDesiredVersion: (agentId: number, data: AgentDesiredVersionRequest) =>
+    api.put<AgentMachineResponse>(`/managed-machines/agents/${agentId}/desired-version`, data),
 }
 
 // Schedule API
@@ -1310,7 +1502,13 @@ export const notificationsAPI = {
 }
 
 export const activityAPI = {
-  list: (params?: ApiData) => api.get('/activity/recent', { params }),
+  list: (params?: ApiData) =>
+    api.get('/activity/recent', {
+      params,
+      // FastAPI's `Query(list[str])` reads repeated keys (`category=a&category=b`);
+      // axios's default serializer would emit `category[]=a`, which the route ignores.
+      paramsSerializer: { indexes: null },
+    }),
   getLogs: (jobType: string, jobId: string | number, offset: number = 0) =>
     api.get(`/activity/${jobType}/${jobId}/logs`, { params: { offset } }),
   cancelJob: (jobType: string, jobId: string | number) =>
@@ -1388,6 +1586,8 @@ export const mountsAPI = {
     repository_id: number
     archive_name?: string
     mount_point?: string
+    // Borg 2 series archives share one name; the id addresses exactly one.
+    archive_id?: string
   }) => api.post('/mounts/borg', data),
 
   // Unmount a mounted archive

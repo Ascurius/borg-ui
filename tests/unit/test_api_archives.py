@@ -18,14 +18,18 @@ import asyncio
 import base64
 import os
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from app.core.security import get_password_hash
+from app.services.operations.job_facade import resolve_maintenance_job
+from tests.utils.operations import seed_job_operation
+from tests.utils.ssh import ssh_connection
 from app.database.models import (
     AgentMachine,
-    DeleteArchiveJob,
     Repository,
     SystemSettings,
 )
@@ -94,12 +98,18 @@ class TestArchivesResourceValidation:
             == "backend.errors.restore.repositoryNotFound"
         )
 
-    def test_delete_archive_legacy_route_dispatches_v2_repo_via_router(
+    def test_delete_archive_enqueues_and_the_executor_dispatches_through_borg_router(
         self,
         test_client: TestClient,
         admin_headers,
         test_db,
     ):
+        """Phase 5: the delete route no longer dispatches directly. It
+        enqueues an operation, and `BorgRouter.delete_archive` inside the
+        executor is what routes to Borg 1, Borg 2, or an agent."""
+        from app.database.models import Operation
+        from app.services.operations.executors import maintenance
+
         repo = Repository(
             name="V2 Repo",
             path="/tmp/v2-repo",
@@ -109,63 +119,44 @@ class TestArchivesResourceValidation:
         )
         test_db.add(repo)
         test_db.commit()
-
-        with patch(
-            "app.api.archives.BorgRouter.delete_archive", new_callable=AsyncMock
-        ) as mock_delete:
-            response = test_client.delete(
-                "/api/archives/archive-1",
-                params={"repository": repo.path},
-                headers=admin_headers,
-            )
-
-        assert response.status_code == 200
-        mock_delete.assert_awaited_once()
-
-    def test_delete_archive_route_constructs_router_with_stable_repo_identity(
-        self,
-        test_client: TestClient,
-        admin_headers,
-        test_db,
-    ):
-        repo = Repository(
-            name="Repo",
-            path="/tmp/repo",
-            encryption="none",
-            repository_type="local",
-            borg_version=2,
-        )
-        test_db.add(repo)
-        test_db.commit()
         test_db.refresh(repo)
 
-        fake_router = Mock(delete_archive=AsyncMock())
-        created = {}
-
-        def fake_create_task(coro):
-            created["coro"] = coro
-            return object()
-
-        with (
-            patch(
-                "app.api.archives.BorgRouter", return_value=fake_router
-            ) as mock_router,
-            patch("app.api.archives.asyncio.create_task", side_effect=fake_create_task),
-        ):
-            response = test_client.delete(
-                "/api/archives/archive-1",
-                params={"repository": repo.path},
-                headers=admin_headers,
-            )
+        response = test_client.delete(
+            "/api/archives/archive-1",
+            params={"repository": repo.path},
+            headers=admin_headers,
+        )
 
         assert response.status_code == 200
+        op = test_db.get(Operation, response.json()["job_id"])
+        assert op.kind == "delete_archive"
+        assert op.params["archive_name"] == "archive-1"
+
+        ctx = SimpleNamespace(
+            db=test_db,
+            operation=op,
+            operation_id=op.id,
+            repository_id=repo.id,
+            kind="delete_archive",
+            params=dict(op.params or {}),
+            cancelled=lambda: False,
+            log=lambda line: None,
+        )
+        fake_router = Mock(delete_archive=AsyncMock())
+        with patch(
+            "app.services.operations.executors.maintenance.BorgRouter",
+            return_value=fake_router,
+        ) as mock_router:
+            await_result = asyncio.run(maintenance.run_delete_archive(ctx))
+
+        mock_router.assert_called_once()
         routed_repo = mock_router.call_args.args[0]
-        assert not isinstance(routed_repo, Repository)
         assert routed_repo.id == repo.id
         assert routed_repo.borg_version == repo.borg_version
-
-        asyncio.run(created["coro"])
-        fake_router.delete_archive.assert_awaited_once()
+        fake_router.delete_archive.assert_awaited_once_with(
+            op.id, "archive-1", raise_busy=True
+        )
+        assert await_result is not None
 
     def test_delete_archive_borg2_addresses_series_by_aid_selector(
         self,
@@ -176,6 +167,9 @@ class TestArchivesResourceValidation:
         # A Borg 2 series name is ambiguous, so the frontend sends the archive
         # id; the endpoint must wrap it as aid:<hex> before deleting, otherwise
         # borg matches N archives in the series.
+        from app.database.models import Operation
+        from app.services.operations.executors import maintenance
+
         repo = Repository(
             name="V2 Repo",
             path="/tmp/v2-aid-repo",
@@ -188,33 +182,37 @@ class TestArchivesResourceValidation:
         test_db.refresh(repo)
 
         hex_id = "a1b2c3d4e5f60718"
-        fake_router = Mock(delete_archive=AsyncMock())
-        created = {}
-
-        with (
-            patch("app.api.archives.BorgRouter", return_value=fake_router),
-            patch(
-                "app.api.archives.asyncio.create_task",
-                side_effect=lambda coro: created.setdefault("coro", coro) or object(),
-            ),
-        ):
-            response = test_client.delete(
-                f"/api/archives/{hex_id}",
-                params={"repository": repo.path},
-                headers=admin_headers,
-            )
+        response = test_client.delete(
+            f"/api/archives/{hex_id}",
+            params={"repository": repo.path},
+            headers=admin_headers,
+        )
 
         assert response.status_code == 200
         job_id = response.json()["job_id"]
-        delete_job = (
-            test_db.query(DeleteArchiveJob)
-            .filter(DeleteArchiveJob.id == job_id)
-            .first()
-        )
-        assert delete_job.archive_name == f"aid:{hex_id}"
+        op = test_db.get(Operation, job_id)
+        assert op.params["archive_name"] == f"aid:{hex_id}"
 
-        asyncio.run(created["coro"])
-        fake_router.delete_archive.assert_awaited_once_with(job_id, f"aid:{hex_id}")
+        ctx = SimpleNamespace(
+            db=test_db,
+            operation=op,
+            operation_id=op.id,
+            repository_id=repo.id,
+            kind="delete_archive",
+            params=dict(op.params or {}),
+            cancelled=lambda: False,
+            log=lambda line: None,
+        )
+        fake_router = Mock(delete_archive=AsyncMock())
+        with patch(
+            "app.services.operations.executors.maintenance.BorgRouter",
+            return_value=fake_router,
+        ):
+            asyncio.run(maintenance.run_delete_archive(ctx))
+
+        fake_router.delete_archive.assert_awaited_once_with(
+            job_id, f"aid:{hex_id}", raise_busy=True
+        )
 
     def test_delete_job_status_applies_log_save_policy(
         self, test_client: TestClient, admin_headers, test_db, tmp_path
@@ -234,7 +232,9 @@ class TestArchivesResourceValidation:
         test_db.flush()
         log_file = tmp_path / "delete.log"
         log_file.write_text("archive deleted", encoding="utf-8")
-        job = DeleteArchiveJob(
+        job = seed_job_operation(
+            test_db,
+            "delete_archive",
             repository_id=repo.id,
             repository_path=repo.path,
             archive_name="archive-1",
@@ -244,7 +244,6 @@ class TestArchivesResourceValidation:
             log_file_path=str(log_file),
             has_logs=True,
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get(
@@ -270,7 +269,7 @@ class TestArchivesSshEnvironment:
             name="SSH Repo",
             path="ssh://borgsmoke@127.0.0.1:2222/home/borgsmoke/remote-repo",
             repository_type="ssh",
-            connection_id=1,
+            connection_id=ssh_connection(test_db).id,
             passphrase=None,
         )
         test_db.add(repo)
@@ -313,7 +312,7 @@ class TestArchivesSshEnvironment:
             name="SSH Repo",
             path="ssh://borgsmoke@127.0.0.1:2222/home/borgsmoke/remote-repo",
             repository_type="ssh",
-            connection_id=1,
+            connection_id=ssh_connection(test_db).id,
             passphrase=None,
         )
         test_db.add(repo)
@@ -472,7 +471,7 @@ class TestDownloadFileEndpoint:
             name="SSH Repo",
             path="ssh://borgsmoke@127.0.0.1:2222/home/borgsmoke/remote-repo",
             repository_type="ssh",
-            connection_id=1,
+            connection_id=ssh_connection(test_db).id,
             passphrase=None,
         )
         test_db.add(repo)
@@ -714,6 +713,83 @@ class TestDownloadFileEndpoint:
 
 
 @pytest.mark.unit
+class TestDownloadFolderEndpoint:
+    def test_download_folder_streams_a_tar_from_borg(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        repo = Repository(
+            name="Local Repo", path="/tmp/local-repo", repository_type="local"
+        )
+        test_db.add(repo)
+        test_db.commit()
+
+        class TarStream:
+            return_code = 0
+            stderr = ""
+
+            def __aiter__(self):
+                async def chunks():
+                    yield b"tar-bytes"
+
+                return chunks()
+
+            async def close(self):
+                return None
+
+        with patch(
+            "app.api.archives.borg.export_archive_tar", return_value=TarStream()
+        ) as export:
+            response = test_client.get(
+                f"/api/archives/download-folder?repository={repo.id}&archive=archive-1&directory_path=/documents/Projects",
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.content == b"tar-bytes"
+        assert response.headers["content-type"].startswith("application/x-tar")
+        assert 'filename="Projects.tar"' in response.headers["content-disposition"]
+        export.assert_called_once_with(
+            repo.path,
+            "archive-1",
+            "/documents/Projects",
+            remote_path=repo.remote_path,
+            passphrase=repo.passphrase,
+            bypass_lock=repo.bypass_lock,
+            env=export.call_args.kwargs["env"],
+            strip_components=1,
+        )
+
+    @pytest.mark.asyncio
+    async def test_agent_tar_timeout_abandons_the_queued_job(self):
+        from app.api.archives import _stream_agent_archive_tar
+
+        class TimeoutStream:
+            async def __anext__(self):
+                raise TimeoutError
+
+        agent_job = SimpleNamespace(id=17)
+        relay = Mock()
+        relay.stream.return_value = TimeoutStream()
+        with (
+            patch(
+                "app.api.archives.queue_agent_repository_operation_job",
+                return_value=agent_job,
+            ),
+            patch("app.api.archives.agent_artifact_relay", relay),
+            patch("app.api.archives.dispatch_agent_job_best_effort", new=AsyncMock()),
+            patch("app.api.archives.abandon_agent_repository_operation_job") as abandon,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await _stream_agent_archive_tar(
+                    Mock(), SimpleNamespace(id=3), "archive-1", "/Documents"
+                )
+
+        assert exc_info.value.status_code == 504
+        abandon.assert_called_once()
+        relay.unregister.assert_called_once_with(17)
+
+
+@pytest.mark.unit
 def test_archive_extract_selector_addresses_borg2_id_via_aid():
     from types import SimpleNamespace
     from app.api.archives import _archive_extract_selector
@@ -730,3 +806,103 @@ def test_archive_extract_selector_addresses_borg2_id_via_aid():
     assert _archive_extract_selector("m3s01", borg2) == "m3s01"
     # Borg 1 never uses aid: (unique names)
     assert _archive_extract_selector(hex_id, borg1) == hex_id
+
+
+@pytest.mark.unit
+def test_archives_list_route_sends_deprecation_headers(
+    test_client, test_db, admin_headers, monkeypatch
+):
+    """Spec 9.2: /archives/list stays one release and is marked deprecated."""
+    repo = Repository(
+        name="dep-repo", path="/tmp/dep-repo", encryption="none", compression="lz4"
+    )
+    test_db.add(repo)
+    test_db.commit()
+
+    with patch(
+        "app.api.archives.borg.list_archives",
+        new=AsyncMock(return_value={"success": True, "stdout": "{}"}),
+    ):
+        r = test_client.get(
+            f"/api/archives/list?repository={repo.path}", headers=admin_headers
+        )
+
+    assert r.status_code == 200
+    assert r.headers["deprecation"] == "true"
+    assert "/archives" in r.headers["link"]
+
+
+@pytest.mark.unit
+class TestDeleteJobCancel:
+    @staticmethod
+    def _create_delete_job(test_db, status: str):
+        repo = Repository(
+            name="Cancel Repo",
+            path="/tmp/cancel-repo",
+            encryption="none",
+            repository_type="local",
+        )
+        test_db.add(repo)
+        test_db.flush()
+        job = seed_job_operation(
+            test_db,
+            "delete_archive",
+            repository_id=repo.id,
+            repository_path=repo.path,
+            archive_name="archive-1",
+            status=status,
+            started_at=datetime(2026, 4, 27, 3, 0, 6),
+        )
+        test_db.commit()
+        return job
+
+    def test_cancel_running_delete_job_asks_the_runner_to_cancel(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """The runner owns the kill and writes the terminal status, so the
+        route raises its flag rather than stamping `cancelled` itself."""
+        job = self._create_delete_job(test_db, "running")
+
+        with patch(
+            "app.services.operations.runner.operation_runner.request_cancel",
+            new_callable=AsyncMock,
+        ) as request_cancel:
+            response = test_client.post(
+                f"/api/archives/delete-jobs/{job.id}/cancel", headers=admin_headers
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "message": "backend.success.archives.deletionCancelled"
+        }
+        request_cancel.assert_awaited_once_with(job.id)
+
+    def test_cancel_finished_delete_job_leaves_it_alone(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """A finished operation has nothing to cancel: the runner refuses the
+        flag and the row keeps its outcome."""
+        job = self._create_delete_job(test_db, "completed")
+
+        response = test_client.post(
+            f"/api/archives/delete-jobs/{job.id}/cancel", headers=admin_headers
+        )
+
+        assert response.status_code == 200
+        test_db.expire_all()
+        assert (
+            resolve_maintenance_job(test_db, job.id, "delete_archive").status
+            == "completed"
+        )
+
+    def test_cancel_unknown_delete_job_returns_404(
+        self, test_client: TestClient, admin_headers
+    ):
+        response = test_client.post(
+            "/api/archives/delete-jobs/999999/cancel", headers=admin_headers
+        )
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == {
+            "key": "backend.errors.archives.deleteJobNotFound"
+        }

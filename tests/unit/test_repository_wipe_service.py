@@ -3,9 +3,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 from app.core.borg_router import BorgRouter
-from app.database.models import Repository, RepositoryWipeJob, User
+from app.database.models import Operation, Repository, RepositoryWipeJob, User
+from app.services.operations.wipe_facade import resolve_wipe_job
+from tests.utils.operations import seed_job_operation
 from app.services.repository_wipe_service import (
     RepositoryWipeService,
     WipeArchiveSetChanged,
@@ -235,24 +238,38 @@ async def test_execute_marks_compact_failure_after_successful_delete(db_session)
     db_session.add_all([user, repo])
     db_session.commit()
     db_session.refresh(repo)
+    # The confirmed wipe is an operation (phase 6); the preview it was
+    # confirmed from keeps its own row and its own status.
     preview = RepositoryWipeJob(
         repository_id=repo.id,
         repository_path=repo.path,
         repository_name=repo.name,
         borg_version=1,
-        status="pending",
-        phase="queued",
+        status="previewed",
+        phase="preview",
+        archive_count=1,
+        archive_fingerprint=compute_archive_fingerprint(manifest),
+        archive_manifest_json='[{"identity":"archive-a","name":"archive-a"}]',
+        run_compact=True,
+        requested_by_user_id=user.id,
+        created_at=datetime.utcnow(),
+    )
+    db_session.add(preview)
+    db_session.commit()
+    db_session.refresh(preview)
+    wipe = seed_job_operation(
+        db_session,
+        "wipe",
+        repository_id=repo.id,
+        status="running",
+        params={"preview_id": preview.id},
         archive_count=1,
         archive_fingerprint=compute_archive_fingerprint(manifest),
         archive_manifest_json='[{"identity":"archive-a","name":"archive-a"}]',
         run_compact=True,
         requested_by_user_id=user.id,
         confirmed_by_user_id=user.id,
-        created_at=datetime.utcnow(),
     )
-    db_session.add(preview)
-    db_session.commit()
-    db_session.refresh(preview)
 
     service = RepositoryWipeService()
 
@@ -270,11 +287,233 @@ async def test_execute_marks_compact_failure_after_successful_delete(db_session)
             "run_wipe_compact",
             new=AsyncMock(return_value={"success": False, "stderr": "compact failed"}),
         ),
-        patch.object(BorgRouter, "update_stats", new=AsyncMock(return_value=True)),
     ):
-        await service.execute_wipe(preview.id, repo.id)
+        await service.execute_wipe(wipe.id, repo.id)
 
+    job = resolve_wipe_job(db_session, wipe.id)
+    assert job.status == "completed_compaction_failed"
+    assert job.phase == "compact_failed"
+    assert "compact failed" in (job.error_message or "")
+
+
+def test_manifest_preserves_epoch_zero_time():
+    # 0 is falsy but a valid epoch - it must win over the start fallback.
+    manifest = normalize_archive_manifest(
+        borg_version=1,
+        archives=[{"name": "a", "time": 0, "start": "2026-05-17T00:00:00"}],
+    )
+
+    assert manifest[0]["time"] == "1970-01-01T00:00:00+00:00"
+
+
+def _wipe_user_and_repository(db_session):
+    user = User(username="admin", password_hash="hash", is_active=True, role="admin")
+    repo = Repository(
+        name="Primary",
+        path="/tmp/repo",
+        encryption="none",
+        repository_type="local",
+        borg_version=1,
+    )
+    db_session.add_all([user, repo])
+    db_session.commit()
+    db_session.refresh(repo)
+    db_session.refresh(user)
+    return user, repo
+
+
+def _fresh_preview(db_session, user, repo):
+    manifest = normalize_archive_manifest(
+        borg_version=1,
+        archives=[{"name": "archive-a", "time": "2026-05-17T00:00:00"}],
+    )
+    preview = RepositoryWipeJob(
+        repository_id=repo.id,
+        repository_path=repo.path,
+        repository_name=repo.name,
+        borg_version=1,
+        status="previewed",
+        phase="preview",
+        archive_count=1,
+        archive_fingerprint=compute_archive_fingerprint(manifest),
+        archive_manifest_json='[{"identity":"archive-a","name":"archive-a"}]',
+        protected_archives_json="[]",
+        dry_run_output="would delete archive-a",
+        run_compact=True,
+        requested_by_user_id=user.id,
+        created_at=datetime.utcnow(),
+    )
+    db_session.add(preview)
+    db_session.commit()
     db_session.refresh(preview)
-    assert preview.status == "completed_compaction_failed"
-    assert preview.phase == "compact_failed"
-    assert "compact failed" in (preview.error_message or "")
+    return preview
+
+
+@pytest.mark.asyncio
+async def test_start_execution_enqueues_an_operation_and_copies_the_preview(
+    db_session,
+):
+    from app.database.models import Operation, OperationWipeDetails
+
+    user, repo = _wipe_user_and_repository(db_session)
+    preview = _fresh_preview(db_session, user, repo)
+    service = RepositoryWipeService()
+    unchanged = [{"name": "archive-a", "time": "2026-05-17T00:00:00"}]
+
+    with patch.object(
+        BorgRouter, "list_archives", new=AsyncMock(return_value=unchanged)
+    ):
+        job = await service.start_execution(
+            db_session,
+            repo,
+            user,
+            preview_id=preview.id,
+            preview_fingerprint=preview.archive_fingerprint,
+            confirmation_phrase="WIPE Primary",
+            understood=True,
+            run_compact=True,
+        )
+
+    operation = db_session.query(Operation).filter(Operation.kind == "wipe").one()
+    details = db_session.get(OperationWipeDetails, operation.id)
+    assert operation.status == "queued"
+    assert operation.trigger == "manual"
+    assert operation.category == "maintenance"
+    assert operation.repository_id == repo.id
+    assert operation.params["preview_id"] == preview.id
+    assert details.archive_fingerprint == preview.archive_fingerprint
+    assert details.archive_count == 1
+    assert details.archive_manifest_json == preview.archive_manifest_json
+    assert details.dry_run_output == "would delete archive-a"
+    assert details.requested_by_user_id == user.id
+    assert details.confirmed_by_user_id == user.id
+    assert details.confirmed_at is not None
+    assert details.phase == "queued"
+    assert job.id == operation.id
+    assert job.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_start_execution_rejects_a_preview_already_consumed(db_session):
+    """The freshness gate is the operation that already names this preview,
+    not a status word on the preview row."""
+    from app.services.repository_wipe_service import WipeValidationError
+
+    user, repo = _wipe_user_and_repository(db_session)
+    preview = _fresh_preview(db_session, user, repo)
+    service = RepositoryWipeService()
+    unchanged = [{"name": "archive-a", "time": "2026-05-17T00:00:00"}]
+
+    with patch.object(
+        BorgRouter, "list_archives", new=AsyncMock(return_value=unchanged)
+    ):
+        await service.start_execution(
+            db_session,
+            repo,
+            user,
+            preview_id=preview.id,
+            preview_fingerprint=preview.archive_fingerprint,
+            confirmation_phrase="WIPE Primary",
+            understood=True,
+            run_compact=True,
+        )
+
+        with pytest.raises(WipeValidationError) as excinfo:
+            await service.start_execution(
+                db_session,
+                repo,
+                user,
+                preview_id=preview.id,
+                preview_fingerprint=preview.archive_fingerprint,
+                confirmation_phrase="WIPE Primary",
+                understood=True,
+                run_compact=True,
+            )
+
+    assert excinfo.value.detail_key == "backend.errors.repo.wipePreviewNotFresh"
+    # The gate is the operation naming the preview, not a status word: the
+    # preview row itself is untouched by a confirm.
+    db_session.refresh(preview)
+    assert preview.status == "previewed"
+
+
+def test_cancel_preview_finds_a_preview_row(db_session):
+    """Previews are the only rows left in `repository_wipe_jobs`, so the
+    cancel route cannot resolve them through the operations facade."""
+    user, repo = _wipe_user_and_repository(db_session)
+    preview = _fresh_preview(db_session, user, repo)
+    service = RepositoryWipeService()
+
+    payload = service.cancel_preview(db_session, repo, user, job_id=preview.id)
+
+    assert payload["status"] == "cancelled"
+    db_session.refresh(preview)
+    assert preview.status == "cancelled"
+    assert preview.phase == "cancelled"
+    assert preview.completed_at is not None
+
+
+def test_cancel_preview_still_cancels_a_queued_operation(db_session):
+    user, repo = _wipe_user_and_repository(db_session)
+    operation = seed_job_operation(
+        db_session, "wipe", repository_id=repo.id, status="queued"
+    )
+    service = RepositoryWipeService()
+
+    payload = service.cancel_preview(db_session, repo, user, job_id=operation.id)
+
+    assert payload["status"] == "cancelled"
+    db_session.refresh(operation)
+    assert operation.status == "cancelled"
+
+
+def test_cancel_preview_finds_a_preview_behind_another_repositorys_operation(
+    db_session,
+):
+    """The two id spaces are independent, so an operation elsewhere can hold
+    the preview's id. It must not shadow the preview, which the caller would
+    then reject on the repository check and never reach."""
+    user, repo = _wipe_user_and_repository(db_session)
+    other = Repository(
+        name="Other",
+        path="/repos/other-wipe-shadow",
+        encryption="none",
+        repository_type="local",
+    )
+    db_session.add(other)
+    db_session.commit()
+    preview = _fresh_preview(db_session, user, repo)
+    shadow = seed_job_operation(
+        db_session, "wipe", repository_id=other.id, status="queued"
+    )
+    # force the collision the id spaces allow
+    db_session.query(Operation).filter(Operation.id == shadow.id).update(
+        {Operation.id: preview.id}
+    )
+    db_session.commit()
+    service = RepositoryWipeService()
+
+    payload = service.cancel_preview(db_session, repo, user, job_id=preview.id)
+
+    assert payload["status"] == "cancelled"
+    db_session.refresh(preview)
+    assert preview.status == "cancelled"
+
+
+def test_cancel_preview_rejects_a_preview_of_another_repository(db_session):
+    user, repo = _wipe_user_and_repository(db_session)
+    other = Repository(
+        name="Other",
+        path="/repos/other-wipe",
+        encryption="none",
+        repository_type="local",
+    )
+    db_session.add(other)
+    db_session.commit()
+    preview = _fresh_preview(db_session, user, repo)
+    service = RepositoryWipeService()
+
+    with pytest.raises(HTTPException) as raised:
+        service.cancel_preview(db_session, other, user, job_id=preview.id)
+
+    assert raised.value.status_code == 404

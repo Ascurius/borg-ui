@@ -7,6 +7,9 @@ and message IDs from the JSON API output.
 Reference: https://borgbackup.readthedocs.io/en/stable/usage/general.html#return-codes
 """
 
+import re as _re
+from typing import Any
+
 # Exit code mappings (modern exit codes)
 # Source: https://borgbackup.readthedocs.io/en/stable/internals/frontends.html#message-ids
 BORG_EXIT_CODES = {
@@ -97,6 +100,45 @@ BORG_EXIT_CODES = {
     106: "Warning: Backup IO error",
     107: "Warning: Backup file not found",
 }
+
+# "Repository already exists", the one repo-create failure that is not a
+# failure for us: the caller is adding a repository that is already there.
+# Only the modern code counts. Under the legacy codes every error is 2, so
+# matching that would swallow every failed repo-create, and the old `== 2`
+# check did exactly that while never matching a real already-exists, since
+# Borg 2 has always answered 10.
+REPOSITORY_EXISTS_EXIT_CODE = 10
+
+# Both shipped versions raise Repository.AlreadyExists with the same text,
+# verified against borg 1.4.5 and 2.0.0b24: "A repository already exists at
+# {}." Matched whole, one line at a time: borg prints other diagnostics
+# around it, and a bare "repository already exists" substring would also
+# accept an unrelated failure. Getting this wrong in the permissive
+# direction records a repository that was never created, so a reworded
+# future borg failing this match (a visible error on an existing
+# repository) is the better way to be wrong.
+_REPOSITORY_EXISTS_LINE = _re.compile(r"a repository already exists at .+\.", _re.I)
+
+
+def is_repository_exists_failure(result: dict) -> bool:
+    """Whether a failed repository create failed only because the repository
+    was already there, the one outcome a caller may treat as success.
+
+    The modern codes say so outright. Under the legacy codes, which an
+    operator can still pin with BORG_EXIT_CODES, every error collapses into
+    2, so the code cannot separate this from a generic failure and borg's
+    own wording has to.
+    """
+    return_code = result.get("return_code")
+    if return_code == REPOSITORY_EXISTS_EXIT_CODE:
+        return True
+    if return_code != 2:
+        return False
+    return any(
+        _REPOSITORY_EXISTS_LINE.fullmatch(line.strip())
+        for line in (result.get("stderr") or "").splitlines()
+    )
+
 
 # Message ID to user-friendly error messages
 # These come from Borg's JSON log output
@@ -245,6 +287,41 @@ def get_exit_code_message(exit_code: int) -> str:
         return f"Unknown error (exit code {exit_code})"
 
 
+def is_borg_warning_exit_code(exit_code) -> bool:
+    """Borg's warning exit codes: legacy rc 1, modern range 100-127.
+
+    Warnings mean the operation ran to completion but something was worth
+    telling the operator (a file changed mid-read, a path was missing).
+    They are not failures; jobs record them as completed_with_warnings.
+    """
+    return (
+        isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and (exit_code == 1 or 100 <= exit_code <= 127)
+    )
+
+
+# Borg's modern exit codes for a lock another process holds: LockTimeout
+# (73), and LockError / LockErrorT (70, 71) for a lock that could not be
+# taken. Not LockFailed (72), the lock file could not be created (a
+# read-only or foreign-owned repository), nor NotLocked / NotMyLock (74,
+# 75), about a lock that is not there: waiting changes neither.
+LOCK_CONTENTION_EXIT_CODES = (70, 71, 73)
+
+# The key a waiter's failure detail carries when the agent's Borg run ended
+# on such a lock, for the operations runner: the repository is taken for
+# now, and the operation is deferred like one the admission refused.
+LOCK_CONTENTION_DETAIL_KEY = "lock_contention"
+
+
+def is_lock_contention_exit_code(exit_code: Any) -> bool:
+    return (
+        isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and exit_code in LOCK_CONTENTION_EXIT_CODES
+    )
+
+
 def is_lock_error(exit_code: int = None, msgid: str = None) -> bool:
     """
     Check if an error is a lock-related error
@@ -297,6 +374,29 @@ _MSGID_TO_LOCALE_KEY = {
     "Archive.AlreadyExists": "archiveAlreadyExists",
 }
 
+# The same locale keys, reached by exit code, for the failures that arrive
+# without a message id (no --log-json, or a wrapper that swallowed it). Only
+# the modern codes carry this much: the legacy set collapses every error into
+# 2, which is why this map is worth having only now that every borg we run is
+# asked for the modern codes. Codes with no key of their own fall through to
+# the generic "exit code N" below rather than inventing an untranslated
+# string.
+_EXIT_CODE_TO_LOCALE_KEY = {
+    10: "repositoryAlreadyExists",
+    12: "repositoryCheckNeeded",
+    13: "repositoryDoesNotExist",
+    15: "notValidBorgRepository",
+    16: "notValidBorgRepository",
+    30: "archiveAlreadyExists",
+    31: "archiveDoesNotExist",
+    70: "lockError",
+    71: "lockError",
+    72: "lockError",
+    73: "lockTimeout",
+    74: "lockError",
+    75: "lockError",
+}
+
 
 def format_error_message(
     msgid: str = None, original_message: str = None, exit_code: int = None
@@ -318,6 +418,11 @@ def format_error_message(
     if msgid and msgid in _MSGID_TO_LOCALE_KEY:
         return _json.dumps(
             {"key": f"backend.errors.borg.{_MSGID_TO_LOCALE_KEY[msgid]}"}
+        )
+
+    if exit_code in _EXIT_CODE_TO_LOCALE_KEY:
+        return _json.dumps(
+            {"key": f"backend.errors.borg.{_EXIT_CODE_TO_LOCALE_KEY[exit_code]}"}
         )
 
     if exit_code is not None:

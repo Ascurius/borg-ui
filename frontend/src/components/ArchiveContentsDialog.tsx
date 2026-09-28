@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { alpha, Box, Typography } from '@mui/material'
+import { alpha, Alert, Box, Button, Link as MuiLink, Typography } from '@mui/material'
 import { Hourglass, ShieldCheck } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useQuery } from '@tanstack/react-query'
+import { Link as RouterLink } from 'react-router-dom'
 import { BorgApiClient, type Repository } from '../services/borgApi/client'
 import { Archive } from '../types'
 import { formatDateCompact, formatBytes as formatBytesUtil } from '../utils/dateUtils'
 import { normalizeBrowserPath } from '../utils/storageBrowserPaths'
+import { getApiErrorDetail } from '../utils/apiErrors'
+import { translateBackendKey } from '../utils/translateBackendKey'
 import StorageBrowserDialog, { type StorageBrowserItem } from './StorageBrowserDialog'
+import type { ArchiveRow } from '../types/archives'
 
 interface ArchiveContentsDialogProps {
   open: boolean
@@ -19,6 +23,10 @@ interface ArchiveContentsDialogProps {
     filePath: string,
     size?: number | null
   ) => void | Promise<void>
+  onDownloadFolder?: (archiveName: string, folderPath: string) => void | Promise<void>
+  /** Stored archive rows, used to find the numeric DB id for "Open full page".
+   *  The action is hidden when the archive has no matching row. */
+  storedArchives?: ArchiveRow[]
 }
 
 interface RawFileItem {
@@ -48,8 +56,13 @@ export default function ArchiveContentsDialog({
   repository,
   onClose,
   onDownloadFile,
+  onDownloadFolder,
+  storedArchives,
 }: ArchiveContentsDialogProps) {
   const { t } = useTranslation()
+  const storedRow = archive
+    ? (storedArchives || []).find((row) => row.borg_id === archive.id)
+    : undefined
   const [currentPath, setCurrentPath] = useState('')
   const [downloading, setDownloading] = useState(false)
   // Handle of an in-flight agent listing job (see getArchiveContents): a slow
@@ -68,8 +81,15 @@ export default function ArchiveContentsDialog({
     jobIdRef.current = null
   }, [currentPath])
 
-  const { data: archiveContents, isFetching } = useQuery({
-    queryKey: ['archive-contents', repository?.id, archive?.name, currentPath],
+  const {
+    data: archiveContents,
+    isFetching,
+    error: listingError,
+    refetch,
+  } = useQuery({
+    // Keyed by id as well as name: a Borg 2 series repeats names, and the
+    // id may be empty when the caller only knows the name.
+    queryKey: ['archive-contents', repository?.id, archive?.id, archive?.name, currentPath],
     queryFn: async () => {
       if (!repository || !archive) {
         throw new Error('Repository or archive not selected')
@@ -91,6 +111,23 @@ export default function ArchiveContentsDialog({
   })
 
   const isAwaitingAgent = archiveContents?.status === 202
+
+  // A failed listing (wrong selector, agent down) must say so and offer a
+  // retry rather than falling through to the "no information" placeholder.
+  const errorBanner =
+    listingError && !isFetching ? (
+      <Alert
+        severity="error"
+        sx={{ flexShrink: 0 }}
+        action={
+          <Button color="inherit" size="small" onClick={() => refetch()}>
+            {t('archiveContents.retry')}
+          </Button>
+        }
+      >
+        {translateBackendKey(getApiErrorDetail(listingError), 'archiveContents.loadFailed')}
+      </Alert>
+    ) : null
 
   const canaryDescription = t('archiveContents.managedCanaryDescription')
   const items = useMemo<StorageBrowserItem[] | null>(() => {
@@ -130,7 +167,12 @@ export default function ArchiveContentsDialog({
       }}
     >
       <Hourglass size={17} style={{ marginTop: 2, flexShrink: 0 }} />
-      <Typography variant="body2" color="text.secondary">
+      <Typography
+        variant="body2"
+        sx={{
+          color: 'text.secondary',
+        }}
+      >
         {t('archiveContents.slowLoadingHint')}
       </Typography>
     </Box>
@@ -152,6 +194,19 @@ export default function ArchiveContentsDialog({
       emptyRootDescription={t('archiveContents.emptyArchiveDesc')}
       noInfoLabel={t('archiveContents.noInfo')}
       showModifiedColumn
+      titleAction={
+        storedRow && repository ? (
+          <MuiLink
+            component={RouterLink}
+            to={`/archives/${repository.id}/${storedRow.id}`}
+            onClick={onClose}
+            variant="body2"
+          >
+            {t('archives.openFullPage')}
+          </MuiLink>
+        ) : undefined
+      }
+      error={errorBanner}
       banner={
         isInsideCanaryPath ? (
           <Box
@@ -169,7 +224,12 @@ export default function ArchiveContentsDialog({
             }}
           >
             <ShieldCheck size={17} style={{ marginTop: 2, flexShrink: 0 }} />
-            <Typography variant="body2" color="text.secondary">
+            <Typography
+              variant="body2"
+              sx={{
+                color: 'text.secondary',
+              }}
+            >
               {t('archiveContents.managedCanaryBanner')}
             </Typography>
           </Box>
@@ -192,8 +252,23 @@ export default function ArchiveContentsDialog({
             }
           : undefined
       }
+      onDownloadFolder={
+        onDownloadFolder && archive
+          ? async (folderPath) => {
+              setDownloading(true)
+              try {
+                await onDownloadFolder(archive.name, folderPath)
+              } catch {
+                // The download utility presents failures to the user.
+              } finally {
+                setDownloading(false)
+              }
+            }
+          : undefined
+      }
       downloadBusy={downloading}
       downloadLabel={t('archiveContents.downloadFile')}
+      folderDownloadLabel={t('archives.files.downloadFolder')}
       formatSize={formatBytesUtil}
       formatModified={formatDateCompact}
     />

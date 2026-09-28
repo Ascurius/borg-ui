@@ -2,10 +2,10 @@
 
 from typing import Any, Dict, Optional
 
-from app.core.borg2 import borg2
+from app.core.borg2 import borg2, borg2_encryption_flags
 from app.database.database import SessionLocal  # noqa: F401
 from app.utils.fs import calculate_path_size_bytes
-from app.utils.borg_env import ssh_key_borg_env
+from app.utils.borg_env import effective_repository_remote_path, ssh_key_borg_env
 
 
 class RepositoryV2Service:
@@ -36,8 +36,7 @@ class RepositoryV2Service:
                         "-r",
                         path,
                         "repo-create",
-                        "--encryption",
-                        encryption,
+                        *borg2_encryption_flags(encryption),
                     ]
                     + (["--remote-path", remote_path] if remote_path else []),
                     timeout=init_timeout,
@@ -78,8 +77,8 @@ class RepositoryV2Service:
 
     async def export_keyfile(self, repository, output_path: str) -> Dict[str, Any]:
         cmd = [borg2.borg_cmd, "-r", repository.path, "key", "export", output_path]
-        if repository.remote_path:
-            cmd.extend(["--remote-path", repository.remote_path])
+        if remote_path := effective_repository_remote_path(repository):
+            cmd.extend(["--remote-path", remote_path])
         env = (
             {"BORG_PASSPHRASE": repository.passphrase}
             if repository.passphrase

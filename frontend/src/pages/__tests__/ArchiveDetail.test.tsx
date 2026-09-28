@@ -1,0 +1,319 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { screen, fireEvent, within } from '@testing-library/react'
+import { renderWithProviders } from '../../test/test-utils'
+import ArchiveDetail from '../ArchiveDetail'
+import { archivesAPI, repositoriesAPI, restoreAPI } from '../../services/api'
+
+let mockParams = { repositoryId: '7', archiveId: '12' }
+
+vi.mock('react-router-dom', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('react-router-dom')>()
+  return {
+    ...actual,
+    useParams: () => mockParams,
+  }
+})
+
+vi.mock('../../components/archives/ArchiveFilesTab', () => ({
+  default: ({
+    onRestorePaths,
+  }: {
+    onRestorePaths?: (paths: string[], items: unknown[], fromArchiveId?: number) => void
+  }) => (
+    <>
+      <button onClick={() => onRestorePaths?.(['home/alex/docs'], [])}>Restore selection</button>
+      <button onClick={() => onRestorePaths?.(['home/alex/docs/invoices.xlsx'], [], 9)}>
+        Restore this version
+      </button>
+    </>
+  ),
+}))
+
+vi.mock('../../components/RestoreWizard', () => ({
+  default: ({
+    open,
+    initialSelectedPaths,
+    archive,
+    onRestore,
+  }: {
+    open: boolean
+    initialSelectedPaths?: string[]
+    archive?: { name?: string } | null
+    onRestore: (data: unknown) => void
+  }) =>
+    open ? (
+      <div>
+        Wizard: {(initialSelectedPaths ?? []).join(',')} from {archive?.name}
+        <button
+          onClick={() =>
+            onRestore({ selected_paths: ['home/alex/docs'], restore_strategy: 'original' })
+          }
+        >
+          Start restore
+        </button>
+      </div>
+    ) : null,
+}))
+
+vi.mock('../../services/api', () => ({
+  archivesAPI: {
+    getArchive: vi.fn(),
+    getChanges: vi.fn(),
+  },
+  repositoriesAPI: {
+    getRepositories: vi.fn(),
+  },
+  restoreAPI: {
+    getRestoreStatus: vi.fn(),
+    startRestore: vi.fn(),
+  },
+}))
+
+const archive = {
+  id: 12,
+  repository_id: 7,
+  borg_id: 'abc123',
+  name: 'nas-2026-09-02T02:00',
+  series: 'nightly',
+  start: '2026-09-02T02:00:00Z',
+  end: '2026-09-02T02:14:00Z',
+  duration_seconds: 840,
+  nfiles: 12000,
+  original_size: 90_000_000_000,
+  compressed_size: 60_000_000_000,
+  deduplicated_size: 41_200_000_000,
+  stats_measured_at: '2026-09-02T02:20:00Z',
+  hostname: 'nas',
+  username: 'root',
+  comment: null,
+  backup_operation_id: 55,
+  history_state: 'indexed' as const,
+  history_indexed_at: '2026-09-02T02:20:00Z',
+  history_rows: 40,
+  history_truncated: false,
+  first_seen_at: '2026-09-02T02:00:00Z',
+  last_seen_at: '2026-09-02T02:00:00Z',
+  predecessor_id: 11,
+  successor_id: null,
+  predecessor_stats: {
+    id: 11,
+    nfiles: 11000,
+    original_size: 80_000_000_000,
+    deduplicated_size: 30_000_000_000,
+    duration_seconds: 900,
+  },
+  history_available: true,
+}
+
+function renderRoute(path: string) {
+  const parts = path.split('?')[0].split('/').filter(Boolean)
+  mockParams = { repositoryId: parts[1], archiveId: parts[2] }
+  renderWithProviders(<ArchiveDetail />, { initialRoute: path })
+}
+
+describe('ArchiveDetail', () => {
+  beforeEach(() => {
+    vi.mocked(archivesAPI.getArchive).mockReset()
+    vi.mocked(archivesAPI.getChanges).mockReset()
+    vi.mocked(archivesAPI.getChanges).mockResolvedValue({
+      data: {
+        archive_id: 12,
+        compare_to_id: 11,
+        changes: [],
+        totals: { added: 4, removed: 2, modified: 3, summary: 0 },
+        next_cursor: null,
+        incomplete: false,
+        unindexed_archive_ids: [],
+        history_state: 'indexed',
+        history_truncated: false,
+      },
+    } as never)
+    vi.mocked(repositoriesAPI.getRepositories).mockReset()
+    vi.mocked(repositoriesAPI.getRepositories).mockResolvedValue({
+      data: { repositories: [{ id: 7, name: 'nas', path: '/data/nas', mode: 'full' }] },
+    } as never)
+    vi.mocked(restoreAPI.startRestore).mockReset()
+    vi.mocked(restoreAPI.getRestoreStatus).mockReset()
+  })
+
+  it('shows the stats header with deltas in place of the size chips', async () => {
+    vi.mocked(archivesAPI.getArchive).mockResolvedValue({ data: archive } as never)
+    renderRoute('/archives/7/12?tab=files')
+    expect(await screen.findByText('Added to the repository')).toBeInTheDocument()
+    expect(screen.getByText('+1,000 vs previous')).toBeInTheDocument()
+    expect(screen.queryByText('Deduplicated size')).not.toBeInTheDocument()
+  })
+
+  it('follows the started restore in the bottom-right panel until dismissed', async () => {
+    vi.mocked(archivesAPI.getArchive).mockResolvedValue({ data: archive } as never)
+    vi.mocked(restoreAPI.startRestore).mockResolvedValue({ data: { job_id: 42 } } as never)
+    vi.mocked(restoreAPI.getRestoreStatus).mockResolvedValue({
+      data: {
+        id: 42,
+        status: 'completed',
+        destination: '/tmp/out',
+        progress_details: { nfiles: 3, current_file: '', progress_percent: 100 },
+      },
+    } as never)
+    renderRoute('/archives/7/12?tab=files')
+    fireEvent.click(await screen.findByRole('button', { name: /restore selection/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /start restore/i }))
+
+    const panel = await screen.findByRole('status', { name: /restore progress/i })
+    await within(panel).findByText('Restore complete')
+    expect(panel).toHaveTextContent('3 files restored to /tmp/out')
+    expect(vi.mocked(restoreAPI.getRestoreStatus)).toHaveBeenCalledWith(42)
+
+    fireEvent.click(within(panel).getByRole('button', { name: /dismiss/i }))
+    expect(screen.queryByRole('status', { name: /restore progress/i })).not.toBeInTheDocument()
+  })
+
+  it('says so when the job status cannot be read', async () => {
+    vi.mocked(archivesAPI.getArchive).mockResolvedValue({ data: archive } as never)
+    vi.mocked(restoreAPI.startRestore).mockResolvedValue({ data: { job_id: 44 } } as never)
+    vi.mocked(restoreAPI.getRestoreStatus).mockRejectedValue(new Error('500'))
+    renderRoute('/archives/7/12?tab=files')
+    fireEvent.click(await screen.findByRole('button', { name: /restore selection/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /start restore/i }))
+
+    const panel = await screen.findByRole('status', { name: /restore progress/i })
+    await within(panel).findByText('Restore status unavailable')
+    expect(panel).toHaveTextContent('may still be running')
+  })
+
+  it('shows the failure reason when the restore fails', async () => {
+    vi.mocked(archivesAPI.getArchive).mockResolvedValue({ data: archive } as never)
+    vi.mocked(restoreAPI.startRestore).mockResolvedValue({ data: { job_id: 43 } } as never)
+    vi.mocked(restoreAPI.getRestoreStatus).mockResolvedValue({
+      data: { id: 43, status: 'failed', destination: '/tmp/out', error_message: 'disk full' },
+    } as never)
+    renderRoute('/archives/7/12?tab=files')
+    fireEvent.click(await screen.findByRole('button', { name: /restore selection/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /start restore/i }))
+
+    const panel = await screen.findByRole('status', { name: /restore progress/i })
+    await within(panel).findByText('Restore failed')
+    expect(panel).toHaveTextContent('disk full')
+  })
+
+  it('shows the archive header and defaults to the Files tab', async () => {
+    vi.mocked(archivesAPI.getArchive).mockResolvedValue({ data: archive } as never)
+    renderRoute('/archives/7/12')
+    expect(await screen.findByText('nas-2026-09-02T02:00')).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /files/i })).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('labels the Changes tab with the totals the route returns', async () => {
+    vi.mocked(archivesAPI.getArchive).mockResolvedValue({ data: archive } as never)
+    renderRoute('/archives/7/12')
+    expect(await screen.findByRole('tab', { name: 'Changes (+4 −2 ~3)' })).toBeInTheDocument()
+  })
+
+  it('falls back to the Files tab for a tab the page does not have', async () => {
+    vi.mocked(archivesAPI.getArchive).mockResolvedValue({ data: archive } as never)
+    renderRoute('/archives/7/12?tab=unknown')
+    expect(await screen.findByText('nas-2026-09-02T02:00')).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /files/i })).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('lists Files before Changes in the archive navigation', async () => {
+    vi.mocked(archivesAPI.getArchive).mockResolvedValue({ data: archive } as never)
+    renderRoute('/archives/7/12')
+    await screen.findByText('nas-2026-09-02T02:00')
+    const tabs = screen.getAllByRole('tab')
+    expect(tabs.map((tab) => tab.textContent)).toEqual(['Files', 'Changes'])
+  })
+
+  it('shows where the archive was taken under its name', async () => {
+    vi.mocked(archivesAPI.getArchive).mockResolvedValue({ data: archive } as never)
+    renderRoute('/archives/7/12')
+    expect(await screen.findByText(/root@nas/)).toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: /info/i })).not.toBeInTheDocument()
+  })
+
+  it('opens the restore wizard with the Files tab selection', async () => {
+    vi.mocked(archivesAPI.getArchive).mockResolvedValue({ data: archive } as never)
+    renderRoute('/archives/7/12?tab=files')
+    fireEvent.click(await screen.findByRole('button', { name: /restore selection/i }))
+    expect(
+      await screen.findByText(/Wizard: home\/alex\/docs from nas-2026-09-02T02:00/)
+    ).toBeInTheDocument()
+  })
+
+  it('restores an older version from the archive that version lives in', async () => {
+    const older = {
+      ...archive,
+      id: 9,
+      borg_id: 'older-borg-id',
+      name: 'nas-2026-08-24T02:00',
+      start: '2026-08-24T02:00:00Z',
+    }
+    vi.mocked(archivesAPI.getArchive).mockImplementation(
+      (_repositoryId: number, archiveId: number) =>
+        Promise.resolve({ data: archiveId === 9 ? older : archive }) as never
+    )
+    renderRoute('/archives/7/12?tab=files')
+    fireEvent.click(await screen.findByRole('button', { name: /restore this version/i }))
+    expect(
+      await screen.findByText(/Wizard: home\/alex\/docs\/invoices.xlsx from nas-2026-08-24T02:00/)
+    ).toBeInTheDocument()
+  })
+
+  it('reports an archive that cannot be loaded', async () => {
+    vi.mocked(archivesAPI.getArchive).mockRejectedValue(new Error('nope'))
+    renderRoute('/archives/7/999')
+    expect(await screen.findByText(/could not be loaded/i)).toBeInTheDocument()
+  })
+
+  describe('index mode (spec 6.8)', () => {
+    // A repository that does not index file history has no counts to show.
+    // Labelling the tab with them while the tab itself says the history is
+    // not indexed is the contradiction the mode exists to avoid.
+    for (const mode of ['archives', 'off'] as const) {
+      it(`asks for no change totals in ${mode} mode`, async () => {
+        vi.mocked(repositoriesAPI.getRepositories).mockResolvedValue({
+          data: {
+            repositories: [
+              { id: 7, name: 'nas', path: '/data/nas', mode: 'full', index_mode: mode },
+            ],
+          },
+        } as never)
+        vi.mocked(archivesAPI.getArchive).mockResolvedValue({ data: archive } as never)
+        renderRoute('/archives/7/12')
+        expect(await screen.findByText('nas-2026-09-02T02:00')).toBeInTheDocument()
+        expect(screen.getByRole('tab', { name: /changes/i })).not.toHaveTextContent(/\+4/)
+        expect(archivesAPI.getChanges).not.toHaveBeenCalled()
+      })
+    }
+
+    it('waits for the repository before asking for totals', async () => {
+      // The mode falls back to `full` while the repository list loads, so
+      // without a guard on the repository itself the query would fire once
+      // under that fallback and fetch history for a repository that has
+      // none.
+      let resolveRepositories: (value: unknown) => void = () => {}
+      vi.mocked(repositoriesAPI.getRepositories).mockReturnValue(
+        new Promise((resolve) => {
+          resolveRepositories = resolve
+        }) as never
+      )
+      vi.mocked(archivesAPI.getArchive).mockResolvedValue({ data: archive } as never)
+      renderRoute('/archives/7/12')
+      expect(await screen.findByText('nas-2026-09-02T02:00')).toBeInTheDocument()
+      expect(archivesAPI.getChanges).not.toHaveBeenCalled()
+
+      resolveRepositories({
+        data: {
+          repositories: [
+            { id: 7, name: 'nas', path: '/data/nas', mode: 'full', index_mode: 'archives' },
+          ],
+        },
+      })
+      fireEvent.click(await screen.findByRole('tab', { name: /changes/i }))
+      // The mode panel only renders once the repository has resolved, so it
+      // is the signal that the fallback window has closed.
+      expect(await screen.findByText(/archives only/i)).toBeInTheDocument()
+      expect(archivesAPI.getChanges).not.toHaveBeenCalled()
+    })
+  })
+})

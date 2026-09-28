@@ -53,6 +53,14 @@ def test_db(tmp_path, monkeypatch):
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.close()
 
+    # Production enforces foreign keys on every connection
+    # (app/database/database.py); the tests run under the same rule.
+    @event.listens_for(engine, "connect")
+    def enforce_foreign_keys(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     Base.metadata.create_all(bind=engine)
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -60,7 +68,18 @@ def test_db(tmp_path, monkeypatch):
     shared_session = TestingSessionLocal()
 
     def override_get_db():
-        """Return the same session for all requests in this test"""
+        """Return the same session for all requests in this test.
+
+        Production yields a fresh session per request, so a request always
+        reads what background tasks committed through their own sessions.
+        Sharing one session keeps already-loaded rows in the identity map,
+        which can serve pre-task values indefinitely (a polled backup job
+        stuck on "pending" while the job actually finished). Expiring the
+        loaded state first restores per-request read semantics. Only
+        already-flushed state is expired, so staged fixture data is kept.
+        """
+        if not shared_session.dirty and not shared_session.new:
+            shared_session.expire_all()
         try:
             yield shared_session
         except Exception:
@@ -100,16 +119,13 @@ def test_db(tmp_path, monkeypatch):
         patch("app.services.mount_service.SessionLocal", TestingSessionLocal),
         patch("app.services.mqtt_service.SessionLocal", TestingSessionLocal),
         patch("app.services.remote_backup_service.SessionLocal", TestingSessionLocal),
-        patch("app.services.stats_refresh_scheduler.SessionLocal", TestingSessionLocal),
+        patch("app.services.operations.reconcile.SessionLocal", TestingSessionLocal),
         patch("app.services.restore_check_scheduler.SessionLocal", TestingSessionLocal),
         patch("app.api.schedule.SessionLocal", TestingSessionLocal),
         patch("app.api.repositories.SessionLocal", TestingSessionLocal),
         patch("app.utils.ssh_utils.SessionLocal", TestingSessionLocal),
-        # Prevent startup event from creating users or running migrations (conflicts with fixtures)
+        # Prevent the startup event from creating users (conflicts with fixtures)
         patch("app.main.create_first_user", new_callable=AsyncMock),
-        patch(
-            "app.database.migrations.run_migrations", new_callable=lambda: lambda: None
-        ),
         patch("app.main.sync_licensing_state", new_callable=AsyncMock),
     ]
 

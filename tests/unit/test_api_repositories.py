@@ -23,28 +23,26 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import text
 from app.core.agent_auth import AGENT_AUTH_HEADER
 from app.core.security import get_password_hash
+from app.services.operations.maintenance_start import active_maintenance_operation
 from app.database.models import (
     AgentJob,
+    AgentJobLog,
     AgentMachine,
-    CheckJob,
-    CompactJob,
+    Operation,
     LicensingState,
-    PruneJob,
     Repository,
     RepositoryStorage,
-    RestoreCheckJob,
     ScheduledJob,
     SSHConnection,
     SystemSettings,
 )
 from app.api.repositories import _build_repository_path_from_connection
-
-
-def _discard_background_coro(coro):
-    coro.close()
+from app.services.operations.job_facade import resolve_maintenance_job
+from tests.utils.agent_jobs import agent_maintenance_job
+from tests.utils.operations import seed_job_operation
+from tests.utils.ssh import ssh_connection
 
 
 def _enable_borg_v2(test_db):
@@ -101,6 +99,14 @@ def _create_borg_like_repository_dir(path: Path) -> None:
     path.mkdir(parents=True)
     (path / "config").write_text("[repository]\nversion = 1\n")
     (path / "data").mkdir()
+
+
+def _create_borg2_like_repository_dir(path: Path) -> None:
+    config_path = path / "config"
+    config_path.mkdir(parents=True)
+    (config_path / "version").write_text("3\n")
+    (config_path / "id").write_text("repository-id\n")
+    (config_path / "readme").write_text("Borg repository\n")
 
 
 @pytest.mark.unit
@@ -226,6 +232,41 @@ class TestRepositoriesListAndGet:
         assert matching["post_backup_script_parameters"] == {
             "STATUS_FILE": "/tmp/status"
         }
+
+    def test_list_repositories_includes_ssh_connection_id(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        # The plan wizard matches this against each source's connection to
+        # preview the route; without it every SSH repository looked
+        # connectionless and remote-direct was never previewed.
+        connection = SSHConnection(host="repo-host", username="user", port=22)
+        test_db.add(connection)
+        test_db.commit()
+        test_db.add_all(
+            [
+                Repository(
+                    name="On SSH",
+                    path="ssh://user@repo-host:22/srv/repo",
+                    encryption="none",
+                    repository_type="ssh",
+                    connection_id=connection.id,
+                ),
+                Repository(
+                    name="Local",
+                    path="/repo-local-conn",
+                    encryption="none",
+                    repository_type="local",
+                ),
+            ]
+        )
+        test_db.commit()
+
+        response = test_client.get("/api/repositories/", headers=admin_headers)
+
+        assert response.status_code == 200
+        by_name = {repo["name"]: repo for repo in response.json()["repositories"]}
+        assert by_name["On SSH"]["connection_id"] == connection.id
+        assert by_name["Local"]["connection_id"] is None
 
     def test_list_repositories_includes_schedule_summary(
         self, test_client: TestClient, admin_headers, test_db
@@ -473,6 +514,45 @@ class TestRepositoriesCreate:
             "key": "backend.errors.repo.invalidUploadLimit"
         }
 
+    def test_create_repository_rejects_multiline_passphrase(
+        self, test_client: TestClient, admin_headers
+    ):
+        """The remote path shlex-quotes the passphrase into a shell command and
+        redacts echoed output line-by-line; a passphrase spanning lines would
+        come back as fragments the masking pattern cannot match."""
+        response = test_client.post(
+            "/api/repositories/",
+            json={
+                "name": "Multiline Passphrase Repo",
+                "path": "/tmp/multiline-pass-repo",
+                "encryption": "repokey",
+                "compression": "lz4",
+                "repository_type": "local",
+                "passphrase": "first line\nsecond line",
+            },
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 422
+        assert "line breaks" in response.text
+
+    def test_import_repository_rejects_multiline_passphrase(
+        self, test_client: TestClient, admin_headers
+    ):
+        response = test_client.post(
+            "/api/repositories/import",
+            json={
+                "name": "Multiline Passphrase Import",
+                "path": "/tmp/multiline-pass-import",
+                "encryption": "repokey",
+                "passphrase": "first line\nsecond line",
+            },
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 422
+        assert "line breaks" in response.text
+
     def test_create_ssh_repository(
         self, test_client: TestClient, admin_headers, test_db
     ):
@@ -609,6 +689,159 @@ class TestRepositoriesCreate:
         assert repo.executor_type == "agent"
         assert repo.agent_machine_id == agent.id
         assert repo.path == "/agent/repo"
+
+    def test_create_borg2_agent_repository_rejects_agent_without_borg2(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        agent = AgentMachine(
+            name="Borg1 Only",
+            agent_id="agt_borg1_only",
+            token_hash=get_password_hash("borgui_agent_secret"),
+            token_prefix="borgui_agent_secret"[:20],
+            status="online",
+            capabilities=["repository.init"],
+            borg_versions=[{"major": 1, "version": "1.2.4", "path": "/usr/bin/borg"}],
+        )
+        test_db.add(agent)
+        test_db.commit()
+        test_db.refresh(agent)
+
+        with (
+            patch(
+                "app.api.repositories.wait_for_agent_repository_operation_job",
+                new=AsyncMock(return_value={"status": "completed"}),
+            ),
+            patch(
+                "app.api.repositories.dispatch_agent_job_best_effort",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("app.api.repositories.mqtt_service.sync_state_with_db"),
+        ):
+            response = test_client.post(
+                "/api/repositories/",
+                json={
+                    "name": "Agent Borg2 Repo",
+                    "path": "/agent/borg2-repo",
+                    "encryption": "repokey-aes-ocb",
+                    "passphrase": "hunter2",
+                    "compression": "lz4",
+                    "execution_target": "agent",
+                    "agent_machine_id": agent.id,
+                    "borg_version": 2,
+                },
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 400
+        assert (
+            response.json()["detail"]["key"]
+            == "backend.errors.repo.agentBorg2Unavailable"
+        )
+        assert test_db.query(AgentJob).count() == 0
+        assert (
+            test_db.query(Repository).filter_by(name="Agent Borg2 Repo").first() is None
+        )
+
+    def test_create_borg2_agent_repository_rejects_outdated_borg2(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        agent = AgentMachine(
+            name="Old Borg2",
+            agent_id="agt_old_borg2",
+            token_hash=get_password_hash("borgui_agent_secret"),
+            token_prefix="borgui_agent_secret"[:20],
+            status="online",
+            capabilities=["repository.init"],
+            borg_versions=[
+                {"major": 2, "version": "2.0.0b21", "path": "/usr/local/bin/borg2"}
+            ],
+        )
+        test_db.add(agent)
+        test_db.commit()
+        test_db.refresh(agent)
+
+        with (
+            patch(
+                "app.api.repositories.wait_for_agent_repository_operation_job",
+                new=AsyncMock(return_value={"status": "completed"}),
+            ),
+            patch(
+                "app.api.repositories.dispatch_agent_job_best_effort",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("app.api.repositories.mqtt_service.sync_state_with_db"),
+        ):
+            response = test_client.post(
+                "/api/repositories/",
+                json={
+                    "name": "Agent Borg2 Repo",
+                    "path": "/agent/borg2-repo",
+                    "encryption": "repokey-aes-ocb",
+                    "passphrase": "hunter2",
+                    "compression": "lz4",
+                    "execution_target": "agent",
+                    "agent_machine_id": agent.id,
+                    "borg_version": 2,
+                },
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["key"] == "backend.errors.repo.agentBorg2TooOld"
+        assert detail["params"]["version"] == "2.0.0b21"
+        assert detail["params"]["minimum"] == "2.0.0b22"
+        assert test_db.query(AgentJob).count() == 0
+
+    def test_create_borg2_agent_repository_allows_agent_reporting_borg2(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        agent = AgentMachine(
+            name="Borg2 Capable",
+            agent_id="agt_borg2_capable",
+            token_hash=get_password_hash("borgui_agent_secret"),
+            token_prefix="borgui_agent_secret"[:20],
+            status="online",
+            capabilities=["repository.init"],
+            borg_versions=[
+                {"major": 1, "version": "1.4.5", "path": "/usr/local/bin/borg"},
+                {"major": 2, "version": "2.0.0b24", "path": "/usr/local/bin/borg2"},
+            ],
+        )
+        test_db.add(agent)
+        test_db.commit()
+        test_db.refresh(agent)
+
+        with (
+            patch(
+                "app.api.repositories.wait_for_agent_repository_operation_job",
+                new=AsyncMock(return_value={"status": "completed"}),
+            ),
+            patch(
+                "app.api.repositories.dispatch_agent_job_best_effort",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("app.api.repositories.mqtt_service.sync_state_with_db"),
+        ):
+            response = test_client.post(
+                "/api/repositories/",
+                json={
+                    "name": "Agent Borg2 Repo",
+                    "path": "/agent/borg2-repo",
+                    "encryption": "repokey-aes-ocb",
+                    "passphrase": "hunter2",
+                    "compression": "lz4",
+                    "execution_target": "agent",
+                    "agent_machine_id": agent.id,
+                    "borg_version": 2,
+                },
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        agent_job = test_db.query(AgentJob).one()
+        assert agent_job.payload["repository"]["borg_version"] == 2
+        assert agent_job.payload["operation"]["encryption"] == "repokey-aes-ocb"
 
     def test_create_agent_repository_requires_pro_plan(
         self, test_client: TestClient, admin_headers, test_db
@@ -1014,41 +1247,16 @@ class TestRepositoriesCreate:
         assert repo.connection_id is None
         assert repo.repository_type == "local"
 
-    @pytest.mark.parametrize(
-        "endpoint,request_body,job_model,job_kind,capability",
-        [
-            (
-                "check",
-                {"max_duration": 600},
-                CheckJob,
-                "repository.check",
-                "repository.check",
-            ),
-            ("compact", None, CompactJob, "repository.compact", "repository.compact"),
-            (
-                "prune",
-                {"keep_daily": 7, "dry_run": False},
-                PruneJob,
-                "repository.prune",
-                "repository.prune",
-            ),
-        ],
-    )
-    def test_agent_repository_maintenance_routes_queue_agent_job(
-        self,
-        test_client: TestClient,
-        admin_headers,
-        test_db,
-        endpoint,
-        request_body,
-        job_model,
-        job_kind,
-        capability,
+    def test_agent_repository_check_route_enqueues_instead_of_queueing_the_agent(
+        self, test_client: TestClient, admin_headers, test_db
     ):
-        agent = _agent_machine_with_capabilities(capability)
+        """Phase 5: the check route no longer has an agent branch. It enqueues
+        an operation, and `BorgRouter.check` inside the executor is what
+        queues the agent job when the runner starts the work."""
+        agent = _agent_machine_with_capabilities("repository.check")
         repo = Repository(
-            name=f"Agent {endpoint} Repo",
-            path=f"/agent/{endpoint}/repo",
+            name="Agent check Repo",
+            path="/agent/check/repo",
             encryption="none",
             compression="lz4",
             executor_type="agent",
@@ -1062,39 +1270,97 @@ class TestRepositoriesCreate:
         test_db.commit()
         test_db.refresh(repo)
 
-        with (
-            patch(
-                "app.api.repositories.BorgRouter.check", new_callable=AsyncMock
-            ) as check,
-            patch(
-                "app.api.repositories.BorgRouter.compact", new_callable=AsyncMock
-            ) as compact,
-            patch(
-                "app.api.repositories.BorgRouter.prune", new_callable=AsyncMock
-            ) as prune,
-        ):
+        with patch(
+            "app.services.operations.executors.maintenance.BorgRouter"
+        ) as router:
+            router.return_value.check = AsyncMock()
             response = test_client.post(
-                f"/api/repositories/{repo.id}/{endpoint}",
-                json=request_body,
+                f"/api/repositories/{repo.id}/check",
+                json={"max_duration": 600},
                 headers=admin_headers,
             )
 
         assert response.status_code == 200
-        maintenance_job = (
-            test_db.query(job_model).filter_by(repository_id=repo.id).one()
+        op = test_db.get(Operation, response.json()["job_id"])
+        assert op.kind == "check"
+        assert op.repository_id == repo.id
+        assert op.params["max_duration"] == 600
+
+    def test_agent_repository_prune_route_enqueues_instead_of_queueing_the_agent(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """Phase 5: the prune route no longer has an agent branch. It enqueues
+        an operation, and `BorgRouter.prune` inside the executor is what
+        queues the agent job when the runner starts the work."""
+        agent = _agent_machine_with_capabilities("repository.prune")
+        repo = Repository(
+            name="Agent prune Repo",
+            path="/agent/prune/repo",
+            encryption="none",
+            compression="lz4",
+            executor_type="agent",
+            execution_target="agent",
+            agent_machine_id=1,
+            repository_type="local",
         )
-        agent_job = test_db.query(AgentJob).one()
-        assert response.json()["job_id"] == maintenance_job.id
-        assert agent_job.agent_machine_id == agent.id
-        assert agent_job.payload["job_kind"] == job_kind
-        assert agent_job.payload["repository"]["path"] == repo.path
-        assert agent_job.payload["operation"]["maintenance_job"] == {
-            "kind": endpoint,
-            "id": maintenance_job.id,
-        }
-        check.assert_not_called()
-        compact.assert_not_called()
-        prune.assert_not_called()
+        test_db.add_all([agent, repo])
+        test_db.commit()
+        repo.agent_machine_id = agent.id
+        test_db.commit()
+        test_db.refresh(repo)
+
+        with patch(
+            "app.services.operations.executors.maintenance.BorgRouter"
+        ) as router:
+            router.return_value.prune = AsyncMock()
+            response = test_client.post(
+                f"/api/repositories/{repo.id}/prune",
+                json={"keep_daily": 7, "dry_run": False},
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        op = test_db.get(Operation, response.json()["job_id"])
+        assert op.kind == "prune"
+        assert op.repository_id == repo.id
+        assert op.params["keep_daily"] == 7
+
+    def test_agent_repository_compact_route_enqueues_instead_of_queueing_the_agent(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """Phase 5: the compact route no longer has an agent branch. It
+        enqueues an operation, and `BorgRouter.compact` inside the executor is
+        what queues the agent job when the runner starts the work."""
+        agent = _agent_machine_with_capabilities("repository.compact")
+        repo = Repository(
+            name="Agent compact Repo",
+            path="/agent/compact/repo",
+            encryption="none",
+            compression="lz4",
+            executor_type="agent",
+            execution_target="agent",
+            agent_machine_id=1,
+            repository_type="local",
+        )
+        test_db.add_all([agent, repo])
+        test_db.commit()
+        repo.agent_machine_id = agent.id
+        test_db.commit()
+        test_db.refresh(repo)
+
+        with patch(
+            "app.services.operations.executors.maintenance.BorgRouter"
+        ) as router:
+            router.return_value.compact = AsyncMock()
+            response = test_client.post(
+                f"/api/repositories/{repo.id}/compact",
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        op = test_db.get(Operation, response.json()["job_id"])
+        assert op.kind == "compact"
+        assert op.repository_id == repo.id
 
     def test_agent_repository_info_queues_agent_job_and_returns_existing_shape(
         self, test_client: TestClient, admin_headers, test_db
@@ -1155,6 +1421,382 @@ class TestRepositoriesCreate:
         )
         run_local.assert_not_called()
 
+    def test_agent_repository_info_normalizes_borg2_b22_encryption(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """The route the info dialog actually calls for an agent repository.
+
+        BorgApiClient sends every agent repo to the v1 path regardless of Borg
+        major (`v = execution_target === 'agent' ? '' : ...`), so a fix that only
+        landed on /api/v2/repositories left the dialog showing "N/A". The payload
+        is verbatim from `borg2 info --json` on 2.0.0b22.
+        """
+        agent = _agent_machine_with_capabilities("repository.info")
+        repo = Repository(
+            name="Agent b22 Repo",
+            path="/agent/b22/repo",
+            encryption="repokey-aes-ocb",
+            compression="lz4",
+            executor_type="agent",
+            execution_target="agent",
+            agent_machine_id=1,
+            repository_type="local",
+            borg_version=2,
+        )
+        test_db.add_all([agent, repo])
+        test_db.commit()
+        repo.agent_machine_id = agent.id
+        test_db.commit()
+        test_db.refresh(repo)
+
+        with (
+            patch(
+                "app.api.repositories.wait_for_agent_repository_operation_job",
+                new=AsyncMock(
+                    return_value={
+                        "data": {
+                            "repository": {"id": "abc"},
+                            "cache": {},
+                            "encryption": {
+                                "encryption": "aes256-ocb",
+                                "id_hash": "sha256",
+                            },
+                            "archives": [],
+                        }
+                    }
+                ),
+            ),
+            patch(
+                "app.api.repositories._run_repository_command",
+                new=AsyncMock(return_value=(0, b"{}", b"")),
+            ),
+        ):
+            response = test_client.get(
+                f"/api/repositories/{repo.id}/info", headers=admin_headers
+            )
+
+        assert response.status_code == 200
+        assert response.json()["info"]["encryption"] == {
+            "encryption": "aes256-ocb",
+            "id_hash": "sha256",
+            "mode": "aes256-ocb",
+        }
+
+    def test_agent_repository_info_syncs_archive_stats_to_the_row(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """The live case: stats refresh wrote 1, a backup finished, the info
+        click showed 2 in the dialog while the card kept rendering the stale
+        stored count. The info route now writes the list it fetched back."""
+        agent = _agent_machine_with_capabilities("repository.info")
+        repo = Repository(
+            name="Agent Sync Repo",
+            path="/agent/sync/repo",
+            encryption="repokey-aes-ocb",
+            compression="lz4",
+            executor_type="agent",
+            execution_target="agent",
+            agent_machine_id=1,
+            repository_type="local",
+            borg_version=2,
+            archive_count=1,
+        )
+        test_db.add_all([agent, repo])
+        test_db.commit()
+        repo.agent_machine_id = agent.id
+        test_db.commit()
+        test_db.refresh(repo)
+
+        with (
+            patch(
+                "app.api.repositories.wait_for_agent_repository_operation_job",
+                new=AsyncMock(
+                    return_value={
+                        "data": {
+                            "repository": {"id": "abc"},
+                            "cache": {},
+                            "encryption": {
+                                "encryption": "aes256-ocb",
+                                "id_hash": "sha256",
+                            },
+                            "archives": [
+                                {
+                                    "name": "k8s-borg",
+                                    "start": "2026-08-19T20:03:15.388152+02:00",
+                                },
+                                {
+                                    "name": "k8s-borg",
+                                    "start": "2026-08-19T21:03:18.624537+02:00",
+                                },
+                            ],
+                        }
+                    }
+                ),
+            ),
+            patch(
+                "app.api.repositories._run_repository_command",
+                new=AsyncMock(return_value=(0, b"{}", b"")),
+            ),
+        ):
+            response = test_client.get(
+                f"/api/repositories/{repo.id}/info", headers=admin_headers
+            )
+
+        assert response.status_code == 200
+        test_db.refresh(repo)
+        assert repo.archive_count == 2
+        assert repo.last_backup == datetime(2026, 8, 19, 19, 3, 18, 624537)
+
+    @pytest.mark.parametrize(
+        "refused_job, raise_busy, expect_raise, expect_result",
+        [
+            # the list is refused with nothing in hand: raised for the runner
+            # to defer, swallowed for a route ("not refreshed")
+            ("repository.list_archives", True, True, None),
+            ("repository.list_archives", False, False, False),
+            # a later job is refused with the listing in hand: never raised,
+            # since a deferral would repeat the listing; it only costs what
+            # the refused job would have added
+            ("repository.rinfo", True, False, True),
+            ("repository.rinfo", False, False, True),
+            ("repository.storage_usage", True, False, True),
+            ("repository.storage_usage", False, False, True),
+            ("repository.disk_usage", True, False, True),
+            ("repository.disk_usage", False, False, True),
+        ],
+    )
+    async def test_agent_stats_refresh_and_the_admission_refusal(
+        self, test_db, refused_job, raise_busy, expect_raise, expect_result
+    ):
+        from fastapi import HTTPException
+
+        from app.api.repositories import _update_agent_repository_stats
+
+        capabilities = ["repository.list_archives", "repository.rinfo"]
+        if refused_job in ("repository.storage_usage", "repository.disk_usage"):
+            capabilities.append(refused_job)
+        agent = _agent_machine_with_capabilities(*capabilities)
+        repo = Repository(
+            name="Busy Agent Repo",
+            path="/agent/busy/repo",
+            encryption="repokey-blake2",
+            executor_type="agent",
+            execution_target="agent",
+            repository_type="local",
+            archive_count=5,
+            total_size="9.0 GB",
+        )
+        test_db.add_all([agent, repo])
+        test_db.commit()
+        repo.agent_machine_id = agent.id
+        test_db.commit()
+        refusal = HTTPException(
+            status_code=409,
+            detail={"key": "backend.errors.jobs.repositoryOperationActive"},
+        )
+
+        def queue(db, r, **kw):
+            if kw["job_kind"] == refused_job:
+                raise refusal
+            return SimpleNamespace(id=1)
+
+        listing = json.dumps([{"name": "a1", "time": "2026-09-01T01:00:00"}])
+        rinfo = json.dumps({"encryption": {"mode": "repokey-blake2"}})
+
+        async def wait(db, job_id, **kw):
+            # the list answers first, then repo-info; a size probe that still
+            # runs afterwards gets the repo-info text, which is not a du line
+            wait.calls += 1
+            return {"return_code": 0, "stdout": listing if wait.calls == 1 else rinfo}
+
+        wait.calls = 0
+        with (
+            patch(
+                "app.services.repository_executor.queue_agent_repository_operation_job",
+                side_effect=queue,
+            ),
+            patch(
+                "app.services.agent_job_dispatcher.dispatch_agent_job_best_effort",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.services.repository_executor.wait_for_agent_repository_operation_job",
+                new=wait,
+            ),
+        ):
+            if expect_raise:
+                with pytest.raises(HTTPException) as raised:
+                    await _update_agent_repository_stats(
+                        repo, test_db, raise_busy=raise_busy
+                    )
+                assert raised.value is refusal
+            else:
+                result = await _update_agent_repository_stats(
+                    repo, test_db, raise_busy=raise_busy
+                )
+                assert bool(result) is expect_result
+
+        test_db.refresh(repo)
+        # a refused list writes nothing; after it the listing is written and
+        # the size left alone
+        expected_count = 5 if refused_job == "repository.list_archives" else 1
+        assert (repo.archive_count, repo.total_size) == (expected_count, "9.0 GB")
+
+    @pytest.mark.parametrize(
+        "timed_out_job, claimed, raise_busy",
+        [
+            ("repository.list_archives", False, False),
+            ("repository.list_archives", False, True),
+            ("repository.list_archives", True, False),
+            ("repository.rinfo", False, False),
+            ("repository.rinfo", True, True),
+            ("repository.storage_usage", False, False),
+            ("repository.disk_usage", False, False),
+        ],
+    )
+    async def test_agent_stats_refresh_abandons_a_job_it_stopped_waiting_for(
+        self, test_db, timed_out_job, claimed, raise_busy
+    ):
+        """A queued job the server no longer waits for would be refused as a
+        duplicate by every later refresh, and the reaper never reaps a
+        queued job; the refresh cancels it on its way out. A job the agent
+        already runs is left to it: its result warms the next attempt. Real
+        jobs through the real queue, so admission sees what it would see in
+        production. A timeout is not the admission's refusal, so `raise_busy`
+        changes nothing here."""
+        from fastapi import HTTPException
+
+        from app.api.repositories import _update_agent_repository_stats
+        from app.database.models import AgentJob
+        from app.services.job_admission import (
+            ensure_repository_admission,
+            operation_for_agent_job_kind,
+        )
+
+        capabilities = ["repository.list_archives", "repository.rinfo"]
+        if timed_out_job in ("repository.storage_usage", "repository.disk_usage"):
+            capabilities.append(timed_out_job)
+        agent = _agent_machine_with_capabilities(*capabilities)
+        repo = Repository(
+            name="Slow Agent Repo",
+            path="/agent/slow/repo",
+            encryption="repokey-blake2",
+            executor_type="agent",
+            execution_target="agent",
+            repository_type="local",
+            archive_count=5,
+        )
+        test_db.add_all([agent, repo])
+        test_db.commit()
+        repo.agent_machine_id = agent.id
+        test_db.commit()
+
+        async def wait(db, job_id, **kw):
+            job = db.get(AgentJob, job_id)
+            if job.payload["job_kind"] == timed_out_job:
+                if claimed:
+                    # the agent picked it up just before the server gave up
+                    job.status = "claimed"
+                    db.commit()
+                raise HTTPException(status_code=504, detail="timed out")
+            job.status = "completed"
+            db.commit()
+            if job.payload["job_kind"] == "repository.list_archives":
+                return {"return_code": 0, "stdout": "[]"}
+            return {"return_code": 0, "stdout": json.dumps({"encryption": {}})}
+
+        with (
+            patch(
+                "app.services.agent_job_dispatcher.dispatch_agent_job_best_effort",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.services.agent_job_dispatcher.dispatch_agent_cancel_if_connected",
+                new=AsyncMock(return_value=True),
+            ) as cancel,
+            patch(
+                "app.services.repository_executor.wait_for_agent_repository_operation_job",
+                new=wait,
+            ),
+        ):
+            ok = await _update_agent_repository_stats(
+                repo, test_db, raise_busy=raise_busy
+            )
+
+        # the list timing out ends the refresh; a later job timing out only
+        # costs what it would have added
+        assert bool(ok) is (timed_out_job != "repository.list_archives")
+        assert cancel.await_count == 0
+        if claimed:
+            # the agent is running it: left alone, the reaper's if the agent
+            # is gone
+            live = test_db.query(AgentJob).filter(AgentJob.status == "claimed").one()
+            assert live.payload["job_kind"] == timed_out_job
+        else:
+            abandoned = (
+                test_db.query(AgentJob).filter(AgentJob.status == "canceled").one()
+            )
+            assert abandoned.payload["job_kind"] == timed_out_job
+            # nothing of this refresh blocks the next one
+            for kind in capabilities:
+                ensure_repository_admission(
+                    test_db, repo, operation_for_agent_job_kind(kind)
+                )
+
+    async def test_agent_stats_refresh_raises_the_refusal_the_real_admission_makes(
+        self, test_db
+    ):
+        """No hand-built 409: a list job of an earlier refresh is still queued,
+        so the real admission refuses this refresh's list as its duplicate,
+        and that refusal is what the runner gets to defer on."""
+        from fastapi import HTTPException
+
+        from app.api.repositories import _update_agent_repository_stats
+        from app.services.operations.runner import repository_busy
+        from app.services.repository_executor import (
+            queue_agent_repository_operation_job,
+        )
+
+        agent = _agent_machine_with_capabilities(
+            "repository.list_archives", "repository.rinfo"
+        )
+        repo = Repository(
+            name="Contended Agent Repo",
+            path="/agent/contended/repo",
+            encryption="repokey-blake2",
+            executor_type="agent",
+            execution_target="agent",
+            repository_type="local",
+            archive_count=5,
+        )
+        test_db.add_all([agent, repo])
+        test_db.commit()
+        repo.agent_machine_id = agent.id
+        test_db.commit()
+        earlier = queue_agent_repository_operation_job(
+            test_db, repo, job_kind="repository.list_archives"
+        )
+        assert earlier.status == "queued"
+
+        with (
+            patch(
+                "app.services.agent_job_dispatcher.dispatch_agent_job_best_effort",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.services.repository_executor.wait_for_agent_repository_operation_job",
+                new=AsyncMock(return_value={"return_code": 0, "stdout": "[]"}),
+            ),
+        ):
+            with pytest.raises(HTTPException) as raised:
+                await _update_agent_repository_stats(repo, test_db, raise_busy=True)
+            assert repository_busy(raised.value)
+            assert raised.value.detail["params"]["active_job_id"] == earlier.id
+            assert not await _update_agent_repository_stats(repo, test_db)
+
+        test_db.refresh(repo)
+        assert repo.archive_count == 5
+
     async def test_agent_stats_refresh_keeps_count_when_list_job_fails(self, test_db):
         # A completed list job can still carry a non-zero borg exit with no
         # stdout (-> []). That must not wipe the stored archive_count to 0.
@@ -1202,9 +1844,66 @@ class TestRepositoriesCreate:
         ):
             ok = await _update_agent_repository_stats(repo, test_db)
 
-        assert ok is True
+        assert bool(ok) is True
         test_db.refresh(repo)
         assert repo.archive_count == 5  # preserved, not overwritten with 0
+
+    @pytest.mark.asyncio
+    async def test_agent_stats_refresh_interprets_archive_times_in_agent_zone(
+        self, test_db
+    ):
+        # Borg reports archive times in the agent's local wall clock; the
+        # refresh must convert them with the agent's reported zone instead of
+        # assuming UTC (which pushed last_backup into the future).
+        from app.api.repositories import _update_agent_repository_stats
+
+        agent = _agent_machine_with_capabilities(
+            "repository.list_archives", "repository.rinfo"
+        )
+        agent.timezone = "Europe/Berlin"
+        repo = Repository(
+            name="Agent Zone Repo",
+            path="/agent/zone/repo",
+            encryption="repokey-blake2",
+            executor_type="agent",
+            execution_target="agent",
+            repository_type="local",
+        )
+        test_db.add_all([agent, repo])
+        test_db.commit()
+        repo.agent_machine_id = agent.id
+        test_db.commit()
+        test_db.refresh(repo)
+
+        list_stdout = json.dumps(
+            {"archives": [{"name": "a1", "time": "2026-09-02T12:45:14"}]}
+        )
+        rinfo_stdout = json.dumps({"encryption": {"mode": "repokey-blake2"}})
+        with (
+            patch(
+                "app.services.repository_executor.queue_agent_repository_operation_job",
+                side_effect=lambda db, r, **kw: SimpleNamespace(id=1),
+            ),
+            patch(
+                "app.services.agent_job_dispatcher.dispatch_agent_job_best_effort",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.services.repository_executor.wait_for_agent_repository_operation_job",
+                new=AsyncMock(
+                    side_effect=[
+                        {"return_code": 0, "stdout": list_stdout},
+                        {"return_code": 0, "stdout": rinfo_stdout},
+                    ]
+                ),
+            ),
+        ):
+            ok = await _update_agent_repository_stats(repo, test_db)
+
+        assert bool(ok) is True
+        test_db.refresh(repo)
+        # 12:45 CEST (UTC+2 on this date) stored as naive UTC.
+        assert repo.last_backup == datetime(2026, 9, 2, 10, 45, 14)
 
     def test_agent_repository_list_archives_queues_agent_job(
         self, test_client: TestClient, admin_headers, test_db
@@ -1232,7 +1931,7 @@ class TestRepositoriesCreate:
             new=AsyncMock(return_value={"data": {"archives": [{"name": "archive-1"}]}}),
         ) as wait_for_agent:
             response = test_client.get(
-                f"/api/repositories/{repo.id}/archives", headers=admin_headers
+                f"/api/repositories/{repo.id}/archives/live", headers=admin_headers
             )
 
         assert response.status_code == 200
@@ -1268,21 +1967,14 @@ class TestRepositoriesCreate:
         test_db.add_all([agent, repo])
         test_db.commit()
         repo.agent_machine_id = agent.id
-        check_job = CheckJob(repository_id=repo.id, repository_path=repo.path)
-        test_db.add(check_job)
+        check_job = seed_job_operation(
+            test_db, "check", repository_id=repo.id, repository_path=repo.path
+        )
         test_db.commit()
         test_db.refresh(check_job)
-        agent_job = AgentJob(
-            agent_machine_id=agent.id,
-            job_type="repository",
-            status="running",
-            payload={
-                "job_kind": "repository.check",
-                "operation": {"maintenance_job": {"kind": "check", "id": check_job.id}},
-            },
+        agent_job = agent_maintenance_job(
+            test_db, agent, "check", check_job.id, repository=repo
         )
-        test_db.add(agent_job)
-        test_db.commit()
         test_db.refresh(agent_job)
 
         response = test_client.post(
@@ -1295,7 +1987,7 @@ class TestRepositoriesCreate:
         test_db.refresh(check_job)
         test_db.refresh(repo)
         assert check_job.status == "completed"
-        assert check_job.progress == 100
+        assert resolve_maintenance_job(test_db, check_job.id, "check").progress == 100
         assert repo.last_check is not None
 
     def test_create_repository_missing_name(
@@ -1586,6 +2278,77 @@ class TestRepositoriesCreate:
             routed_keep_within = args[8]
         assert routed_keep_within == "1d"
 
+    def test_prune_dry_run_closes_its_operation_when_the_router_raises(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """The dry-run preview runs inline on an operation created `running`.
+        A router error must close that row, or it blocks the repository via
+        admission control until the next restart."""
+        repo = Repository(**_base_repository_payload(name="Dry Run Prune"))
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+
+        with patch(
+            "app.api.repositories.BorgRouter.prune",
+            new=AsyncMock(side_effect=RuntimeError("agent prune failed: refused")),
+        ):
+            response = test_client.post(
+                f"/api/repositories/{repo.id}/prune",
+                json={"keep_daily": 7, "dry_run": True},
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 500
+        test_db.expire_all()
+        prune = test_db.query(Operation).filter(Operation.kind == "prune").one()
+        assert prune.status == "failed"
+        assert prune.error_message == "agent prune failed: refused"
+        assert prune.completed_at is not None
+
+    def test_prune_dry_run_on_an_agent_repository_records_the_refusal(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """End to end through the router: admission refuses the agent job,
+        the router fails the operation with the cause, and the route's own
+        handler leaves that verdict alone."""
+        from fastapi import HTTPException
+
+        repo = Repository(
+            **_base_repository_payload(name="Dry Run Agent Prune"),
+            executor_type="agent",
+            execution_target="agent",
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        refused = HTTPException(
+            status_code=409,
+            detail={
+                "key": "backend.errors.jobs.repositoryOperationActive",
+                "params": {"active_operation": "list_archives"},
+            },
+        )
+
+        with patch(
+            "app.services.repository_executor.queue_agent_repository_operation_job",
+            side_effect=refused,
+        ):
+            response = test_client.post(
+                f"/api/repositories/{repo.id}/prune",
+                json={"keep_daily": 7, "dry_run": True},
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 500
+        test_db.expire_all()
+        prune = test_db.query(Operation).filter(Operation.kind == "prune").one()
+        assert prune.status == "failed"
+        assert prune.error_message == (
+            "agent job could not be queued: list_archives is active on the repository"
+        )
+        assert active_maintenance_operation(test_db, repo.id, "prune") is None
+
     def test_legacy_prune_route_rejects_non_string_keep_within(
         self, test_client: TestClient, admin_headers, test_db
     ):
@@ -1851,18 +2614,361 @@ class TestRepositoriesUpdate:
 
         assert response.status_code == 200
 
+    def test_moving_a_repository_back_to_the_server_reopens_its_history(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """An agent's archives carry `skipped` (no history run reaches them);
+        once the server executes the repository the history stage exists
+        again, so they go back to `pending` for the next index run, a
+        `failed` one the listing had not marked yet with them."""
+        from app.database.models import Archive
+
+        repo = Repository(
+            name="Moved Back",
+            path="/repos/moved-back",
+            encryption="none",
+            repository_type="local",
+            executor_type="agent",
+            execution_target="agent",
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        for i, state in enumerate(("skipped", "failed", "indexed")):
+            test_db.add(
+                Archive(
+                    repository_id=repo.id,
+                    borg_id=f"id-{i}",
+                    name=f"a{i}",
+                    series="nas",
+                    start=datetime(2026, 9, 1 + i, 2),
+                    history_state=state,
+                    history_attempts=3,
+                )
+            )
+        test_db.commit()
+
+        from app.services.operations.executors import load_default_executors
+
+        load_default_executors()  # the queued run needs registered kinds
+        with patch("app.api.repositories.mqtt_service.sync_state_with_db"):
+            response = test_client.put(
+                f"/api/repositories/{repo.id}",
+                json={"executor_type": "server"},
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200, response.text
+        test_db.expire_all()
+        rows = test_db.query(Archive).filter_by(repository_id=repo.id).all()
+        assert sorted(a.history_state for a in rows) == [
+            "indexed",
+            "pending",
+            "pending",
+        ]
+        assert all(
+            a.history_attempts == 0 for a in rows if a.history_state == "pending"
+        )
+
+    def test_moving_back_to_the_server_queues_the_history_despite_a_running_listing(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """The agent's listing may still be in flight when the repository
+        moves back, and its chain has no history stage: the reopened
+        archives would wait for the hourly reconcile. The run is queued
+        anyway (the runner serialises it on the repository)."""
+        from app.database.models import Archive, Operation
+
+        repo = Repository(
+            name="Moved Back Busy",
+            path="/repos/moved-back-busy",
+            encryption="none",
+            repository_type="local",
+            executor_type="agent",
+            execution_target="agent",
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        test_db.add(
+            Archive(
+                repository_id=repo.id,
+                borg_id="id-busy",
+                name="busy",
+                series="nas",
+                start=datetime(2026, 9, 1, 2),
+                history_state="skipped",
+            )
+        )
+        listing = Operation(
+            repository_id=repo.id,
+            kind="archive_sync",
+            category="index",
+            status="running",
+            trigger="followup",
+            run_id="run-busy",
+        )
+        test_db.add(listing)
+        test_db.commit()
+        listing_id = listing.id
+
+        from app.services.operations.executors import load_default_executors
+
+        load_default_executors()
+        with patch("app.api.repositories.mqtt_service.sync_state_with_db"):
+            response = test_client.put(
+                f"/api/repositories/{repo.id}",
+                json={"executor_type": "server"},
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200, response.text
+        test_db.expire_all()
+        run = (
+            test_db.query(Operation)
+            .filter(
+                Operation.repository_id == repo.id, Operation.trigger == "reconcile"
+            )
+            .order_by(Operation.id)
+            .all()
+        )
+        assert run, "a reconcile run was queued despite the listing"
+        # its own chain, not one hung behind the listing
+        assert run[0].depends_on_id is None
+        assert listing_id not in [op.depends_on_id for op in run]
+        assert "history_index" in [op.kind for op in run]
+
+    def test_moving_back_to_the_server_reopens_but_does_not_index_a_narrower_mode(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """A mode without the history stage keeps the reopened archives
+        `pending`, the state every archive of such a repository has, and
+        queues no run for them: a later return to `full` catches up."""
+        from app.database.models import Archive, Operation
+
+        repo = Repository(
+            name="Moved Back Archives",
+            path="/repos/moved-back-archives",
+            encryption="none",
+            repository_type="local",
+            executor_type="agent",
+            execution_target="agent",
+            index_mode="archives",
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        test_db.add(
+            Archive(
+                repository_id=repo.id,
+                borg_id="id-narrow",
+                name="narrow",
+                series="nas",
+                start=datetime(2026, 9, 1, 2),
+                history_state="skipped",
+                history_attempts=3,
+            )
+        )
+        test_db.commit()
+
+        from app.services.operations.executors import load_default_executors
+
+        load_default_executors()
+        with patch("app.api.repositories.mqtt_service.sync_state_with_db"):
+            response = test_client.put(
+                f"/api/repositories/{repo.id}",
+                json={"executor_type": "server"},
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200, response.text
+        test_db.expire_all()
+        archive = test_db.query(Archive).filter_by(repository_id=repo.id).one()
+        assert archive.history_state == "pending"
+        assert archive.history_attempts == 0
+        assert (
+            test_db.query(Operation).filter(Operation.repository_id == repo.id).count()
+            == 0
+        )
+
+    def test_moving_back_to_the_server_with_a_mode_change_queues_one_run(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """An update that both returns the repository to the server and
+        sets its mode to `full` has one catch-up run, not one per reason."""
+        from app.database.models import Archive, Operation
+
+        repo = Repository(
+            name="Moved Back Full",
+            path="/repos/moved-back-full",
+            encryption="none",
+            repository_type="local",
+            executor_type="agent",
+            execution_target="agent",
+            index_mode="archives",
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        test_db.add(
+            Archive(
+                repository_id=repo.id,
+                borg_id="id-full",
+                name="full",
+                series="nas",
+                start=datetime(2026, 9, 1, 2),
+                history_state="skipped",
+            )
+        )
+        test_db.commit()
+
+        from app.services.operations.executors import load_default_executors
+
+        load_default_executors()
+        with patch("app.api.repositories.mqtt_service.sync_state_with_db"):
+            response = test_client.put(
+                f"/api/repositories/{repo.id}",
+                json={"executor_type": "server", "index_mode": "full"},
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200, response.text
+        test_db.expire_all()
+        listings = (
+            test_db.query(Operation)
+            .filter(
+                Operation.repository_id == repo.id, Operation.kind == "archive_sync"
+            )
+            .all()
+        )
+        assert len(listings) == 1
+        kinds = {
+            op.kind
+            for op in test_db.query(Operation).filter(
+                Operation.repository_id == repo.id
+            )
+        }
+        assert "history_index" in kinds
+        archive = test_db.query(Archive).filter_by(repository_id=repo.id).one()
+        assert archive.history_state == "pending"
+
+    def test_moving_back_to_the_server_keeps_the_reopen_when_the_queueing_fails(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """The reopen is stored with the executor change; the index run is
+        a convenience the hourly reconcile makes up for."""
+        from app.database.models import Archive
+
+        repo = Repository(
+            name="Moved Back Unqueued",
+            path="/repos/moved-back-unqueued",
+            encryption="none",
+            repository_type="local",
+            executor_type="agent",
+            execution_target="agent",
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        test_db.add(
+            Archive(
+                repository_id=repo.id,
+                borg_id="id-unqueued",
+                name="unqueued",
+                series="nas",
+                start=datetime(2026, 9, 1, 2),
+                history_state="skipped",
+            )
+        )
+        test_db.commit()
+
+        with (
+            patch("app.api.repositories.mqtt_service.sync_state_with_db"),
+            patch(
+                "app.api.repositories.enqueue_reconcile_run",
+                side_effect=RuntimeError("queue closed"),
+            ),
+        ):
+            response = test_client.put(
+                f"/api/repositories/{repo.id}",
+                json={"executor_type": "server"},
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200, response.text
+        test_db.expire_all()
+        archive = test_db.query(Archive).filter_by(repository_id=repo.id).one()
+        assert archive.history_state == "pending"
+        test_db.refresh(repo)
+        assert repo.executor_type == "server"
+
+    def test_moving_a_repository_to_an_agent_leaves_its_archive_states_alone(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """The other direction changes nothing on the rows: an index built on
+        the server stays (the Changes tab still serves it), and `pending`
+        archives are marked `skipped` by the next listing, not here."""
+        from app.database.models import Archive
+
+        agent = AgentMachine(
+            name="Taker",
+            agent_id="agt_taker",
+            token_hash=get_password_hash("borgui_agent_secret"),
+            token_prefix="borgui_agent_secret"[:20],
+            status="online",
+            capabilities=["repository.init"],
+        )
+        repo = Repository(
+            name="Moved Out",
+            path="/repos/moved-out",
+            encryption="none",
+            repository_type="local",
+        )
+        test_db.add_all([agent, repo])
+        test_db.commit()
+        test_db.refresh(repo)
+        for i, state in enumerate(("indexed", "pending")):
+            test_db.add(
+                Archive(
+                    repository_id=repo.id,
+                    borg_id=f"id-{i}",
+                    name=f"a{i}",
+                    series="nas",
+                    start=datetime(2026, 9, 1 + i, 2),
+                    history_state=state,
+                )
+            )
+        test_db.commit()
+
+        with patch("app.api.repositories.mqtt_service.sync_state_with_db"):
+            response = test_client.put(
+                f"/api/repositories/{repo.id}",
+                json={"executor_type": "agent", "agent_machine_id": agent.id},
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200, response.text
+        test_db.expire_all()
+        assert test_db.get(Repository, repo.id).executor_type == "agent"
+        states = sorted(
+            a.history_state
+            for a in test_db.query(Archive).filter_by(repository_id=repo.id)
+        )
+        assert states == ["indexed", "pending"]
+
     def test_update_repository_clear_source_connection_id(
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Test clearing source_connection_id when switching from remote to local source"""
         # Create repository with a remote source
+        connection = ssh_connection(test_db)
         repo = Repository(
             name="Remote Source Repo",
             path="/tmp/remote-source-repo",
             encryption="none",
             compression="lz4",
             repository_type="local",
-            source_ssh_connection_id=1,  # Initially has remote source
+            source_ssh_connection_id=connection.id,  # Initially has remote source
             source_directories=json.dumps(["/remote/data"]),
         )
         test_db.add(repo)
@@ -1870,7 +2976,7 @@ class TestRepositoriesUpdate:
         test_db.refresh(repo)
 
         # Verify initial state
-        assert repo.source_ssh_connection_id == 1
+        assert repo.source_ssh_connection_id == connection.id
 
         # Update to clear source_connection_id (switch to local source)
         response = test_client.put(
@@ -1891,13 +2997,14 @@ class TestRepositoriesUpdate:
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Test empty source and exclude lists remove legacy source settings"""
+        connection = ssh_connection(test_db)
         repo = Repository(
             name="Legacy Source Repo",
             path="/tmp/legacy-source-repo",
             encryption="none",
             compression="lz4",
             repository_type="local",
-            source_ssh_connection_id=1,
+            source_ssh_connection_id=connection.id,
             source_directories=json.dumps(["/remote/data"]),
             exclude_patterns=json.dumps(["*.tmp"]),
         )
@@ -1972,19 +3079,20 @@ class TestRepositoriesUpdate:
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Empty source fields clear stale remote source connection metadata."""
+        connection = ssh_connection(test_db)
         repo = Repository(
             name="Remote Source Clear Repo",
             path="/tmp/remote-source-clear-repo",
             encryption="none",
             compression="lz4",
             repository_type="local",
-            source_ssh_connection_id=42,
+            source_ssh_connection_id=connection.id,
             source_directories=json.dumps(["/remote/old"]),
             source_locations=json.dumps(
                 [
                     {
                         "source_type": "remote",
-                        "source_ssh_connection_id": 42,
+                        "source_ssh_connection_id": connection.id,
                         "agent_machine_id": None,
                         "paths": ["/remote/old"],
                     }
@@ -2402,6 +3510,38 @@ class TestRepositoriesDelete:
             test_db.query(Repository).filter(Repository.id == repo_id).first() is None
         )
 
+    def test_permanent_delete_repository_removes_borg2_layout_and_record(
+        self, test_client: TestClient, admin_headers, test_db, tmp_path
+    ):
+        """Permanent deletion recognizes Borg 2's directory-based config layout."""
+        repo_path = tmp_path / "delete-borg2-repo-files"
+        _create_borg2_like_repository_dir(repo_path)
+        repo = Repository(
+            name="Delete Borg 2 Files",
+            path=str(repo_path),
+            encryption="none",
+            compression="lz4",
+            repository_type="local",
+            execution_target="local",
+            borg_version=2,
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        repo_id = repo.id
+
+        response = test_client.post(
+            f"/api/repositories/{repo_id}/permanent-delete",
+            json={"confirmation_phrase": "Delete Borg 2 Files", "understood": True},
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 200
+        assert not repo_path.exists()
+        assert (
+            test_db.query(Repository).filter(Repository.id == repo_id).first() is None
+        )
+
     def test_permanent_delete_keeps_record_when_filesystem_removal_fails(
         self, test_client: TestClient, admin_headers, test_db, tmp_path
     ):
@@ -2555,9 +3695,6 @@ class TestRepositoriesDelete:
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Deleting observe-only repositories should clean up restore-check jobs."""
-        test_db.execute(text("PRAGMA foreign_keys=ON"))
-        test_db.commit()
-
         repo = Repository(
             name="Delete Observe Repo",
             path="/tmp/delete-observe-repo",
@@ -2570,7 +3707,9 @@ class TestRepositoriesDelete:
         test_db.commit()
         test_db.refresh(repo)
 
-        restore_check_job = RestoreCheckJob(
+        restore_check_job = seed_job_operation(
+            test_db,
+            "restore_check",
             repository_id=repo.id,
             repository_path=repo.path,
             archive_name="archive-2026-05-31",
@@ -2578,21 +3717,20 @@ class TestRepositoriesDelete:
             started_at=datetime.utcnow(),
             completed_at=datetime.utcnow(),
         )
-        test_db.add(restore_check_job)
         test_db.commit()
         repo_id = repo.id
+        operation_id = restore_check_job.id
 
         response = test_client.delete(
             f"/api/repositories/{repo_id}", headers=admin_headers
         )
 
         assert response.status_code == 200
-        assert (
-            test_db.query(RestoreCheckJob)
-            .filter(RestoreCheckJob.repository_id == repo_id)
-            .count()
-            == 0
-        )
+        assert test_db.get(Repository, repo_id) is None
+        # `operations.repository_id` is ON DELETE CASCADE: the route leaves
+        # the job rows to the cascade instead of deleting them by hand.
+        test_db.expunge_all()
+        assert test_db.get(Operation, operation_id) is None
 
     def test_delete_nonexistent_repository(
         self, test_client: TestClient, admin_headers
@@ -2727,6 +3865,51 @@ class TestRepositoriesStatistics:
         assert "-r" in cmd
         assert "info" in cmd
 
+    def test_get_repository_info_syncs_archive_stats_on_server_path(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """The server-managed branch must sync the stored columns exactly like
+        the agent branch above it."""
+        repo = Repository(
+            name="V2 Server Sync Repo",
+            path="/tmp/v2-server-sync-repo",
+            encryption="none",
+            compression="lz4",
+            repository_type="local",
+            borg_version=2,
+            archive_count=1,
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+
+        info_json = json.dumps(
+            {
+                "repository": {"id": "abc"},
+                "archives": [
+                    {"name": "s", "start": "2026-08-19T20:03:15+02:00"},
+                    {"name": "s", "start": "2026-08-19T21:03:18+02:00"},
+                ],
+            }
+        ).encode()
+
+        with (
+            patch("app.core.borg2.borg2.borg_cmd", "borg2"),
+            patch(
+                "app.api.repositories._run_repository_command",
+                new=AsyncMock(return_value=(0, info_json, b"")),
+            ),
+        ):
+            response = test_client.get(
+                f"/api/repositories/{repo.id}/info",
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        test_db.refresh(repo)
+        assert repo.archive_count == 2
+        assert repo.last_backup == datetime(2026, 8, 19, 19, 3, 18)
+
     def test_get_repository_stats_not_found(
         self, test_client: TestClient, admin_headers
     ):
@@ -2798,6 +3981,62 @@ class TestRepositoriesStatistics:
         _, kwargs = mock_exec.call_args
         assert kwargs["env"]["BORG_PASSPHRASE"] == "secret-passphrase"
         mock_list.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_get_repository_stats_reports_last_modified_from_the_info_call(
+        self, test_db
+    ):
+        """The endpoint runs `info` anyway; Borg's own last_modified from
+        that payload wins over the stored column, which serves as the
+        fallback for a payload without one."""
+        from datetime import datetime
+
+        from app.api.repositories import get_repository_stats
+
+        repo = Repository(
+            name="Stats Repo",
+            path="/tmp/stats-repo",
+            encryption="none",
+            compression="lz4",
+            repository_type="local",
+            borg_last_modified=datetime(2026, 9, 1, 6, 0),
+        )
+        test_db.add(repo)
+        test_db.commit()
+
+        async def stats_for(stdout):
+            with (
+                patch(
+                    "app.api.repositories.resolve_repo_ssh_key_file", return_value=None
+                ),
+                patch(
+                    "app.api.repositories.borg._execute_command",
+                    new=AsyncMock(
+                        return_value={
+                            "success": True,
+                            "stdout": stdout,
+                            "stderr": "",
+                            "return_code": 0,
+                        }
+                    ),
+                ) as mock_exec,
+                patch(
+                    "app.api.repositories.BorgRouter.list_archives",
+                    new=AsyncMock(return_value=[]),
+                ),
+            ):
+                stats = await get_repository_stats(repo, test_db)
+            assert mock_exec.call_args.kwargs["env"]["TZ"] == "UTC"
+            return stats
+
+        live = await stats_for(
+            '{"repository": {"last_modified": "2026-09-07T08:00:00.000000"}}'
+        )
+        assert live["last_modified"] == "2026-09-07T08:00:00+00:00"
+        stored = await stats_for('{"repository": {}}')
+        assert stored["last_modified"] == "2026-09-01T06:00:00+00:00"
+        unparsable = await stats_for("ok")
+        assert unparsable["last_modified"] == "2026-09-01T06:00:00+00:00"
 
     @pytest.mark.asyncio
     async def test_get_repository_stats_omits_passphrase_for_unencrypted_local_repo(
@@ -3001,10 +4240,6 @@ class TestRepositoriesImport:
                 new=AsyncMock(return_value=verify_result),
             ) as mock_verify,
             patch(
-                "app.core.borg_router.BorgRouter.update_stats",
-                new=AsyncMock(return_value=True),
-            ),
-            patch(
                 "app.api.repositories.mqtt_service.sync_state_with_db",
                 return_value=None,
             ),
@@ -3141,12 +4376,16 @@ class TestRepositoriesJobStatus:
 
         test_db.add_all(
             [
-                CheckJob(
+                seed_job_operation(
+                    test_db,
+                    "check",
                     repository_id=repo.id,
                     status="completed",
                     scheduled_check=True,
                 ),
-                CheckJob(
+                seed_job_operation(
+                    test_db,
+                    "check",
                     repository_id=repo.id,
                     status="completed",
                     scheduled_check=False,
@@ -3226,21 +4465,26 @@ class TestRepositoriesJobStatus:
         assert response.status_code == 200
 
     @pytest.mark.parametrize(
-        "job_model,response_key",
+        "kind,response_key",
         [
-            (CheckJob, "check_job"),
-            (CompactJob, "compact_job"),
-            (PruneJob, "prune_job"),
-            (RestoreCheckJob, "restore_check_job"),
+            ("check", "check_job"),
+            ("compact", "compact_job"),
+            ("prune", "prune_job"),
+            ("restore_check", "restore_check_job"),
         ],
     )
-    def test_get_repository_running_jobs_includes_pending_maintenance_job(
-        self, test_client: TestClient, admin_headers, test_db, job_model, response_key
+    def test_get_repository_running_jobs_includes_a_queued_operation(
+        self, test_client: TestClient, admin_headers, test_db, kind, response_key
     ):
-        """Pending maintenance jobs should be active while startup is settling."""
+        """Phase 5 moved check, compact, prune, and restore check to
+        `operations`; this endpoint must still see them as running work,
+        since nothing writes new rows to their legacy tables any more."""
+        from app.database.models import Operation
+        from app.services.operations.vocab import category_for
+
         repo = Repository(
-            name=f"Pending {response_key} Repo",
-            path=f"/job/pending-{response_key}-repo",
+            name=f"Queued {response_key} Repo",
+            path=f"/job/queued-{response_key}-repo",
             encryption="none",
             repository_type="local",
         )
@@ -3248,12 +4492,19 @@ class TestRepositoriesJobStatus:
         test_db.commit()
         test_db.refresh(repo)
 
-        job = job_model(
+        # A raw insert, not `enqueue()`: `enqueue()` wakes the real
+        # background runner, which would then actually dispatch this row
+        # against a repository with no real Borg data behind it.
+        op = Operation(
             repository_id=repo.id,
-            repository_path=repo.path,
-            status="pending",
+            kind=kind,
+            category=category_for(kind),
+            status="queued",
+            trigger="manual",
+            priority=0,
+            run_id="test-run",
         )
-        test_db.add(job)
+        test_db.add(op)
         test_db.commit()
 
         response = test_client.get(
@@ -3263,7 +4514,7 @@ class TestRepositoriesJobStatus:
         assert response.status_code == 200
         data = response.json()
         assert data["has_running_jobs"] is True
-        assert data[response_key]["id"] == job.id
+        assert data[response_key]["id"] == op.id
         assert data[response_key]["status"] == "pending"
 
     def test_get_check_jobs_repository_not_found(
@@ -3337,31 +4588,21 @@ class TestRepositoryCheck:
         test_db.commit()
         test_db.refresh(repo)
 
-        with patch(
-            "app.api.repositories.start_background_maintenance_job"
-        ) as mock_start:
-            mock_start.return_value = CheckJob(
-                id=42,
-                repository_id=repo.id,
-                status="pending",
-                max_duration=0,
-                extra_flags="--repair --archives-only",
-            )
-
-            response = test_client.post(
-                f"/api/repositories/{repo.id}/check",
-                headers=admin_headers,
-                json={
-                    "max_duration": 0,
-                    "check_extra_flags": "  --repair --archives-only  ",
-                },
-            )
+        response = test_client.post(
+            f"/api/repositories/{repo.id}/check",
+            headers=admin_headers,
+            json={
+                "max_duration": 0,
+                "check_extra_flags": "  --repair --archives-only  ",
+            },
+        )
 
         assert response.status_code == 200
-        assert mock_start.call_args.kwargs["extra_fields"] == {
-            "max_duration": 0,
-            "extra_flags": "--repair --archives-only",
-        }
+        # Phase 5: the flags live in `operations.params` (spec 6.2), trimmed.
+        op = test_db.get(Operation, response.json()["job_id"])
+        assert op.kind == "check"
+        assert op.params["max_duration"] == 0
+        assert op.params["extra_flags"] == "--repair --archives-only"
 
     def test_start_check_rejects_full_check_flags_with_partial_duration(
         self, test_client: TestClient, admin_headers, test_db
@@ -3377,24 +4618,20 @@ class TestRepositoryCheck:
         test_db.commit()
         test_db.refresh(repo)
 
-        with patch(
-            "app.api.repositories.start_background_maintenance_job"
-        ) as mock_start:
-            response = test_client.post(
-                f"/api/repositories/{repo.id}/check",
-                headers=admin_headers,
-                json={
-                    "max_duration": 600,
-                    "check_extra_flags": " --verify-data ",
-                },
-            )
+        response = test_client.post(
+            f"/api/repositories/{repo.id}/check",
+            headers=admin_headers,
+            json={
+                "max_duration": 600,
+                "check_extra_flags": " --verify-data ",
+            },
+        )
 
         assert response.status_code == 422
         assert response.json()["detail"]["key"] == (
             "backend.errors.repo.checkFlagsRequireUnlimitedDuration"
         )
         assert response.json()["detail"]["params"]["flags"] == "--verify-data"
-        mock_start.assert_not_called()
 
 
 @pytest.mark.unit
@@ -3793,25 +5030,18 @@ class TestRepositoryRestoreCheckSchedule:
         test_db.commit()
         test_db.refresh(repo)
 
-        with patch(
-            "app.api.repositories.start_background_maintenance_job"
-        ) as mock_start:
-            mock_start.return_value = RestoreCheckJob(
-                id=501,
-                repository_id=repo.id,
-                status="pending",
-                probe_paths='["etc/hostname"]',
-            )
-            response = test_client.post(
-                f"/api/repositories/{repo.id}/restore-check",
-                headers=admin_headers,
-                json={},
-            )
+        response = test_client.post(
+            f"/api/repositories/{repo.id}/restore-check",
+            headers=admin_headers,
+            json={},
+        )
 
         assert response.status_code == 200
         data = response.json()
-        assert data["job_id"] == 501
         assert data["message"] == "backend.success.repo.restoreCheckJobStarted"
+        op = test_db.get(Operation, data["job_id"])
+        assert op.kind == "restore_check"
+        assert op.category == "restore"
 
     def test_manual_canary_restore_check_marks_canary_for_future_backups(
         self, test_client: TestClient, admin_headers, test_db
@@ -3827,15 +5057,11 @@ class TestRepositoryRestoreCheckSchedule:
         test_db.commit()
         test_db.refresh(repo)
 
-        with patch(
-            "app.api.maintenance_jobs.schedule_background_job",
-            side_effect=_discard_background_coro,
-        ):
-            response = test_client.post(
-                f"/api/repositories/{repo.id}/restore-check",
-                headers=admin_headers,
-                json={"paths": [], "full_archive": False},
-            )
+        response = test_client.post(
+            f"/api/repositories/{repo.id}/restore-check",
+            headers=admin_headers,
+            json={"paths": [], "full_archive": False},
+        )
 
         assert response.status_code == 200
         test_db.refresh(repo)
@@ -3883,15 +5109,11 @@ class TestRepositoryRestoreCheckSchedule:
         test_db.commit()
         test_db.refresh(repo)
 
-        with patch(
-            "app.api.maintenance_jobs.schedule_background_job",
-            side_effect=_discard_background_coro,
-        ):
-            response = test_client.post(
-                f"/api/repositories/{repo.id}/restore-check",
-                headers=admin_headers,
-                json={"paths": ["etc/hostname"], "full_archive": False},
-            )
+        response = test_client.post(
+            f"/api/repositories/{repo.id}/restore-check",
+            headers=admin_headers,
+            json={"paths": ["etc/hostname"], "full_archive": False},
+        )
 
         assert response.status_code == 200
 
@@ -3971,3 +5193,119 @@ class TestBorgEnvironmentSetup:
 
         assert "BORG_RSH" in env
         assert "StrictHostKeyChecking=no" in env["BORG_RSH"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "deletion_marker",
+    [
+        pytest.param({"status": "deleted"}, id="status-deleted"),
+        pytest.param({"deleted_at": datetime.utcnow()}, id="deleted_at-set"),
+    ],
+)
+@pytest.mark.parametrize("validator", ["backup", "repository_operation", "script"])
+def test_agent_validators_reject_deleted_agent(test_db, deletion_marker, validator):
+    # Each marker alone must be enough: a row can carry either one depending
+    # on which code path deleted the agent.
+    from app.services.repository_executor import (
+        validate_agent_backup_repository,
+        validate_agent_repository_operation,
+        validate_agent_script,
+    )
+
+    agent = AgentMachine(
+        name="Gone Agent",
+        agent_id="agt_gone",
+        token_hash=get_password_hash("borgui_agent_secret"),
+        token_prefix="borgui_agent_secret"[:20],
+        capabilities=["repository.info", "script.run"],
+        **{"status": "online", **deletion_marker},
+    )
+    test_db.add(agent)
+    test_db.commit()
+    repo = Repository(
+        name="Orphaned Agent Repo",
+        path="/agent/repo",
+        encryption="none",
+        compression="lz4",
+        executor_type="agent",
+        execution_target="agent",
+        agent_machine_id=agent.id,
+        repository_type="local",
+        source_directories=json.dumps(["/data"]),
+    )
+    test_db.add(repo)
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        if validator == "backup":
+            validate_agent_backup_repository(test_db, repo)
+        elif validator == "repository_operation":
+            validate_agent_repository_operation(
+                test_db, repo, job_kind="repository.info"
+            )
+        else:
+            validate_agent_script(agent)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["key"] == "backend.errors.agents.agentNotQueueable"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_wait_for_agent_job_failure_surfaces_borg_stderr(test_db):
+    from datetime import timezone
+
+    from app.services.repository_executor import (
+        wait_for_agent_repository_operation_job,
+    )
+
+    agent = AgentMachine(
+        name="Pi",
+        agent_id="agt_pi_stderr",
+        token_hash=get_password_hash("borgui_agent_secret"),
+        token_prefix="borgui_agent_secret"[:20],
+        status="online",
+    )
+    test_db.add(agent)
+    test_db.commit()
+    now = datetime.now(timezone.utc)
+    job = AgentJob(
+        agent_machine_id=agent.id,
+        job_type="repository",
+        status="failed",
+        payload={"schema_version": 1, "job_kind": "repository.info"},
+        error_message="repository.info exited with code 2",
+        created_at=now,
+        updated_at=now,
+    )
+    test_db.add(job)
+    test_db.commit()
+    test_db.add(
+        AgentJobLog(
+            agent_job_id=job.id,
+            sequence=2,
+            stream="stderr",
+            message=(
+                "Failed to create/acquire the lock /repo/lock.exclusive "
+                "(Permission denied).\nTraceback (most recent call last):\n  ..."
+            ),
+            created_at=now,
+            received_at=now,
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await wait_for_agent_repository_operation_job(
+            test_db, job.id, timeout_seconds=1
+        )
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail["key"] == (
+        "backend.errors.agents.repositoryOperationFailedWithReason"
+    )
+    assert exc_info.value.detail["params"]["reason"] == (
+        "repository.info exited with code 2: "
+        "Failed to create/acquire the lock /repo/lock.exclusive (Permission denied)."
+    )

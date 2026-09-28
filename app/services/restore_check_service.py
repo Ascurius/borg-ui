@@ -12,17 +12,29 @@ import structlog
 from fastapi import HTTPException
 
 from app.config import settings
+from app.core.borg_errors import is_borg_warning_exit_code
 from app.core.borg_router import BorgRouter
 from app.database.database import SessionLocal
-from app.database.models import Repository, RestoreCheckJob
+from app.database.models import Repository
 from app.services.notification_service import NotificationService
+from app.services.operations.job_facade import resolve_maintenance_job
 from app.services.restore_check_canary import (
     CANARY_MANIFEST,
     get_legacy_restore_canary_archive_paths,
     get_restore_canary_archive_paths,
     verify_restored_canary,
 )
-from app.utils.borg_env import build_repository_borg_env, cleanup_temp_key_file
+from app.utils.borg_env import (
+    build_repository_borg_env,
+    cleanup_temp_key_file,
+    effective_repository_remote_path,
+    with_lock_wait,
+)
+
+from app.services.process_cancel import (
+    terminate_process,
+    terminate_tracked_process,
+)
 
 logger = structlog.get_logger()
 
@@ -82,10 +94,32 @@ def _get_archive_name(archive: dict | str | None) -> str:
     return ""
 
 
+def _get_archive_selector(archive: dict | str | None, repository) -> str:
+    """Selector that resolves to exactly one archive.
+
+    Borg 2 archives in a series share one name and are told apart by id, so
+    extract needs the aid: selector - a bare series name matches every
+    archive in the series and borg refuses to pick one. Borg 1 names are
+    unique and are passed as-is.
+    """
+    name = _get_archive_name(archive)
+    if getattr(repository, "borg_version", 1) != 2:
+        return name
+    if isinstance(archive, dict):
+        archive_id = archive.get("id")
+        if isinstance(archive_id, str) and archive_id:
+            return f"aid:{archive_id}"
+    return name
+
+
 # Upper bounds so a delegated restore-check cannot wait on the agent forever:
 # fail if the job is never claimed (agent offline) or goes silent (agent died).
 _AGENT_OP_CLAIM_TIMEOUT_SECONDS = 120
 _AGENT_OP_STALL_TIMEOUT_SECONDS = 600
+# An agent reports a keepalive while its Borg is silent (0.1.7), which holds
+# off the stall timeout; this bounds how long a job may keep doing so without
+# any progress, so a hung but live process is not waited on forever.
+_AGENT_OP_NO_PROGRESS_MAX_SECONDS = 6 * 3600
 
 
 def _http_detail_text(exc: HTTPException) -> str:
@@ -95,10 +129,6 @@ def _http_detail_text(exc: HTTPException) -> str:
     return str(detail)
 
 
-def _is_borg_warning_exit_code(returncode: int | None) -> bool:
-    return returncode == 1 or (returncode is not None and 100 <= returncode <= 127)
-
-
 class RestoreCheckService:
     """Restore latest archive into a disposable temp directory to verify restorability."""
 
@@ -106,10 +136,21 @@ class RestoreCheckService:
         self.log_dir = Path(settings.data_dir) / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.running_processes: dict[int, asyncio.subprocess.Process] = {}
+        # Checks whose cancel was requested while they ran: an extract must
+        # not start after it (the canary's legacy-path retry included).
+        self.cancelled_jobs: set[int] = set()
+        self._active_jobs: set[int] = set()
 
-    def _save_job_logs(
-        self, job: RestoreCheckJob, job_id: int, raw_logs: list[str]
-    ) -> None:
+    async def cancel_restore_check(self, job_id: int) -> bool:
+        """Cancel a running restore check by terminating its tracked process."""
+        if job_id in self._active_jobs:
+            # Only a running check is remembered; its run clears the mark.
+            self.cancelled_jobs.add(job_id)
+        return await terminate_tracked_process(
+            self.running_processes, job_id, "restore check"
+        )
+
+    def _save_job_logs(self, job, job_id: int, raw_logs: list[str]) -> None:
         if not raw_logs:
             return
 
@@ -131,7 +172,7 @@ class RestoreCheckService:
         *,
         db,
         repository: Repository,
-        job: RestoreCheckJob,
+        job,
     ) -> None:
         if job.status not in {
             "completed",
@@ -184,17 +225,18 @@ class RestoreCheckService:
             )
 
     async def execute_restore_check(self, job_id: int, repository_id: int):
+        self._active_jobs.add(job_id)
         db = SessionLocal()
         temp_key_file = None
         temp_restore_dir = None
-        job: RestoreCheckJob | None = None
+        job = None
         repository: Repository | None = None
         raw_logs: list[str] = []
         logs_saved = False
         use_canary = False
 
         try:
-            job = db.query(RestoreCheckJob).filter(RestoreCheckJob.id == job_id).first()
+            job = resolve_maintenance_job(db, job_id, "restore_check")
             if not job:
                 logger.error("Restore check job not found", job_id=job_id)
                 return
@@ -237,6 +279,7 @@ class RestoreCheckService:
             archives = await BorgRouter(repository).list_archives(env=env)
             archive = _select_latest_archive(archives)
             archive_name = _get_archive_name(archive)
+            archive_selector = _get_archive_selector(archive, repository)
             if not archive_name:
                 job.status = "needs_backup" if use_canary else "failed"
                 job.error_message = (
@@ -307,14 +350,14 @@ class RestoreCheckService:
             async def run_extract(paths: list[str]) -> int | None:
                 cmd = BorgRouter(repository).build_restore_extract_command(
                     repository_path=repository.path,
-                    archive_name=archive_name,
+                    archive_name=archive_selector,
                     paths=paths,
-                    remote_path=repository.remote_path,
+                    remote_path=effective_repository_remote_path(repository),
                     bypass_lock=repository.bypass_lock,
                 )
 
                 process = await asyncio.create_subprocess_exec(
-                    *cmd,
+                    *with_lock_wait(cmd, env),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=temp_restore_dir,
@@ -326,7 +369,15 @@ class RestoreCheckService:
                 job.process_start_time = get_process_start_time(process.pid)
                 db.commit()
 
-                stdout, stderr = await process.communicate()
+                # Reads the pipes while the process is terminated: its exit
+                # is not seen while a full pipe goes unread.
+                output = asyncio.ensure_future(process.communicate())
+                if job_id in self.cancelled_jobs:
+                    # The cancel landed while the process was starting and
+                    # found nothing tracked to terminate.
+                    await terminate_process(process, job_id, "restore check")
+
+                stdout, stderr = await output
                 if stdout:
                     raw_logs.extend(
                         stdout.decode("utf-8", errors="replace").splitlines()
@@ -347,6 +398,8 @@ class RestoreCheckService:
             verification = None
             canary_prerequisite_error = None
             for attempt_index, attempt_paths in enumerate(restore_path_attempts):
+                if job_id in self.cancelled_jobs:
+                    break
                 if attempt_index > 0:
                     raw_logs.append(
                         "Retrying restore canary using legacy archive path: "
@@ -354,7 +407,7 @@ class RestoreCheckService:
                     )
 
                 returncode = await run_extract(attempt_paths)
-                warning_exit = _is_borg_warning_exit_code(returncode)
+                warning_exit = is_borg_warning_exit_code(returncode)
 
                 if not use_canary:
                     break
@@ -384,8 +437,19 @@ class RestoreCheckService:
                     continue
                 break
 
-            warning_exit = _is_borg_warning_exit_code(returncode)
-            if canary_prerequisite_error:
+            warning_exit = is_borg_warning_exit_code(returncode)
+            if job_id in self.cancelled_jobs:
+                # Before any verdict from the exit code: a cancelled check
+                # verified nothing, whatever its last extract returned. Not
+                # a failure: no failure notification goes out for it, and the
+                # runner keeps the row cancelled.
+                job.status = "cancelled"
+                job.progress = 100
+                job.completed_at = datetime.utcnow()
+                job.error_message = "Restore verification cancelled"
+                job.progress_message = job.error_message
+                raw_logs.append(job.error_message)
+            elif canary_prerequisite_error:
                 job.status = "needs_backup"
                 job.progress = 100
                 job.completed_at = datetime.utcnow()
@@ -435,11 +499,7 @@ class RestoreCheckService:
             try:
                 db.rollback()
                 if job is None:
-                    job = (
-                        db.query(RestoreCheckJob)
-                        .filter(RestoreCheckJob.id == job_id)
-                        .first()
-                    )
+                    job = resolve_maintenance_job(db, job_id, "restore_check")
                 if job:
                     job.status = "failed"
                     job.error_message = str(exc)
@@ -457,20 +517,22 @@ class RestoreCheckService:
                 db.rollback()
         finally:
             self.running_processes.pop(job_id, None)
+            self.cancelled_jobs.discard(job_id)
+            self._active_jobs.discard(job_id)
             cleanup_temp_key_file(temp_key_file)
             if temp_restore_dir:
                 shutil.rmtree(temp_restore_dir, ignore_errors=True)
             db.close()
 
     async def _execute_agent_restore_check(
-        self, db, job: RestoreCheckJob, job_id: int, repository: Repository
+        self, db, job, job_id: int, repository: Repository
     ):
         """Run a restore check by delegating to the repository's managed agent.
 
         Lists archives on the node, extracts the latest one into a throwaway
         directory the agent owns, and (for canary mode) verifies the canary
         manifest on the node. The agent's verdict is mapped onto the
-        RestoreCheckJob status.
+        restore check operation's status.
         """
         from app.services.agent_job_dispatcher import dispatch_agent_job_best_effort
         from app.services.repository_executor import (
@@ -519,6 +581,7 @@ class RestoreCheckService:
 
         archive = _select_latest_archive(archives)
         archive_name = _get_archive_name(archive)
+        archive_selector = _get_archive_selector(archive, repository)
         if not archive_name:
             job.status = "needs_backup" if use_canary else "failed"
             job.error_message = (
@@ -573,7 +636,7 @@ class RestoreCheckService:
         )
 
         operation: dict = {
-            "archive": archive_name,
+            "archive": archive_selector,
             "paths": restore_paths,
             "target": {"type": "temp"},
         }
@@ -604,7 +667,7 @@ class RestoreCheckService:
             return
 
         await dispatch_agent_job_best_effort(
-            db, agent_job, repository_id=repository.id, archive=archive_name
+            db, agent_job, repository_id=repository.id, archive=archive_selector
         )
 
         try:
@@ -651,11 +714,17 @@ class RestoreCheckService:
         self, db, agent_job_id: int, *, job=None, poll_interval_seconds: float = 1.0
     ) -> dict:
         from app.database.models import AgentJob
-        from app.services.repository_executor import TERMINAL_AGENT_STATUSES
+        from app.services.repository_executor import (
+            SUCCESSFUL_AGENT_STATUSES,
+            TERMINAL_AGENT_STATUSES,
+            agent_operation_failed_detail,
+        )
 
         started_at = time.monotonic()
         stale_since = started_at
-        last_marker = None
+        progress_since = started_at
+        last_progress = None
+        last_seen = None
 
         while True:
             db.expire_all()
@@ -665,15 +734,14 @@ class RestoreCheckService:
                     status_code=502,
                     detail={"key": "backend.errors.agents.jobNotFound"},
                 )
-            if agent_job.status == "completed":
+            if agent_job.status in SUCCESSFUL_AGENT_STATUSES:
                 return agent_job.result or {}
             if agent_job.status in TERMINAL_AGENT_STATUSES:
                 raise HTTPException(
                     status_code=502,
-                    detail={
-                        "key": "backend.errors.agents.repositoryOperationFailed",
-                        "message": agent_job.error_message or agent_job.status,
-                    },
+                    detail=agent_operation_failed_detail(
+                        agent_job.error_message or agent_job.status
+                    ),
                 )
             if job is not None and agent_job.progress_percent is not None:
                 job.progress = max(15, min(99, int(agent_job.progress_percent)))
@@ -681,29 +749,99 @@ class RestoreCheckService:
 
             # Bound the wait so an unclaimed or dead-agent job can't hang forever.
             now = time.monotonic()
-            marker = (
+            progress = (
                 agent_job.status,
                 agent_job.progress_percent,
                 agent_job.current_file,
             )
-            if marker != last_marker:
-                last_marker = marker
+            if progress != last_progress:
+                last_progress = progress
+                progress_since = now
+                stale_since = now
+            if agent_job.updated_at != last_seen:
+                # Any report, the agent's keepalive (0.1.7) included, shows
+                # the agent alive: a silent extract is not a stalled one.
+                last_seen = agent_job.updated_at
                 stale_since = now
             never_claimed = (
                 agent_job.status == "queued"
                 and now - started_at > _AGENT_OP_CLAIM_TIMEOUT_SECONDS
             )
-            if never_claimed or now - stale_since > _AGENT_OP_STALL_TIMEOUT_SECONDS:
-                # Terminalize the agent job so a still-queued job can't be claimed
-                # and run borg extract after the restore check was already failed.
-                if agent_job.status not in ("completed", "failed", "canceled"):
-                    agent_job.status = "failed"
-                    agent_job.error_message = (
-                        "restore check timed out waiting for the agent"
+            went_silent = (
+                now - stale_since > _AGENT_OP_STALL_TIMEOUT_SECONDS
+                or now - progress_since > _AGENT_OP_NO_PROGRESS_MAX_SECONDS
+            )
+            if never_claimed or went_silent:
+                from app.services.agent_job_dispatcher import (
+                    dispatch_agent_cancel_if_connected,
+                )
+
+                # Conditional on the status just read: the agent's reports
+                # land concurrently, and a verdict that got there first is the
+                # check's result, not a timeout.
+                now_utc = datetime.utcnow()
+                if agent_job.status in ("claimed", "running", "cancel_requested"):
+                    from app.services.operations.executors.maintenance import (
+                        AGENT_WAIT_ABANDONED_MESSAGE,
+                        agent_machine_stops_on_cancel,
                     )
-                    agent_job.completed_at = datetime.utcnow()
-                    agent_job.updated_at = datetime.utcnow()
+
+                    # An agent runs it: ask it to stop, so Borg does not run
+                    # on holding the repository after the check was failed.
+                    # Only an agent that stops Borg on a cancel is asked: an
+                    # older one reports `canceled` at once and lets a silent
+                    # Borg run on, so its job stays live (admission keeps
+                    # counting it) until it reports or the reaper closes it.
+                    if agent_machine_stops_on_cancel(db, agent_job.agent_machine_id):
+                        if agent_job.status != "cancel_requested":
+                            # The message tells the runner that the agent's
+                            # `canceled` answers this stop, not a user's
+                            # cancel. A cancel already asked for keeps its
+                            # own provenance and is only sent again.
+                            changed = (
+                                db.query(AgentJob)
+                                .filter(
+                                    AgentJob.id == agent_job.id,
+                                    AgentJob.status.in_(("claimed", "running")),
+                                )
+                                .update(
+                                    {
+                                        AgentJob.status: "cancel_requested",
+                                        AgentJob.error_message: (
+                                            AGENT_WAIT_ABANDONED_MESSAGE
+                                        ),
+                                        AgentJob.updated_at: now_utc,
+                                    },
+                                    synchronize_session=False,
+                                )
+                            )
+                            db.commit()
+                            if not changed:
+                                continue
+                            db.refresh(agent_job)
+                        await dispatch_agent_cancel_if_connected(agent_job)
+                elif agent_job.status == "queued":
+                    # Never claimed: close it so it cannot be claimed later.
+                    changed = (
+                        db.query(AgentJob)
+                        .filter(
+                            AgentJob.id == agent_job.id, AgentJob.status == "queued"
+                        )
+                        .update(
+                            {
+                                AgentJob.status: "failed",
+                                AgentJob.error_message: (
+                                    "restore check timed out waiting for the agent"
+                                ),
+                                AgentJob.completed_at: now_utc,
+                                AgentJob.updated_at: now_utc,
+                            },
+                            synchronize_session=False,
+                        )
+                    )
                     db.commit()
+                    if not changed:
+                        continue
                 raise HTTPException(
                     status_code=504,
                     detail={"key": "backend.errors.agents.repositoryOperationTimeout"},
@@ -724,7 +862,7 @@ class RestoreCheckService:
     def _finish_agent_restore_check_failure(
         self,
         db,
-        job: RestoreCheckJob,
+        job,
         job_id: int,
         raw_logs: list[str],
         *,
@@ -742,7 +880,7 @@ class RestoreCheckService:
     def _apply_agent_restore_check_result(
         self,
         db,
-        job: RestoreCheckJob,
+        job,
         job_id: int,
         repository: Repository,
         result: dict,

@@ -3,12 +3,21 @@ from datetime import datetime
 from pathlib import Path
 import structlog
 from sqlalchemy.orm import Session
-from app.database.models import DeleteArchiveJob, Repository
+from app.database.models import Repository
 from app.database.database import SessionLocal
 from app.config import settings
 from app.core.borg import borg
+from app.core.borg_errors import is_borg_warning_exit_code
+from app.services.operations.job_facade import refresh_job, resolve_maintenance_job
 from app.utils.db_retries import commit_with_retry
-from app.utils.borg_env import build_repository_borg_env, cleanup_temp_key_file
+from app.utils.borg_env import (
+    build_repository_borg_env,
+    cleanup_temp_key_file,
+    effective_repository_remote_path,
+    with_lock_wait,
+)
+
+from app.services.process_cancel import terminate_process
 
 logger = structlog.get_logger()
 
@@ -50,9 +59,7 @@ class DeleteArchiveService:
         temp_key_file = None
         try:
             # Get job
-            job = (
-                db.query(DeleteArchiveJob).filter(DeleteArchiveJob.id == job_id).first()
-            )
+            job = resolve_maintenance_job(db, job_id, "delete_archive")
             if not job:
                 logger.error("Delete archive job not found", job_id=job_id)
                 return
@@ -105,8 +112,8 @@ class DeleteArchiveService:
 
             # Build command
             cmd = [borg.borg_cmd, "delete", "--stats", "--progress"]
-            if repository.remote_path:
-                cmd.extend(["--remote-path", repository.remote_path])
+            if remote_path := effective_repository_remote_path(repository):
+                cmd.extend(["--remote-path", remote_path])
             cmd.append(f"{repository.path}::{archive_name}")
 
             logger.info(
@@ -119,7 +126,7 @@ class DeleteArchiveService:
 
             # Execute command
             process = await asyncio.create_subprocess_exec(
-                *cmd,
+                *with_lock_wait(cmd, env),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
@@ -164,21 +171,13 @@ class DeleteArchiveService:
                 nonlocal cancelled
                 while not cancelled and process.returncode is None:
                     await asyncio.sleep(3)
-                    db.refresh(job)
+                    refresh_job(db, job)
                     if job.status == "cancelled":
                         logger.info(
                             "Delete job cancelled, terminating process", job_id=job_id
                         )
                         cancelled = True
-                        process.terminate()
-                        try:
-                            await asyncio.wait_for(process.wait(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "Process didn't terminate, killing it", job_id=job_id
-                            )
-                            process.kill()
-                            await process.wait()
+                        await terminate_process(process, job_id, "delete_archive")
                         break
 
             async def stream_logs():
@@ -220,7 +219,7 @@ class DeleteArchiveService:
                 job.progress = 100
                 job.progress_message = f"Archive {archive_name} deleted successfully"
                 logger.info("Delete job completed", job_id=job_id)
-            elif process.returncode == 1 or (100 <= process.returncode <= 127):
+            elif is_borg_warning_exit_code(process.returncode):
                 # Warning (legacy exit code 1 or modern exit codes 100-127)
                 job.status = "completed_with_warnings"
                 job.progress = 100
@@ -245,14 +244,23 @@ class DeleteArchiveService:
                     "Delete job failed", job_id=job_id, return_code=process.returncode
                 )
 
-            # A deleted archive takes its job records with it - same cascade
-            # the prune paths run.
+            # A deleted archive is recorded on its backup job - the same mark
+            # the prune paths set. The row stays as the run's record.
+            # one completion time for the job row and for the mark on the
+            # backup job of the deleted archive
+            completed_at = datetime.utcnow()
             if job.status in ("completed", "completed_with_warnings"):
                 from app.services.job_history_retention import (
-                    purge_jobs_for_pruned_archives,
+                    mark_jobs_of_pruned_archives,
                 )
 
-                purge_jobs_for_pruned_archives(db, repository_id, {archive_name})
+                mark_jobs_of_pruned_archives(
+                    db,
+                    repository_id,
+                    {archive_name},
+                    created_before=job.started_at,
+                    pruned_at=completed_at,
+                )
 
             # Save logs
             if log_buffer:
@@ -262,7 +270,6 @@ class DeleteArchiveService:
                 job.log_file_path = str(log_file_path)
                 job.has_logs = True
 
-            completed_at = datetime.utcnow()
             final_status = job.status
             final_progress = job.progress
             final_progress_message = job.progress_message
@@ -295,9 +302,11 @@ class DeleteArchiveService:
             try:
                 completed_at = datetime.utcnow()
 
+                error_message = str(e)
+
                 def persist_failure_state():
                     job.status = "failed"
-                    job.error_message = str(e)
+                    job.error_message = error_message
                     job.completed_at = completed_at
 
                 await commit_with_retry(
@@ -316,7 +325,7 @@ class DeleteArchiveService:
 
     async def cancel_delete(self, job_id: int, db: Session):
         """Cancel a running delete job"""
-        job = db.query(DeleteArchiveJob).filter(DeleteArchiveJob.id == job_id).first()
+        job = resolve_maintenance_job(db, job_id, "delete_archive")
         if not job:
             raise ValueError(f"Delete job {job_id} not found")
 

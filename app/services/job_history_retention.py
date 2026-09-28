@@ -25,6 +25,12 @@ user-visible:
                           unbounded job table is never what anyone wants, so
                           only the window moves.
 
+A pruned or deleted archive does not take its backup job with it: the row
+is the record that the backup ran (the dashboard timeline and the plan
+history are built from it), so it is marked with archive_pruned_at and
+falls with cleanup_retention_days like everything else. The log content
+follows the two windows above as before.
+
 Deletes are chunked so SQLite never holds a giant transaction;
 DB-level FK actions (agent_job_logs CASCADE, script_executions CASCADE,
 various SET NULL) handle the children — SQLite connections run with
@@ -36,13 +42,16 @@ the file; the manual cleanup endpoint runs VACUUM for that.
 
 from __future__ import annotations
 
+import os
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+
+from app.config import settings as app_config
+from typing import Any, Dict, Iterable, Optional
 
 import structlog
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.services.log_policy import DEFAULT_LOG_SAVE_POLICY, LOG_SAVE_POLICIES
@@ -50,19 +59,15 @@ from app.services.log_policy import DEFAULT_LOG_SAVE_POLICY, LOG_SAVE_POLICIES
 from app.database.models import (
     AgentJob,
     AgentJobLog,
-    BackupJob,
-    BackupJobRetryLineage,
+    AvailabilityScheduleSkip,
     BackupPlanRun,
-    CheckJob,
-    CompactJob,
-    DeleteArchiveJob,
-    PackageInstallJob,
-    PruneJob,
-    RcloneSyncJob,
+    Operation,
+    OperationBackupDetails,
+    OperationBackupRetryLineage,
+    OperationRcloneDetails,
+    OperationWipeDetails,
     Repository,
     RepositoryWipeJob,
-    RestoreCheckJob,
-    RestoreJob,
     ScriptExecution,
     SystemSettings,
     utc_now,
@@ -81,21 +86,87 @@ DEFAULT_CLEANUP_RETENTION_DAYS = 90
 # of job record, including plan runs and script executions. Deleting a plan
 # run cascades its run-repository links and hook executions at the DB level.
 # (model, inline log columns cleared at log_retention_days)
+# `repository_wipe_jobs` holds wipe previews only since phase 9, and a preview
+# expires with the rest of the history.
 _JOB_TABLES = (
     (AgentJob, ()),
-    (BackupJob, ("logs",)),
-    (RestoreJob, ("logs",)),
-    (CheckJob, ("logs",)),
-    (RestoreCheckJob, ("logs",)),
-    (CompactJob, ("logs",)),
-    (PruneJob, ("logs",)),
-    (DeleteArchiveJob, ("logs",)),
     (RepositoryWipeJob, ("logs",)),
-    (RcloneSyncJob, ("log_text",)),
-    (PackageInstallJob, ("stdout", "stderr")),
     (ScriptExecution, ("stdout", "stderr")),
     (BackupPlanRun, ()),
+    (AvailabilityScheduleSkip, ()),
+    (Operation, ()),
 )
+
+
+def _agent_maintenance_job_for(db: Session, payload: Any) -> Any:
+    """The maintenance operation an agent job's payload names, as a facade:
+    the kinds whose log file holds the agent's lines and nothing else."""
+    from app.api.agents import REPOSITORY_OPERATION_JOB_KINDS
+    from app.services.operations.job_facade import resolve_agent_maintenance_job
+
+    return resolve_agent_maintenance_job(
+        db, payload, kinds=REPOSITORY_OPERATION_JOB_KINDS
+    )
+
+
+def _repair_operation_log(db: Session, operation_job: Any, full_log: str) -> None:
+    """Rewrite the operation's log file when it differs from the agent's
+    stored lines. An operation keeps only its log file, and the facade's
+    setter never overwrites an existing file (that protects a service's
+    captured output from a later marker), so the repair writes the file
+    itself. Only an existing file is repaired: one that log retention
+    removed stays removed."""
+    path = operation_job.log_file_path
+    if not path:
+        return
+    # not the name `_complete_finished_operation_log` stages under
+    tmp_path = f"{path}.repair.tmp"
+    try:
+        try:
+            # a log cut off inside a character differs, and is repaired
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                if handle.read() == full_log:
+                    return
+        except FileNotFoundError:
+            return
+        # A path is not unique (see `purge_operation_log_files`): a file
+        # another operation names too is not this job's to rewrite.
+        named = (
+            db.query(func.count(Operation.id))
+            .filter(Operation.log_file_path == path)
+            .scalar()
+        )
+        if named > 1:
+            return
+        # staged, so a write that fails leaves the log as it was
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                handle.write(full_log)
+            os.replace(tmp_path, path)
+        except OSError:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        # a full or read-only data directory loses this repair, not the
+        # marking below it or the rest of the retention pass
+        logger.warning(
+            "Could not repair the operation's log file",
+            operation_id=operation_job.id,
+            error=str(exc),
+        )
+        return
+    # Log retention forgets the path, commits, then unlinks the file. If
+    # it did so meanwhile, the rename brought the file back: remove it.
+    db.rollback()
+    named = db.query(Operation.id).filter(Operation.log_file_path == path).first()
+    if named is None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def _older_than(model, cutoff):
@@ -108,25 +179,73 @@ def _older_than(model, cutoff):
     the freshest timestamp the table has: completed_at, then updated_at
     (refreshed on every agent log line), then started_at, then created_at.
     """
-    columns = [model.completed_at]
-    if hasattr(model, "updated_at"):
-        columns.append(model.updated_at)
-    if hasattr(model, "started_at"):
-        columns.append(model.started_at)
-    if hasattr(model, "created_at"):
-        columns.append(model.created_at)
-    return (func.coalesce(*columns) < cutoff,)
+    columns = []
+    for name in (
+        "completed_at",
+        "occurred_at",
+        "updated_at",
+        "started_at",
+        "created_at",
+    ):
+        column = getattr(model, name, None)
+        if column is not None:
+            columns.append(column)
+    timestamp = columns[0] if len(columns) == 1 else func.coalesce(*columns)
+    return (timestamp < cutoff,)
+
+
+def _referenced_log_files(db: Session, paths: list[str]) -> set:
+    """The subset of paths some surviving row still names.
+
+    log_file_path carries no uniqueness guarantee, so an expired row and a
+    retained one can point at the same file - deleting by the expired row
+    alone would take the retained row's log with it.
+    """
+    referenced: set = set()
+    if not paths:
+        return referenced
+    for model, _ in _JOB_TABLES:
+        column = getattr(model, "log_file_path", None)
+        if column is None:
+            continue
+        for (path,) in db.query(column).filter(column.in_(paths)):
+            referenced.add(path)
+    return referenced
 
 
 def _delete_chunked(db: Session, model, filters) -> int:
-    """Delete matching rows in CHUNK_SIZE batches, committing per batch."""
+    """Delete matching rows in CHUNK_SIZE batches, committing per batch.
+
+    Rows that name a log file take it with them: paths are captured before
+    the delete and unlinked only after the commit, so a failed commit never
+    leaves a surviving row pointing at a vanished file. Unlink errors are
+    tolerated - retention must not fail over a file the filesystem already
+    lost.
+    """
+    log_column = getattr(model, "log_file_path", None)
     total = 0
     while True:
-        ids = [row[0] for row in db.query(model.id).filter(*filters).limit(CHUNK_SIZE)]
+        log_files: list[str] = []
+        if log_column is not None:
+            rows = (
+                db.query(model.id, log_column).filter(*filters).limit(CHUNK_SIZE).all()
+            )
+            ids = [row[0] for row in rows]
+            log_files = [row[1] for row in rows if row[1]]
+        else:
+            ids = [
+                row[0] for row in db.query(model.id).filter(*filters).limit(CHUNK_SIZE)
+            ]
         if not ids:
             return total
         db.query(model).filter(model.id.in_(ids)).delete(synchronize_session=False)
         db.commit()
+        still_referenced = _referenced_log_files(db, log_files)
+        for path in set(log_files) - still_referenced:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
         total += len(ids)
 
 
@@ -148,6 +267,42 @@ def purge_agent_job_logs(db: Session, filters) -> int:
         )
         db.commit()
         total += len(ids)
+
+
+# The spec 6.2 extension rows that hold captured output. Their age is their
+# operation's, so they cannot ride in _JOB_TABLES (whose age filter needs the
+# row's own timestamps); spec 7.8's "rows do not outlive retention" is met for
+# them by the ondelete=CASCADE on operations.id, and the log window is applied
+# by _clear_operation_detail_logs below.
+_OPERATION_DETAIL_LOG_COLUMNS = (
+    (OperationRcloneDetails, ("log_text", "error_text")),
+    (OperationWipeDetails, ("dry_run_output",)),
+)
+
+
+def clear_operation_detail_logs(db: Session, make_filters) -> int:
+    """NULL the captured output on operation extension rows whose operation
+    matches make_filters(Operation)."""
+    total = 0
+    for model, log_columns in _OPERATION_DETAIL_LOG_COLUMNS:
+        values = {column: None for column in log_columns}
+        any_set = or_(*[getattr(model, column).isnot(None) for column in log_columns])
+        while True:
+            ids = [
+                row[0]
+                for row in db.query(model.operation_id)
+                .join(Operation, Operation.id == model.operation_id)
+                .filter(*make_filters(Operation), any_set)
+                .limit(CHUNK_SIZE)
+            ]
+            if not ids:
+                break
+            db.query(model).filter(model.operation_id.in_(ids)).update(
+                values, synchronize_session=False
+            )
+            db.commit()
+            total += len(ids)
+    return total
 
 
 def clear_inline_job_logs(db: Session, make_filters) -> int:
@@ -182,8 +337,174 @@ def clear_inline_job_logs(db: Session, make_filters) -> int:
     return total
 
 
+def purge_operation_log_files(db: Session, filters) -> int:
+    """Unlink the log files of matching operations and forget their paths.
+
+    Operations write their logs to files, not to an inline column, so the
+    inline-column sweep above cannot reach them. Without this the files
+    outlive both retention windows and the rows that named them.
+
+    The order (clear the path, commit, unlink) is load-bearing, here and in
+    `_delete_chunked`: `_complete_finished_operation_log` rewrites a file
+    without a lock and removes it again when no operation names the path
+    any more. `test_log_purge_commits_the_cleared_path_before_unlinking`
+    and `test_row_purge_commits_the_deleted_row_before_unlinking` pin it.
+    """
+    total = 0
+    while True:
+        rows = (
+            db.query(Operation.id, Operation.log_file_path)
+            .filter(*filters, Operation.log_file_path.isnot(None))
+            .limit(CHUNK_SIZE)
+            .all()
+        )
+        if not rows:
+            return total
+        ids = [row[0] for row in rows]
+        db.query(Operation).filter(Operation.id.in_(ids)).update(
+            {"log_file_path": None}, synchronize_session=False
+        )
+        db.commit()
+        # Unlinked only once the column is cleared, so a failed commit never
+        # leaves a surviving row pointing at a vanished file.
+        # A path is not unique: the phase 9 copy preserved whatever file each
+        # legacy row named, so two operations can point at one file. Unlink
+        # only what no surviving operation still names.
+        paths = {path for _id, path in rows}
+        still_named = {
+            row[0]
+            for row in db.query(Operation.log_file_path)
+            .filter(Operation.log_file_path.in_(paths))
+            .all()
+        }
+        for path in paths - still_named:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        total += len(rows)
+
+
+def sweep_orphaned_log_files(db: Session, cutoff) -> int:
+    """Unlink job-log files that no row references anymore.
+
+    Rows purged before file cleanup existed - and any crash between a
+    chunk's commit and its unlink - leave files behind that no DB-driven
+    pass can ever find again. Swept here by age (file mtime against the
+    row-retention cutoff), restricted to *.log inside the log directory,
+    and never touching a file some live row still names.
+    """
+    log_dir = Path(app_config.data_dir) / "logs"
+    if not log_dir.is_dir():
+        return 0
+
+    referenced: set = set()
+    for model, _ in _JOB_TABLES:
+        column = getattr(model, "log_file_path", None)
+        if column is None:
+            continue
+        for (path,) in db.query(column).filter(column.isnot(None)):
+            referenced.add(path)
+
+    cutoff_ts = (
+        cutoff if cutoff.tzinfo else cutoff.replace(tzinfo=timezone.utc)
+    ).timestamp()
+    total = 0
+    for file in log_dir.glob("*.log"):
+        try:
+            if str(file) in referenced:
+                continue
+            if file.stat().st_mtime >= cutoff_ts:
+                continue
+            file.unlink(missing_ok=True)
+            total += 1
+        except OSError:
+            continue
+    return total
+
+
+# A machine-parsed agent result (a listing, a repository or archive info)
+# is reduced by the wait that reads it (repository_executor's
+# drop_consumed_agent_job_output). One whose reader gave up before the agent
+# finished is nobody's and stays full; this pass reduces those. The grace is
+# measured on the server clock (updated_at is set at completion) and covers
+# a reader's hand-over, which happens within one poll of the completion.
+CONSUMED_RESULT_GRACE = timedelta(hours=1)
+
+
+def reduce_consumed_agent_job_results(db: Session, cutoff) -> int:
+    """Reduce the stored results of machine-parsed agent jobs that completed
+    before cutoff and still carry their raw output. Returns the row count.
+
+    Best effort like the hand-over's reduction: a failed chunk is rolled back
+    and logged, the committed count is returned, and the rest of the
+    retention pass runs; the next pass takes the chunk up again."""
+    from app.services.repository_executor import (
+        MACHINE_PARSED_JOB_KINDS,
+        SUCCESSFUL_AGENT_STATUSES,
+        consumed_result,
+    )
+
+    # The subscripts compile to json_extract on SQLite and ->> on Postgres.
+    # `as_string` matters: the bare subscript wraps SQLite's in JSON_QUOTE,
+    # which turns a missing key into the text 'null' and matches every row.
+    # A reduced result has neither key and drops out of the filter; the id
+    # cursor keeps the loop finite either way.
+    filters = (
+        AgentJob.job_type == "repository",
+        AgentJob.status.in_(SUCCESSFUL_AGENT_STATUSES),
+        func.coalesce(AgentJob.updated_at, AgentJob.completed_at, AgentJob.created_at)
+        < cutoff,
+        AgentJob.payload["job_kind"].as_string().in_(sorted(MACHINE_PARSED_JOB_KINDS)),
+        or_(
+            AgentJob.result["stdout"].as_string().isnot(None),
+            AgentJob.result["data"].as_string().isnot(None),
+        ),
+    )
+    total = 0
+    last_id = 0
+    while True:
+        try:
+            ids = [
+                row[0]
+                for row in db.query(AgentJob.id)
+                .filter(*filters, AgentJob.id > last_id)
+                .order_by(AgentJob.id)
+                .limit(CHUNK_SIZE)
+            ]
+            if not ids:
+                return total
+            for job_id in ids:
+                # One result in memory at a time: a listing of a large
+                # repository is megabytes, and the first pass after the
+                # upgrade walks every retained one.
+                result = (
+                    db.query(AgentJob.result).filter(AgentJob.id == job_id).scalar()
+                )
+                db.query(AgentJob).filter(AgentJob.id == job_id).update(
+                    {AgentJob.result: consumed_result(result)},
+                    synchronize_session=False,
+                )
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            # the exception text can carry the bound parameters, stderr included
+            logger.warning(
+                "agent job results could not be reduced",
+                reduced=total,
+                error_type=type(exc).__name__,
+            )
+            return total
+        total += len(ids)
+        last_id = ids[-1]
+
+
 def purge_job_rows(db: Session, cutoff) -> int:
-    """Delete finished job rows older than cutoff (all job tables)."""
+    """Delete finished job rows older than cutoff (all job tables).
+
+    _delete_chunked takes each row's log file with it, uniformly for every
+    model that names one - no per-model special case.
+    """
     total = 0
     for model, _ in _JOB_TABLES:
         total += _delete_chunked(db, model, _older_than(model, cutoff))
@@ -191,8 +512,8 @@ def purge_job_rows(db: Session, cutoff) -> int:
     # jobs of their era are gone the husks serve nothing. Same window.
     total += _delete_chunked(
         db,
-        BackupJobRetryLineage,
-        (BackupJobRetryLineage.requested_at < cutoff,),
+        OperationBackupRetryLineage,
+        (OperationBackupRetryLineage.requested_at < cutoff,),
     )
     return total
 
@@ -217,129 +538,196 @@ def archive_names_from_prune_output(output: str) -> set:
     return {match.group("name") for match in _PRUNED_ARCHIVE_LINE.finditer(output)}
 
 
-def purge_jobs_for_pruned_archives(
-    db: Session, repository_id: Optional[int], archive_names: Iterable[str]
+def mark_jobs_of_pruned_archives(
+    db: Session,
+    repository_id: Optional[int],
+    archive_names: Iterable[str],
+    *,
+    created_before: Optional[datetime] = None,
+    pruned_at: Optional[datetime] = None,
 ) -> int:
-    """Delete the job records of archives that no longer exist.
+    """Record on the backup jobs of `archive_names` that their archive is gone.
 
-    A backup job whose archive was pruned is not history anymore but a
-    reference into the void, so the whole record goes: its log file on disk,
-    the linked agent job (whose log rows die via the DB cascade, as do the
-    job's script executions), and the backup_jobs row itself.
+    The job row stays: it is the record that the backup ran, which the
+    dashboard timeline, the plan history and the activity feed are built
+    from. Only `archive_pruned_at` is set (once; a second call for the same
+    archive is a no-op), and the row still falls with cleanup_retention_days.
+    Log content is untouched here; log_retention_days and the save policy
+    handle it like for any other job.
+
+    `created_before` is when the prune or delete
+    started, on the server clock, compared with the job's server-set
+    `created_at`: Borg 1 lets a name be reused once its archive is gone, so
+    a job created once the prune was under way made a different archive and
+    is left alone. (`completed_at` would not do for the comparison: an agent
+    reports it from its own clock.) `pruned_at` is the time recorded on the
+    row, normally when the prune or delete finished; it defaults to now.
 
     Borg 2 repositories are skipped: an archive *series* shares one name
     across all its archives, so a name match would hit jobs whose archives
     still exist. Lifting that needs the archive id captured per job first.
     """
-    names = {name for name in archive_names if name}
+    names = sorted({name for name in archive_names if name})
     if not names or repository_id is None:
         return 0
     repository = db.get(Repository, repository_id)
     if repository is None or int(getattr(repository, "borg_version", 1) or 1) == 2:
         return 0
 
-    jobs = (
-        db.query(BackupJob)
-        .filter(
-            BackupJob.repository_id == repository_id,
-            BackupJob.archive_name.in_(names),
-        )
-        .all()
-    )
-    if not jobs:
-        return 0
+    pruned_at = pruned_at or utc_now()
 
-    # Captured before the delete: afterwards the ORM objects are gone. The
-    # files are only unlinked once the DB delete has committed, so a failed
-    # commit never leaves surviving rows pointing at vanished log files.
-    log_files = [job.log_file_path for job in jobs if job.log_file_path]
-    ids = [job.id for job in jobs]
-    db.query(AgentJob).filter(AgentJob.backup_job_id.in_(ids)).delete(
-        synchronize_session=False
-    )
-    removed = (
-        db.query(BackupJob)
-        .filter(BackupJob.id.in_(ids))
-        .delete(synchronize_session=False)
-    )
-    db.commit()
-    for path in log_files:
-        try:
-            Path(path).unlink(missing_ok=True)
-        except OSError:
-            pass
-    # The bulk delete bypasses the identity map: detach only the rows we
-    # removed. Callers run this mid-flow in long-lived sessions and still
-    # update their own objects afterwards - those must stay attached.
-    for job in jobs:
-        db.expunge(job)
-    logger.info(
-        "Removed job records for pruned archives",
-        repository_id=repository_id,
-        archives=sorted(names),
-        backup_jobs_removed=removed,
-    )
-    return removed
+    marked = 0
+    # one transaction per chunk, like the module's deletes
+    for start in range(0, len(names), CHUNK_SIZE):
+        chunk = names[start : start + CHUNK_SIZE]
+        # An operation always carries repository_id, so no path fallback is
+        # needed to find the backups of this repository.
+        operation_ids = [
+            row.operation_id
+            for row in db.query(OperationBackupDetails.operation_id)
+            .join(Operation, Operation.id == OperationBackupDetails.operation_id)
+            .filter(
+                Operation.repository_id == repository_id,
+                Operation.kind == "backup",
+                OperationBackupDetails.archive_pruned_at.is_(None),
+                OperationBackupDetails.archive_name.in_(chunk),
+                *(
+                    [Operation.created_at <= created_before]
+                    if created_before is not None
+                    else []
+                ),
+            )
+            .all()
+        ]
+        if operation_ids:
+            marked += (
+                db.query(OperationBackupDetails)
+                .filter(OperationBackupDetails.operation_id.in_(operation_ids))
+                .update(
+                    {OperationBackupDetails.archive_pruned_at: pruned_at},
+                    synchronize_session=False,
+                )
+            )
+        db.commit()
+    if marked:
+        logger.info(
+            "Marked job records of pruned archives",
+            repository_id=repository_id,
+            archives=names,
+            backup_jobs_marked=marked,
+        )
+    return marked
+
+
+def _in_id_batches(query, id_column):
+    """The query's rows, read CHUNK_SIZE at a time in id order."""
+    last_id = 0
+    while True:
+        batch = (
+            query.filter(id_column > last_id)
+            .order_by(id_column)
+            .limit(CHUNK_SIZE)
+            .all()
+        )
+        if not batch:
+            return
+        yield from batch
+        last_id = batch[-1].id
+
+
+# A finished agent job's late log lines reach its log file as they arrive
+# (app/api/agents.py), and each one moves the job's updated_at. The log
+# repair below leaves a job touched less than this long ago to that path, so
+# the two do not write the same line.
+LATE_LOG_SETTLE = timedelta(seconds=60)
 
 
 def sweep_pruned_archive_records(
-    db: Session, lookback: timedelta = timedelta(days=2)
+    db: Session,
+    lookback: timedelta = timedelta(days=2),
+    repair_lookback: Optional[timedelta] = None,
 ) -> int:
-    """Re-parse recent agent prune logs and cascade any pruned archives.
+    """Repair agent maintenance logs and mark any pruned archives' jobs.
 
     The completion hook in the agents API often runs before the agent's log
     lines have all been ingested (log streaming races the command result), so
-    it can miss the 'Pruning archive:' lines entirely. By the time the daily
-    retention pass runs they are all there: parse again, cascade
-    idempotently, and while at it repair the linked prune job's stored log -
-    the same race leaves it truncated to whatever had arrived at completion.
+    it can miss the 'Pruning archive:' lines entirely, and the write of a
+    late line into the log file is best effort. By the time the daily
+    retention pass runs the lines are all there: bring the linked
+    operation's log file in line with them, whatever the kind and outcome,
+    then for a completed prune parse again and mark idempotently.
+
+    `lookback` bounds the marking and `repair_lookback` (default: the same)
+    the repair; the daily pass repairs for as long as the lines are kept.
     """
-    since = utc_now() - lookback
-    candidates = (
-        db.query(AgentJob)
-        .filter(
-            AgentJob.job_type == "repository",
-            AgentJob.status == "completed",
-            AgentJob.completed_at >= since,
-        )
-        .all()
+    from app.api.agents import FINAL_AGENT_JOB_STATUSES
+
+    now = utc_now()
+    mark_since = now - lookback
+    repair_since = now - (lookback if repair_lookback is None else repair_lookback)
+    # Only the columns the loop reads, only jobs whose payload names an
+    # operation (most repository jobs in the window are reads that link to
+    # none), and in batches: the repair window spans the log retention.
+    marker = AgentJob.payload[("operation", "maintenance_job", "table")].as_string()
+    candidates = db.query(
+        AgentJob.id,
+        AgentJob.payload,
+        AgentJob.status,
+        AgentJob.claimed_at,
+        AgentJob.completed_at,
+        (AgentJob.updated_at <= now - LATE_LOG_SETTLE).label("settled"),
+        (AgentJob.completed_at >= mark_since).label("in_mark_window"),
+        (AgentJob.completed_at >= repair_since).label("in_repair_window"),
+    ).filter(
+        AgentJob.job_type == "repository",
+        AgentJob.status.in_(FINAL_AGENT_JOB_STATUSES),
+        AgentJob.completed_at >= min(mark_since, repair_since),
+        marker == Operation.__tablename__,
     )
-    removed = 0
-    for agent_job in candidates:
+    marked = 0
+    for agent_job in _in_id_batches(candidates, AgentJob.id):
         payload = agent_job.payload if isinstance(agent_job.payload, dict) else {}
-        if str(payload.get("job_kind") or "") != "repository.prune":
+        operation_job = _agent_maintenance_job_for(db, payload)
+        if operation_job is None:
             continue
-        operation = payload.get("operation") or {}
-        maintenance = (
-            operation.get("maintenance_job") if isinstance(operation, dict) else None
+        is_completed_prune = (
+            operation_job.kind == "prune"
+            and agent_job.status == "completed"
+            and agent_job.in_mark_window
         )
-        prune_job = None
-        if isinstance(maintenance, dict) and maintenance.get("id"):
-            prune_job = db.get(PruneJob, int(maintenance["id"]))
-        if prune_job is None:
+        repairable = (
+            agent_job.settled
+            and agent_job.in_repair_window
+            and bool(operation_job.log_file_path)
+        )
+        if not is_completed_prune and not repairable:
             continue
 
         lines = (
             db.query(AgentJobLog.message)
             .filter(AgentJobLog.agent_job_id == agent_job.id)
-            .order_by(AgentJobLog.sequence.asc())
+            .order_by(AgentJobLog.sequence.asc(), AgentJobLog.id.asc())
             .all()
         )
         full_log = "\n".join(row[0] for row in lines)
         if not full_log:
             continue
 
-        if len(full_log) > len(prune_job.logs or ""):
-            prune_job.logs = full_log
-            prune_job.has_logs = True
-            db.commit()
+        if repairable:
+            _repair_operation_log(db, operation_job, full_log)
+        if not is_completed_prune:
+            continue
 
-        removed += purge_jobs_for_pruned_archives(
+        marked += mark_jobs_of_pruned_archives(
             db,
-            prune_job.repository_id,
+            operation_job.repository_id,
             archive_names_from_prune_output(full_log),
+            # claimed_at is the server's clock; the prune cannot have started
+            # before the agent claimed the job
+            created_before=agent_job.claimed_at or operation_job.started_at,
+            pruned_at=operation_job.completed_at or agent_job.completed_at,
         )
-    return removed
+    return marked
 
 
 def _policy_discarded_statuses(policy: str) -> tuple:
@@ -376,11 +764,25 @@ def run_retention(db: Session, settings: Optional[SystemSettings] = None) -> Dic
 
     now = utc_now()
     log_cutoff = now - timedelta(days=log_days)
+    # First: the sweep reads the agent maintenance logs, and the save policy
+    # below drops the logs of completed jobs regardless of age (the default
+    # policy keeps failures and warnings only). Read before deleting.
     results = {
+        "pruned_archive_records_marked": sweep_pruned_archive_records(
+            db, repair_lookback=timedelta(days=log_days)
+        )
+    }
+    results |= {
         "agent_log_rows_deleted": purge_agent_job_logs(
             db, _older_than(AgentJob, log_cutoff)
         ),
         "inline_logs_cleared": clear_inline_job_logs(
+            db, lambda model: _older_than(model, log_cutoff)
+        ),
+        "operation_log_files_deleted": purge_operation_log_files(
+            db, _older_than(Operation, log_cutoff)
+        ),
+        "operation_detail_logs_cleared": clear_operation_detail_logs(
             db, lambda model: _older_than(model, log_cutoff)
         ),
         # The log save policy applies to the database exactly as it does to
@@ -396,8 +798,25 @@ def run_retention(db: Session, settings: Optional[SystemSettings] = None) -> Dic
             if discarded
             else 0
         ),
+        "policy_operation_log_files_deleted": (
+            purge_operation_log_files(db, (Operation.status.in_(discarded),))
+            if discarded
+            else 0
+        ),
+        "policy_operation_detail_logs_cleared": (
+            clear_operation_detail_logs(
+                db, lambda model: (model.status.in_(discarded),)
+            )
+            if discarded
+            else 0
+        ),
+        "agent_results_reduced": reduce_consumed_agent_job_results(
+            db, now - CONSUMED_RESULT_GRACE
+        ),
         "job_rows_deleted": purge_job_rows(db, now - timedelta(days=row_days)),
-        "pruned_archive_records_removed": sweep_pruned_archive_records(db),
+        "orphaned_log_files_deleted": sweep_orphaned_log_files(
+            db, now - timedelta(days=row_days)
+        ),
     }
     if any(results.values()):
         logger.info(

@@ -918,6 +918,57 @@ def test_delete_agent_hides_it_from_list_and_keeps_job_logs(
     assert logs.json()[0]["message"] == "still readable"
 
 
+def test_delete_agent_cancels_its_pending_jobs(
+    test_client: TestClient, admin_headers, test_db
+):
+    agent = _agent(test_db)
+    pending = {}
+    for status_value in ("queued", "claimed", "cancel_requested", "running"):
+        job = _agent_job(test_db, agent)
+        job.status = status_value
+        pending[status_value] = job
+    done = _agent_job(test_db, agent)
+    done.status = "completed"
+    other_agent = _agent(
+        test_db, name="Other", agent_id="agt_other", token_prefix="borgui_agent_other"
+    )
+    other_job = _agent_job(test_db, other_agent)
+    test_db.commit()
+
+    response = test_client.delete(
+        f"/api/managed-machines/agents/{agent.id}",
+        headers=admin_headers,
+    )
+
+    assert response.status_code == 204
+    for job in (*pending.values(), done, other_job):
+        test_db.refresh(job)
+    for status_value, job in pending.items():
+        assert job.status == "canceled", status_value
+        assert job.error_message == "Agent deleted", status_value
+        assert job.completed_at is not None, status_value
+    assert done.status == "completed"
+    assert other_job.status == "queued"
+
+
+def test_delete_agent_retry_cancels_jobs_left_behind(
+    test_client: TestClient, admin_headers, test_db
+):
+    # An agent deleted before this cleanup existed still has a queued job.
+    agent = _agent(test_db, status="deleted", deleted_at=datetime.now(timezone.utc))
+    leftover = _agent_job(test_db, agent)
+
+    response = test_client.delete(
+        f"/api/managed-machines/agents/{agent.id}",
+        headers=admin_headers,
+    )
+
+    assert response.status_code == 204
+    test_db.refresh(leftover)
+    assert leftover.status == "canceled"
+    assert leftover.error_message == "Agent deleted"
+
+
 def test_agent_job_logs_apply_log_save_policy(
     test_client: TestClient, admin_headers, test_db
 ):
@@ -974,3 +1025,177 @@ def test_agent_job_logs_keep_running_logs_visible(
 
     assert response.status_code == 200
     assert response.json()[0]["message"] == "live agent log"
+
+
+def test_list_agents_reports_upgrade_status(
+    test_client, admin_headers, test_db, monkeypatch
+):
+    monkeypatch.setattr(
+        "app.api.managed_machines.agent_package_version", lambda: "0.1.3"
+    )
+    _agent(
+        test_db,
+        name="behind",
+        agent_id="agt_behind",
+        agent_version="0.1.2",
+        capabilities=["filesystem.browse"],
+    )
+    _agent(
+        test_db,
+        name="current",
+        agent_id="agt_current",
+        agent_version="0.1.3",
+        capabilities=["filesystem.browse", "self_upgrade"],
+    )
+
+    _agent(
+        test_db,
+        name="silent",
+        agent_id="agt_silent",
+        capabilities=None,
+    )
+
+    response = test_client.get("/api/managed-machines/agents", headers=admin_headers)
+    assert response.status_code == 200
+    by_name = {row["name"]: row for row in response.json()}
+
+    assert by_name["behind"]["upgrade_status"] == "outdated"
+    assert by_name["behind"]["available_agent_version"] == "0.1.3"
+    assert by_name["behind"]["self_upgrade_supported"] is False
+
+    assert by_name["current"]["upgrade_status"] == "up_to_date"
+    assert by_name["current"]["self_upgrade_supported"] is True
+
+    # Never checked in: it has not said it cannot upgrade itself, so it must
+    # not be reported as manual only.
+    assert by_name["silent"]["self_upgrade_supported"] is None
+
+
+def test_list_agents_respects_pin(test_client, admin_headers, test_db, monkeypatch):
+    monkeypatch.setattr(
+        "app.api.managed_machines.agent_package_version", lambda: "0.1.3"
+    )
+    _agent(
+        test_db,
+        name="pinned",
+        agent_id="agt_pinned",
+        agent_version="0.1.2",
+        desired_agent_version="0.1.2",
+    )
+
+    response = test_client.get("/api/managed-machines/agents", headers=admin_headers)
+    assert response.status_code == 200
+    row = next(r for r in response.json() if r["name"] == "pinned")
+    assert row["upgrade_status"] == "pinned"
+    assert row["desired_agent_version"] == "0.1.2"
+
+
+def test_list_agents_report_unknown_when_server_serves_no_wheel(
+    test_client, admin_headers, test_db, monkeypatch
+):
+    """A server built without a bundled agent wheel has nothing to compare
+    against, and must say so rather than calling every endpoint current."""
+    monkeypatch.setattr("app.api.managed_machines.agent_package_version", lambda: None)
+    _agent(test_db, name="no-target", agent_id="agt_no_target", agent_version="0.1.2")
+
+    response = test_client.get("/api/managed-machines/agents", headers=admin_headers)
+    assert response.status_code == 200
+    row = next(r for r in response.json() if r["name"] == "no-target")
+    assert row["upgrade_status"] == "unknown"
+    assert row["available_agent_version"] is None
+
+
+def test_set_desired_version_pins_agent(
+    test_client, admin_headers, test_db, monkeypatch
+):
+    monkeypatch.setattr(
+        "app.api.managed_machines.agent_package_version", lambda: "0.1.3"
+    )
+    agent = _agent(test_db, name="pin-me", agent_id="agt_pin_me", agent_version="0.1.3")
+
+    response = test_client.put(
+        f"/api/managed-machines/agents/{agent.id}/desired-version",
+        json={"desired_agent_version": "0.1.3", "desired_borg_version": "2"},
+        headers=admin_headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["desired_agent_version"] == "0.1.3"
+    assert body["desired_borg_version"] == "2"
+    assert body["upgrade_status"] == "pinned"
+
+
+def test_clearing_desired_version_returns_to_tracking_server(
+    test_client, admin_headers, test_db, monkeypatch
+):
+    monkeypatch.setattr(
+        "app.api.managed_machines.agent_package_version", lambda: "0.1.3"
+    )
+    agent = _agent(
+        test_db,
+        name="unpin-me",
+        agent_id="agt_unpin_me",
+        agent_version="0.1.3",
+        desired_agent_version="0.1.2",
+    )
+
+    response = test_client.put(
+        f"/api/managed-machines/agents/{agent.id}/desired-version",
+        json={"desired_agent_version": None, "desired_borg_version": None},
+        headers=admin_headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["desired_agent_version"] is None
+    assert response.json()["upgrade_status"] == "up_to_date"
+
+
+def test_cannot_pin_a_version_the_server_cannot_serve(
+    test_client, admin_headers, test_db, monkeypatch
+):
+    """The installer installs from this server's wheelhouse and nowhere else,
+    so a pin to any other version could never be satisfied."""
+    monkeypatch.setattr(
+        "app.api.managed_machines.agent_package_version", lambda: "0.1.3"
+    )
+    agent = _agent(
+        test_db, name="bad-pin", agent_id="agt_bad_pin", agent_version="0.1.3"
+    )
+
+    response = test_client.put(
+        f"/api/managed-machines/agents/{agent.id}/desired-version",
+        json={"desired_agent_version": "9.9.9", "desired_borg_version": None},
+        headers=admin_headers,
+    )
+    assert response.status_code == 422
+    assert (
+        response.json()["detail"]["key"]
+        == "backend.errors.agents.desiredVersionUnavailable"
+    )
+
+
+def test_desired_borg_version_must_be_1_or_2(
+    test_client, admin_headers, test_db, monkeypatch
+):
+    monkeypatch.setattr(
+        "app.api.managed_machines.agent_package_version", lambda: "0.1.3"
+    )
+    agent = _agent(
+        test_db, name="bad-borg", agent_id="agt_bad_borg", agent_version="0.1.3"
+    )
+
+    response = test_client.put(
+        f"/api/managed-machines/agents/{agent.id}/desired-version",
+        json={"desired_agent_version": None, "desired_borg_version": "3"},
+        headers=admin_headers,
+    )
+    assert response.status_code == 422
+
+
+def test_set_desired_version_requires_a_known_agent(test_client, admin_headers):
+    response = test_client.put(
+        "/api/managed-machines/agents/999999/desired-version",
+        json={"desired_agent_version": None, "desired_borg_version": None},
+        headers=admin_headers,
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"]["key"] == "backend.errors.agents.agentNotFound"

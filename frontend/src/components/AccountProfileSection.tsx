@@ -5,6 +5,7 @@ import {
   Stack,
   TextField,
   Typography,
+  alpha,
   useTheme,
 } from '@mui/material'
 import { User, Building2, Pencil, ShieldCheck, KeyRound, Calendar, Fingerprint } from 'lucide-react'
@@ -80,26 +81,25 @@ export default function AccountProfileSection({
   const iconBoxBorder = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)'
 
   // Badge color schemes
+  // Badge text takes the theme's palette shades, which clear 4.5:1 on their
+  // own tint in both modes. The 400-level hues these used were dark-only.
+  const tintBadge = (color: string) => ({
+    bg: alpha(color, 0.12),
+    border: alpha(color, 0.28),
+    text: color,
+  })
   const roleBadge = isAdmin
-    ? {
-        bg: 'rgba(168,85,247,0.12)',
-        border: 'rgba(168,85,247,0.28)',
-        text: 'rgb(192,132,252)',
-        icon: ShieldCheck,
-      }
+    ? { ...tintBadge(theme.palette.secondary.main), icon: ShieldCheck }
     : isOperator
-      ? {
-          bg: 'rgba(14,165,233,0.12)',
-          border: 'rgba(14,165,233,0.28)',
-          text: 'rgb(56,189,248)',
-          icon: KeyRound,
-        }
+      ? { ...tintBadge(theme.palette.info.main), icon: KeyRound }
       : {
           bg: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.05)',
           border: isDark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.12)',
-          text: isDark ? 'rgb(161,161,170)' : 'rgb(113,113,122)',
+          text: theme.palette.text.secondary,
           icon: User,
         }
+  const totpBadge = tintBadge(theme.palette.success.main)
+  const passkeyBadge = tintBadge(theme.palette.warning.main)
 
   const RoleIcon = roleBadge.icon
 
@@ -120,11 +120,19 @@ export default function AccountProfileSection({
         <Stack spacing={2.5}>
           <Stack
             direction={{ xs: 'column', sm: 'row' }}
-            justifyContent="space-between"
-            alignItems={{ xs: 'flex-start', sm: 'center' }}
-            gap={1.5}
+            sx={{
+              justifyContent: 'space-between',
+              alignItems: { xs: 'flex-start', sm: 'center' },
+              gap: 1.5,
+            }}
           >
-            <Stack direction="row" spacing={1.25} alignItems="center">
+            <Stack
+              direction="row"
+              spacing={1.25}
+              sx={{
+                alignItems: 'center',
+              }}
+            >
               <Box
                 sx={{
                   width: 34,
@@ -147,20 +155,33 @@ export default function AccountProfileSection({
                     fontWeight: 700,
                     textTransform: 'uppercase',
                     letterSpacing: '0.08em',
-                    color: 'info.light',
+                    color: 'info.main',
                     mb: 0.35,
                   }}
                 >
                   {t('settings.account.profile.title')}
                 </Typography>
-                <Typography variant="h6" fontWeight={700} sx={{ lineHeight: 1.1 }}>
+                <Typography
+                  variant="h6"
+                  sx={{
+                    fontWeight: 700,
+                    lineHeight: 1.1,
+                  }}
+                >
                   {profileForm.full_name || profileForm.username}
                 </Typography>
               </Box>
             </Stack>
 
             {/* ── Role & status badges ── */}
-            <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+            <Stack
+              direction="row"
+              spacing={0.75}
+              useFlexGap
+              sx={{
+                flexWrap: 'wrap',
+              }}
+            >
               {/* Role badge */}
               <Box
                 sx={{
@@ -199,16 +220,16 @@ export default function AccountProfileSection({
                     px: 1.25,
                     py: 0.5,
                     borderRadius: 10,
-                    bgcolor: 'rgba(34,197,94,0.10)',
-                    border: '1px solid rgba(34,197,94,0.24)',
+                    bgcolor: totpBadge.bg,
+                    border: `1px solid ${totpBadge.border}`,
                   }}
                 >
-                  <ShieldCheck size={12} style={{ color: 'rgb(74,222,128)' }} />
+                  <ShieldCheck size={12} style={{ color: totpBadge.text }} />
                   <Typography
                     variant="caption"
                     sx={{
                       fontWeight: 700,
-                      color: 'rgb(74,222,128)',
+                      color: totpBadge.text,
                       lineHeight: 1,
                       letterSpacing: '0.02em',
                     }}
@@ -228,16 +249,16 @@ export default function AccountProfileSection({
                     px: 1.25,
                     py: 0.5,
                     borderRadius: 10,
-                    bgcolor: 'rgba(251,191,36,0.10)',
-                    border: '1px solid rgba(251,191,36,0.24)',
+                    bgcolor: passkeyBadge.bg,
+                    border: `1px solid ${passkeyBadge.border}`,
                   }}
                 >
-                  <Fingerprint size={12} style={{ color: 'rgb(252,211,77)' }} />
+                  <Fingerprint size={12} style={{ color: passkeyBadge.text }} />
                   <Typography
                     variant="caption"
                     sx={{
                       fontWeight: 700,
-                      color: 'rgb(252,211,77)',
+                      color: passkeyBadge.text,
                       lineHeight: 1,
                       letterSpacing: '0.02em',
                     }}
@@ -262,7 +283,7 @@ export default function AccountProfileSection({
                     borderColor: subtleBorder,
                   }}
                 >
-                  <Calendar size={12} style={{ color: 'rgb(161,161,170)', opacity: 0.8 }} />
+                  <Calendar size={12} style={{ color: theme.palette.text.secondary }} />
                   <Typography
                     variant="caption"
                     sx={{
@@ -283,8 +304,11 @@ export default function AccountProfileSection({
 
           <Typography
             variant="body2"
-            color="text.secondary"
-            sx={{ maxWidth: 720, fontSize: { md: '0.95rem' } }}
+            sx={{
+              color: 'text.secondary',
+              maxWidth: 720,
+              fontSize: { md: '0.95rem' },
+            }}
           >
             {t('settings.account.profile.description')}
           </Typography>
@@ -334,7 +358,13 @@ export default function AccountProfileSection({
                 >
                   {item.label}
                 </Typography>
-                <Typography variant="subtitle2" fontWeight={700} noWrap>
+                <Typography
+                  variant="subtitle2"
+                  noWrap
+                  sx={{
+                    fontWeight: 700,
+                  }}
+                >
                   {item.value}
                 </Typography>
               </Box>
@@ -384,7 +414,14 @@ export default function AccountProfileSection({
               },
             }}
           >
-            <Stack direction="row" spacing={2} alignItems="center" sx={{ minWidth: 0 }}>
+            <Stack
+              direction="row"
+              spacing={2}
+              sx={{
+                alignItems: 'center',
+                minWidth: 0,
+              }}
+            >
               <Box
                 sx={{
                   width: 38,
@@ -402,10 +439,22 @@ export default function AccountProfileSection({
                 <Pencil size={16} style={{ opacity: 0.45 }} />
               </Box>
               <Box sx={{ minWidth: 0 }}>
-                <Typography variant="body2" fontWeight={600} noWrap>
+                <Typography
+                  variant="body2"
+                  noWrap
+                  sx={{
+                    fontWeight: 600,
+                  }}
+                >
                   {t('settings.account.editProfile')}
                 </Typography>
-                <Typography variant="caption" color="text.secondary" noWrap>
+                <Typography
+                  variant="caption"
+                  noWrap
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {profileForm.username} · {profileForm.email}
                 </Typography>
               </Box>
@@ -432,10 +481,22 @@ export default function AccountProfileSection({
       {/* ── Deployment profile (admin only) ── */}
       {canManageSystem && (
         <Box>
-          <Typography variant="subtitle2" fontWeight={700} gutterBottom>
+          <Typography
+            variant="subtitle2"
+            gutterBottom
+            sx={{
+              fontWeight: 700,
+            }}
+          >
             {t('settings.account.profile.deployment.title')}
           </Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+              mb: 2,
+            }}
+          >
             {t('settings.account.profile.deployment.description')}
           </Typography>
 
@@ -492,7 +553,14 @@ export default function AccountProfileSection({
                         },
                       }}
                     >
-                      <Stack direction="row" spacing={1.5} alignItems="center" sx={{ mb: 1 }}>
+                      <Stack
+                        direction="row"
+                        spacing={1.5}
+                        sx={{
+                          alignItems: 'center',
+                          mb: 1,
+                        }}
+                      >
                         <Box
                           sx={{
                             width: 30,
@@ -508,11 +576,22 @@ export default function AccountProfileSection({
                         >
                           {option.icon}
                         </Box>
-                        <Typography variant="subtitle2" fontWeight={700}>
+                        <Typography
+                          variant="subtitle2"
+                          sx={{
+                            fontWeight: 700,
+                          }}
+                        >
                           {option.title}
                         </Typography>
                       </Stack>
-                      <Typography variant="body2" color="text.secondary" sx={{ pl: '42px' }}>
+                      <Typography
+                        variant="body2"
+                        sx={{
+                          color: 'text.secondary',
+                          pl: '42px',
+                        }}
+                      >
                         {option.body}
                       </Typography>
                     </Box>

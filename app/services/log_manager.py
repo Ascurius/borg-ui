@@ -13,14 +13,7 @@ import structlog
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database.models import (
-    BackupJob,
-    RestoreJob,
-    CheckJob,
-    CompactJob,
-    PruneJob,
-    PackageInstallJob,
-)
+from app.database.models import Operation
 
 logger = structlog.get_logger()
 
@@ -125,7 +118,7 @@ class LogManager:
 
     def get_running_job_log_paths(self, db: Session) -> Set[str]:
         """
-        Query all job tables for running jobs and return their log file paths.
+        Return the log file paths of every running operation.
 
         This protects running job logs from deletion during cleanup.
 
@@ -135,21 +128,10 @@ class LogManager:
         try:
             protected_paths = set()
 
-            # Query all job types for running status
-            job_models = [
-                BackupJob,
-                RestoreJob,
-                CheckJob,
-                CompactJob,
-                PruneJob,
-                PackageInstallJob,
-            ]
-
-            for model in job_models:
-                running_jobs = db.query(model).filter(model.status == "running").all()
-                for job in running_jobs:
-                    if hasattr(job, "log_file_path") and job.log_file_path:
-                        protected_paths.add(str(job.log_file_path))
+            # Every kind writes its log here (spec 6.1).
+            for op in db.query(Operation).filter(Operation.status == "running").all():
+                if op.log_file_path:
+                    protected_paths.add(str(op.log_file_path))
 
             logger.info(
                 "Found running job logs to protect",

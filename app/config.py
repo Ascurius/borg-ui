@@ -1,8 +1,15 @@
 import os
 import secrets
-from typing import Any, List, Union, Optional
+from typing import Any, List, Union, Optional, Mapping
 from pathlib import Path
+from urllib.parse import quote_plus
 from pydantic_settings import BaseSettings
+from app.utils.redaction import install_log_redaction
+
+# Every entry point (the app, db-upgrade, the admin scripts) imports this
+# module before anything can log, including import-time work such as the
+# archive cache connecting to Redis. Installing here covers all of them.
+install_log_redaction()
 
 
 def _packaged_version() -> str:
@@ -19,11 +26,69 @@ def _packaged_version() -> str:
         return ""
 
 
+def resolve_database_url(env: Mapping[str, str], data_dir: str) -> str:
+    """Work out which database to use, from most explicit to least.
+
+    DATABASE_URL wins, so nothing existing changes. Otherwise DB_HOST switches
+    to Postgres and the DSN is assembled here rather than handed over ready-made:
+    a generated password may contain "/", "@", ":" or "%", any of which silently
+    breaks a URL, and the resulting error points at the host or the credentials
+    rather than at the quoting. Assembling it in one place means it is escaped
+    exactly once.
+
+    With neither, the database is a SQLite file under data_dir, as before.
+    """
+    if env.get("DATABASE_URL"):
+        return env["DATABASE_URL"]
+
+    host = env.get("DB_HOST")
+    if not host:
+        return f"sqlite:///{data_dir}/borg.db"
+
+    missing = [name for name in ("DB_USER", "DB_PASSWORD") if not env.get(name)]
+    if missing:
+        # Falling back to SQLite here would start the application on a local
+        # file while the real database sits untouched, and the two would drift
+        # apart until someone noticed the data was missing.
+        raise RuntimeError(
+            f"DB_HOST is set but {' and '.join(missing)} "
+            f"{'is' if len(missing) == 1 else 'are'} not. Refusing to fall back "
+            "to SQLite, which would quietly run on the wrong database."
+        )
+
+    user = quote_plus(env["DB_USER"])
+    password = quote_plus(env["DB_PASSWORD"])
+    port = env.get("DB_PORT", "5432")
+    name = env.get("DB_NAME", "borg")
+    return f"postgresql+psycopg://{user}:{password}@{host}:{port}/{name}"
+
+
+def resolve_ssh_home_dir(env: Mapping[str, str], ssh_keys_dir: str) -> str:
+    """Directory the system SSH key pair is deployed to on disk.
+
+    Defaults to ssh_keys_dir (``$DATA_DIR/ssh_keys``), so a native install
+    (for example the Proxmox LXC running from /opt/borg-ui as root) keeps its
+    keys next to the rest of its data without any extra configuration.
+
+    SSH_HOME_DIR overrides it. The Docker entrypoint exports it as
+    /home/borg/.ssh: normally that is a symlink to /data/ssh_keys, so both names
+    are the same directory, but when a user bind-mounts /home/borg/.ssh the
+    entrypoint keeps the mount and the keys must still land there so plain
+    ``ssh`` in hooks finds them under ~/.ssh.
+    """
+    return env.get("SSH_HOME_DIR") or ssh_keys_dir
+
+
+def resolve_secret_key_file(data_dir: str) -> Path:
+    """Path of the persisted auto-generated SECRET_KEY under data_dir."""
+    return Path(data_dir) / ".secret_key"
+
+
 class Settings(BaseSettings):
     """Application settings"""
 
     # Application settings
-    app_name: str = "Borg Web UI"
+    app_name: str = "Borg UI"
     debug: bool = False
     environment: str = "production"  # Default to production for safety
 
@@ -74,6 +139,7 @@ class Settings(BaseSettings):
 
     # SSH keys directory - auto-derived from data_dir
     ssh_keys_dir: str = ""  # Will be auto-derived from data_dir
+    ssh_home_dir: str = ""  # Where the system key is deployed; see resolve_ssh_home_dir
 
     # Logging settings
     log_level: str = "INFO"
@@ -151,6 +217,19 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = 7200  # 2 hours
     cache_max_size_mb: int = 2048  # 2GB
 
+    # Operations index: per-archive `borg info` calls per archive_sync run
+    index_archive_info_per_run: int = 20
+
+    # Operations index: change rows stored per archive before the rest is
+    # collapsed into per-subtree summary rows (spec 6.7)
+    index_history_max_rows: int = 200000
+
+    # Operations index: wall-clock budget for one history_index run. Archives
+    # past it stay `pending` for the next reconcile run, so a long backfill
+    # cannot hold an index worker (and the index work of every other
+    # repository) for hours. 0 disables the budget.
+    index_history_seconds_per_run: int = 900
+
     # Backup settings
     max_backup_jobs: int = 5
     backup_timeout: int = 3600  # 1 hour
@@ -197,18 +276,28 @@ class Settings(BaseSettings):
         env_file = ".env"
         case_sensitive = False
         extra = "ignore"
-        # Map env vars to internal string fields
-        fields = {
-            "_cors_origins_str": {"env": "CORS_ORIGINS"},
-            "_trusted_proxies_str": {"env": "TRUSTED_PROXIES"},
-            "_oidc_allowed_return_origins_str": {"env": "OIDC_ALLOWED_RETURN_ORIGINS"},
-        }
+        # NOTE: pydantic v1 mapped CORS_ORIGINS / TRUSTED_PROXIES /
+        # OIDC_ALLOWED_RETURN_ORIGINS onto the private _*_str fields here via a
+        # `fields = {...}` block. v2 removed that config key (it only warned and
+        # was ignored), so those env vars already have no effect -- the defaults
+        # are always used. Removed to silence the warning; wiring them back up
+        # needs Field(validation_alias=...) on public fields, a separate change.
 
     def model_post_init(self, __context: Any) -> None:
         if not self.rclone_config_root:
             self.rclone_config_root = f"{self.data_dir}/rclone"
         if not self.rclone_cache_root:
             self.rclone_cache_root = f"{self.data_dir}/rclone-cache"
+
+
+def derive_ssh_dirs(settings: "Settings", env: Mapping[str, str]) -> None:
+    """Derive the SSH key directories from data_dir and the environment.
+
+    Kept out of the module body so it can be exercised on a fresh Settings
+    without re-importing the module.
+    """
+    settings.ssh_keys_dir = f"{settings.data_dir}/ssh_keys"
+    settings.ssh_home_dir = resolve_ssh_home_dir(env, settings.ssh_keys_dir)
 
 
 # Create settings instance
@@ -224,22 +313,17 @@ if not os.getenv("RCLONE_CACHE_ROOT"):
 # AUTO-DERIVE all paths from data_dir
 # Users only need to configure data_dir (via volume mount), everything else is automatic
 
-# 1. Database URL - always derived from data_dir
-env_database_url = os.getenv("DATABASE_URL")
-if env_database_url:
-    settings.database_url = env_database_url
-else:
-    # Auto-derive: sqlite:////data/borg.db
-    settings.database_url = f"sqlite:///{settings.data_dir}/borg.db"
+# 1. Database URL
+settings.database_url = resolve_database_url(os.environ, settings.data_dir)
 
 # 2. SSH keys directory - always derived from data_dir
-settings.ssh_keys_dir = f"{settings.data_dir}/ssh_keys"
+derive_ssh_dirs(settings, os.environ)
 
 # 3. Log file - always derived from data_dir
 settings.log_file = f"{settings.data_dir}/logs/borg-ui.log"
 
 # 4. SECRET_KEY - auto-generate on first run if not provided
-secret_key_file = Path(settings.data_dir) / ".secret_key"
+secret_key_file = resolve_secret_key_file(settings.data_dir)
 env_secret_key = os.getenv("SECRET_KEY")
 
 if env_secret_key:

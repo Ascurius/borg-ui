@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from sqlalchemy import (
     Column,
     Integer,
@@ -8,19 +10,45 @@ from sqlalchemy import (
     ForeignKey,
     Float,
     BigInteger,
+    Index,
     Table,
     UniqueConstraint,
     JSON,
+    func,
 )
 from sqlalchemy.orm import relationship
-from datetime import datetime, timezone
+from sqlalchemy.types import TypeDecorator
 from app.database.database import Base
 from app.utils.schedule_time import get_container_timezone
 
 
-# Helper function for timezone-aware UTC timestamps
-def utc_now():
-    return datetime.now(timezone.utc)
+# Canonical naive-UTC "now" for column defaults (see its docstring).
+from app.utils.datetime_utils import utc_now  # noqa: E402,F401
+
+
+class EncryptedString(TypeDecorator):
+    """Transparently Fernet-encrypts a string column at rest.
+
+    Imports app.core.security lazily: that module imports models from here,
+    so a module-level import would be circular.
+    """
+
+    impl = String
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if not value:
+            return value
+        from app.core.security import encrypt_secret
+
+        return encrypt_secret(value)
+
+    def process_result_value(self, value, dialect):
+        if not value:
+            return value
+        from app.core.security import decrypt_secret
+
+        return decrypt_secret(value)
 
 
 class User(Base):
@@ -88,6 +116,22 @@ class AgentMachine(Base):
     os = Column(String, nullable=True)
     arch = Column(String, nullable=True)
     agent_version = Column(String, nullable=True)
+    # Version an operator pinned this endpoint to. NULL means "track whatever
+    # this server serves", which is the default and the normal case.
+    desired_agent_version = Column(String, nullable=True)
+    # Borg major version this endpoint should run ("1" or "2"). NULL means
+    # leave whatever is installed alone.
+    desired_borg_version = Column(String, nullable=True)
+    # Set while a remote upgrade is in flight. The agent is killed by the
+    # upgrade it performs, so the server owns the outcome rather than waiting
+    # for a completion the agent cannot send.
+    upgrade_state = Column(String, nullable=True)
+    upgrade_requested_at = Column(DateTime, nullable=True)
+    upgrade_target_version = Column(String, nullable=True)
+    upgrade_error = Column(Text, nullable=True)
+    # IANA zone the agent reported (e.g. "Europe/Berlin"); interprets the
+    # local-time archive timestamps borg emits on that machine.
+    timezone = Column(String, nullable=True)
     default_path = Column(String, nullable=True)
     borg_versions = Column(JSON, nullable=True)
     capabilities = Column(JSON, nullable=True)
@@ -122,14 +166,25 @@ class AgentEnrollmentToken(Base):
 
 class AgentJob(Base):
     __tablename__ = "agent_jobs"
+    __table_args__ = (
+        Index("ix_agent_jobs_agent_status", "agent_machine_id", "status"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     agent_machine_id = Column(
         Integer, ForeignKey("agent_machines.id", ondelete="CASCADE"), nullable=False
     )
-    backup_job_id = Column(
-        Integer, ForeignKey("backup_jobs.id", ondelete="SET NULL"), nullable=True
+    # Phase 8: the backup this job transports.
+    operation_id = Column(
+        Integer,
+        ForeignKey("operations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
+    # Set once, by the first start report that wins the claim, and never
+    # cleared: a requeue resets `started_at`, so only this marker can tell a
+    # reconnect apart from a genuine first start.
+    start_notified_at = Column(DateTime, nullable=True)
     job_type = Column(String, nullable=False)
     status = Column(String, default="queued", index=True, nullable=False)
     payload = Column(JSON, nullable=False)
@@ -159,7 +214,10 @@ class AgentJobLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     agent_job_id = Column(
-        Integer, ForeignKey("agent_jobs.id", ondelete="CASCADE"), nullable=False
+        Integer,
+        ForeignKey("agent_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     sequence = Column(Integer, nullable=False)
     stream = Column(String, default="stdout", nullable=False)
@@ -206,8 +264,21 @@ class UserRepositoryPermission(Base):
     __table_args__ = (UniqueConstraint("user_id", "repository_id"),)
 
 
+# Default history index excludes (spec 6.7). Seeded on every repository
+# creation path through the column default and backfilled by migration
+# c2d3e4f5a6b7 for rows that predate it.
+DEFAULT_HISTORY_INDEX_EXCLUDES: tuple[str, ...] = (
+    "**/.cache/**",
+    "**/Library/Caches/**",
+    "**/node_modules/**",
+    "**/__pycache__/**",
+    "**/.git/objects/**",
+)
+
+
 class Repository(Base):
     __tablename__ = "repositories"
+    __table_args__ = (Index("idx_repositories_source_ssh", "source_ssh_connection_id"),)
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, index=True)
@@ -215,8 +286,8 @@ class Repository(Base):
     encryption = Column(String, default="repokey")
     compression = Column(String, default="lz4")
     passphrase = Column(
-        String, nullable=True
-    )  # Borg repository passphrase (for encrypted repos)
+        EncryptedString, nullable=True
+    )  # Borg repository passphrase (for encrypted repos), encrypted at rest
     has_keyfile = Column(
         Boolean, default=False
     )  # Whether repository has a keyfile (keyfile/keyfile-blake2 encryption)
@@ -233,6 +304,16 @@ class Repository(Base):
     last_check = Column(DateTime, nullable=True)  # Last successful check completion
     last_compact = Column(DateTime, nullable=True)  # Last successful compact completion
     total_size = Column(String, nullable=True)
+    # Which measurement total_size holds: borg1_cache_stats (deduplicated),
+    # borg2_index (repository object size), storage_used (store file bytes),
+    # compact_stats (pack file bytes as `borg compact --stats` reported them).
+    total_size_source = Column(String, nullable=True)
+    # The same measurement as a number, and when it was written; NULL on a
+    # row no size write has touched since the columns arrived.
+    total_size_bytes = Column(BigInteger, nullable=True)
+    total_size_measured_at = Column(DateTime, nullable=True)
+    # repository.last_modified as Borg reports it: the last manifest write.
+    borg_last_modified = Column(DateTime, nullable=True)
     archive_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
@@ -248,17 +329,18 @@ class Repository(Base):
     connection_id = Column(
         Integer, ForeignKey("ssh_connections.id"), nullable=True
     )  # Associated SSH connection (preferred over host/port/username)
+    repository_connection = relationship("SSHConnection", foreign_keys=[connection_id])
     remote_path = Column(
         String, nullable=True
     )  # Path to borg binary on remote server (e.g., /usr/local/bin/borg)
     execution_target = Column(
-        String, default="local", nullable=False
+        String, default="local", nullable=False, index=True
     )  # Where borg create executes: local, ssh, or agent
     executor_type = Column(
-        String, default="server", nullable=False
+        String, default="server", nullable=False, index=True
     )  # First-class executor: server or agent
     agent_machine_id = Column(
-        Integer, ForeignKey("agent_machines.id"), nullable=True
+        Integer, ForeignKey("agent_machines.id"), nullable=True, index=True
     )  # Agent machine that executes backups for this repository
 
     # New fields for authentication status
@@ -304,6 +386,15 @@ class Repository(Base):
     # Borg version this repository was created with (1 or 2)
     # Controls which binary and /api/v2/ routes are used for all operations
     borg_version = Column(Integer, default=1, nullable=False)
+
+    # Glob patterns the history index drops from borg diff output (spec 6.7)
+    history_index_excludes = Column(
+        JSON, nullable=True, default=lambda: list(DEFAULT_HISTORY_INDEX_EXCLUDES)
+    )
+
+    # How much derived data this repository keeps refreshed (spec 6.8).
+    # "full", "archives" or "off"; see app/services/operations/index_mode.py.
+    index_mode = Column(String(20), nullable=False, server_default="full")
 
     # Custom flags for borg create command (advanced users)
     custom_flags = Column(
@@ -445,9 +536,7 @@ class SSHConnection(Base):
     is_backup_source = Column(
         Boolean, default=False
     )  # Mark this connection as a backup source
-    borg_binary_path = Column(
-        String, default="/usr/bin/borg"
-    )  # Path to borg on remote host
+    borg_binary_path = Column(String, default="borg")  # Path to borg on remote host
     borg_version = Column(String, nullable=True)  # Detected borg version
     last_borg_check = Column(DateTime, nullable=True)  # Last time borg was verified
 
@@ -458,6 +547,20 @@ class SSHConnection(Base):
     use_sudo = Column(
         Boolean, default=False
     )  # Prepend sudo when running borg on remote host
+    # Last connection test authenticated but the remote shell refused the
+    # probe command: a forced-command (Borg-only) key or a restricted shell.
+    # Browsing and storage info are unavailable on such a connection.
+    shell_restricted = Column(Boolean, nullable=True)
+
+    # Pinned host key (known_hosts lines) used to verify the remote host on
+    # every SSH invocation. Null means nothing has been trusted yet; see
+    # app/utils/ssh_host_keys.py.
+    known_host_key = Column(Text, nullable=True)
+    # True only for connections that predate host-key verification: they pin
+    # whatever key answers on their next use, because they were already running
+    # with no verification at all. Connections created since default to False
+    # and need the user to confirm the fingerprint.
+    host_key_trust_on_first_use = Column(Boolean, default=False, nullable=True)
 
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
@@ -542,7 +645,7 @@ class RepositoryStorage(Base):
     sync_cron_expression = Column(String, nullable=True)
     sync_timezone = Column(String, default="UTC", nullable=False)
     last_scheduled_sync_at = Column(DateTime, nullable=True)
-    next_scheduled_sync_at = Column(DateTime, nullable=True)
+    next_scheduled_sync_at = Column(DateTime, nullable=True, index=True)
     last_synced_at = Column(DateTime, nullable=True)
     last_hydrated_at = Column(DateTime, nullable=True)
     last_remote_check_at = Column(DateTime, nullable=True)
@@ -555,29 +658,71 @@ class RepositoryStorage(Base):
     rclone_remote = relationship("RcloneRemote", back_populates="storages")
 
 
-class RcloneSyncJob(Base):
-    __tablename__ = "rclone_sync_jobs"
+class RepositorySizeSample(Base):
+    """One row per repository size measurement, appended by every writer
+    that goes through `set_repository_size`: the stats step after a backup,
+    a prune or a delete, and a compact's own statistics. The growth chart
+    reads these back as the repository's size over time, which no
+    per-archive figure from Borg can reconstruct."""
 
-    id = Column(Integer, primary_key=True, index=True)
+    __tablename__ = "repository_size_samples"
+
+    id = Column(Integer, primary_key=True)
     repository_id = Column(
         Integer,
         ForeignKey("repositories.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
-    direction = Column(String, nullable=False)
-    operation = Column(String, default="sync", nullable=False)
-    status = Column(String, default="pending", nullable=False)
-    triggered_by = Column(String, default="manual", nullable=False)
-    scheduled_for = Column(DateTime, nullable=True)
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    bytes_transferred = Column(BigInteger, nullable=True)
-    files_transferred = Column(Integer, nullable=True)
-    log_path = Column(String, nullable=True)
-    log_text = Column(Text, nullable=True)
-    error_text = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=utc_now, nullable=False)
+    measured_at = Column(DateTime, nullable=False, index=True)
+    size_bytes = Column(BigInteger, nullable=False)
+    source = Column(String, nullable=True)
+
+
+class PruneComparison(Base):
+    """Spec 4.5: one row per repository and candidate policy, replaced
+    wholesale by each prune_compare run."""
+
+    __tablename__ = "prune_comparisons"
+    __table_args__ = (
+        UniqueConstraint("repository_id", "candidate", name="uq_prune_comparison"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    repository_id = Column(
+        Integer,
+        ForeignKey("repositories.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    candidate = Column(String, nullable=False)
+    label = Column(String, nullable=False)
+    retention = Column(JSON, nullable=True)
+    kept_count = Column(Integer, nullable=False, default=0)
+    deleted_count = Column(Integer, nullable=False, default=0)
+    freed_at_least = Column(BigInteger, nullable=False, default=0)
+    # logical size of the files no kept archive holds, from the history
+    # index; an upper bound on the storage this frees, not a measurement of
+    # it. None without the index.
+    lost_size = Column(BigInteger, nullable=True)
+    partial_measure = Column(Boolean, nullable=False, default=False)
+    # Borg's own verdict lines, as [borg_id, name, verdict, rule]. The dry
+    # run's log is subject to log retention, and the preview page reads a
+    # candidate from here instead of running Borg again; everything else the
+    # page shows is joined from the live index at read time.
+    verdicts = Column(JSON, nullable=True)
+    operation_id = Column(
+        Integer, ForeignKey("operations.id", ondelete="SET NULL"), nullable=True
+    )
+    archive_count_at = Column(Integer, nullable=False, default=0)
+    # The archive set this was computed for, as a fingerprint: how many, the
+    # highest id, and the newest first_seen_at. SQLite hands a deleted row's
+    # id to the next insert, so the id alone can repeat; a row is only ever
+    # first seen when a listing inserts it, so that timestamp moves on every
+    # replacement the count and the id would hide.
+    archive_max_id = Column(Integer, nullable=True)
+    archive_seen_at = Column(DateTime, nullable=True)
+    computed_at = Column(DateTime, nullable=False, default=utc_now)
 
 
 class Configuration(Base):
@@ -595,161 +740,18 @@ class Configuration(Base):
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 
-class BackupJob(Base):
-    __tablename__ = "backup_jobs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    repository = Column(String)  # Repository path/name
-    repository_id = Column(
-        Integer, ForeignKey("repositories.id", ondelete="SET NULL"), nullable=True
-    )
-    backup_plan_id = Column(
-        Integer, ForeignKey("backup_plans.id", ondelete="SET NULL"), nullable=True
-    )
-    backup_plan_run_id = Column(
-        Integer, ForeignKey("backup_plan_runs.id", ondelete="SET NULL"), nullable=True
-    )
-    status = Column(
-        String, default="pending"
-    )  # pending, running, completed, completed_with_warnings, failed
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    progress = Column(Integer, default=0)
-    error_message = Column(Text, nullable=True)
-    logs = Column(Text, nullable=True)  # Full logs (stored after completion)
-    log_file_path = Column(String, nullable=True)  # Path to streaming log file
-    scheduled_job_id = Column(
-        Integer, ForeignKey("scheduled_jobs.id"), nullable=True
-    )  # NULL for manual backups
-
-    # Detailed progress fields from Borg JSON output
-    original_size = Column(BigInteger, default=0)  # Original uncompressed size in bytes
-    compressed_size = Column(BigInteger, default=0)  # Compressed size in bytes
-    deduplicated_size = Column(BigInteger, default=0)  # Deduplicated size in bytes
-    nfiles = Column(Integer, default=0)  # Number of files processed
-    current_file = Column(Text, nullable=True)  # Current file being processed
-    progress_percent = Column(Float, default=0.0)  # Progress percentage
-    backup_speed = Column(Float, default=0.0)  # Current backup speed in MB/s
-    total_expected_size = Column(
-        BigInteger, default=0
-    )  # Total size of source directories (calculated before backup)
-    estimated_time_remaining = Column(Integer, default=0)  # Estimated seconds remaining
-
-    # Archive name created by this backup
-    archive_name = Column(
-        String, nullable=True
-    )  # Name of the archive created (e.g., "manual-backup-2024-04-13T10:30:00")
-
-    # Maintenance status tracking
-    maintenance_status = Column(
-        String, nullable=True
-    )  # null, "running_prune", "prune_completed", "prune_failed", "running_compact", "compact_completed", "compact_failed", "maintenance_completed"
-
-    # Remote backup execution
-    execution_mode = Column(String, default="local")  # "local" or "remote_ssh"
-    route_strategy = Column(String, nullable=True)
-    source_ssh_connection_id = Column(
-        Integer, ForeignKey("ssh_connections.id"), nullable=True
-    )  # SSH connection for remote execution
-    remote_process_pid = Column(Integer, nullable=True)  # PID on remote host
-    remote_hostname = Column(String, nullable=True)  # Remote hostname for reference
-
-    # Retry lineage metadata. Original attempts default to attempt 1; retry
-    # attempts point at the original and immediate source rows.
-    retry_original_job_id = Column(
-        Integer, ForeignKey("backup_jobs.id", ondelete="SET NULL"), nullable=True
-    )
-    retry_source_job_id = Column(
-        Integer, ForeignKey("backup_jobs.id", ondelete="SET NULL"), nullable=True
-    )
-    retry_attempt = Column(Integer, default=1, nullable=False)
-    retry_requested_by_user_id = Column(
-        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
-    )
-    retry_requested_at = Column(DateTime, nullable=True)
-
-    created_at = Column(DateTime, default=utc_now)
-
-
-class BackupJobRetryLineage(Base):
-    __tablename__ = "backup_job_retry_lineage"
-    __table_args__ = (
-        UniqueConstraint("created_job_id", name="uq_backup_job_retry_created_job"),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    original_job_id = Column(
-        Integer, ForeignKey("backup_jobs.id", ondelete="SET NULL"), nullable=True
-    )
-    retry_source_job_id = Column(
-        Integer, ForeignKey("backup_jobs.id", ondelete="SET NULL"), nullable=True
-    )
-    attempt_number = Column(Integer, nullable=False)
-    requested_by_user_id = Column(
-        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
-    )
-    requested_at = Column(DateTime, default=utc_now, nullable=False)
-    created_job_id = Column(
-        Integer, ForeignKey("backup_jobs.id", ondelete="SET NULL"), nullable=True
-    )
-    request_snapshot = Column(JSON, nullable=False)
-
-
-class RestoreJob(Base):
-    __tablename__ = "restore_jobs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    repository = Column(String)  # Repository path
-    archive = Column(String)  # Archive name
-    destination = Column(String)  # Restore destination path
-    status = Column(
-        String, default="pending"
-    )  # pending, running, completed, failed, cancelled
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    progress = Column(Integer, default=0)
-    error_message = Column(Text, nullable=True)
-    logs = Column(Text, nullable=True)  # Full logs (stored after completion)
-
-    # Progress tracking fields
-    nfiles = Column(Integer, default=0)  # Number of files restored
-    current_file = Column(Text, nullable=True)  # Current file being restored
-    progress_percent = Column(Float, default=0.0)  # Progress percentage
-
-    # Speed and ETA tracking (similar to backup jobs)
-    original_size = Column(BigInteger, default=0)  # Total bytes to restore
-    restored_size = Column(BigInteger, default=0)  # Bytes restored so far
-    restore_speed = Column(Float, default=0.0)  # Current restore speed in MB/s
-    estimated_time_remaining = Column(Integer, default=0)  # Estimated seconds remaining
-
-    # Remote restore fields
-    destination_type = Column(String(50), default="local")  # 'local' or 'ssh'
-    destination_connection_id = Column(
-        Integer, ForeignKey("ssh_connections.id"), nullable=True
-    )
-    destination_connection = relationship(
-        "SSHConnection", foreign_keys=[destination_connection_id]
-    )
-    execution_mode = Column(
-        String(50), default="local_to_local"
-    )  # 'local_to_local', 'ssh_to_local', 'local_to_ssh'
-    temp_extraction_path = Column(
-        String(255), nullable=True
-    )  # For local→SSH two-phase restore
-    destination_hostname = Column(String(255), nullable=True)  # For display purposes
-    repository_type = Column(String(50), default="local")  # 'local' or 'ssh'
-
-    created_at = Column(DateTime, default=utc_now)
-
-
 class ScheduledJob(Base):
     __tablename__ = "scheduled_jobs"
+    __table_args__ = (
+        Index("idx_scheduled_jobs_source_ssh", "source_ssh_connection_id"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, nullable=False, index=True)
-    cron_expression = Column(
-        String, nullable=False
-    )  # e.g., "0 2 * * *" for daily at 2 AM
+    cron_expression = Column(String, nullable=True)  # Required for cron mode
+    schedule_mode = Column(String, default="cron", nullable=False)
+    availability_check_interval_minutes = Column(Integer, default=30, nullable=False)
+    min_success_interval_minutes = Column(Integer, default=0, nullable=False)
     timezone = Column(
         String, default="UTC", nullable=False
     )  # IANA timezone used to interpret cron_expression
@@ -772,10 +774,10 @@ class ScheduledJob(Base):
         Boolean, default=False, nullable=False
     )  # Whether to run per-repository pre/post scripts
     pre_backup_script_id = Column(
-        Integer, ForeignKey("scripts.id"), nullable=True
+        Integer, ForeignKey("scripts.id", ondelete="SET NULL"), nullable=True
     )  # Schedule-level pre-backup script (runs once)
     post_backup_script_id = Column(
-        Integer, ForeignKey("scripts.id"), nullable=True
+        Integer, ForeignKey("scripts.id", ondelete="SET NULL"), nullable=True
     )  # Schedule-level post-backup script (runs once)
     pre_backup_script_parameters = Column(
         JSON, nullable=True
@@ -813,6 +815,26 @@ class ScheduledJob(Base):
     updated_at = Column(DateTime, nullable=True)
 
 
+class AvailabilityScheduleSkip(Base):
+    """A neutral, durable decision not to dispatch an availability automation."""
+
+    __tablename__ = "availability_schedule_skips"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scheduled_job_id = Column(
+        Integer,
+        ForeignKey("scheduled_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    reason = Column(String, nullable=False)
+    detail = Column(Text, nullable=True)
+    occurred_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    next_check_at = Column(DateTime, nullable=True)
+
+    scheduled_job = relationship("ScheduledJob")
+
+
 class ScheduledJobRepository(Base):
     """Junction table for multi-repository scheduled jobs"""
 
@@ -823,7 +845,7 @@ class ScheduledJobRepository(Base):
         ),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     scheduled_job_id = Column(
         Integer,
         ForeignKey("scheduled_jobs.id", ondelete="CASCADE"),
@@ -840,7 +862,9 @@ class ScheduledJobRepository(Base):
         Integer, nullable=False
     )  # Order in which repositories should be backed up
 
-    created_at = Column(DateTime, default=utc_now)
+    # func.now() so the default renders per dialect; a literal CURRENT_TIMESTAMP
+    # would be accepted by SQLite and rejected by Postgres, and vice versa.
+    created_at = Column(DateTime, default=utc_now, server_default=func.now())
 
     def __repr__(self):
         return f"<ScheduledJobRepository(schedule_id={self.scheduled_job_id}, repo_id={self.repository_id}, order={self.execution_order})>"
@@ -880,6 +904,9 @@ class BackupPlan(Base):
     failure_behavior = Column(String, default="continue", nullable=False)
 
     schedule_enabled = Column(Boolean, default=False, nullable=False)
+    schedule_mode = Column(String, default="cron", nullable=False)
+    availability_check_interval_minutes = Column(Integer, default=30, nullable=False)
+    min_success_interval_minutes = Column(Integer, default=0, nullable=False)
     cron_expression = Column(String, nullable=True)
     timezone = Column(String, default="UTC", nullable=False)
     last_run = Column(DateTime, nullable=True)
@@ -1019,17 +1046,26 @@ class BackupPlanRun(Base):
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     error_message = Column(Text, nullable=True)
+    # A scheduler decision that deliberately did not dispatch work. This remains
+    # separate from error_message so API consumers can render it as neutral.
+    skip_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
     retry_original_run_id = Column(
-        Integer, ForeignKey("backup_plan_runs.id", ondelete="SET NULL"), nullable=True
+        Integer,
+        ForeignKey("backup_plan_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     retry_source_run_id = Column(
-        Integer, ForeignKey("backup_plan_runs.id", ondelete="SET NULL"), nullable=True
+        Integer,
+        ForeignKey("backup_plan_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     retry_attempt = Column(Integer, default=1, nullable=False)
     retry_requested_by_user_id = Column(
-        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     retry_requested_at = Column(DateTime, nullable=True)
 
@@ -1038,9 +1074,13 @@ class BackupPlanRun(Base):
         back_populates="backup_plan_run",
         cascade="all, delete-orphan",
     )
+    # The hooks go with their run, as the foreign key says. Without a delete
+    # cascade here the ORM would null their run id before the row is deleted,
+    # and the database cascade would find nothing left to remove.
     script_executions = relationship(
         "ScriptExecution",
         back_populates="backup_plan_run",
+        cascade="all, delete-orphan",
     )
 
 
@@ -1052,18 +1092,27 @@ class BackupPlanRunRetryLineage(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     original_run_id = Column(
-        Integer, ForeignKey("backup_plan_runs.id", ondelete="SET NULL"), nullable=True
+        Integer,
+        ForeignKey("backup_plan_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     retry_source_run_id = Column(
-        Integer, ForeignKey("backup_plan_runs.id", ondelete="SET NULL"), nullable=True
+        Integer,
+        ForeignKey("backup_plan_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     attempt_number = Column(Integer, nullable=False)
     requested_by_user_id = Column(
-        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     requested_at = Column(DateTime, default=utc_now, nullable=False)
     created_run_id = Column(
-        Integer, ForeignKey("backup_plan_runs.id", ondelete="SET NULL"), nullable=True
+        Integer,
+        ForeignKey("backup_plan_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     request_snapshot = Column(JSON, nullable=False)
 
@@ -1084,8 +1133,8 @@ class BackupPlanRunRepository(Base):
         nullable=True,
         index=True,
     )
-    backup_job_id = Column(
-        Integer, ForeignKey("backup_jobs.id", ondelete="SET NULL"), nullable=True
+    backup_operation_id = Column(
+        Integer, ForeignKey("operations.id", ondelete="SET NULL"), nullable=True
     )
     status = Column(String, default="pending", nullable=False)
     started_at = Column(DateTime, nullable=True)
@@ -1094,179 +1143,19 @@ class BackupPlanRunRepository(Base):
 
     backup_plan_run = relationship("BackupPlanRun", back_populates="repositories")
     repository = relationship("Repository")
-    backup_job = relationship("BackupJob")
-
-
-class CheckJob(Base):
-    __tablename__ = "check_jobs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    repository_id = Column(Integer, ForeignKey("repositories.id"), nullable=False)
-    repository_path = Column(
-        String, nullable=True
-    )  # Captured at job creation for display even if repo is deleted
-    status = Column(
-        String, default="pending"
-    )  # pending, running, completed, failed, cancelled
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    progress = Column(Integer, default=0)  # 0-100 percentage
-    progress_message = Column(
-        String, nullable=True
-    )  # Current progress message (e.g., "Checking segments 25%")
-    error_message = Column(Text, nullable=True)
-    logs = Column(
-        Text, nullable=True
-    )  # Deprecated: kept for backwards compatibility, use log_file_path instead
-    log_file_path = Column(String, nullable=True)  # Path to log file on disk
-    has_logs = Column(Boolean, default=False)  # Flag indicating if logs are available
-    max_duration = Column(
-        Integer, nullable=True
-    )  # Maximum duration in seconds (for partial checks)
-    extra_flags = Column(Text, nullable=True)  # Extra command-line flags for borg check
-    process_pid = Column(Integer, nullable=True)  # Container PID for orphan detection
-    process_start_time = Column(
-        BigInteger, nullable=True
-    )  # Process start time in jiffies for PID uniqueness
-    scheduled_check = Column(
-        Boolean, default=False, nullable=False
-    )  # True if triggered by scheduler, False if manual
-    created_at = Column(DateTime, default=utc_now)
-
-
-class RestoreCheckJob(Base):
-    __tablename__ = "restore_check_jobs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    repository_id = Column(Integer, ForeignKey("repositories.id"), nullable=False)
-    repository_path = Column(
-        String, nullable=True
-    )  # Captured at job creation for display even if repo is deleted
-    archive_name = Column(
-        String, nullable=True
-    )  # Archive selected for verification, usually the latest archive
-    status = Column(
-        String, default="pending"
-    )  # pending, running, completed, completed_with_warnings, needs_backup, failed, cancelled
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    progress = Column(Integer, default=0)  # 0-100 percentage
-    progress_message = Column(
-        String, nullable=True
-    )  # Current progress message (e.g., "Restoring archive to temp dir")
-    error_message = Column(Text, nullable=True)
-    logs = Column(
-        Text, nullable=True
-    )  # Deprecated: kept for backwards compatibility, use log_file_path instead
-    log_file_path = Column(String, nullable=True)  # Path to log file on disk
-    has_logs = Column(Boolean, default=False)  # Flag indicating if logs are available
-    probe_paths = Column(
-        Text, nullable=True
-    )  # JSON array of paths restored for verification
-    full_archive = Column(
-        Boolean, default=False, nullable=False
-    )  # Whether the verification extracted the full archive
-    process_pid = Column(Integer, nullable=True)  # Container PID for orphan detection
-    process_start_time = Column(
-        BigInteger, nullable=True
-    )  # Process start time in jiffies for PID uniqueness
-    scheduled_restore_check = Column(
-        Boolean, default=False, nullable=False
-    )  # True if triggered by scheduler, False if manual
-    created_at = Column(DateTime, default=utc_now)
-
-
-class CompactJob(Base):
-    __tablename__ = "compact_jobs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    repository_id = Column(Integer, ForeignKey("repositories.id"), nullable=False)
-    repository_path = Column(
-        String, nullable=True
-    )  # Captured at job creation for display even if repo is deleted
-    status = Column(
-        String, default="pending"
-    )  # pending, running, completed, failed, cancelled
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    progress = Column(Integer, default=0)  # 0-100 percentage
-    progress_message = Column(
-        String, nullable=True
-    )  # Current progress message (e.g., "Compacting segments 50%")
-    error_message = Column(Text, nullable=True)
-    logs = Column(
-        Text, nullable=True
-    )  # Deprecated: kept for backwards compatibility, use log_file_path instead
-    log_file_path = Column(String, nullable=True)  # Path to log file on disk
-    has_logs = Column(Boolean, default=False)  # Flag indicating if logs are available
-    scheduled_compact = Column(
-        Boolean, default=False, nullable=False
-    )  # True if triggered by scheduler, False if manual
-    process_pid = Column(Integer, nullable=True)  # Container PID for orphan detection
-    process_start_time = Column(
-        BigInteger, nullable=True
-    )  # Process start time in jiffies for PID uniqueness
-    created_at = Column(DateTime, default=utc_now)
-
-
-class PruneJob(Base):
-    __tablename__ = "prune_jobs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    repository_id = Column(Integer, ForeignKey("repositories.id"), nullable=False)
-    repository_path = Column(
-        String, nullable=True
-    )  # Captured at job creation for display even if repo is deleted
-    status = Column(
-        String, default="pending"
-    )  # pending, running, completed, failed, cancelled
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    error_message = Column(Text, nullable=True)
-    logs = Column(
-        Text, nullable=True
-    )  # Deprecated: kept for backwards compatibility, use log_file_path instead
-    log_file_path = Column(String, nullable=True)  # Path to log file on disk
-    has_logs = Column(Boolean, default=False)  # Flag indicating if logs are available
-    scheduled_prune = Column(
-        Boolean, default=False, nullable=False
-    )  # True if triggered by scheduler, False if manual
-    created_at = Column(DateTime, default=utc_now)
-
-
-class DeleteArchiveJob(Base):
-    __tablename__ = "delete_archive_jobs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    repository_id = Column(
-        Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
-    )
-    repository_path = Column(
-        String, nullable=True
-    )  # Captured at job creation for display even if repo is deleted
-    archive_name = Column(String, nullable=False)  # Name of the archive being deleted
-    status = Column(
-        String, default="pending"
-    )  # pending, running, completed, failed, cancelled
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    progress = Column(Integer, default=0)  # 0-100 percentage
-    progress_message = Column(String, nullable=True)  # Current progress message
-    error_message = Column(Text, nullable=True)
-    logs = Column(
-        Text, nullable=True
-    )  # Deprecated: kept for backwards compatibility, use log_file_path instead
-    log_file_path = Column(String, nullable=True)  # Path to log file on disk
-    has_logs = Column(Boolean, default=False)  # Flag indicating if logs are available
-    process_pid = Column(Integer, nullable=True)  # Container PID for orphan detection
-    process_start_time = Column(
-        BigInteger, nullable=True
-    )  # Process start time in jiffies for PID uniqueness
-    created_at = Column(DateTime, default=utc_now)
+    backup_operation = relationship("Operation")
 
 
 class RepositoryWipeJob(Base):
+    """The wipe preview store since section 13 phase 6. Executed wipes are
+    `operations` rows; phase 9 moved the rows written before phase 6 there and
+    this table holds `previewed` rows only."""
+
     __tablename__ = "repository_wipe_jobs"
+    __table_args__ = (
+        Index("idx_repository_wipe_jobs_repository_id", "repository_id"),
+        Index("idx_repository_wipe_jobs_status", "status"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     repository_id = Column(
@@ -1302,6 +1191,307 @@ class RepositoryWipeJob(Base):
     repository = relationship("Repository")
     requested_by_user = relationship("User", foreign_keys=[requested_by_user_id])
     confirmed_by_user = relationship("User", foreign_keys=[confirmed_by_user_id])
+
+
+class Operation(Base):
+    """One unit of work on (usually) one repository. Spec section 6.1."""
+
+    __tablename__ = "operations"
+
+    id = Column(Integer, primary_key=True)
+    repository_id = Column(
+        Integer,
+        ForeignKey("repositories.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    kind = Column(String, nullable=False, index=True)
+    category = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, default="queued", index=True)
+    trigger = Column(String, nullable=False, default="manual")
+    priority = Column(Integer, nullable=False, default=10)
+    run_id = Column(String(36), nullable=False, index=True)
+    depends_on_id = Column(
+        Integer, ForeignKey("operations.id", ondelete="SET NULL"), nullable=True
+    )
+    triggered_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    scheduled_job_id = Column(
+        Integer, ForeignKey("scheduled_jobs.id", ondelete="SET NULL"), nullable=True
+    )
+    backup_plan_run_id = Column(
+        Integer, ForeignKey("backup_plan_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    execution_mode = Column(
+        String, nullable=True
+    )  # server | remote_ssh | agent | rclone
+    process_pid = Column(Integer, nullable=True)
+    process_start_time = Column(Float, nullable=True)
+    progress_percent = Column(Float, nullable=True)
+    progress_current = Column(Integer, nullable=True)
+    progress_total = Column(Integer, nullable=True)
+    progress_message = Column(String, nullable=True)
+    error_message = Column(Text, nullable=True)
+    skip_reason = Column(String, nullable=True)
+    log_file_path = Column(String, nullable=True)
+    params = Column(JSON, nullable=True)  # kind-specific input, small
+    result = Column(JSON, nullable=True)  # kind-specific output summary, small
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_operations_repository_status", "repository_id", "status"),
+        Index(
+            "ix_operations_status_priority_created", "status", "priority", "created_at"
+        ),
+        Index("ix_operations_category_created", "category", "created_at"),
+        # the dashboard's activity window: every row of a kind since a date
+        Index("ix_operations_kind_started_at", "kind", "started_at"),
+        # the Activity window: newest first by when the row ran, else when
+        # it was queued (app/api/activity.py orders and pages on this)
+        Index(
+            "ix_operations_activity_window",
+            func.coalesce(started_at, created_at).desc(),
+            id.desc(),
+        ),
+    )
+
+
+class OperationWipeDetails(Base):
+    """Wipe-specific columns for an `operations` row. Spec section 6.2."""
+
+    __tablename__ = "operation_wipe_details"
+
+    operation_id = Column(
+        Integer,
+        ForeignKey("operations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    phase = Column(String, nullable=True)
+    archive_count = Column(Integer, default=0)
+    archive_fingerprint = Column(String, nullable=True)
+    archive_manifest_json = Column(Text, nullable=True)
+    dry_run_output = Column(Text, nullable=True)
+    blocking_reason = Column(String, nullable=True)
+    protected_archives_json = Column(Text, nullable=True)
+    run_compact = Column(Boolean, default=True, nullable=False)
+    requested_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    confirmed_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    confirmed_at = Column(DateTime, nullable=True)
+
+
+class OperationRcloneDetails(Base):
+    """Rclone-specific columns for an `operations` row. Spec section 6.2.
+
+    The legacy `log_path` is not here: an operation's log lives in
+    `operations.log_file_path` (spec 6.1).
+    """
+
+    __tablename__ = "operation_rclone_details"
+
+    operation_id = Column(
+        Integer,
+        ForeignKey("operations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    direction = Column(String, nullable=True)
+    operation = Column(String, default="sync", nullable=False)
+    scheduled_for = Column(DateTime, nullable=True)
+    bytes_transferred = Column(BigInteger, nullable=True)
+    files_transferred = Column(Integer, nullable=True)
+    log_text = Column(Text, nullable=True)
+    error_text = Column(Text, nullable=True)
+
+
+class OperationRestoreDetails(Base):
+    """Restore-specific columns for an `operations` row. Spec section 6.2.
+
+    `original_size` is not in the spec's list. The legacy row kept it (the
+    byte total borg reports, from which the percentage and the ETA are
+    computed) and it cannot ride in `operations.progress_total`, an Integer
+    column that overflows at 2 GiB on PostgreSQL. `estimated_time_remaining`
+    and `progress` are not here either: the first is arithmetic over the
+    sizes and the speed, the second is `operations.progress_percent`.
+    """
+
+    __tablename__ = "operation_restore_details"
+
+    operation_id = Column(
+        Integer,
+        ForeignKey("operations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    archive = Column(String, nullable=True)
+    destination = Column(String, nullable=True)
+    destination_type = Column(String(50), default="local")
+    destination_connection_id = Column(
+        Integer, ForeignKey("ssh_connections.id", ondelete="SET NULL"), nullable=True
+    )
+    temp_extraction_path = Column(String(255), nullable=True)
+    destination_hostname = Column(String(255), nullable=True)
+    repository_type = Column(String(50), default="local")
+    original_size = Column(BigInteger, default=0)
+    restored_size = Column(BigInteger, default=0)
+    restore_speed = Column(Float, default=0.0)
+    nfiles = Column(Integer, default=0)
+    current_file = Column(Text, nullable=True)
+
+
+class OperationBackupDetails(Base):
+    """Backup-specific columns for an `operations` row. Spec section 6.2.
+
+    `archive_pruned_at` is not in the spec's list: the legacy column was
+    added after the spec was written (migration a5b7c9d1e3f2) and the routes
+    return it. `progress` and `progress_percent` are both
+    `operations.progress_percent`; `logs` is the operation's log file;
+    `backup_plan_id` is derived from `operations.backup_plan_run_id`. The
+    three retry ids are unqualified job ids (Appendix B): a retry of a row
+    written before phase 8 names a `backup_jobs` id, so they carry no
+    foreign key.
+    """
+
+    __tablename__ = "operation_backup_details"
+
+    operation_id = Column(
+        Integer,
+        ForeignKey("operations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    archive_name = Column(String, nullable=True)
+    archive_pruned_at = Column(DateTime, nullable=True)
+    original_size = Column(BigInteger, default=0)
+    compressed_size = Column(BigInteger, default=0)
+    deduplicated_size = Column(BigInteger, default=0)
+    nfiles = Column(Integer, default=0)
+    current_file = Column(Text, nullable=True)
+    backup_speed = Column(Float, default=0.0)
+    total_expected_size = Column(BigInteger, default=0)
+    estimated_time_remaining = Column(Integer, default=0)
+    route_strategy = Column(String, nullable=True)
+    source_ssh_connection_id = Column(
+        Integer, ForeignKey("ssh_connections.id", ondelete="SET NULL"), nullable=True
+    )
+    remote_process_pid = Column(Integer, nullable=True)
+    remote_hostname = Column(String, nullable=True)
+    retry_original_job_id = Column(Integer, nullable=True)
+    retry_source_job_id = Column(Integer, nullable=True)
+    retry_attempt = Column(Integer, default=1, nullable=False)
+    retry_requested_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    retry_requested_at = Column(DateTime, nullable=True)
+    maintenance_status = Column(String, nullable=True)
+
+
+class OperationBackupRetryLineage(Base):
+    """The retry audit row the legacy backup table kept, for backups that are
+    operations. The three ids are unqualified job ids like the details row's
+    retry columns, so they carry no foreign key; retention drops rows by
+    `requested_at` as it does for the legacy table."""
+
+    __tablename__ = "operation_backup_retry_lineage"
+    __table_args__ = (
+        UniqueConstraint(
+            "created_operation_id", name="uq_operation_backup_retry_created"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    original_job_id = Column(Integer, nullable=True, index=True)
+    retry_source_job_id = Column(Integer, nullable=True, index=True)
+    attempt_number = Column(Integer, nullable=False)
+    requested_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    requested_at = Column(DateTime, default=utc_now, nullable=False)
+    created_operation_id = Column(Integer, nullable=True, index=True)
+    request_snapshot = Column(JSON, nullable=False)
+
+
+class Archive(Base):
+    """Persisted archive list per repository. Spec section 6.4."""
+
+    __tablename__ = "archives"
+
+    id = Column(Integer, primary_key=True)
+    repository_id = Column(
+        Integer,
+        ForeignKey("repositories.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    borg_id = Column(String(64), nullable=False)
+    # Distinguishes recreated rows even if SQLite IDs and timestamps repeat.
+    # Migrated rows receive an identity on their next listing.
+    generation_id = Column(String(36), nullable=True, default=lambda: str(uuid4()))
+    name = Column(String, nullable=False)
+    series = Column(String, nullable=False, index=True)
+    start = Column(DateTime, nullable=False, index=True)
+    end = Column(DateTime, nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    nfiles = Column(Integer, nullable=True)
+    original_size = Column(BigInteger, nullable=True)
+    compressed_size = Column(BigInteger, nullable=True)
+    deduplicated_size = Column(BigInteger, nullable=True)
+    # When fill_archive_info last wrote the four Borg figures above. NULL is
+    # "never measured" or "stale": a listing that observed a removed archive
+    # clears it on that archive's neighbours in its series, because
+    # deduplicated_size is relative to the archives that exist (spec 4.1).
+    # Values stay in place while stale.
+    stats_measured_at = Column(DateTime, nullable=True)
+    hostname = Column(String, nullable=True)
+    username = Column(String, nullable=True)
+    comment = Column(Text, nullable=True)
+    backup_operation_id = Column(
+        Integer, ForeignKey("operations.id", ondelete="SET NULL"), nullable=True
+    )
+    history_state = Column(String, nullable=False, default="pending")
+    history_indexed_at = Column(DateTime, nullable=True)
+    history_rows = Column(Integer, nullable=True)
+    history_truncated = Column(Boolean, nullable=False, default=False)
+    # Consecutive failed history_index attempts. Bounds the retry of an archive
+    # that fails deterministically, since each attempt is a full borg diff
+    # under the repository metadata lock. Reset to 0 once it indexes.
+    history_attempts = Column(Integer, nullable=False, default=0)
+    first_seen_at = Column(DateTime, default=utc_now, nullable=False)
+    last_seen_at = Column(DateTime, default=utc_now, nullable=False)
+
+    __table_args__ = (UniqueConstraint("repository_id", "borg_id"),)
+
+
+class ArchiveChange(Base):
+    """One changed path per archive relative to its predecessor. Spec 6.5."""
+
+    __tablename__ = "archive_changes"
+
+    id = Column(Integer, primary_key=True)
+    archive_id = Column(
+        Integer,
+        ForeignKey("archives.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    path = Column(Text, nullable=False)
+    change = Column(String(8), nullable=False)  # added | removed | modified | summary
+    size_before = Column(BigInteger, nullable=True)
+    size_after = Column(BigInteger, nullable=True)
+    mode_changed = Column(Boolean, nullable=False, default=False)
+    owner_changed = Column(Boolean, nullable=False, default=False)
+    summary_count = Column(Integer, nullable=True)
+
+    # No B-tree index on the unbounded `path` Text column: PostgreSQL caps a
+    # B-tree entry at ~1/3 of a page (~2.7 KB, after compressing the value), so
+    # a long archived path that does not compress well makes the INSERT of its
+    # own change row fail. archive_id keeps its own index
+    # (Column index=True) for the per-archive reads; the repository-wide
+    # "which archives touched this exact path" lookup drives off that FK index
+    # and filters path, which stays correct without a dedicated path index.
 
 
 class SystemSettings(Base):
@@ -1353,6 +1543,20 @@ class SystemSettings(Base):
     last_stats_refresh = Column(
         DateTime, nullable=True
     )  # Last time stats were refreshed
+    # Operations runner (spec section 7.3)
+    index_workers = Column(Integer, default=2, nullable=False)
+    # Stage keys from vocab.STAGES whose follow-up and reconcile work waits.
+    paused_stages = Column(JSON, default=list, nullable=False)
+    # Whether Borg UI runs the retention comparison on its own: after a
+    # listing that changed the archive set, and when the preview page opens
+    # on a stale one. A manual Compare now runs either way.
+    auto_prune_preview = Column(Boolean, default=True, nullable=False)
+    # Set once the first post-phase-2 startup has enqueued a reconcile run
+    # for every repository (spec 14)
+    history_bootstrap_at = Column(DateTime, nullable=True)
+    # When the reconcile scheduler last ran its tick; the interval counts
+    # from here, so it survives a process restart
+    last_reconcile_tick_at = Column(DateTime, nullable=True)
     dashboard_backup_warning_days = Column(Integer, default=3, nullable=False)
     dashboard_backup_critical_days = Column(Integer, default=7, nullable=False)
     dashboard_check_warning_days = Column(Integer, default=7, nullable=False)
@@ -1571,10 +1775,17 @@ class LicensingState(Base):
     )  # none, active, expired, invalid
     is_trial = Column(Boolean, default=False, nullable=False)
     trial_consumed = Column(Boolean, default=False, nullable=False)
+    # The features whose trial this install has already spent. Kept apart from
+    # the entitlement because the entitlement is cleared when it lapses, and
+    # the offer must not come back with it (spec 2026-09-21, section 3).
+    trial_features_used = Column(JSON, nullable=True)
     entitlement_id = Column(String, nullable=True, unique=True)
     key_id = Column(String, nullable=True)
     customer_id = Column(String, nullable=True)
     license_id = Column(String, nullable=True)
+    # Kept so the instance can manage its own license seats without the
+    # customer pasting the key again on every visit.
+    license_key = Column("license_key_encrypted", EncryptedString, nullable=True)
     max_users = Column(Integer, nullable=True)
     issued_at = Column(DateTime, nullable=True)
     starts_at = Column(DateTime, nullable=True)
@@ -1601,6 +1812,22 @@ class MQTTSyncState(Base):
     sync_key = Column(String, unique=True, nullable=False, index=True)
     sync_value = Column(Text, nullable=False)  # JSON payload
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+
+class OperationsRunnerLease(Base):
+    """Which server process runs the operations runner (#1166).
+
+    One row. A replacement process can start while the old one is still in
+    its graceful shutdown (a Kubernetes pod replacement); the runner of each
+    only recovers, sweeps and claims while it holds this lease, so the two
+    never run the same operation.
+    """
+
+    __tablename__ = "operations_runner_lease"
+
+    id = Column(Integer, primary_key=True)
+    holder = Column(String, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
 
 
 # Association table for repository notification filters
@@ -1705,39 +1932,8 @@ class InstalledPackage(Base):
     created_at = Column(DateTime, default=utc_now, nullable=False)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
-    # Cascade delete install jobs when package is deleted
-    install_jobs = relationship(
-        "PackageInstallJob", cascade="all, delete-orphan", passive_deletes=True
-    )
-
     def __repr__(self):
         return f"<InstalledPackage(id={self.id}, name='{self.name}', status='{self.status}')>"
-
-
-class PackageInstallJob(Base):
-    __tablename__ = "package_install_jobs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    package_id = Column(
-        Integer, ForeignKey("installed_packages.id", ondelete="CASCADE"), nullable=False
-    )
-    status = Column(
-        String, default="pending", nullable=False
-    )  # pending, installing, completed, failed
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    exit_code = Column(Integer, nullable=True)
-    stdout = Column(Text, nullable=True)
-    stderr = Column(Text, nullable=True)
-    error_message = Column(Text, nullable=True)
-    process_pid = Column(Integer, nullable=True)  # Container PID for orphan detection
-    process_start_time = Column(
-        BigInteger, nullable=True
-    )  # Process start time in jiffies for PID uniqueness
-    created_at = Column(DateTime, default=utc_now, nullable=False)
-
-    def __repr__(self):
-        return f"<PackageInstallJob(id={self.id}, package_id={self.package_id}, status='{self.status}')>"
 
 
 class Script(Base):
@@ -1878,12 +2074,12 @@ class ScriptExecution(Base):
         nullable=True,
         index=True,
     )  # NULL for standalone runs
-    backup_job_id = Column(
+    operation_id = Column(
         Integer,
-        ForeignKey("backup_jobs.id", ondelete="CASCADE"),
+        ForeignKey("operations.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
-    )  # NULL for standalone runs
+    )
     backup_plan_id = Column(
         Integer,
         ForeignKey("backup_plans.id", ondelete="SET NULL"),
@@ -1934,9 +2130,20 @@ class ScriptExecution(Base):
     # Relationships
     script = relationship("Script", back_populates="executions")
     repository = relationship("Repository")
-    backup_job = relationship("BackupJob")
     backup_plan = relationship("BackupPlan", back_populates="script_executions")
     backup_plan_run = relationship("BackupPlanRun", back_populates="script_executions")
 
     def __repr__(self):
         return f"<ScriptExecution(id={self.id}, script_id={self.script_id}, status='{self.status}')>"
+
+
+# SQLite recycles the id of a deleted row unless the primary key is declared
+# AUTOINCREMENT; Postgres never does. Apply it to every table that can carry it,
+# so ids mean the same thing on both dialects. Derived from the primary key
+# rather than declared per table: a new model then cannot forget it, and
+# AUTOINCREMENT is invisible to reflection, so a table that forgets it drifts
+# silently and no tooling can see it afterwards.
+for _table in Base.metadata.tables.values():
+    _pk_columns = list(_table.primary_key.columns)
+    if len(_pk_columns) == 1 and isinstance(_pk_columns[0].type, Integer):
+        _table.dialect_options["sqlite"]["autoincrement"] = True

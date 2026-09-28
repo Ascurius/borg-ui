@@ -1,12 +1,14 @@
 import { Box, Button, Stack, Tooltip, Typography } from '@mui/material'
 import { alpha, keyframes } from '@mui/material/styles'
 import { CheckCircle, Copy, Loader2 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import type { AgentMachineResponse } from '../../services/api'
 import {
   buildAgentInstallCommand,
   type AgentServiceUserMode,
   type BorgInstallMode,
 } from './agentInstallCommandText'
+import InsecureCommandWarning from './InsecureCommandWarning'
 
 const spin = keyframes`
   from { transform: rotate(0deg); }
@@ -30,6 +32,7 @@ export default function AgentInstallCommand({
   connectedAgent?: AgentMachineResponse | null
   onCopy: (value: string) => void
 }) {
+  const { t } = useTranslation()
   const command = buildAgentInstallCommand(
     serverUrl,
     token,
@@ -40,8 +43,14 @@ export default function AgentInstallCommand({
 
   return (
     <Stack spacing={1.5}>
-      <Typography variant="subtitle2" fontWeight={700}>
-        Install command
+      <InsecureCommandWarning serverUrl={serverUrl} />
+      <Typography
+        variant="subtitle2"
+        sx={{
+          fontWeight: 700,
+        }}
+      >
+        {t('managedAgents.installCommand.title')}
       </Typography>
       <Box sx={{ position: 'relative', minWidth: 0 }}>
         <Box
@@ -64,9 +73,9 @@ export default function AgentInstallCommand({
         >
           {command}
         </Box>
-        <Tooltip title="Copy install command">
+        <Tooltip title={t('managedAgents.installCommand.copy')}>
           <Button
-            aria-label="Copy install command"
+            aria-label={t('managedAgents.installCommand.copy')}
             variant="outlined"
             size="small"
             onClick={() => onCopy(command)}
@@ -96,9 +105,13 @@ export default function AgentInstallCommand({
           </Button>
         </Tooltip>
       </Box>
-      <Typography variant="body2" color="text.secondary">
-        Run the command on the Linux machine. The installer registers the agent and enables the
-        systemd service by default.
+      <Typography
+        variant="body2"
+        sx={{
+          color: 'text.secondary',
+        }}
+      >
+        {t('managedAgents.installCommand.description')}
       </Typography>
       <Box
         sx={{
@@ -136,15 +149,27 @@ export default function AgentInstallCommand({
           </Box>
         )}
         <Stack spacing={0.25} sx={{ minWidth: 0 }}>
-          <Typography variant="body2" fontWeight={600}>
+          <Typography
+            variant="body2"
+            sx={{
+              fontWeight: 600,
+            }}
+          >
             {connectedAgent
-              ? `${connectedAgent.name || connectedAgent.hostname || 'Agent'} connected`
-              : 'Waiting for agent to connect…'}
+              ? t('managedAgents.installCommand.connected', {
+                  name: connectedAgent.name || connectedAgent.hostname || t('managedAgents.agent'),
+                })
+              : t('managedAgents.installCommand.waiting')}
           </Typography>
-          <Typography variant="caption" color="text.secondary">
+          <Typography
+            variant="caption"
+            sx={{
+              color: 'text.secondary',
+            }}
+          >
             {connectedAgent
-              ? 'You can close this dialog; the agent will keep running.'
-              : 'This page will update automatically once the install completes.'}
+              ? t('managedAgents.installCommand.connectedDescription')
+              : t('managedAgents.installCommand.waitingDescription')}
           </Typography>
         </Stack>
       </Box>

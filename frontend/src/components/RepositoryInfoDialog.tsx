@@ -12,6 +12,7 @@ import {
   Tooltip,
   Paper,
   CircularProgress,
+  alpha,
 } from '@mui/material'
 import ResponsiveDialog from './shared/ResponsiveDialog'
 import { useEffect, useRef, useState } from 'react'
@@ -19,46 +20,46 @@ import CalendarMonth from '@mui/icons-material/CalendarMonth'
 import CheckIcon from '@mui/icons-material/Check'
 import ContentCopyIcon from '@mui/icons-material/ContentCopy'
 import FileDownload from '@mui/icons-material/FileDownload'
-import Info from '@mui/icons-material/Info'
 import Lock from '@mui/icons-material/Lock'
 import Storage from '@mui/icons-material/Storage'
 import { useTranslation } from 'react-i18next'
 import { formatDateShort } from '../utils/dateUtils'
 import { repositoriesAPI } from '../services/api'
 import { toast } from 'react-hot-toast'
-import RepositoryStatsV1 from './RepositoryStatsV1'
-import RepositoryStatsV2, { type ArchiveEntry } from './RepositoryStatsV2'
-import type { CacheStats } from './RepositoryStatsV1'
+import RepositoryStats from './RepositoryStats'
+import StatsFreshness from './StatsFreshness'
+import { statsUpdatedAt, statsUpdating } from '../utils/repositoryStats'
+import type { SyncState } from '../types/archives'
 import PlanGate from './shared/PlanGate'
 import UpgradePrompt from './UpgradePrompt'
-import { Repository } from '../types'
+import type { Repository, RepositoryStorage } from '../types'
 import { isV2Repo } from '../utils/repoCapabilities'
 import { generateBorgInitCommand } from '../utils/borgUtils'
-
-interface RepositoryInfo {
-  encryption?: {
-    mode?: string
-  }
-  repository?: {
-    last_modified?: string
-    location?: string
-  }
-  cache?: {
-    stats?: CacheStats
-  }
-  // Borg 2: per-archive stats (from `borg2 info --json`)
-  archives?: ArchiveEntry[]
-}
 
 interface RepositoryInfoDialogProps {
   open: boolean
   repository: Repository | null
-  repositoryInfo: RepositoryInfo | null
-  isLoading: boolean
+  /** The repository's stored size figures (#981): `null` when the server
+   * could not compute them, `undefined` while they have not been loaded. */
+  storage?: RepositoryStorage | null
+  /** Index work still pending for the repository (#1063); falls back to
+   * the repository row's own list when not given. */
+  indexPendingKinds?: string[] | null
+  /** The archive listing's freshness, for the "Updated" caption. */
+  lastSyncedAt?: string | null
+  syncState?: SyncState
+  /** Runs a live `borg info` for the repository as the health probe (a
+   * failure shows the recovery panel), then asks for the index run that
+   * refreshes every figure. */
+  onRefresh?: () => void
+  isRefreshing?: boolean
+  refreshFailed?: boolean
   onClose: () => void
   onRunRecoveryCheck?: (repository: Repository) => void
   canRunRecoveryCheck?: boolean
   isRecoveryCheckStarting?: boolean
+  /** The backend's reason for the failure, e.g. borg's stderr from an agent job. */
+  errorMessage?: string | null
 }
 
 interface RecoveryCommand {
@@ -165,7 +166,13 @@ function RecoveryCommandBox({ command }: { command: RecoveryCommand }) {
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
-      <Typography variant="caption" color="text.secondary" fontWeight={700}>
+      <Typography
+        variant="caption"
+        sx={{
+          color: 'text.secondary',
+          fontWeight: 700,
+        }}
+      >
         {command.label}
       </Typography>
       <Box
@@ -241,14 +248,31 @@ function RecoveryGuidedCheckAction({
       }}
     >
       <Box sx={{ minWidth: 0 }}>
-        <Typography variant="body2" fontWeight={700}>
+        <Typography
+          variant="body2"
+          sx={{
+            fontWeight: 700,
+          }}
+        >
           {t('repositoryInfoDialog.recovery.guidedCheckTitle')}
         </Typography>
-        <Typography variant="body2" color="text.secondary">
+        <Typography
+          variant="body2"
+          sx={{
+            color: 'text.secondary',
+          }}
+        >
           {t('repositoryInfoDialog.recovery.guidedCheckDescription')}
         </Typography>
         {!canRunRecoveryCheck && (
-          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+          <Typography
+            variant="caption"
+            sx={{
+              color: 'text.secondary',
+              display: 'block',
+              mt: 0.5,
+            }}
+          >
             {t('repositoryInfoDialog.recovery.guidedCheckUnavailable')}
           </Typography>
         )}
@@ -278,36 +302,58 @@ function RecoveryGuidedCheckAction({
 export default function RepositoryInfoDialog({
   open,
   repository,
-  repositoryInfo,
-  isLoading,
+  storage,
+  indexPendingKinds,
+  lastSyncedAt = null,
+  syncState,
+  onRefresh,
+  isRefreshing = false,
+  refreshFailed = false,
   onClose,
   onRunRecoveryCheck,
   canRunRecoveryCheck = true,
   isRecoveryCheckStarting = false,
+  errorMessage = null,
 }: RepositoryInfoDialogProps) {
   const { t } = useTranslation()
   const [displayRepository, setDisplayRepository] = useState<Repository | null>(repository)
-  const [displayRepositoryInfo, setDisplayRepositoryInfo] = useState<RepositoryInfo | null>(
-    repositoryInfo
+  // The storage figures and the pending kinds are kept the way the live
+  // info is, so the closing transition does not flip them to "unknown";
+  // a different repository opening resets them before its own arrive.
+  const [displayStorage, setDisplayStorage] = useState<RepositoryStorage | null | undefined>(
+    storage
   )
+  const [displayIndexPending, setDisplayIndexPending] = useState<string[] | null | undefined>(
+    indexPendingKinds
+  )
+  const displayedRepositoryId = useRef<number | null>(repository?.id ?? null)
 
   useEffect(() => {
     if (repository) {
       setDisplayRepository(repository)
+      if (displayedRepositoryId.current !== repository.id) {
+        displayedRepositoryId.current = repository.id
+        setDisplayStorage(undefined)
+        setDisplayIndexPending(undefined)
+      }
     }
   }, [repository])
 
   useEffect(() => {
-    if (repositoryInfo) {
-      setDisplayRepositoryInfo(repositoryInfo)
-    }
-  }, [repositoryInfo])
+    if (storage !== undefined) setDisplayStorage(storage)
+  }, [storage])
+
+  useEffect(() => {
+    if (indexPendingKinds !== undefined) setDisplayIndexPending(indexPendingKinds)
+  }, [indexPendingKinds])
 
   useEffect(() => {
     if (!open && !repository) {
       const timeout = window.setTimeout(() => {
         setDisplayRepository(null)
-        setDisplayRepositoryInfo(null)
+        setDisplayStorage(undefined)
+        setDisplayIndexPending(undefined)
+        displayedRepositoryId.current = null
       }, 225)
 
       return () => window.clearTimeout(timeout)
@@ -351,21 +397,34 @@ export default function RepositoryInfoDialog({
       <DialogTitle>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
           <Storage color="primary" />
-          <Typography variant="h5" fontWeight={600}>
+          <Typography
+            variant="h5"
+            sx={{
+              fontWeight: 600,
+              flex: 1,
+              minWidth: 0,
+            }}
+          >
             {displayRepository?.name}
           </Typography>
+          <StatsFreshness
+            updatedAt={statsUpdatedAt(displayStorage, lastSyncedAt)}
+            syncState={syncState}
+            updating={
+              isRefreshing ||
+              statsUpdating(
+                displayIndexPending ?? displayRepository?.index_pending_kinds,
+                syncState
+              )
+            }
+            onRefresh={onRefresh}
+          />
         </Box>
       </DialogTitle>
       <DialogContent>
         {displayRepository && (
           <>
-            {isLoading ? (
-              <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', py: 8 }}>
-                <Typography variant="body2" color="text.secondary">
-                  {t('dialogs.repositoryInfo.loadingInfo')}
-                </Typography>
-              </Box>
-            ) : displayRepositoryInfo ? (
+            {!refreshFailed ? (
               <PlanGate
                 feature="borg_v2"
                 when={isV2Repo(displayRepository)}
@@ -386,7 +445,15 @@ export default function RepositoryInfoDialog({
                     }}
                   >
                     {/* Encryption */}
-                    <Card sx={{ backgroundColor: '#f3e5f5' }}>
+                    <Card
+                      elevation={0}
+                      sx={(theme) => ({
+                        bgcolor: alpha(
+                          theme.palette.secondary.main,
+                          theme.palette.mode === 'dark' ? 0.16 : 0.09
+                        ),
+                      })}
+                    >
                       <CardContent sx={{ py: 2 }}>
                         <Box
                           sx={{
@@ -397,8 +464,14 @@ export default function RepositoryInfoDialog({
                           }}
                         >
                           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
-                            <Lock sx={{ color: '#7b1fa2', fontSize: 28 }} />
-                            <Typography variant="body2" color="text.secondary" fontWeight={500}>
+                            <Lock sx={{ color: 'secondary.main', fontSize: 28 }} />
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                color: 'text.secondary',
+                                fontWeight: 500,
+                              }}
+                            >
                               {t('dialogs.repositoryInfo.encryption')}
                             </Typography>
                           </Box>
@@ -412,12 +485,12 @@ export default function RepositoryInfoDialog({
                                 onClick={handleDownloadKeyfile}
                                 size="small"
                                 sx={{
-                                  backgroundColor: '#7b1fa2',
-                                  color: 'white',
+                                  bgcolor: 'secondary.main',
+                                  color: 'secondary.contrastText',
                                   width: 30,
                                   height: 30,
                                   '&:hover': {
-                                    backgroundColor: '#4a148c',
+                                    bgcolor: 'secondary.dark',
                                     transform: 'scale(1.1)',
                                   },
                                   transition: 'all 0.15s ease',
@@ -428,28 +501,52 @@ export default function RepositoryInfoDialog({
                             </Tooltip>
                           )}
                         </Box>
-                        <Typography variant="h6" fontWeight={700} sx={{ color: '#7b1fa2', ml: 5 }}>
-                          {displayRepositoryInfo.encryption?.mode || 'N/A'}
+                        <Typography
+                          variant="h6"
+                          sx={{
+                            fontWeight: 700,
+                            color: 'secondary.main',
+                            ml: 5,
+                          }}
+                        >
+                          {displayRepository.encryption || 'N/A'}
                         </Typography>
                       </CardContent>
                     </Card>
 
                     {/* Last Modified */}
-                    <Card sx={{ backgroundColor: '#e1f5fe' }}>
+                    <Card
+                      elevation={0}
+                      sx={(theme) => ({
+                        bgcolor: alpha(
+                          theme.palette.info.main,
+                          theme.palette.mode === 'dark' ? 0.16 : 0.09
+                        ),
+                      })}
+                    >
                       <CardContent sx={{ py: 2 }}>
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 1 }}>
-                          <CalendarMonth sx={{ color: '#0277bd', fontSize: 28 }} />
-                          <Typography variant="body2" color="text.secondary" fontWeight={500}>
+                          <CalendarMonth sx={{ color: 'info.main', fontSize: 28 }} />
+                          <Typography
+                            variant="body2"
+                            sx={{
+                              color: 'text.secondary',
+                              fontWeight: 500,
+                            }}
+                          >
                             {t('dialogs.repositoryInfo.lastModified')}
                           </Typography>
                         </Box>
                         <Typography
                           variant="body2"
-                          fontWeight={600}
-                          sx={{ color: '#0277bd', ml: 5 }}
+                          sx={{
+                            fontWeight: 600,
+                            color: 'info.main',
+                            ml: 5,
+                          }}
                         >
-                          {displayRepositoryInfo.repository?.last_modified
-                            ? formatDateShort(displayRepositoryInfo.repository.last_modified)
+                          {displayStorage?.last_modified
+                            ? formatDateShort(displayStorage.last_modified)
                             : 'N/A'}
                         </Typography>
                       </CardContent>
@@ -461,9 +558,11 @@ export default function RepositoryInfoDialog({
                     <CardContent sx={{ py: 2 }}>
                       <Typography
                         variant="caption"
-                        color="text.secondary"
-                        display="block"
-                        sx={{ mb: 0.5 }}
+                        sx={{
+                          color: 'text.secondary',
+                          display: 'block',
+                          mb: 0.5,
+                        }}
                       >
                         {t('dialogs.repositoryInfo.repositoryLocation')}
                       </Typography>
@@ -471,32 +570,32 @@ export default function RepositoryInfoDialog({
                         variant="body2"
                         sx={{ fontFamily: 'monospace', wordBreak: 'break-all' }}
                       >
-                        {displayRepositoryInfo.repository?.location || 'N/A'}
+                        {displayRepository.path || 'N/A'}
                       </Typography>
                     </CardContent>
                   </Card>
-
-                  {/* Storage Statistics */}
-                  {isV2Repo(displayRepository) ? (
-                    <RepositoryStatsV2 archives={displayRepositoryInfo.archives || []} />
-                  ) : displayRepositoryInfo.cache?.stats &&
-                    (displayRepositoryInfo.cache.stats.total_size ?? 0) > 0 ? (
-                    <RepositoryStatsV1 stats={displayRepositoryInfo.cache.stats} />
-                  ) : (
-                    <Alert severity="info" icon={<Info />}>
-                      <Typography variant="body2" fontWeight={600} gutterBottom>
-                        {t('dialogs.repositoryInfo.noBackupsYet')}
-                      </Typography>
-                      <Typography variant="body2" color="text.secondary">
-                        {t('repositoryInfoDialog.noArchivesDescription')}
-                      </Typography>
-                    </Alert>
-                  )}
                 </Box>
               </PlanGate>
             ) : (
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                <Alert severity="error">{t('repositoryInfoDialog.failedToLoad')}</Alert>
+                <Alert severity="error">
+                  {t('repositoryInfoDialog.failedToLoad')}
+                  {errorMessage && (
+                    <Box
+                      component="pre"
+                      sx={{
+                        m: 0,
+                        mt: 1,
+                        fontFamily: 'monospace',
+                        fontSize: '0.8rem',
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                      }}
+                    >
+                      {errorMessage}
+                    </Box>
+                  )}
+                </Alert>
                 {displayRepository && (
                   <Paper
                     variant="outlined"
@@ -506,10 +605,22 @@ export default function RepositoryInfoDialog({
                       bgcolor: 'action.hover',
                     }}
                   >
-                    <Typography variant="subtitle2" fontWeight={700} gutterBottom>
+                    <Typography
+                      variant="subtitle2"
+                      gutterBottom
+                      sx={{
+                        fontWeight: 700,
+                      }}
+                    >
                       {t('repositoryInfoDialog.recovery.title')}
                     </Typography>
-                    <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+                    <Typography
+                      variant="body2"
+                      sx={{
+                        color: 'text.secondary',
+                        mb: 1.5,
+                      }}
+                    >
                       {t('repositoryInfoDialog.recovery.description')}
                     </Typography>
                     {onRunRecoveryCheck && (
@@ -531,6 +642,21 @@ export default function RepositoryInfoDialog({
                 )}
               </Box>
             )}
+            {/* Storage Statistics: the stored figures, as the card and the
+                archive header show them, never a live per-version block.
+                A failed refresh shows them under its error too; a Borg 2
+                repository's stay behind the same plan gate as its details,
+                whose prompt says so. */}
+            <PlanGate feature="borg_v2" when={isV2Repo(displayRepository)} fallback={null}>
+              <Box sx={{ mt: 2 }}>
+                <RepositoryStats
+                  variant="detail"
+                  storage={displayStorage}
+                  archiveCount={displayRepository.archive_count}
+                  indexPendingKinds={displayIndexPending ?? displayRepository.index_pending_kinds}
+                />
+              </Box>
+            </PlanGate>
           </>
         )}
       </DialogContent>

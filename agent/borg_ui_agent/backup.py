@@ -11,7 +11,13 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from agent.borg_ui_agent.borg import is_warning_return_code
+from agent.borg_ui_agent.cancel import (
+    cancel_requested,
+    start_cancel_poller,
+    start_keepalive,
+)
 from agent.borg_ui_agent.client import AgentClient
+from agent.borg_ui_agent.failure_report import FailureTail, failure_report
 
 
 @dataclass(frozen=True)
@@ -121,6 +127,7 @@ class BackupCreatePayload:
 
         cmd = [
             borg_cmd,
+            *borg1_lock_wait_args(self.environment),
             "create",
             "--progress",
             "--stats",
@@ -177,6 +184,14 @@ def _extract_environment(
         if secret_value is not None:
             environment["BORG_PASSPHRASE"] = secret_value
 
+    # A lock wait sent with the job wins over the agent's default, for the
+    # Borg 1 flag and the Borg 2 variable alike.
+    environment_source = payload.get("environment")
+    if isinstance(environment_source, dict):
+        lock_wait = environment_source.get("BORG_LOCK_WAIT")
+        if isinstance(lock_wait, str) and lock_wait.isdigit():
+            environment["BORG_LOCK_WAIT"] = lock_wait
+
     return environment
 
 
@@ -190,6 +205,24 @@ def _extract_environment(
 _BORG_NONINTERACTIVE_ACCESS_DEFAULTS = {
     "BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK": "yes",
     "BORG_RELOCATED_REPO_ACCESS_IS_OK": "yes",
+    # Borg 2.0.0b23's pack cache: borgstore serves archive metadata as
+    # whole-pack loads, so on remote repositories every listing re-transfers
+    # packs. The writethrough cache under borg's own cache directory downloads
+    # each pack once. Applied via setdefault like the flags above, so the
+    # container environment can resize it or disable it (BORG_STORE_CACHE="").
+    # Borg 1 ignores both variables.
+    "BORG_STORE_CACHE": "1",
+    "BORG_PACK_CACHE_SIZE": str(2 * 1024**3),
+    # Borg's modern exit codes (0 success, 2-99 errors, 100-127 warnings), so
+    # an agent's Borg 1 reports failures in the same vocabulary the server's
+    # does and `is_warning_return_code` sees the range it already accepts.
+    # Borg 2 uses them anyway. setdefault like the rest: an operator can pin
+    # "legacy", and a per-job override from the server still wins.
+    "BORG_EXIT_CODES": "modern",
+    # How long borg waits for a held repository lock, the server's value for
+    # background jobs. Borg 2 reads it from the environment; Borg 1 ignores
+    # the variable and gets it as a flag (borg1_lock_wait_args).
+    "BORG_LOCK_WAIT": "180",
 }
 
 
@@ -209,7 +242,31 @@ def build_borg_env(overrides: Optional[dict[str, str]] = None) -> dict[str, str]
     return env
 
 
+def borg1_lock_wait_args(overrides: Optional[dict[str, str]] = None) -> list[str]:
+    """`--lock-wait` for a Borg 1 command line, from the same environment the
+    command runs with. Borg 1.4 never reads BORG_LOCK_WAIT and defaults to
+    1 second, so a held lock fails the job almost at once (#1216)."""
+    return ["--lock-wait", build_borg_env(overrides)["BORG_LOCK_WAIT"]]
+
+
+# The counters `archive_progress` reports while `borg create` runs
+ARCHIVE_STATS_FIELDS = (
+    "original_size",
+    "compressed_size",
+    "deduplicated_size",
+    "nfiles",
+)
+
+
+# The logger Borg's progress indicators print through
+PROGRESS_LOGGER = "borg.output.progress"
+
+
 def parse_borg_progress(line: str) -> Optional[dict[str, Any]]:
+    """The progress report a Borg `--log-json` line makes: None for a line
+    that is not a progress line, an empty report for one that has nothing
+    to report (a step such as the cache transaction, which no reader
+    shows)."""
     stripped = line.strip()
     if not stripped.startswith("{"):
         return None
@@ -221,19 +278,14 @@ def parse_borg_progress(line: str) -> Optional[dict[str, Any]]:
     msg_type = payload.get("type")
     if msg_type == "archive_progress":
         progress: dict[str, Any] = {}
-        for key in (
-            "original_size",
-            "compressed_size",
-            "deduplicated_size",
-            "nfiles",
-        ):
+        for key in ARCHIVE_STATS_FIELDS:
             if key in payload:
                 progress[key] = payload[key]
         if "path" in payload:
             progress["current_file"] = payload["path"]
         if payload.get("finished"):
             progress["progress_percent"] = 100.0
-        return progress or None
+        return progress
 
     if msg_type == "progress_percent":
         if payload.get("finished"):
@@ -245,12 +297,34 @@ def parse_borg_progress(line: str) -> Optional[dict[str, Any]]:
             and isinstance(total, (int, float))
             and total
         ):
-            return {"progress_percent": float(current / total * 100.0)}
+            progress = {"progress_percent": float(current / total * 100.0)}
+            # `borg extract` names the file it is at in `info`
+            info = payload.get("info")
+            if isinstance(info, list) and info and isinstance(info[0], str):
+                progress["current_file"] = info[0]
+            return progress
 
     if msg_type == "file_status" and payload.get("path"):
         return {"current_file": payload["path"]}
 
+    # A progress indicator prints JSON only when it is the only one
+    # running; one that starts while another runs (the cache transaction
+    # during a prune) prints through the progress logger as a
+    # `log_message` instead.
+    if msg_type == "progress_message" or (
+        msg_type == "log_message" and payload.get("name") == PROGRESS_LOGGER
+    ):
+        return {}
+
     return None
+
+
+def progress_replaces_log_line(progress: Optional[dict[str, Any]]) -> bool:
+    """Whether the progress report parsed from a line says all the line did,
+    so the line is not stored as a log line too. A `file_status` line
+    (`create --list`) is both: it names the current file, and it is the
+    listing the operator asked for."""
+    return progress is not None and set(progress) != {"current_file"}
 
 
 def _parse_created_archive_name(stdout: str) -> Optional[str]:
@@ -275,6 +349,33 @@ def _parse_created_archive_name(stdout: str) -> Optional[str]:
         if isinstance(name, str) and name.strip():
             return name.strip()
     return None
+
+
+def _parse_created_archive_stats(stdout: str) -> Optional[dict[str, int]]:
+    """The final counters of the archive ``borg create --json`` made
+    (``archive.stats``), or None when there are none.
+
+    Borg reports ``archive_progress`` at most once a second, and its last
+    one (``finished``) carries no counters, so the progress reports never
+    hold the final figures. Borg 2 reports no ``compressed_size`` or
+    ``deduplicated_size`` here; only the fields present are returned.
+    """
+    if not stdout or not stdout.strip():
+        return None
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    archive = data.get("archive") if isinstance(data, dict) else None
+    stats = archive.get("stats") if isinstance(archive, dict) else None
+    if not isinstance(stats, dict):
+        return None
+    counters = {
+        key: stats[key]
+        for key in ARCHIVE_STATS_FIELDS
+        if isinstance(stats.get(key), int) and not isinstance(stats[key], bool)
+    }
+    return counters or None
 
 
 def execute_backup_create_job(
@@ -305,6 +406,16 @@ def execute_backup_create_job(
         message=f"Starting backup.create: {shlex.join(cmd)}",
     )
     sequence += 1
+
+    if cancel_requested(should_cancel):
+        # Cancelled between dispatch and start (the log above may have
+        # waited on the server): nothing to stop yet.
+        client.cancel_job(job_id)
+        return BackupExecutionResult(
+            job_id=job_id,
+            status="canceled",
+            message="backup.create canceled before it started",
+        )
 
     try:
         popen_kwargs: dict[str, Any] = {
@@ -339,46 +450,72 @@ def execute_backup_create_job(
     stdout_thread = threading.Thread(target=_drain_stdout, daemon=True)
     stdout_thread.start()
 
-    if process.stderr is not None:
-        for line in process.stderr:
-            message = line.rstrip("\n")
-            client.send_log(job_id, sequence=sequence, stream="stderr", message=message)
-            sequence += 1
-            progress = parse_borg_progress(message)
-            if progress:
-                client.send_progress(job_id, progress)
-            if should_cancel and should_cancel():
-                cancel_message = "Cancellation requested; stopping borg create"
-                client.send_log(
-                    job_id, sequence=sequence, stream="stderr", message=cancel_message
-                )
-                return_code = _terminate_process(process)
-                stdout_thread.join()
-                client.cancel_job(job_id)
-                return BackupExecutionResult(
-                    job_id=job_id,
-                    status="canceled",
-                    return_code=return_code,
-                    message="backup.create canceled",
-                )
-
-    return_code = process.wait()
+    done = threading.Event()
+    # The per-line check answers at once while borg reports progress; the
+    # poller reaches a borg that is silent (a lock wait, a stalled store).
+    cancelled = start_cancel_poller(process, should_cancel, done, _terminate_process)
+    start_keepalive(process, client, job_id, done)
+    # The last plain lines borg wrote, for the failure report.
+    failure_tail = FailureTail()
+    try:
+        if process.stderr is not None:
+            for line in process.stderr:
+                message = line.rstrip("\n")
+                failure_tail.append(message)
+                progress = parse_borg_progress(message)
+                if progress:
+                    client.send_progress(job_id, progress)
+                if not progress_replaces_log_line(progress):
+                    client.send_log(
+                        job_id, sequence=sequence, stream="stderr", message=message
+                    )
+                    sequence += 1
+                if cancel_requested(should_cancel) and process.poll() is None:
+                    # not once Borg ended on its own while the check ran (it
+                    # may have asked the server): that run is its verdict
+                    cancelled.set()
+                    _terminate_process(process)
+                    break
+        return_code = process.wait()
+    except BaseException:
+        # A report that failed (the server unreachable) unwinds this worker;
+        # borg create must not run on unsupervised, holding the repository.
+        _terminate_process(process)
+        raise
+    finally:
+        done.set()
     stdout_thread.join()
+
+    if cancelled.is_set():
+        client.send_log(
+            job_id,
+            sequence=sequence,
+            stream="stderr",
+            message="Cancellation requested; stopped borg create",
+        )
+        client.cancel_job(job_id)
+        return BackupExecutionResult(
+            job_id=job_id,
+            status="canceled",
+            return_code=return_code,
+            message="backup.create canceled",
+        )
     if return_code == 0 or is_warning_return_code(return_code):
         # Warnings (rc 1 / 100-127) still produced an archive: complete the
         # job and let the server record completed_with_warnings from the
         # return code, matching how server-side backups are classified.
-        resolved_archive_name = (
-            _parse_created_archive_name("".join(stdout_chunks)) or payload.archive_name
-        )
-        client.complete_job(
-            job_id,
-            result={
-                "archive_name": resolved_archive_name,
-                "return_code": return_code,
-                "command": cmd,
-            },
-        )
+        stdout = "".join(stdout_chunks)
+        result: dict[str, Any] = {
+            "archive_name": _parse_created_archive_name(stdout) or payload.archive_name,
+            "return_code": return_code,
+            "command": cmd,
+        }
+        # The final counters travel with the outcome: the progress reports
+        # go another way and may arrive after it, or never hold them.
+        archive_stats = _parse_created_archive_stats(stdout)
+        if archive_stats:
+            result["archive_stats"] = archive_stats
+        client.complete_job(job_id, result=result)
         return BackupExecutionResult(
             job_id=job_id,
             status="completed" if return_code == 0 else "completed_with_warnings",
@@ -387,7 +524,12 @@ def execute_backup_create_job(
         )
 
     error_message = f"borg create exited with code {return_code}"
-    client.fail_job(job_id, error_message=error_message, return_code=return_code)
+    client.fail_job(
+        job_id,
+        error_message=error_message,
+        return_code=return_code,
+        **failure_report(return_code, failure_tail.lines()),
+    )
     return BackupExecutionResult(
         job_id=job_id,
         status="failed",
@@ -397,6 +539,9 @@ def execute_backup_create_job(
 
 
 def _terminate_process(process: subprocess.Popen) -> int:
+    if process.poll() is not None:
+        # Already reaped: its pid may be another process's by now.
+        return process.returncode
     if os.name == "posix" and getattr(process, "pid", None):
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)

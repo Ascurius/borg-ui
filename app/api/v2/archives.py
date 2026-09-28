@@ -6,20 +6,33 @@ All routes accept a `repository` query param (the repo path).
 
 import json
 import os
-import asyncio
 import re
+from typing import Optional
 import tempfile  # noqa: F401 - retained as a patch target in download endpoint tests
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 import structlog
 
 from app.api.archive_download import extract_file_download
+from app.api.archives import (
+    _content_disposition_attachment,
+    _stream_agent_archive_tar,
+    _tar_strip_components,
+)
 from app.database.database import get_db
-from app.database.models import User, Repository, DeleteArchiveJob, SystemSettings
-from app.core.security import get_current_user, get_current_download_user
+from app.database.models import User, Repository, SystemSettings
+from app.services.operations.enqueue import enqueue
+from app.services.operations.job_facade import resolve_maintenance_job
+from app.services.operations.maintenance_start import active_delete_for_archive
+from app.core.security import (
+    check_repo_access,
+    get_current_user,
+    get_current_download_user,
+)
 from app.core.features import require_feature
-from app.core.borg2 import borg2
+from app.core.borg2 import borg2, normalize_repo_info_encryption
 from app.services.agent_job_dispatcher import dispatch_agent_job_best_effort
 from app.services.archive_browse_service import (
     build_browse_items,
@@ -29,16 +42,44 @@ from app.services.archive_browse_service import (
 from app.services.cache_service import archive_cache
 from app.services.log_policy import get_log_save_policy, job_has_logs_by_policy
 from app.services.repository_executor import (
+    agent_timezone_for_repository,
     is_agent_executor,
     queue_agent_repository_operation_job,
     wait_for_agent_repository_operation_job,
 )
 from app.services.v2.archive_browse import get_browse_depth, is_fast_browse_enabled
-from app.utils.borg_env import repository_borg_env
-from app.utils.datetime_utils import serialize_datetime
+from app.utils.borg_env import effective_repository_remote_path, repository_borg_env
+from app.utils.datetime_utils import serialize_borg_archive_time, serialize_datetime
 
 logger = structlog.get_logger()
-router = APIRouter(tags=["Archives v2"], dependencies=[require_feature("borg_v2")])
+# Borg 2 support is the Pro feature, but reading an existing Borg 2 archive is
+# not: a backup tool that refuses to hand back your own files because a plan
+# lapsed is not a backup tool. `contents`, `download` and `download-folder`
+# are open on every plan; everything else here carries BORG2 (spec
+# 2026-09-21-community-teasers-and-feature-trials, section 1.2).
+router = APIRouter(tags=["Archives v2"])
+
+BORG2 = require_feature("borg_v2")
+
+
+_UNSUPPORTED_VERSION = re.compile(
+    r"repository version (\d+) is not supported by this borg version"
+)
+
+
+def _unsupported_repository_version(stderr: str) -> Optional[dict]:
+    """Borg 2 is in beta and its repository format has changed between
+    betas. A repository written by another beta fails with a borgstore
+    trace that ends in this sentence; hand the frontend a key it can
+    translate instead of the trace."""
+    match = _UNSUPPORTED_VERSION.search(stderr or "")
+    if not match:
+        return None
+    return {
+        "key": "backend.errors.archives.unsupportedRepositoryVersion",
+        "params": {"version": int(match.group(1))},
+    }
+
 
 ARCHIVE_ID_RE = re.compile(r"^[0-9a-fA-F]{16,}$")
 
@@ -133,7 +174,7 @@ def _repo_needs_custom_env(repo: Repository) -> bool:
     )
 
 
-def _get_v2_repo(repository: str, db: Session) -> Repository:
+def _get_v2_repo(repository: str, db: Session, current_user: User) -> Repository:
     """Resolve and validate a Borg 2 repository by ID or path.
 
     BorgApiClient sends the integer ID as a string; legacy callers may send
@@ -162,6 +203,7 @@ def _get_v2_repo(repository: str, db: Session) -> Repository:
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"key": "backend.errors.restore.repositoryNotFound"},
         )
+    check_repo_access(db, current_user, repo, "viewer")
     return repo
 
 
@@ -183,7 +225,7 @@ async def _resolve_archive_name(repo: Repository, archive_ref: str, db: Session)
             result = await borg2.list_archives(
                 repo.path,
                 passphrase=repo.passphrase,
-                remote_path=repo.remote_path,
+                remote_path=effective_repository_remote_path(repo),
                 bypass_lock=repo.bypass_lock,
                 env=env,
             )
@@ -191,7 +233,7 @@ async def _resolve_archive_name(repo: Repository, archive_ref: str, db: Session)
         result = await borg2.list_archives(
             repo.path,
             passphrase=repo.passphrase,
-            remote_path=repo.remote_path,
+            remote_path=effective_repository_remote_path(repo),
             bypass_lock=repo.bypass_lock,
         )
     if not result["success"]:
@@ -222,29 +264,38 @@ def _get_archive_selector(archive_ref: str) -> str:
     return archive_ref
 
 
+# Bump when the shape or semantics of cached archive items change, so entries
+# written by an older build are never served (e.g. the mtime timezone change:
+# a cache hit bypasses parse_archive_items).
+_ARCHIVE_CONTENTS_CACHE_VERSION = "v2-utc-mtime"
+
+
 def _get_browse_cache_key(archive_ref: str, path: str) -> str:
     archive_key = _get_archive_selector(archive_ref)
     normalized_path = path.strip("/")
+    version = _ARCHIVE_CONTENTS_CACHE_VERSION
     if not normalized_path:
-        return f"{archive_key}::managed-root"
-    return f"{archive_key}::managed-path::{normalized_path}"
+        return f"{version}::{archive_key}::managed-root"
+    return f"{version}::{archive_key}::managed-path::{normalized_path}"
 
 
 def _get_browse_raw_cache_key(archive_ref: str) -> str:
-    return f"{_get_archive_selector(archive_ref)}::raw"
+    return (
+        f"{_ARCHIVE_CONTENTS_CACHE_VERSION}::{_get_archive_selector(archive_ref)}::raw"
+    )
 
 
 # ── List archives ──────────────────────────────────────────────────────────────
 
 
-@router.get("/list")
+@router.get("/list", dependencies=[BORG2])
 async def list_archives(
     repository: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """List archives in a Borg 2 repository."""
-    repo = _get_v2_repo(repository, db)
+    repo = _get_v2_repo(repository, db, current_user)
     if is_agent_executor(repo):
         result = await _agent_list_archives_result(
             db, repo, timeout_seconds=_get_list_timeout(db)
@@ -254,7 +305,7 @@ async def list_archives(
             result = await borg2.list_archives(
                 repo.path,
                 passphrase=repo.passphrase,
-                remote_path=repo.remote_path,
+                remote_path=effective_repository_remote_path(repo),
                 bypass_lock=repo.bypass_lock,
                 env=env,
             )
@@ -262,7 +313,7 @@ async def list_archives(
         result = await borg2.list_archives(
             repo.path,
             passphrase=repo.passphrase,
-            remote_path=repo.remote_path,
+            remote_path=effective_repository_remote_path(repo),
             bypass_lock=repo.bypass_lock,
         )
     if not result.get("success", bool(result.get("stdout"))):
@@ -276,7 +327,7 @@ async def list_archives(
 # ── Archive info ───────────────────────────────────────────────────────────────
 
 
-@router.get("/{archive_id}/info")
+@router.get("/{archive_id}/info", dependencies=[BORG2])
 async def get_archive_info(
     repository: str,
     archive_id: str,
@@ -286,7 +337,7 @@ async def get_archive_info(
     db: Session = Depends(get_db),
 ):
     """Get detailed information about a Borg 2 archive."""
-    repo = _get_v2_repo(repository, db)
+    repo = _get_v2_repo(repository, db, current_user)
     archive_selector = _get_archive_selector(archive_id)
     if is_agent_executor(repo):
         result = await _agent_archive_info_result(
@@ -298,7 +349,7 @@ async def get_archive_info(
                 repo.path,
                 archive_selector,
                 passphrase=repo.passphrase,
-                remote_path=repo.remote_path,
+                remote_path=effective_repository_remote_path(repo),
                 bypass_lock=repo.bypass_lock,
                 env=env,
             )
@@ -307,7 +358,7 @@ async def get_archive_info(
             repo.path,
             archive_selector,
             passphrase=repo.passphrase,
-            remote_path=repo.remote_path,
+            remote_path=effective_repository_remote_path(repo),
             bypass_lock=repo.bypass_lock,
         )
     if not result.get("success", bool(result.get("stdout"))):
@@ -335,7 +386,9 @@ async def get_archive_info(
             "limits": archive_info.get("limits", {}),
             "comment": archive_info.get("comment", ""),
             "repository": archive_data.get("repository", {}),
-            "encryption": archive_data.get("encryption", {}),
+            "encryption": normalize_repo_info_encryption(archive_data).get(
+                "encryption", {}
+            ),
             "cache": archive_data.get("cache", {}),
         }
 
@@ -355,7 +408,7 @@ async def get_archive_info(
                         repo.path,
                         archive_selector,
                         passphrase=repo.passphrase,
-                        remote_path=repo.remote_path,
+                        remote_path=effective_repository_remote_path(repo),
                         bypass_lock=repo.bypass_lock,
                         env=env,
                     )
@@ -364,9 +417,16 @@ async def get_archive_info(
                     repo.path,
                     archive_selector,
                     passphrase=repo.passphrase,
-                    remote_path=repo.remote_path,
+                    remote_path=effective_repository_remote_path(repo),
                     bypass_lock=repo.bypass_lock,
                 )
+            # An agent listing renders mtimes in the agent's zone; a
+            # server-side listing runs under TZ=UTC (the wrapper pins it).
+            mtime_zone = (
+                agent_timezone_for_repository(db, repo)
+                if is_agent_executor(repo)
+                else "UTC"
+            )
             if list_result.get("success", bool(list_result.get("stdout"))):
                 files = []
                 for line in (list_result.get("stdout") or "").strip().split("\n"):
@@ -381,7 +441,9 @@ async def get_archive_info(
                                     "user": f.get("user"),
                                     "group": f.get("group"),
                                     "size": f.get("size"),
-                                    "mtime": f.get("mtime"),
+                                    "mtime": serialize_borg_archive_time(
+                                        f.get("mtime"), timezone_name=mtime_zone
+                                    ),
                                     "healthy": f.get("healthy", True),
                                 }
                             )
@@ -414,7 +476,7 @@ async def get_archive_contents(
     Returns {"items": [...]} matching the v1 /browse/ response shape so
     ArchiveContentsDialog works without version branching.
     """
-    repo = _get_v2_repo(repository, db)
+    repo = _get_v2_repo(repository, db, current_user)
     archive_selector = _get_archive_selector(archive_id)
     fast_browse = is_fast_browse_enabled(db)
     cache_key = _get_browse_cache_key(archive_id, path)
@@ -456,7 +518,7 @@ async def get_archive_contents(
                     "archive": archive_selector,
                     "path": path if fast_browse else "",
                     "passphrase": repo.passphrase,
-                    "remote_path": repo.remote_path,
+                    "remote_path": effective_repository_remote_path(repo),
                     "bypass_lock": repo.bypass_lock,
                     "env": env,
                 }
@@ -469,7 +531,7 @@ async def get_archive_contents(
                 "archive": archive_selector,
                 "path": path if fast_browse else "",
                 "passphrase": repo.passphrase,
-                "remote_path": repo.remote_path,
+                "remote_path": effective_repository_remote_path(repo),
                 "bypass_lock": repo.bypass_lock,
             }
             if fast_browse:
@@ -488,12 +550,21 @@ async def get_archive_contents(
             stderr=result.get("stderr", "")[:200],
         )
         if not stdout and not result.get("success", True):
+            stderr = result.get("stderr", "unknown error")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to get archive contents: {result.get('stderr', 'unknown error')}",
+                detail=_unsupported_repository_version(stderr)
+                or f"Failed to get archive contents: {stderr}",
             )
 
-        all_items = parse_archive_items(stdout)
+        # An agent listing renders mtimes in the agent's zone; a server-side
+        # listing runs under TZ=UTC (the wrapper pins it).
+        mtime_zone = (
+            agent_timezone_for_repository(db, repo)
+            if is_agent_executor(repo)
+            else "UTC"
+        )
+        all_items = parse_archive_items(stdout, timezone_name=mtime_zone)
         if not fast_browse:
             await archive_cache.set(repo.id, raw_cache_key, all_items)
 
@@ -523,7 +594,7 @@ async def get_archive_contents(
 # ── Delete archive ─────────────────────────────────────────────────────────────
 
 
-@router.delete("/{archive_id}")
+@router.delete("/{archive_id}", dependencies=[BORG2])
 async def delete_archive(
     repository: str,
     archive_id: str,
@@ -541,18 +612,13 @@ async def delete_archive(
             detail={"key": "backend.errors.archives.adminAccessRequired"},
         )
 
-    repo = _get_v2_repo(repository, db)
+    repo = _get_v2_repo(repository, db, current_user)
     archive_name = await _resolve_archive_name(repo, archive_id, db)
 
-    running_job = (
-        db.query(DeleteArchiveJob)
-        .filter(
-            DeleteArchiveJob.repository_id == repo.id,
-            DeleteArchiveJob.archive_name == archive_name,
-            DeleteArchiveJob.status == "running",
-        )
-        .first()
-    )
+    # Deletes are rejected per archive, not per repository (spec section 13
+    # phase 5): two different archives may be removed at once, the same one
+    # may not.
+    running_job = active_delete_for_archive(db, repo.id, archive_name)
     if running_job:
         raise HTTPException(
             status_code=409,
@@ -562,27 +628,18 @@ async def delete_archive(
             },
         )
 
-    delete_job = DeleteArchiveJob(
+    delete_job = enqueue(
+        db,
+        "delete_archive",
         repository_id=repo.id,
-        repository_path=repo.path,
-        archive_name=archive_name,
-        status="pending",
-    )
-    db.add(delete_job)
-    db.commit()
-    db.refresh(delete_job)
-
-    from app.services.v2.delete_archive_service import delete_archive_v2_service
-
-    asyncio.create_task(
-        delete_archive_v2_service.execute_delete(
-            delete_job.id, repo.id, archive_name, None
-        )
+        trigger="manual",
+        params={"archive_name": archive_name},
+        triggered_by_user_id=current_user.id,
     )
 
     logger.info(
-        "Borg2 delete archive job created",
-        job_id=delete_job.id,
+        "Borg2 delete archive operation queued",
+        operation_id=delete_job.id,
         repository_id=repo.id,
         archive=archive_name,
     )
@@ -606,7 +663,7 @@ async def download_file_from_archive(
     db: Session = Depends(get_db),
 ):
     """Extract and download a specific file from a Borg 2 archive."""
-    repo = _get_v2_repo(repository, db)
+    repo = _get_v2_repo(repository, db, current_user)
     archive_selector = _get_archive_selector(archive)
     try:
 
@@ -619,7 +676,7 @@ async def download_file_from_archive(
                         [file_path],
                         temp_dir,
                         passphrase=repo.passphrase,
-                        remote_path=repo.remote_path,
+                        remote_path=effective_repository_remote_path(repo),
                         bypass_lock=repo.bypass_lock,
                         env=env,
                     )
@@ -629,7 +686,7 @@ async def download_file_from_archive(
                 [file_path],
                 temp_dir,
                 passphrase=repo.passphrase,
-                remote_path=repo.remote_path,
+                remote_path=effective_repository_remote_path(repo),
                 bypass_lock=repo.bypass_lock,
             )
 
@@ -647,17 +704,97 @@ async def download_file_from_archive(
         )
 
 
+@router.get("/download-folder")
+async def download_folder_from_archive(
+    repository: str,
+    archive: str,
+    directory_path: str,
+    current_user: User = Depends(get_current_download_user),
+    db: Session = Depends(get_db),
+):
+    """Download one Borg 2 archived directory as a streaming tar file."""
+    if not directory_path.strip().strip("/"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="directory_path is required",
+        )
+    repo = _get_v2_repo(repository, db, current_user)
+    archive_selector = _get_archive_selector(archive)
+    try:
+        if is_agent_executor(repo):
+            return await _stream_agent_archive_tar(
+                db, repo, archive_selector, directory_path
+            )
+        if _repo_needs_custom_env(repo):
+            with repository_borg_env(repo, db) as env:
+                stream = borg2.export_archive_tar(
+                    repo.path,
+                    archive_selector,
+                    directory_path,
+                    passphrase=repo.passphrase,
+                    remote_path=effective_repository_remote_path(repo),
+                    env=env,
+                    strip_components=_tar_strip_components(directory_path),
+                )
+                return await _tar_download_response(stream, directory_path)
+        stream = borg2.export_archive_tar(
+            repo.path,
+            archive_selector,
+            directory_path,
+            passphrase=repo.passphrase,
+            remote_path=effective_repository_remote_path(repo),
+            strip_components=_tar_strip_components(directory_path),
+        )
+        return await _tar_download_response(stream, directory_path)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to download folder: {str(e)}"
+        )
+
+
+async def _tar_download_response(stream, directory_path: str) -> StreamingResponse:
+    """Prime a tar byte stream so Borg failures are HTTP errors, not empty 200s."""
+    iterator = stream.__aiter__()
+    try:
+        first_chunk = await anext(iterator)
+    except StopAsyncIteration:
+        if stream.return_code not in (None, 0):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to download folder: {stream.stderr or 'Borg export failed'}",
+            )
+        first_chunk = None
+
+    async def body():
+        try:
+            if first_chunk is not None:
+                yield first_chunk
+            async for chunk in iterator:
+                yield chunk
+        finally:
+            await stream.close()
+
+    filename = f"{os.path.basename(directory_path.rstrip('/')) or 'archive'}.tar"
+    return StreamingResponse(
+        body(),
+        media_type="application/x-tar",
+        headers={"Content-Disposition": _content_disposition_attachment(filename)},
+    )
+
+
 # ── Delete job status ──────────────────────────────────────────────────────────
 
 
-@router.get("/delete-jobs/{job_id}")
+@router.get("/delete-jobs/{job_id}", dependencies=[BORG2])
 async def get_delete_job_status(
     job_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Get status of a Borg 2 archive delete job."""
-    job = db.query(DeleteArchiveJob).filter(DeleteArchiveJob.id == job_id).first()
+    job = resolve_maintenance_job(db, job_id, "delete_archive")
     if not job:
         raise HTTPException(
             status_code=404, detail={"key": "backend.errors.archives.deleteJobNotFound"}

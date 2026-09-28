@@ -4,6 +4,7 @@ import { QueryClient } from '@tanstack/react-query'
 import ManagedAgents, {
   AgentDiagnosticsDialog,
   AgentList,
+  AgentReinstallDialog,
   AgentSetupGuide,
   AgentSetupHelpContent,
   JobsTable,
@@ -445,7 +446,7 @@ describe('ManagedAgents', () => {
         token_prefix: 'agent-token-secret',
         expires_at: '2026-05-28T00:00:00.000Z',
         created_at: '2026-05-21T00:00:00.000Z',
-        default_path: '/home/karanhudia',
+        default_path: '/home/alex',
       },
     } as AxiosResponse)
 
@@ -458,12 +459,12 @@ describe('ManagedAgents', () => {
     await user.click(screen.getByRole('button', { name: /next/i }))
     await user.clear(screen.getByLabelText(/agent name/i))
     await user.type(screen.getByLabelText(/agent name/i), 'Odroid M1')
-    await user.type(screen.getByLabelText(/default path/i), ' /home/karanhudia ')
+    await user.type(screen.getByLabelText(/default path/i), ' /home/alex ')
     await user.click(screen.getByRole('button', { name: /generate install command/i }))
 
     expect(vi.mocked(managedAgentsAPI.createEnrollmentToken).mock.calls[0][0]).toEqual({
       name: 'Odroid M1',
-      default_path: '/home/karanhudia',
+      default_path: '/home/alex',
       expires_in_days: 7,
     })
   }, 60000)
@@ -559,6 +560,29 @@ describe('ManagedAgents', () => {
 
     await user.click(screen.getByRole('button', { name: /revoke agent/i }))
     expect(onRevoke).toHaveBeenCalledWith(agent)
+  })
+
+  it('shows a pending Borg pin on the card', () => {
+    const agent = buildAgent({
+      desired_borg_version: '2',
+      borg_versions: [{ major: 1, version: '1.4.0' }],
+    })
+
+    renderWithProviders(
+      <AgentList
+        agents={[agent]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        onRunDiagnostics={vi.fn()}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+    expect(screen.getByText(/borg 2 pending/i)).toBeInTheDocument()
   })
 
   it('opens managed-agent diagnostics from an agent card and runs a session check', async () => {
@@ -726,6 +750,80 @@ describe('ManagedAgents', () => {
     expect(command).not.toContain(' register ')
   })
 
+  it('adds --borg-version to the reinstall command for a Borg selection', () => {
+    const base =
+      'curl -fsSL https://borg-ui.example.com/agent/install.sh | sudo bash -s -- --reinstall'
+
+    expect(buildAgentReinstallCommand('https://borg-ui.example.com', 'skip')).toBe(base)
+    expect(buildAgentReinstallCommand('https://borg-ui.example.com', 'borg1')).toBe(
+      `${base} --borg-version 1`
+    )
+    expect(buildAgentReinstallCommand('https://borg-ui.example.com', 'borg2')).toBe(
+      `${base} --borg-version 2`
+    )
+    expect(buildAgentReinstallCommand('https://borg-ui.example.com', 'both')).toBe(
+      `${base} --borg-version both`
+    )
+  })
+
+  it('defaults the reinstall dialog to Skip and makes a Borg change an explicit choice', async () => {
+    const user = userEvent.setup()
+    const onCopy = vi.fn()
+    const agent = {
+      id: 8,
+      agent_id: 'agent-client-8',
+      name: 'client',
+      hostname: 'client-02',
+      status: 'online',
+      os: 'linux',
+      arch: 'x86_64',
+      agent_version: '0.4.0',
+      borg_versions: [
+        {
+          major: 1,
+          version: '1.4.5',
+          path: '/opt/borg-ui-agent/borg1/current/borg',
+          install_source: 'borg-ui-installer',
+        },
+        {
+          major: 2,
+          version: '2.0.0b23',
+          path: '/opt/borg-ui-agent/borg2/current/borg',
+          install_source: 'borg-ui-installer',
+        },
+      ],
+      last_seen_at: '2026-05-18T10:00:00.000Z',
+      created_at: '2026-05-18T09:00:00.000Z',
+      updated_at: '2026-05-18T10:00:00.000Z',
+    } as AgentMachineResponse
+
+    renderWithProviders(
+      <AgentReinstallDialog
+        open
+        agent={agent}
+        serverUrl="https://borg-ui.example.com"
+        onCancel={vi.fn()}
+        onCopy={onCopy}
+      />
+    )
+
+    const dialog = screen.getByRole('dialog', { name: /reinstall agent/i })
+    // Even for an agent whose Borg binaries the installer manages, a routine
+    // reinstall must not preselect a Borg upgrade.
+    expect(within(dialog).getByRole('radio', { name: /Skip Borg install/i })).toBeChecked()
+
+    await user.click(within(dialog).getByLabelText('Copy reinstall command'))
+    expect(onCopy).toHaveBeenLastCalledWith(
+      'curl -fsSL https://borg-ui.example.com/agent/install.sh | sudo bash -s -- --reinstall'
+    )
+
+    await user.click(within(dialog).getByRole('radio', { name: /Borg 1\.x and Borg 2\.x beta/i }))
+    await user.click(within(dialog).getByLabelText('Copy reinstall command'))
+    expect(onCopy).toHaveBeenLastCalledWith(
+      'curl -fsSL https://borg-ui.example.com/agent/install.sh | sudo bash -s -- --reinstall --borg-version both'
+    )
+  }, 60000)
+
   it('opens a tokenless reinstall script from an agent card', async () => {
     const user = userEvent.setup()
     const onCopy = vi.fn()
@@ -763,6 +861,9 @@ describe('ManagedAgents', () => {
     expect(within(dialog).getByText(/client-01/i)).toBeInTheDocument()
     expect(
       within(dialog).getByText(/No enrollment token or registration step is required/i)
+    ).toBeInTheDocument()
+    expect(
+      within(dialog).getByText(/run the command from any account that can sudo/i)
     ).toBeInTheDocument()
     expect(
       within(dialog).getByText((content) =>
@@ -1051,6 +1152,32 @@ describe('ManagedAgents', () => {
     expect(buttons[3]).toBeDisabled()
   })
 
+  it('does not offer to cancel a job that completed with warnings', () => {
+    const job = {
+      id: 12,
+      agent_machine_id: 3,
+      job_type: 'backup',
+      status: 'completed_with_warnings',
+      progress_percent: 100,
+      created_at: '2026-05-18T10:20:00.000Z',
+      updated_at: '2026-05-18T10:25:00.000Z',
+      payload: {},
+    } as AgentJobResponse
+
+    renderWithProviders(
+      <JobsTable
+        jobs={[job]}
+        agentsById={new Map()}
+        onCancel={vi.fn()}
+        onViewLogs={vi.fn()}
+        isCanceling={false}
+      />
+    )
+
+    const [, cancelButton] = screen.getAllByRole('button')
+    expect(cancelButton).toBeDisabled()
+  })
+
   it('renders token statuses and only revokes active tokens', async () => {
     const user = userEvent.setup()
     const onRevoke = vi.fn()
@@ -1094,5 +1221,481 @@ describe('ManagedAgents', () => {
     expect(onRevoke).toHaveBeenCalledWith(1)
     expect(buttons[1]).toBeDisabled()
     expect(buttons[2]).toBeDisabled()
+  })
+
+  it('shows an update chip and a banner for an out-of-date agent', () => {
+    const agent = {
+      id: 11,
+      agent_id: 'agent-behind-11',
+      name: 'behind',
+      hostname: 'behind-01',
+      status: 'online',
+      agent_version: '0.1.2',
+      available_agent_version: '0.1.3',
+      upgrade_status: 'outdated',
+      created_at: '2026-05-18T09:00:00.000Z',
+      updated_at: '2026-05-18T10:00:00.000Z',
+    } as AgentMachineResponse
+
+    renderWithProviders(
+      <AgentList
+        agents={[agent]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+    expect(screen.getByText('Update available')).toBeInTheDocument()
+    expect(screen.getByText(/1 endpoint is running an older agent/i)).toBeInTheDocument()
+  })
+
+  it('marks an endpoint that cannot be upgraded from the server', () => {
+    const manual = {
+      id: 21,
+      agent_id: 'agent-manual-21',
+      name: 'old-box',
+      hostname: 'old-box-01',
+      status: 'online',
+      agent_version: '0.1.3',
+      available_agent_version: '0.1.3',
+      upgrade_status: 'up_to_date',
+      self_upgrade_supported: false,
+      created_at: '2026-05-18T09:00:00.000Z',
+      updated_at: '2026-05-18T10:00:00.000Z',
+    } as AgentMachineResponse
+    const remote = {
+      ...manual,
+      id: 22,
+      agent_id: 'agent-remote-22',
+      name: 'new-box',
+      hostname: 'new-box-01',
+      self_upgrade_supported: true,
+    } as AgentMachineResponse
+
+    renderWithProviders(
+      <AgentList
+        agents={[manual, remote]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+    expect(screen.getAllByText('Manual upgrades only')).toHaveLength(1)
+  })
+
+  it('stays quiet for an agent running the served version', () => {
+    const agent = {
+      id: 12,
+      agent_id: 'agent-current-12',
+      name: 'current',
+      hostname: 'current-01',
+      status: 'online',
+      agent_version: '0.1.3',
+      available_agent_version: '0.1.3',
+      upgrade_status: 'up_to_date',
+      created_at: '2026-05-18T09:00:00.000Z',
+      updated_at: '2026-05-18T10:00:00.000Z',
+    } as AgentMachineResponse
+
+    renderWithProviders(
+      <AgentList
+        agents={[agent]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+    expect(screen.queryByText('Update available')).not.toBeInTheDocument()
+    expect(screen.queryByText('Current')).not.toBeInTheDocument()
+    expect(screen.queryByText(/running an older agent/i)).not.toBeInTheDocument()
+  })
+
+  it('shows the pin state instead of an update prompt for a pinned agent', () => {
+    const agent = {
+      id: 13,
+      agent_id: 'agent-pinned-13',
+      name: 'pinned',
+      hostname: 'pinned-01',
+      status: 'online',
+      agent_version: '0.1.2',
+      desired_agent_version: '0.1.2',
+      available_agent_version: '0.1.3',
+      upgrade_status: 'pinned',
+      created_at: '2026-05-18T09:00:00.000Z',
+      updated_at: '2026-05-18T10:00:00.000Z',
+    } as AgentMachineResponse
+
+    renderWithProviders(
+      <AgentList
+        agents={[agent]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+    expect(screen.getByText('Pinned')).toBeInTheDocument()
+    expect(screen.queryByText('Update available')).not.toBeInTheDocument()
+    expect(screen.queryByText(/running an older agent/i)).not.toBeInTheDocument()
+  })
+
+  it('names the pin, not the served version, for an agent behind its pin', async () => {
+    // Pinned to 0.1.2 while the server serves 0.1.3: the endpoint is outdated
+    // against its pin. Naming 0.1.3 here would point the operator at a version
+    // the pin forbids.
+    const user = userEvent.setup()
+    const agent = {
+      id: 14,
+      agent_id: 'agent-behind-pin-14',
+      name: 'behind-pin',
+      hostname: 'behind-pin-01',
+      status: 'online',
+      agent_version: '0.1.1',
+      desired_agent_version: '0.1.2',
+      available_agent_version: '0.1.3',
+      upgrade_status: 'outdated',
+      created_at: '2026-05-18T09:00:00.000Z',
+      updated_at: '2026-05-18T10:00:00.000Z',
+    } as AgentMachineResponse
+
+    renderWithProviders(
+      <AgentList
+        agents={[agent]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+    await user.hover(screen.getByText('Update available'))
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(/Pinned to version 0\.1\.2/i)
+    expect(screen.queryByText(/serves agent version 0\.1\.3/i)).not.toBeInTheDocument()
+  })
+  it('offers the upgrade action to an outdated endpoint that can upgrade itself', async () => {
+    const user = userEvent.setup()
+    const onUpgradeMany = vi.fn()
+    const agent = buildAgent({
+      upgrade_status: 'outdated',
+      self_upgrade_supported: true,
+      available_agent_version: '0.1.3',
+    })
+
+    renderWithProviders(
+      <AgentList
+        agents={[agent]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        onUpgradeMany={onUpgradeMany}
+        onRunDiagnostics={vi.fn()}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+    await user.click(screen.getByRole('button', { name: /upgrade this endpoint/i }))
+    await user.click(await screen.findByRole('button', { name: /^upgrade$/i }))
+    expect(onUpgradeMany).toHaveBeenCalledWith([agent])
+  })
+
+  it('leaves an endpoint without the helper on the manual reinstall path', () => {
+    const agent = buildAgent({
+      upgrade_status: 'outdated',
+      self_upgrade_supported: false,
+      available_agent_version: '0.1.3',
+    })
+
+    renderWithProviders(
+      <AgentList
+        agents={[agent]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        onUpgradeMany={vi.fn()}
+        onRunDiagnostics={vi.fn()}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+    expect(screen.queryByRole('button', { name: /upgrade this endpoint/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /reinstall/i })).toBeInTheDocument()
+  })
+
+  it('shows an in-flight upgrade on the row', () => {
+    const agent = buildAgent({
+      upgrade_status: 'outdated',
+      self_upgrade_supported: true,
+      upgrade_state: 'requested',
+      available_agent_version: '0.1.3',
+    })
+
+    renderWithProviders(
+      <AgentList
+        agents={[agent]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        onUpgradeMany={vi.fn()}
+        onRunDiagnostics={vi.fn()}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+    expect(screen.getByText(/Upgrading to 0\.1\.3/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /upgrade this endpoint/i })).toBeDisabled()
+  })
+})
+
+describe('AgentList fleet upgrades', () => {
+  const outdated = (overrides: Partial<AgentMachineResponse> = {}): AgentMachineResponse =>
+    ({
+      id: 1,
+      agent_id: 'agent-fleet-1',
+      name: 'alpha',
+      hostname: 'alpha-01',
+      status: 'online',
+      agent_version: '0.1.2',
+      available_agent_version: '0.1.3',
+      upgrade_status: 'outdated',
+      self_upgrade_supported: true,
+      created_at: '2026-05-18T09:00:00.000Z',
+      updated_at: '2026-05-18T10:00:00.000Z',
+      ...overrides,
+    }) as AgentMachineResponse
+
+  const renderList = (
+    agents: AgentMachineResponse[],
+    onUpgradeMany?: (list: AgentMachineResponse[]) => void
+  ) =>
+    renderWithProviders(
+      <AgentList
+        agents={agents}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        onUpgradeMany={onUpgradeMany}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+  it('offers selection only on endpoints that can upgrade themselves', () => {
+    renderList(
+      [
+        outdated(),
+        outdated({
+          id: 2,
+          agent_id: 'agent-fleet-2',
+          name: 'manual',
+          self_upgrade_supported: false,
+        }),
+      ],
+      vi.fn()
+    )
+
+    expect(screen.getByRole('checkbox', { name: /select alpha/i })).toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: /select manual/i })).toBeNull()
+  })
+
+  it('does not offer selection on an endpoint already waiting for a wave', () => {
+    renderList([outdated({ name: 'waiting', upgrade_state: 'queued' })], vi.fn())
+    expect(screen.queryByRole('checkbox', { name: /select waiting/i })).toBeNull()
+  })
+
+  it('drops a selected endpoint that someone else has already queued', async () => {
+    const onUpgradeMany = vi.fn()
+    const alpha = outdated()
+    const beta = outdated({ id: 2, agent_id: 'agent-fleet-2', name: 'beta' })
+    const { rerender } = renderList([alpha, beta], onUpgradeMany)
+
+    await userEvent.click(screen.getByRole('checkbox', { name: /select alpha/i }))
+    await userEvent.click(screen.getByRole('checkbox', { name: /select beta/i }))
+    rerender(
+      <AgentList
+        agents={[alpha, { ...beta, upgrade_state: 'queued' }]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        onUpgradeMany={onUpgradeMany}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+    await userEvent.click(screen.getByRole('button', { name: /upgrade 1 endpoint/i }))
+    await userEvent.click(screen.getByRole('button', { name: /^upgrade$/i }))
+    expect(onUpgradeMany).toHaveBeenCalledWith([alpha])
+  })
+
+  it('drops a dialog target that was queued while the dialog was open', async () => {
+    const onUpgradeMany = vi.fn()
+    const alpha = outdated()
+    const { rerender } = renderList([alpha], onUpgradeMany)
+
+    await userEvent.click(screen.getByRole('checkbox', { name: /select alpha/i }))
+    await userEvent.click(screen.getByRole('button', { name: /upgrade 1 endpoint/i }))
+    rerender(
+      <AgentList
+        agents={[{ ...alpha, upgrade_state: 'queued' }]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        onUpgradeMany={onUpgradeMany}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+    await userEvent.click(screen.getByRole('button', { name: /^upgrade$/i }))
+
+    expect(onUpgradeMany).not.toHaveBeenCalled()
+  })
+
+  it('upgrades every selected endpoint in one request', async () => {
+    const onUpgradeMany = vi.fn()
+    renderList(
+      [outdated(), outdated({ id: 2, agent_id: 'agent-fleet-2', name: 'beta' })],
+      onUpgradeMany
+    )
+
+    await userEvent.click(screen.getByRole('checkbox', { name: /select alpha/i }))
+    await userEvent.click(screen.getByRole('checkbox', { name: /select beta/i }))
+    await userEvent.click(screen.getByRole('button', { name: /upgrade 2 endpoints/i }))
+    await userEvent.click(screen.getByRole('button', { name: /^upgrade$/i }))
+
+    expect(onUpgradeMany).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 1 }),
+        expect.objectContaining({ id: 2 }),
+      ])
+    )
+    expect(onUpgradeMany.mock.calls[0][0]).toHaveLength(2)
+  })
+
+  it('clears the selection once a bulk upgrade is confirmed', async () => {
+    renderList([outdated()], vi.fn())
+
+    await userEvent.click(screen.getByRole('checkbox', { name: /select alpha/i }))
+    expect(screen.getByRole('button', { name: /upgrade 1 endpoint/i })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: /upgrade 1 endpoint/i }))
+    await userEvent.click(screen.getByRole('button', { name: /^upgrade$/i }))
+
+    expect(screen.queryByRole('button', { name: /upgrade 1 endpoint/i })).toBeNull()
+  })
+
+  it('upgrades the whole fleet from the banner', async () => {
+    const onUpgradeMany = vi.fn()
+    renderList(
+      [outdated(), outdated({ id: 2, agent_id: 'agent-fleet-2', name: 'beta' })],
+      onUpgradeMany
+    )
+
+    await userEvent.click(screen.getByRole('button', { name: /upgrade all \(2\)/i }))
+    await userEvent.click(screen.getByRole('button', { name: /^upgrade$/i }))
+
+    expect(onUpgradeMany.mock.calls[0][0]).toHaveLength(2)
+  })
+})
+
+describe('ManagedAgents server URL recovery', () => {
+  const renderOffline = (agentVersion: string | null = '0.1.4') =>
+    renderWithProviders(
+      <AgentList
+        agents={[buildAgent({ status: 'offline', agent_version: agentVersion })]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+  it('opens the change server URL dialog from the card', async () => {
+    renderOffline()
+
+    await userEvent.click(screen.getByRole('button', { name: /change server url/i }))
+
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByRole('textbox')).toHaveValue('https://borg-ui.example.com')
+    expect(within(dialog).getByText(/sed -i/)).toBeInTheDocument()
+  })
+
+  it('offers the subcommand form to an endpoint new enough for it', async () => {
+    renderOffline('0.1.5')
+
+    await userEvent.click(screen.getByRole('button', { name: /change server url/i }))
+
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/borg-ui-agent set-server/)).toBeInTheDocument()
+  })
+
+  it('opens the uninstall dialog from the card', async () => {
+    renderOffline()
+
+    await userEvent.click(screen.getByRole('button', { name: /uninstall the agent/i }))
+
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/uninstall\.sh" \| sudo bash/)).toBeInTheDocument()
+  })
+
+  it('points an offline card at borg-ui-agent status', () => {
+    renderOffline()
+
+    expect(screen.getByText(/borg-ui-agent status/)).toBeInTheDocument()
+  })
+
+  it('leaves the hint off an online card', () => {
+    renderWithProviders(
+      <AgentList
+        agents={[buildAgent({ status: 'online' })]}
+        serverUrl="https://borg-ui.example.com"
+        onCopy={vi.fn()}
+        onRevoke={vi.fn()}
+        onDelete={vi.fn()}
+        onViewLogs={vi.fn()}
+        isRevoking={false}
+        isDeleting={false}
+      />
+    )
+
+    expect(screen.queryByText(/borg-ui-agent status/)).toBeNull()
   })
 })

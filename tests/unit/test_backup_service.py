@@ -11,7 +11,15 @@ from unittest.mock import ANY, Mock, patch, AsyncMock, MagicMock
 from sqlalchemy.orm import sessionmaker
 from app.services.backup_service import BackupService
 from app.services.filesystem_snapshot_service import PreparedFilesystemSnapshot
-from app.database.models import BackupJob, Repository, SSHConnection, SystemSettings
+from app.services.operations.backup_facade import resolve_backup_job
+from tests.utils.operations import seed_job_operation
+
+from app.database.models import (
+    Operation,
+    Repository,
+    SSHConnection,
+    SystemSettings,
+)
 
 
 class AsyncLineStream:
@@ -101,16 +109,6 @@ class TestBackupService:
         assert backup_service.log_dir.exists()
         assert backup_service.running_processes == {}
         assert backup_service.error_msgids == {}
-
-    def test_format_bytes(self, backup_service):
-        """Test _format_bytes method"""
-        assert backup_service._format_bytes(0) == "0.00 B"
-        assert backup_service._format_bytes(1024) == "1.00 KB"
-        assert backup_service._format_bytes(1024 * 1024) == "1.00 MB"
-        assert backup_service._format_bytes(1024 * 1024 * 1024) == "1.00 GB"
-        assert backup_service._format_bytes(1024 * 1024 * 1024 * 1024) == "1.00 TB"
-        assert backup_service._format_bytes(500) == "500.00 B"
-        assert backup_service._format_bytes(1536) == "1.50 KB"
 
     @pytest.mark.skip(
         reason="rotate_logs() signature changed - needs rewrite for new log management system"
@@ -224,12 +222,15 @@ class TestBackupService:
     @pytest.mark.asyncio
     async def test_update_archive_stats_json_parse_error(self, backup_service, test_db):
         """Test _update_archive_stats with invalid JSON"""
-        job = BackupJob(
-            repository="/test/repo", status="running", started_at=datetime.now()
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository="/test/repo",
+            status="running",
+            started_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         # Mock the subprocess to return invalid JSON
         mock_process = AsyncMock()
@@ -245,12 +246,15 @@ class TestBackupService:
     @pytest.mark.asyncio
     async def test_update_archive_stats_borg_failure(self, backup_service, test_db):
         """Test _update_archive_stats when borg command fails"""
-        job = BackupJob(
-            repository="/test/repo", status="running", started_at=datetime.now()
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository="/test/repo",
+            status="running",
+            started_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         # Mock the subprocess to return error
         mock_process = AsyncMock()
@@ -262,54 +266,6 @@ class TestBackupService:
             await backup_service._update_archive_stats(
                 test_db, job.id, "/test/repo", "test-archive", {}
             )
-
-    @pytest.mark.asyncio
-    async def test_update_repository_stats_success(self, backup_service, test_db):
-        """Test _update_repository_stats with successful response"""
-        # Create a repository record
-        repo = Repository(
-            name="Test Repo",
-            path="/test/repo",
-            encryption="none",
-            repository_type="local",
-        )
-        test_db.add(repo)
-        test_db.commit()
-
-        # Mock the subprocess to return valid JSON
-        mock_process = AsyncMock()
-        mock_process.communicate = AsyncMock(
-            return_value=(b'{"cache": {"stats": {"total_size": 1000000}}}', b"")
-        )
-        mock_process.returncode = 0
-
-        with patch("asyncio.create_subprocess_exec", return_value=mock_process):
-            # Should not raise exception
-            await backup_service._update_repository_stats(test_db, "/test/repo", {})
-
-    @pytest.mark.asyncio
-    async def test_update_repository_stats_failure(self, backup_service, test_db):
-        """Test _update_repository_stats when borg command fails"""
-        # Create a repository record
-        repo = Repository(
-            name="Test Repo",
-            path="/test/repo",
-            encryption="none",
-            repository_type="local",
-        )
-        test_db.add(repo)
-        test_db.commit()
-
-        # Mock the subprocess to return error
-        mock_process = AsyncMock()
-        mock_process.communicate = AsyncMock(
-            return_value=(b"", b"Repository not found")
-        )
-        mock_process.returncode = 1
-
-        with patch("asyncio.create_subprocess_exec", return_value=mock_process):
-            # Should not raise exception, just log warning
-            await backup_service._update_repository_stats(test_db, "/test/repo", {})
 
     def test_get_operation_timeouts_prefers_database_values(
         self, backup_service, test_db
@@ -358,14 +314,17 @@ class TestBackupService:
             repository_type="local",
             compression="lz4",
         )
-        job = BackupJob(
+        test_db.add_all([repo])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository=str(repo_path),
             status="running",
             started_at=datetime.now(),
         )
-        test_db.add_all([repo, job])
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         mock_process = AsyncMock()
         mock_process.communicate = AsyncMock(
@@ -385,7 +344,7 @@ class TestBackupService:
                 {},
             )
 
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         assert job.original_size == 8192
         assert job.compressed_size == 4096
         assert job.deduplicated_size == 2048
@@ -410,15 +369,18 @@ class TestBackupService:
             repository_type="local",
             compression="lz4",
         )
-        job = BackupJob(
+        test_db.add_all([repo])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository=str(repo_path),
             status="running",
             started_at=datetime.now(),
         )
-        test_db.add_all([repo, job])
         test_db.commit()
         test_db.refresh(repo)
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         order: list[str] = []
         holder_started = asyncio.Event()
@@ -483,122 +445,6 @@ class TestBackupService:
         assert order[:3] == ["lock-held", "lock-released", "subprocess:info"]
 
     @pytest.mark.asyncio
-    async def test_update_repository_stats_updates_repository_and_publishes_snapshot(
-        self, backup_service, test_db
-    ):
-        repo = Repository(
-            name="Test Repo",
-            path="/test/repo",
-            encryption="none",
-            repository_type="local",
-        )
-        test_db.add(repo)
-        test_db.commit()
-        test_db.refresh(repo)
-
-        list_process = AsyncMock()
-        list_process.communicate = AsyncMock(
-            return_value=(b'{"archives": [{"name": "a"}, {"name": "b"}]}', b"")
-        )
-        list_process.returncode = 0
-        info_process = AsyncMock()
-        info_process.communicate = AsyncMock(
-            return_value=(b'{"cache": {"stats": {"unique_size": 1048576}}}', b"")
-        )
-        info_process.returncode = 0
-        mqtt = Mock()
-        mqtt.sync_state_with_db = Mock()
-
-        with (
-            patch(
-                "asyncio.create_subprocess_exec",
-                side_effect=[list_process, info_process],
-            ),
-            patch("app.services.backup_service.mqtt_service", mqtt),
-        ):
-            await backup_service._update_repository_stats(test_db, "/test/repo", {})
-
-        test_db.refresh(repo)
-        assert repo.archive_count == 2
-        assert repo.total_size == "1.00 MB"
-        assert repo.last_backup is not None
-        mqtt.sync_state_with_db.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_update_repository_stats_waits_for_repository_command_lock(
-        self, backup_service, test_db
-    ):
-        from app.services.repository_command_lock import (
-            run_serialized_repository_command,
-        )
-
-        repo = Repository(
-            name="Test Repo",
-            path="/test/repo",
-            encryption="none",
-            repository_type="local",
-        )
-        test_db.add(repo)
-        test_db.commit()
-        test_db.refresh(repo)
-
-        order: list[str] = []
-        holder_started = asyncio.Event()
-        release_holder = asyncio.Event()
-
-        async def hold_repository_lock():
-            async def operation():
-                order.append("lock-held")
-                holder_started.set()
-                await release_holder.wait()
-                order.append("lock-released")
-
-            await run_serialized_repository_command(repo.id, operation)
-
-        holder_task = asyncio.create_task(hold_repository_lock())
-        await holder_started.wait()
-        stats_task = None
-
-        async def fake_create_subprocess_exec(*cmd, **kwargs):
-            order.append(f"subprocess:{cmd[1]}")
-            process = AsyncMock()
-            stdout = (
-                b'{"archives": []}'
-                if cmd[1] in {"list", "repo-list"}
-                else b'{"cache": {"stats": {"unique_size": 0}}}'
-            )
-            process.communicate = AsyncMock(return_value=(stdout, b""))
-            process.returncode = 0
-            return process
-
-        try:
-            with patch(
-                "asyncio.create_subprocess_exec",
-                side_effect=fake_create_subprocess_exec,
-            ):
-                stats_task = asyncio.create_task(
-                    backup_service._update_repository_stats(test_db, repo.path, {})
-                )
-                await asyncio.sleep(0.01)
-
-                assert not any(item.startswith("subprocess:") for item in order)
-
-                release_holder.set()
-                await asyncio.wait_for(holder_task, timeout=1)
-                await asyncio.wait_for(stats_task, timeout=1)
-        finally:
-            release_holder.set()
-            pending_tasks = [
-                task
-                for task in (holder_task, stats_task)
-                if task is not None and not task.done()
-            ]
-            if pending_tasks:
-                await asyncio.gather(*pending_tasks, return_exceptions=True)
-
-        assert order[:3] == ["lock-held", "lock-released", "subprocess:list"]
-
-    @pytest.mark.asyncio
     async def test_execute_backup_success_saves_logs_and_notifies_success(
         self, backup_service, test_db, tmp_path
     ):
@@ -617,11 +463,14 @@ class TestBackupService:
             compression="lz4",
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(repository=repo.path, status="pending")
-        test_db.add_all([repo, settings_row, job])
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="pending"
+        )
         test_db.commit()
         test_db.refresh(repo)
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         fake_process = FakeProcess(
             returncode=0,
@@ -658,7 +507,6 @@ class TestBackupService:
                 backup_service, "_calculate_and_update_size_background", AsyncMock()
             ),
             patch.object(backup_service, "_update_archive_stats", AsyncMock()),
-            patch.object(backup_service, "_update_repository_stats", AsyncMock()),
             patch(
                 "app.services.backup_service.resolve_repo_ssh_key_file",
                 return_value=None,
@@ -677,14 +525,114 @@ class TestBackupService:
             mqtt.sync_state_with_db = Mock()
             await backup_service.execute_backup(job.id, repo.path, db=test_db)
 
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         assert job.status == "completed"
         assert job.progress == 100
-        assert job.has_logs is True
         assert job.log_file_path is not None
         assert Path(job.log_file_path).exists()
         notifications.send_backup_success.assert_awaited_once()
         notifications.send_backup_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_execute_backup_drives_an_operation_row(
+        self, backup_service, test_db, tmp_path
+    ):
+        from app.services.operations.backup_facade import BackupJobFacade
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        (repo_path / "data").mkdir()
+        (repo_path / "config").write_text("[repository]\nversion = 1\n")
+        source_path = tmp_path / "source"
+        source_path.mkdir()
+        repo = Repository(
+            name="Repo",
+            path=str(repo_path),
+            encryption="none",
+            repository_type="local",
+            source_directories=f'["{source_path}"]',
+            compression="lz4",
+        )
+        settings_row = SystemSettings(log_save_policy="all_jobs")
+        test_db.add_all([repo, settings_row])
+        test_db.commit()
+        test_db.refresh(repo)
+        op = Operation(
+            repository_id=repo.id,
+            kind="backup",
+            category="backup",
+            status="running",
+            trigger="manual",
+            priority=0,
+            run_id="run-1",
+            params={"executor": "server"},
+        )
+        test_db.add(op)
+        test_db.commit()
+
+        fake_process = FakeProcess(
+            returncode=0,
+            stdout_lines=[
+                '{"type":"archive_progress","original_size":1024,"compressed_size":512,"deduplicated_size":256,"nfiles":3,"finished":true}',
+            ],
+        )
+        notifications = MagicMock()
+        notifications.send_backup_start = AsyncMock()
+        notifications.send_backup_success = AsyncMock()
+        notifications.send_backup_warning = AsyncMock()
+        notifications.send_backup_failure = AsyncMock()
+
+        with (
+            patch.object(
+                backup_service,
+                "_execute_hooks",
+                AsyncMock(
+                    return_value={
+                        "success": True,
+                        "execution_logs": [],
+                        "scripts_executed": 0,
+                        "scripts_failed": 0,
+                        "using_library": False,
+                    }
+                ),
+            ),
+            patch.object(
+                backup_service,
+                "_prepare_source_paths",
+                AsyncMock(return_value=([str(source_path)], [])),
+            ),
+            patch.object(
+                backup_service, "_calculate_and_update_size_background", AsyncMock()
+            ),
+            patch.object(backup_service, "_update_archive_stats", AsyncMock()),
+            patch(
+                "app.services.backup_service.resolve_repo_ssh_key_file",
+                return_value=None,
+            ),
+            patch(
+                "app.services.backup_service.asyncio.create_subprocess_exec",
+                return_value=fake_process,
+            ),
+            patch(
+                "app.services.backup_service.asyncio.create_task",
+                side_effect=_discard_background_task,
+            ),
+            patch("app.services.backup_service.notification_service", notifications),
+            patch("app.services.backup_service.mqtt_service") as mqtt,
+        ):
+            mqtt.sync_state_with_db = Mock()
+            await backup_service.execute_backup(
+                op.id, repo.path, db=test_db, archive_name="a1"
+            )
+
+        test_db.refresh(op)
+        job = BackupJobFacade(test_db, op)
+        assert job.status == "completed"
+        assert job.archive_name == "a1"
+        assert (
+            test_db.query(Operation).filter(Operation.kind == "archive_sync").count()
+            == 0
+        )
 
     @pytest.mark.asyncio
     async def test_execute_backup_waits_for_repository_command_lock_before_create(
@@ -709,11 +657,14 @@ class TestBackupService:
             compression="lz4",
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(repository=repo.path, status="pending")
-        test_db.add_all([repo, settings_row, job])
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="pending"
+        )
         test_db.commit()
         test_db.refresh(repo)
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         order: list[str] = []
         holder_started = asyncio.Event()
@@ -745,7 +696,7 @@ class TestBackupService:
         notifications.send_backup_failure = AsyncMock()
 
         async def fake_create_subprocess_exec(*cmd, **kwargs):
-            order.append(f"subprocess:{cmd[1]}")
+            order.append(f"subprocess:{cmd[3]}")
             return fake_process
 
         try:
@@ -772,7 +723,6 @@ class TestBackupService:
                     backup_service, "_calculate_and_update_size_background", AsyncMock()
                 ),
                 patch.object(backup_service, "_update_archive_stats", AsyncMock()),
-                patch.object(backup_service, "_update_repository_stats", AsyncMock()),
                 patch(
                     "app.services.backup_service.resolve_repo_ssh_key_file",
                     return_value=None,
@@ -836,11 +786,14 @@ class TestBackupService:
             compression="lz4",
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(repository=repo.path, status="pending")
-        test_db.add_all([repo, settings_row, job])
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="pending"
+        )
         test_db.commit()
         test_db.refresh(repo)
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         holder_started = asyncio.Event()
         release_holder = asyncio.Event()
@@ -887,7 +840,6 @@ class TestBackupService:
                     backup_service, "_calculate_and_update_size_background", AsyncMock()
                 ),
                 patch.object(backup_service, "_update_archive_stats", AsyncMock()),
-                patch.object(backup_service, "_update_repository_stats", AsyncMock()),
                 patch(
                     "app.services.backup_service.resolve_repo_ssh_key_file",
                     return_value=None,
@@ -914,9 +866,7 @@ class TestBackupService:
                 cancel_session_factory = sessionmaker(bind=test_db.get_bind())
                 cancel_db = cancel_session_factory()
                 try:
-                    cancelled_job = (
-                        cancel_db.query(BackupJob).filter(BackupJob.id == job.id).one()
-                    )
+                    cancelled_job = resolve_backup_job(cancel_db, job.id)
                     cancelled_job.status = "cancelled"
                     cancel_db.commit()
                 finally:
@@ -936,7 +886,7 @@ class TestBackupService:
                 await asyncio.gather(*pending_tasks, return_exceptions=True)
 
         create_subprocess.assert_not_awaited()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         assert job.status == "cancelled"
 
     @pytest.mark.asyncio
@@ -956,10 +906,13 @@ class TestBackupService:
             compression="lz4",
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(repository=repo.path, status="pending")
-        test_db.add_all([repo, settings_row, job])
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="pending"
+        )
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         fake_process = FakeProcess(
             returncode=107,
@@ -992,7 +945,6 @@ class TestBackupService:
                 backup_service, "_calculate_and_update_size_background", AsyncMock()
             ) as calculate_size,
             patch.object(backup_service, "_update_archive_stats", AsyncMock()),
-            patch.object(backup_service, "_update_repository_stats", AsyncMock()),
             patch(
                 "app.services.backup_service.resolve_repo_ssh_key_file",
                 return_value=None,
@@ -1011,7 +963,7 @@ class TestBackupService:
             mqtt.sync_state_with_db = Mock()
             await backup_service.execute_backup(job.id, repo.path, db=test_db)
 
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         assert job.status == "failed"
         assert "backend.errors.filesystem.pathNotFound" in job.error_message
         assert str(missing_source) in job.error_message
@@ -1059,10 +1011,13 @@ class TestBackupService:
             compression="lz4",
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(repository=repo.path, status="pending")
-        test_db.add_all([repo, settings_row, job])
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="pending"
+        )
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         prepared = [
             PreparedFilesystemSnapshot(
@@ -1125,7 +1080,6 @@ class TestBackupService:
                 calculate_size,
             ),
             patch.object(backup_service, "_update_archive_stats", AsyncMock()),
-            patch.object(backup_service, "_update_repository_stats", AsyncMock()),
             patch(
                 "app.services.backup_service.resolve_repo_ssh_key_file",
                 return_value=None,
@@ -1144,7 +1098,7 @@ class TestBackupService:
             mqtt.sync_state_with_db = Mock()
             await backup_service.execute_backup(job.id, repo.path, db=test_db)
 
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         assert job.status == expected_status
         prepare_snapshots.assert_awaited_once()
         prepare_source_paths.assert_awaited_once_with(
@@ -1179,10 +1133,13 @@ class TestBackupService:
             compression="lz4",
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(repository=repo.path, status="pending")
-        test_db.add_all([repo, settings_row, job])
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="pending"
+        )
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         prepared = [
             PreparedFilesystemSnapshot(
@@ -1380,14 +1337,15 @@ class TestBackupService:
         test_db.add_all([source_connection, repository])
         test_db.flush()
         repository.connection_id = source_connection.id
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository=repository.path,
             status="pending",
             execution_mode="remote_direct",
             route_strategy="remote_direct",
             source_ssh_connection_id=source_connection.id,
         )
-        test_db.add(job)
         test_db.commit()
 
         calls = []
@@ -1437,14 +1395,17 @@ class TestBackupService:
             compression="lz4",
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository=repo.path,
             status="pending",
             total_expected_size=200 * 1024 * 1024,
         )
-        test_db.add_all([repo, settings_row, job])
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         fake_process = FakeProcess(
             returncode=0,
@@ -1482,7 +1443,6 @@ class TestBackupService:
                 backup_service, "_calculate_and_update_size_background", AsyncMock()
             ),
             patch.object(backup_service, "_update_archive_stats", AsyncMock()),
-            patch.object(backup_service, "_update_repository_stats", AsyncMock()),
             patch(
                 "app.services.backup_service.resolve_repo_ssh_key_file",
                 return_value=None,
@@ -1501,7 +1461,7 @@ class TestBackupService:
             mqtt.sync_state_with_db = Mock()
             await backup_service.execute_backup(job.id, repo.path, db=test_db)
 
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         create_cmd = mock_subprocess.call_args.args
         assert "--log-json" in create_cmd
         assert job.original_size > 0
@@ -1530,10 +1490,13 @@ class TestBackupService:
             compression="lz4",
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(repository=repo.path, status="pending")
-        test_db.add_all([repo, settings_row, job])
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="pending"
+        )
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         fake_process = FakeProcess(
             returncode=0,
@@ -1548,7 +1511,7 @@ class TestBackupService:
         notifications.send_backup_failure = AsyncMock()
 
         async def assert_terminal_state_before_stats(*args, **kwargs):
-            refreshed = test_db.query(BackupJob).filter(BackupJob.id == job.id).first()
+            refreshed = resolve_backup_job(test_db, job.id)
             assert refreshed.status == "completed"
             assert refreshed.progress == 100
             assert refreshed.completed_at is not None
@@ -1580,7 +1543,6 @@ class TestBackupService:
                 "_update_archive_stats",
                 AsyncMock(side_effect=assert_terminal_state_before_stats),
             ),
-            patch.object(backup_service, "_update_repository_stats", AsyncMock()),
             patch(
                 "app.services.backup_service.resolve_repo_ssh_key_file",
                 return_value=None,
@@ -1599,7 +1561,7 @@ class TestBackupService:
             mqtt.sync_state_with_db = Mock()
             await backup_service.execute_backup(job.id, repo.path, db=test_db)
 
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         assert job.status == "completed"
         assert job.completed_at is not None
         notifications.send_backup_success.assert_awaited_once()
@@ -1623,10 +1585,13 @@ class TestBackupService:
             compression="lz4",
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(repository=repo.path, status="pending")
-        test_db.add_all([repo, settings_row, job])
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="pending"
+        )
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         fake_process = DeferredReturncodeProcess(
             final_returncode=0,
@@ -1663,7 +1628,6 @@ class TestBackupService:
                 backup_service, "_calculate_and_update_size_background", AsyncMock()
             ),
             patch.object(backup_service, "_update_archive_stats", AsyncMock()),
-            patch.object(backup_service, "_update_repository_stats", AsyncMock()),
             patch(
                 "app.services.backup_service.resolve_repo_ssh_key_file",
                 return_value=None,
@@ -1685,7 +1649,7 @@ class TestBackupService:
                 timeout=10.0,
             )
 
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         assert job.status == "completed"
         assert job.progress == 100
         notifications.send_backup_success.assert_awaited_once()
@@ -1709,11 +1673,14 @@ class TestBackupService:
             compression="lz4",
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(repository=repo.path, status="pending")
-        test_db.add_all([repo, settings_row, job])
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="pending"
+        )
         test_db.commit()
         test_db.refresh(repo)
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         fake_process = FakeProcess(
             returncode=105,
@@ -1750,7 +1717,6 @@ class TestBackupService:
                 backup_service, "_calculate_and_update_size_background", AsyncMock()
             ),
             patch.object(backup_service, "_update_archive_stats", AsyncMock()),
-            patch.object(backup_service, "_update_repository_stats", AsyncMock()),
             patch(
                 "app.services.backup_service.resolve_repo_ssh_key_file",
                 return_value=None,
@@ -1769,10 +1735,9 @@ class TestBackupService:
             mqtt.sync_state_with_db = Mock()
             await backup_service.execute_backup(job.id, repo.path, db=test_db)
 
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         assert job.status == "completed_with_warnings"
         assert "backupCompletedWithWarning" in job.error_message
-        assert job.has_logs is True
         assert Path(job.log_file_path).exists()
         notifications.send_backup_warning.assert_awaited_once()
         notifications.send_backup_success.assert_not_awaited()
@@ -1796,11 +1761,14 @@ class TestBackupService:
             compression="lz4",
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(repository=repo.path, status="pending")
-        test_db.add_all([repo, settings_row, job])
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="pending"
+        )
         test_db.commit()
         test_db.refresh(repo)
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         fake_process = FakeProcess(
             returncode=70,
@@ -1854,10 +1822,9 @@ class TestBackupService:
             mqtt.sync_state_with_db = Mock()
             await backup_service.execute_backup(job.id, repo.path, db=test_db)
 
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         assert job.status == "failed"
         assert f"LOCK_ERROR::{repo.path}" in job.error_message
-        assert job.has_logs is True
         assert Path(job.log_file_path).exists()
         notifications.send_backup_failure.assert_awaited_once()
 
@@ -1875,12 +1842,15 @@ class TestBackupService:
     @pytest.mark.asyncio
     async def test_execute_backup_repository_not_found(self, backup_service, test_db):
         """Test execute_backup with non-existent repository"""
-        job = BackupJob(
-            repository="/nonexistent/repo", status="pending", started_at=datetime.now()
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository="/nonexistent/repo",
+            status="pending",
+            started_at=datetime.now(),
         )
-        test_db.add(job)
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         with patch("app.services.backup_service.SessionLocal", return_value=test_db):
             # Should handle gracefully
@@ -1907,10 +1877,13 @@ class TestBackupService:
             compression="lz4",
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(repository=repo.path, status="pending")
-        test_db.add_all([repo, settings_row, job])
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="pending"
+        )
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         notifications = MagicMock()
         notifications.send_backup_start = AsyncMock()
@@ -1931,7 +1904,7 @@ class TestBackupService:
             mqtt.sync_state_with_db = Mock()
             await backup_service.execute_backup(job.id, repo.path, db=test_db)
 
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         assert job.status == "failed"
         assert "backend.errors.repo.notValidBorgRepository" in job.error_message
         assert str(repo_path) in (job.logs or "")
@@ -1956,10 +1929,13 @@ class TestBackupService:
             borg_version=2,
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(repository=repo.path, status="pending")
-        test_db.add_all([repo, settings_row, job])
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="pending"
+        )
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         fake_process = FakeProcess(
             returncode=0, stdout_lines=['{"type":"archive_progress","finished":true}']
@@ -1993,7 +1969,6 @@ class TestBackupService:
                 backup_service, "_calculate_and_update_size_background", AsyncMock()
             ),
             patch.object(backup_service, "_update_archive_stats", AsyncMock()),
-            patch.object(backup_service, "_update_repository_stats", AsyncMock()),
             patch(
                 "app.services.backup_service.resolve_repo_ssh_key_file",
                 return_value=None,
@@ -2013,7 +1988,7 @@ class TestBackupService:
             mqtt.sync_state_with_db = Mock()
             await backup_service.execute_backup(job.id, repo.path, db=test_db)
 
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         assert job.status == "completed"
         create_call = mock_subprocess.call_args
         create_cmd = create_call.args
@@ -2045,14 +2020,17 @@ class TestBackupService:
             borg_version=2,
         )
         settings_row = SystemSettings(log_save_policy="all_jobs")
-        job = BackupJob(
+        test_db.add_all([repo, settings_row])
+        test_db.flush()
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository=repo.path,
             status="pending",
             total_expected_size=200 * 1024 * 1024,
         )
-        test_db.add_all([repo, settings_row, job])
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         fake_process = FakeProcess(
             returncode=0,
@@ -2090,7 +2068,6 @@ class TestBackupService:
                 backup_service, "_calculate_and_update_size_background", AsyncMock()
             ),
             patch.object(backup_service, "_update_archive_stats", AsyncMock()),
-            patch.object(backup_service, "_update_repository_stats", AsyncMock()),
             patch(
                 "app.services.backup_service.resolve_repo_ssh_key_file",
                 return_value=None,
@@ -2110,7 +2087,7 @@ class TestBackupService:
             mqtt.sync_state_with_db = Mock()
             await backup_service.execute_backup(job.id, repo.path, db=test_db)
 
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
         assert job.original_size > 0
         assert job.compressed_size > 0
         assert job.deduplicated_size > 0
@@ -2167,10 +2144,11 @@ class TestBackupService:
         test_db.refresh(repository)
 
         # Create backup job
-        job = BackupJob(repository=repository.path, status="pending")
-        test_db.add(job)
+        job = seed_job_operation(
+            test_db, "backup", repository=repository.path, status="pending"
+        )
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         # Mock subprocess to capture environment variables
         mock_env = {}
@@ -2227,10 +2205,11 @@ class TestBackupService:
         test_db.refresh(repository)
 
         # Create backup job
-        job = BackupJob(repository=repository.path, status="pending")
-        test_db.add(job)
+        job = seed_job_operation(
+            test_db, "backup", repository=repository.path, status="pending"
+        )
         test_db.commit()
-        test_db.refresh(job)
+        job = resolve_backup_job(test_db, job.id)
 
         # Mock subprocess to capture environment variables
         mock_env = {}

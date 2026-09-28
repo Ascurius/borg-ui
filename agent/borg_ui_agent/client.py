@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Optional
 
@@ -26,6 +27,7 @@ class AgentClient:
         agent_token: Optional[str] = None,
         *,
         session: Optional[requests.Session] = None,
+        upload_session: Optional[requests.Session] = None,
         timeout_seconds: int = 30,
         max_report_attempts: int = 3,
         retry_backoff_seconds: float = 0.1,
@@ -33,6 +35,14 @@ class AgentClient:
         self.server_url = server_url.rstrip("/")
         self.agent_token = agent_token
         self.session = session or requests.Session()
+        # A job's worker, its cancel poller and its keepalive share this
+        # client; requests.Session is not thread-safe, so its requests are
+        # serialized. An artifact upload streams for as long as its command
+        # runs and would hold the others (the cancel check among them) for
+        # that long: it gets a session of its own, never the shared one (a
+        # caller-supplied `session` is the shared one).
+        self._session_lock = threading.Lock()
+        self.upload_session = upload_session or requests.Session()
         self.timeout_seconds = timeout_seconds
         self.max_report_attempts = max(1, max_report_attempts)
         self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
@@ -43,6 +53,7 @@ class AgentClient:
         config: AgentConfig,
         *,
         session: Optional[requests.Session] = None,
+        upload_session: Optional[requests.Session] = None,
         timeout_seconds: int = 30,
         max_report_attempts: int = 3,
         retry_backoff_seconds: float = 0.1,
@@ -51,6 +62,7 @@ class AgentClient:
             config.server_url,
             agent_token=config.agent_token,
             session=session,
+            upload_session=upload_session,
             timeout_seconds=timeout_seconds,
             max_report_attempts=max_report_attempts,
             retry_backoff_seconds=retry_backoff_seconds,
@@ -68,6 +80,7 @@ class AgentClient:
         borg_versions: list[dict[str, Any]],
         capabilities: list[str],
         labels: Optional[dict[str, Any]] = None,
+        timezone: Optional[str] = None,
     ) -> dict[str, Any]:
         return self._request(
             "POST",
@@ -80,6 +93,7 @@ class AgentClient:
                 "os": os_name,
                 "arch": arch,
                 "agent_version": agent_version,
+                "timezone": timezone,
                 "borg_versions": borg_versions,
                 "capabilities": capabilities,
                 "labels": labels or {},
@@ -96,6 +110,7 @@ class AgentClient:
         capabilities: list[str],
         running_job_ids: Optional[list[int]] = None,
         last_error: Optional[str] = None,
+        timezone: Optional[str] = None,
     ) -> dict[str, Any]:
         return self._request(
             "POST",
@@ -104,6 +119,7 @@ class AgentClient:
                 "agent_id": agent_id,
                 "hostname": hostname,
                 "agent_version": agent_version,
+                "timezone": timezone,
                 "borg_versions": borg_versions,
                 "capabilities": capabilities,
                 "running_job_ids": running_job_ids or [],
@@ -148,13 +164,26 @@ class AgentClient:
         )
 
     def fail_job(
-        self, job_id: int, *, error_message: str, return_code: Optional[int] = None
+        self,
+        job_id: int,
+        *,
+        error_message: str,
+        return_code: Optional[int] = None,
+        stderr_tail: Optional[str] = None,
+        failure_kind: Optional[str] = None,
     ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"/api/agents/jobs/{job_id}/fail",
-            json={"error_message": error_message, "return_code": return_code},
-        )
+        """`stderr_tail` and `failure_kind` (see `failure_report`) ride with
+        the report: the log lines that carry Borg's reason can land after
+        it, and a server before them ignores the two fields."""
+        body: dict[str, Any] = {
+            "error_message": error_message,
+            "return_code": return_code,
+        }
+        if stderr_tail is not None:
+            body["stderr_tail"] = stderr_tail
+        if failure_kind is not None:
+            body["failure_kind"] = failure_kind
+        return self._request("POST", f"/api/agents/jobs/{job_id}/fail", json=body)
 
     def cancel_job(self, job_id: int) -> dict[str, Any]:
         return self._request("POST", f"/api/agents/jobs/{job_id}/cancel", json={})
@@ -173,7 +202,7 @@ class AgentClient:
             "Content-Type": "application/octet-stream",
         }
         try:
-            response = self.session.post(
+            response = self.upload_session.post(
                 f"{self.server_url}/api/agents/jobs/{job_id}/artifact",
                 headers=headers,
                 data=data,
@@ -207,13 +236,14 @@ class AgentClient:
         response: Optional[requests.Response] = None
         for attempt in range(self.max_report_attempts):
             try:
-                response = self.session.request(
-                    method,
-                    f"{self.server_url}{path}",
-                    headers=headers,
-                    json=json,
-                    timeout=self.timeout_seconds,
-                )
+                with self._session_lock:
+                    response = self.session.request(
+                        method,
+                        f"{self.server_url}{path}",
+                        headers=headers,
+                        json=json,
+                        timeout=self.timeout_seconds,
+                    )
             except requests.RequestException as exc:
                 last_error = exc
                 if attempt < self.max_report_attempts - 1:

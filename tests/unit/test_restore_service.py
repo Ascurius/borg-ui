@@ -6,8 +6,10 @@ from unittest.mock import AsyncMock, Mock, call, patch
 import pytest
 from sqlalchemy.orm import sessionmaker
 
-from app.database.models import Repository, RestoreJob, SSHConnection
+from app.database.models import Repository, SSHConnection
 from app.services.restore_service import RestoreService
+from app.services.operations.restore_facade import resolve_restore_job
+from tests.utils.operations import seed_job_operation
 
 
 class AsyncReadStream:
@@ -97,16 +99,46 @@ def restore_repository(db_session):
 
 @pytest.fixture
 def restore_job(db_session, restore_repository, tmp_path):
-    job = RestoreJob(
+    """The restore the service drives, through the facade that carries the
+    attribute surface it reads (`repository`, `archive`, `destination`)."""
+    job = seed_job_operation(
+        db_session,
+        "restore",
         repository=restore_repository.path,
         archive="archive-1",
         destination=str(tmp_path / "restore-target"),
         status="pending",
     )
-    db_session.add(job)
     db_session.commit()
-    db_session.refresh(job)
-    return job
+    return resolve_restore_job(db_session, job.id)
+
+
+@pytest.fixture
+def restore_operation(db_session, restore_repository, tmp_path, monkeypatch):
+    from app.database.models import Operation
+    from app.services.operations.details import restore_details
+
+    monkeypatch.setattr("app.config.settings.data_dir", str(tmp_path))
+    op = Operation(
+        repository_id=restore_repository.id,
+        kind="restore",
+        category="restore",
+        status="running",
+        trigger="manual",
+        priority=0,
+        run_id="run-service",
+        params={"archive_name": "archive-1", "paths": []},
+    )
+    db_session.add(op)
+    db_session.flush()
+    details = restore_details(db_session, op)
+    details.archive = "archive-1"
+    details.destination = str(tmp_path / "restore-target")
+    details.repository_type = "local"
+    details.destination_type = "local"
+    db_session.commit()
+    db_session.refresh(op)
+    return op
 
 
 class TestRestoreServiceRouting:
@@ -205,11 +237,7 @@ class TestRestoreServiceRouting:
             )
 
         verification = testing_session_local()
-        refreshed = (
-            verification.query(RestoreJob)
-            .filter(RestoreJob.id == restore_job.id)
-            .first()
-        )
+        refreshed = resolve_restore_job(verification, restore_job.id)
         assert refreshed.status == "failed"
         assert "unsupportedExecutionMode" in refreshed.error_message
         verification.close()
@@ -288,11 +316,7 @@ class TestRestoreServiceExecution:
             )
 
         verification = testing_session_local()
-        refreshed = (
-            verification.query(RestoreJob)
-            .filter(RestoreJob.id == restore_job.id)
-            .first()
-        )
+        refreshed = resolve_restore_job(verification, restore_job.id)
         assert refreshed.status == "failed"
         assert "failedCreateDestinationDir" in refreshed.error_message
         verification.close()
@@ -345,11 +369,7 @@ class TestRestoreServiceExecution:
             )
 
         verification = testing_session_local()
-        refreshed = (
-            verification.query(RestoreJob)
-            .filter(RestoreJob.id == restore_job.id)
-            .first()
-        )
+        refreshed = resolve_restore_job(verification, restore_job.id)
         assert refreshed.status == "completed"
         assert refreshed.progress == 100
         assert refreshed.progress_percent == 100.0
@@ -545,11 +565,7 @@ class TestRestoreServiceExecution:
             )
 
         verification = testing_session_local()
-        refreshed = (
-            verification.query(RestoreJob)
-            .filter(RestoreJob.id == restore_job.id)
-            .first()
-        )
+        refreshed = resolve_restore_job(verification, restore_job.id)
         assert refreshed.status == "failed"
         assert "restoreFailedZeroFilesPermission" in refreshed.error_message
         notification_mock.send_restore_failure.assert_awaited_once()
@@ -603,11 +619,7 @@ class TestRestoreServiceExecution:
             )
 
         verification = testing_session_local()
-        refreshed = (
-            verification.query(RestoreJob)
-            .filter(RestoreJob.id == restore_job.id)
-            .first()
-        )
+        refreshed = resolve_restore_job(verification, restore_job.id)
         assert refreshed.status == "completed_with_warnings"
         assert "restoreCompletedWithWarnings" in refreshed.error_message
         notification_mock.send_restore_success.assert_awaited_once()
@@ -648,15 +660,95 @@ class TestRestoreServiceExecution:
             )
 
         verification = testing_session_local()
-        refreshed = (
-            verification.query(RestoreJob)
-            .filter(RestoreJob.id == restore_job.id)
-            .first()
-        )
+        refreshed = resolve_restore_job(verification, restore_job.id)
         assert refreshed.status == "failed"
         assert "restoreFailedExitCode" in refreshed.error_message
         notification_mock.send_restore_failure.assert_awaited_once()
         verification.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_local_restore_on_an_operation_writes_the_row_and_its_log_file(
+        self, testing_session_local, restore_operation, restore_repository, tmp_path
+    ):
+        from app.database.models import Operation, OperationRestoreDetails
+
+        service = RestoreService()
+        process = FakeRestoreProcess(
+            returncode=0,
+            stderr_chunks=[
+                json.dumps(
+                    {
+                        "type": "progress_percent",
+                        "current": 10,
+                        "total": 20,
+                        "info": ["docs/report.txt"],
+                        "finished": False,
+                    }
+                )
+                + "\n"
+            ],
+            stdout_lines=[b"restored\n"],
+        )
+        notification_mock = SimpleNamespace(
+            send_restore_success=AsyncMock(return_value=None),
+            send_restore_failure=AsyncMock(return_value=None),
+        )
+
+        with (
+            patch("app.services.restore_service.SessionLocal", testing_session_local),
+            patch(
+                "app.services.restore_service.asyncio.create_subprocess_exec",
+                return_value=process,
+            ),
+            patch(
+                "app.services.restore_service.notification_service", notification_mock
+            ),
+        ):
+            await service._execute_local_to_local(
+                restore_operation.id,
+                restore_repository.path,
+                "archive-1",
+                str(tmp_path / "restore-target"),
+                None,
+            )
+
+        verification = testing_session_local()
+        op = verification.get(Operation, restore_operation.id)
+        details = verification.get(OperationRestoreDetails, restore_operation.id)
+        assert op.status == "completed"
+        assert op.progress_percent == 100.0
+        assert op.log_file_path == str(tmp_path / "logs" / f"operation_{op.id}.log")
+        assert "STDOUT:" in (tmp_path / "logs" / f"operation_{op.id}.log").read_text()
+        assert details.original_size == 20
+        assert details.restored_size == 10
+        assert details.nfiles == 1
+        assert details.current_file == "docs/report.txt"
+        notification_mock.send_restore_success.assert_awaited_once()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_agent_terminal_state_lands_on_the_operation(
+        self, db_session, restore_operation
+    ):
+        from app.database.models import Operation
+        from app.services.operations.restore_facade import RestoreJobFacade
+
+        service = RestoreService()
+        job = RestoreJobFacade(db_session, restore_operation)
+        agent_job = SimpleNamespace(
+            id=1, status="completed", result={"warning": True, "return_code": 1}
+        )
+        with patch.object(service, "_collect_agent_job_logs", return_value="agent log"):
+            service._apply_agent_restore_terminal(db_session, job, agent_job)
+        db_session.commit()
+
+        op = db_session.get(Operation, restore_operation.id)
+        assert op.status == "completed_with_warnings"
+        assert op.progress_percent == 100.0
+        assert json.loads(op.error_message)["params"]["exitCode"] == 1
+        assert op.log_file_path is not None
+        assert job.logs == "agent log"
 
 
 class TestRestoreServiceCancellation:
@@ -715,3 +807,337 @@ class TestRestoreServiceCancellation:
         service.running_processes[5] = process
 
         assert await service.cancel_restore(5) is False
+
+
+def _agent_job_row(db_session, status, *, capabilities=("jobs.cancel",)):
+    from datetime import datetime
+
+    from app.core.security import get_password_hash
+    from app.database.models import AgentJob, AgentMachine
+
+    agent = AgentMachine(
+        name=f"restore-agent-{status}",
+        agent_id=f"agt_restore_{status}",
+        token_hash=get_password_hash("secret"),
+        token_prefix="secret",
+        status="online",
+        capabilities=list(capabilities),
+    )
+    db_session.add(agent)
+    db_session.commit()
+    job = AgentJob(
+        agent_machine_id=agent.id,
+        job_type="repository",
+        status=status,
+        payload={"job_kind": "repository.restore"},
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db_session.add(job)
+    db_session.commit()
+    return job
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cancel_agent_restore_takes_a_queued_job_off_the_queue(
+    testing_session_local, db_session
+):
+    """No agent picks up a `cancel_requested` job, so one nobody took is
+    cancelled outright instead of waiting for the stall timeout."""
+    from app.database.models import AgentJob
+
+    job = _agent_job_row(db_session, "queued")
+    service = RestoreService()
+    service.agent_restore_jobs[7] = job.id
+    dispatch = AsyncMock(return_value=True)
+
+    with (
+        patch("app.services.restore_service.SessionLocal", testing_session_local),
+        patch(
+            "app.services.agent_job_dispatcher.dispatch_agent_cancel_if_connected",
+            dispatch,
+        ),
+    ):
+        assert await service.cancel_restore(7) is True
+
+    db_session.expire_all()
+    assert db_session.get(AgentJob, job.id).status == "canceled"
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cancel_agent_restore_asks_the_agent_that_took_the_job(
+    testing_session_local, db_session
+):
+    from app.database.models import AgentJob
+
+    job = _agent_job_row(db_session, "running")
+    service = RestoreService()
+    service.agent_restore_jobs[8] = job.id
+    dispatch = AsyncMock(return_value=True)
+
+    with (
+        patch("app.services.restore_service.SessionLocal", testing_session_local),
+        patch(
+            "app.services.agent_job_dispatcher.dispatch_agent_cancel_if_connected",
+            dispatch,
+        ),
+    ):
+        assert await service.cancel_restore(8) is True
+
+    db_session.expire_all()
+    assert db_session.get(AgentJob, job.id).status == "cancel_requested"
+    dispatch.assert_awaited_once()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_cancel_retry_does_not_count_as_agent_activity(
+    testing_session_local, db_session
+):
+    """The watcher asks again while the command does not reach the agent;
+    a write each time would hold off the stall timer and the reaper."""
+    from datetime import datetime
+
+    from app.database.models import AgentJob
+
+    job = _agent_job_row(db_session, "running")
+    service = RestoreService()
+    service.agent_restore_jobs[9] = job.id
+
+    with (
+        patch("app.services.restore_service.SessionLocal", testing_session_local),
+        patch(
+            "app.services.agent_job_dispatcher.dispatch_agent_cancel_if_connected",
+            AsyncMock(return_value=False),
+        ),
+    ):
+        assert await service.cancel_restore(9) is False
+        db_session.query(AgentJob).filter(AgentJob.id == job.id).update(
+            {AgentJob.updated_at: datetime(2026, 1, 1)}, synchronize_session=False
+        )
+        db_session.commit()
+        assert await service.cancel_restore(9) is False
+
+    db_session.expire_all()
+    stored = db_session.get(AgentJob, job.id)
+    assert stored.status == "cancel_requested"
+    assert stored.updated_at == datetime(2026, 1, 1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_finished_restore_job_gets_no_cancel_command(
+    testing_session_local, db_session
+):
+    job = _agent_job_row(db_session, "completed")
+    service = RestoreService()
+    service.agent_restore_jobs[10] = job.id
+    dispatch = AsyncMock(return_value=True)
+
+    with (
+        patch("app.services.restore_service.SessionLocal", testing_session_local),
+        patch(
+            "app.services.agent_job_dispatcher.dispatch_agent_cancel_if_connected",
+            dispatch,
+        ),
+    ):
+        assert await service.cancel_restore(10) is False
+
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "after_the_read, after_the_write, stored, cancelled, commanded",
+    [
+        ("completed", None, "completed", False, False),
+        ("queued", None, "canceled", True, False),
+        ("queued", "claimed", "cancel_requested", True, True),
+        (None, "queued", "canceled", True, False),
+        (None, "completed", "completed", False, False),
+    ],
+    ids=[
+        "verdict",
+        "requeue",
+        "requeue-and-reclaim",
+        "requeue-over-the-request",
+        "verdict-over-the-request",
+    ],
+)
+async def test_a_cancel_overtaken_after_its_read_does_not_overwrite(
+    testing_session_local,
+    db_session,
+    after_the_read,
+    after_the_write,
+    stored,
+    cancelled,
+    commanded,
+):
+    """The cancel read `running`; before it wrote, the agent's completion
+    committed, or a heartbeat put the job back on the queue. The verdict
+    stands; the queued job is cancelled so it cannot run later; one an agent
+    claimed again meanwhile is still asked to stop. The same holds when a
+    writer that read the job earlier lands over the request."""
+    from app.database.models import AgentJob
+
+    job = _agent_job_row(db_session, "running")
+    service = RestoreService()
+    service.agent_restore_jobs[11] = job.id
+    dispatch = AsyncMock(return_value=True)
+
+    def overtake(status):
+        other = testing_session_local()
+        try:
+            other.query(AgentJob).filter(AgentJob.id == job.id).update(
+                {AgentJob.status: status}, synchronize_session=False
+            )
+            other.commit()
+        finally:
+            other.close()
+
+    def session_whose_read_is_overtaken():
+        session = testing_session_local()
+        refresh, commit = session.refresh, session.commit
+        commits = []
+
+        def refresh_then_overtake(instance, *args, **kwargs):
+            refresh(instance, *args, **kwargs)
+            session.refresh = refresh
+            if after_the_read:
+                overtake(after_the_read)
+
+        def commit_then_overtake():
+            commit()
+            commits.append(1)
+            # the second commit is the write decided from the overtaken read
+            if after_the_write and len(commits) == 2:
+                overtake(after_the_write)
+
+        session.refresh = refresh_then_overtake
+        session.commit = commit_then_overtake
+        return session
+
+    with (
+        patch(
+            "app.services.restore_service.SessionLocal",
+            session_whose_read_is_overtaken,
+        ),
+        patch(
+            "app.services.agent_job_dispatcher.dispatch_agent_cancel_if_connected",
+            dispatch,
+        ),
+    ):
+        assert await service.cancel_restore(11) is cancelled
+
+    db_session.expire_all()
+    assert db_session.get(AgentJob, job.id).status == stored
+    assert dispatch.await_count == (1 if commanded else 0)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_stall_timeout_yields_to_a_verdict_that_landed_first(
+    testing_session_local, db_session
+):
+    """The wait read `running`; the agent's completion committed before the
+    timeout wrote. The verdict stands, the timeout does nothing."""
+    from sqlalchemy.orm import sessionmaker
+
+    from app.database.models import AgentJob
+
+    job = _agent_job_row(db_session, "running")
+    stale = db_session.get(AgentJob, job.id)
+    assert stale.status == "running"
+    other = sessionmaker(bind=db_session.get_bind())()
+    try:
+        other.query(AgentJob).filter(AgentJob.id == job.id).update(
+            {AgentJob.status: "completed"}, synchronize_session=False
+        )
+        other.commit()
+    finally:
+        other.close()
+
+    stopped = await RestoreService()._stop_stalled_agent_job(
+        db_session, stale, "agent did not complete the restore in time"
+    )
+
+    assert stopped is False
+    db_session.expire_all()
+    assert db_session.get(AgentJob, job.id).status == "completed"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_stall_timeout_leaves_the_job_of_an_agent_that_cannot_stop_it(
+    testing_session_local, db_session
+):
+    """An agent before `jobs.cancel` reports `canceled` at once and lets a
+    silent Borg run on: its job stays live, so admission keeps counting the
+    work, and no cancel is sent. A verdict that landed first still stands."""
+    from sqlalchemy.orm import sessionmaker
+
+    from app.database.models import AgentJob
+
+    job = _agent_job_row(db_session, "running", capabilities=())
+    stale = db_session.get(AgentJob, job.id)
+    dispatch = AsyncMock(return_value=True)
+    with patch(
+        "app.services.agent_job_dispatcher.dispatch_agent_cancel_if_connected",
+        dispatch,
+    ):
+        stopped = await RestoreService()._stop_stalled_agent_job(
+            db_session, stale, "agent did not complete the restore in time"
+        )
+        assert stopped is True
+        db_session.expire_all()
+        assert db_session.get(AgentJob, job.id).status == "running"
+
+        other = sessionmaker(bind=db_session.get_bind())()
+        try:
+            other.query(AgentJob).filter(AgentJob.id == job.id).update(
+                {AgentJob.status: "completed"}, synchronize_session=False
+            )
+            other.commit()
+        finally:
+            other.close()
+        assert (
+            await RestoreService()._stop_stalled_agent_job(
+                db_session, stale, "agent did not complete the restore in time"
+            )
+            is False
+        )
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_stall_timeout_only_resends_a_cancel_already_asked_for(
+    testing_session_local, db_session
+):
+    from app.database.models import AgentJob
+
+    job = _agent_job_row(db_session, "cancel_requested")
+    row = db_session.get(AgentJob, job.id)
+    row.error_message = "Cancelled by user"
+    db_session.commit()
+    before = row.updated_at
+    dispatch = AsyncMock(return_value=True)
+    with patch(
+        "app.services.agent_job_dispatcher.dispatch_agent_cancel_if_connected",
+        dispatch,
+    ):
+        stopped = await RestoreService()._stop_stalled_agent_job(
+            db_session, row, "agent did not complete the restore in time"
+        )
+
+    assert stopped is True
+    dispatch.assert_awaited_once()
+    db_session.expire_all()
+    row = db_session.get(AgentJob, job.id)
+    assert row.status == "cancel_requested"
+    assert row.error_message == "Cancelled by user"
+    assert row.updated_at == before

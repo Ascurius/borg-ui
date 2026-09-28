@@ -126,6 +126,15 @@ def refresh_status_if_expired(state: LicensingState) -> None:
         state.plan = "community"
 
 
+def _granted_overrides(payload: dict[str, Any]) -> list[str]:
+    """The features an entitlement document grants on top of its plan."""
+    return [
+        o.get("feature")
+        for o in (payload or {}).get("feature_overrides", []) or []
+        if o.get("enabled") is True and o.get("feature")
+    ]
+
+
 def get_entitlement_summary(db: Session) -> dict[str, Any]:
     state = get_or_create_licensing_state(db)
     refresh_status_if_expired(state)
@@ -134,6 +143,8 @@ def get_entitlement_summary(db: Session) -> dict[str, Any]:
     payload = state.payload_json or {}
     refresh_after = _parse_dt(payload.get("refresh_after"))
     is_full_access = bool(state.is_trial and state.status == "active")
+    granted = _granted_overrides(payload)
+    expires_at = serialize_datetime(state.expires_at)
 
     return {
         "status": state.status,
@@ -148,7 +159,27 @@ def get_entitlement_summary(db: Session) -> dict[str, Any]:
         "key_id": state.key_id,
         "license_id": state.license_id,
         "customer_id": state.customer_id,
+        # The tier as sold. Lite is gated as Pro, so access_level says "pro";
+        # this is the name the reader paid for and expects to see.
+        "license_plan": payload.get("license_plan")
+        if state.status == "active"
+        else None,
         "ui_state": _ui_state(state),
+        # The features a per-feature trial is currently granting, and the
+        # ones whose trial has run out, so the UI can count down and then
+        # say the trial ended instead of offering it again (spec
+        # 2026-09-21-community-teasers-and-feature-trials, section 3).
+        "trial_features": [
+            {"feature": f, "expires_at": expires_at}
+            for f in (granted if state.status == "active" else [])
+        ],
+        # Everything this install has spent that it is not being granted
+        # right now, whether the entitlement that granted it is expired or
+        # already cleared.
+        "expired_trial_features": sorted(
+            set(state.trial_features_used or [])
+            - set(granted if state.status == "active" else [])
+        ),
         "last_refresh_at": serialize_datetime(state.last_refresh_at),
         "last_refresh_error": state.last_refresh_error,
     }
@@ -178,6 +209,7 @@ def _clear_entitlement(
     state.plan = "community"
     state.status = status
     state.is_trial = False
+    state.license_key = None
     state.entitlement_id = None
     state.key_id = None
     state.customer_id = None
@@ -229,9 +261,12 @@ def _apply_entitlement(
     signature: str,
     key_id: str | None = None,
     refresh_error: str | None = None,
+    license_key: str | None = None,
 ) -> None:
     state.entitlement_id = payload.get("entitlement_id")
     state.key_id = key_id
+    if license_key is not None:
+        state.license_key = license_key
     state.customer_id = payload.get("customer_id")
     state.license_id = payload.get("license_id")
     state.plan = payload.get("plan") or "community"
@@ -246,6 +281,14 @@ def _apply_entitlement(
     state.last_refresh_error = refresh_error
     state.payload_json = payload
     state.signature = signature
+    # A trial is spent the moment it is granted, not when it lapses: by then
+    # this document is gone. Recorded by feature, so a later release's own
+    # features are still on offer.
+    granted = _granted_overrides(payload)
+    if granted:
+        state.trial_features_used = sorted(
+            set(state.trial_features_used or []) | set(granted)
+        )
     refresh_status_if_expired(state)
     db.commit()
 
@@ -296,8 +339,16 @@ def _access_level(state: LicensingState) -> str:
 def _ui_state(state: LicensingState) -> str:
     if state.status == "active" and state.is_trial:
         return "full_access_active"
-    if state.status == "active":
+    # A feature trial is an active entitlement on the community plan: it grants
+    # its features and nothing else, so the licensing screen must keep offering
+    # the key field and the buy link rather than reading it as a paid license.
+    if state.status == "active" and (state.plan or "community") != "community":
         return "paid_active"
+    # ...and while it runs, this install is not an install whose access has
+    # lapsed: saying "full access has ended, you are on Community now" over a
+    # running trial contradicts the countdown beside it.
+    if state.status == "active" and _granted_overrides(state.payload_json or {}):
+        return "community"
     if state.trial_consumed:
         return "full_access_expired"
     return "community"
@@ -445,7 +496,70 @@ async def activate_paid_license(
         db.commit()
         raise RuntimeError(error)
 
-    _apply_entitlement(db, state, payload, signature, key_id=key_id)
+    # The key rides along with the entitlement so one commit persists both:
+    # a key stored separately can end up paired with the wrong licence.
+    _apply_entitlement(
+        db, state, payload, signature, key_id=key_id, license_key=license_key
+    )
+    return {
+        "result": data.get("result") or "activated",
+        "entitlement": get_entitlement_summary(db),
+    }
+
+
+async def request_feature_trial(
+    db: Session, *, feature: str, app_version: str
+) -> dict[str, Any]:
+    """Ask the activation service for a time limited trial of one feature.
+
+    The same `/v1/trials/activate` endpoint as the one time full access
+    trial, with `requested_feature` added: the answer is the same `denied`
+    or `entitlement` document, so nothing new is parsed here. A service
+    that does not know the field answers `denied`, which the UI reports as
+    "not available" (spec
+    2026-09-21-community-teasers-and-feature-trials, section 3).
+
+    How long the trial runs, and whether one is granted at all, is the
+    service's call. This install only records what it is handed.
+    """
+    from app.core.features import FEATURES
+
+    if feature not in FEATURES:
+        raise RuntimeError(f"Unknown feature: {feature!r}")
+
+    state = get_or_create_licensing_state(db)
+    data = await _post_activation(
+        "/v1/trials/activate",
+        {
+            "instance_id": state.instance_id,
+            "app": "borg-ui",
+            "app_version": app_version,
+            "hostname": os.getenv("HOSTNAME"),
+            "fingerprint": None,
+            "requested_feature": feature,
+        },
+    )
+
+    if data.get("result") == "denied":
+        state.last_refresh_at = utc_now()
+        db.commit()
+        return {
+            "result": "denied",
+            "reason": data.get("reason"),
+            "entitlement": get_entitlement_summary(db),
+        }
+
+    entitlement = data.get("entitlement") or {}
+    payload = entitlement.get("payload")
+    signature = entitlement.get("signature")
+    error = _validate_entitlement_document(state, payload, signature)
+    if error:
+        state.last_refresh_at = utc_now()
+        state.last_refresh_error = error
+        db.commit()
+        raise RuntimeError(error)
+
+    _apply_entitlement(db, state, payload, signature, key_id=entitlement.get("key_id"))
     return {
         "result": data.get("result") or "activated",
         "entitlement": get_entitlement_summary(db),
@@ -469,6 +583,39 @@ async def deactivate_paid_license(db: Session) -> dict[str, Any]:
         "result": data.get("result") or "deactivated",
         "entitlement": get_entitlement_summary(db),
     }
+
+
+def _require_license_key(db: Session) -> tuple[LicensingState, str]:
+    state = get_or_create_licensing_state(db)
+    if not state.license_key:
+        raise RuntimeError(
+            "No license key is stored on this instance. Activate again with your "
+            "license key to manage seats."
+        )
+    return state, state.license_key
+
+
+async def list_license_seats(db: Session) -> dict[str, Any]:
+    """Every installation currently holding a seat on this license.
+
+    The license key is the credential; the seat list belongs to the license,
+    not to this instance, so it is always fetched live.
+    """
+    state, license_key = _require_license_key(db)
+    data = await _post_activation("/v1/licenses/seats", {"license_key": license_key})
+    # Ours last: the service must not be able to relabel which seat is this one.
+    return {**data, "instance_id": state.instance_id}
+
+
+async def release_license_seat(db: Session, *, instance_id: str) -> dict[str, Any]:
+    state, license_key = _require_license_key(db)
+    if instance_id == state.instance_id:
+        raise RuntimeError("Use deactivate to release the seat held by this instance.")
+    data = await _post_activation(
+        "/v1/licenses/seats/release",
+        {"license_key": license_key, "instance_id": instance_id},
+    )
+    return {"result": data.get("result") or "released"}
 
 
 def import_offline_entitlement(db: Session, document: dict[str, Any]) -> dict[str, Any]:

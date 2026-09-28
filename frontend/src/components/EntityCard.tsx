@@ -119,7 +119,14 @@ export default function EntityCard({
           }}
         >
           <Box sx={{ minWidth: 0, flex: 1 }}>
-            <Typography variant="subtitle1" fontWeight={700} noWrap sx={{ lineHeight: 1.3 }}>
+            <Typography
+              variant="subtitle1"
+              noWrap
+              sx={{
+                fontWeight: 700,
+                lineHeight: 1.3,
+              }}
+            >
               {title}
             </Typography>
             {subtitle && (
@@ -152,8 +159,10 @@ export default function EntityCard({
             const isRightColXs = i % 2 === 1
             const isLastSm = i === stats.length - 1
             const isFirstRowXs = i < 2
+            // Full strength: the label is text, and a faded palette colour
+            // drops under 4.5:1.
             const statColor = stat.color
-              ? alpha((theme.palette[stat.color] as { main: string }).main, 0.7)
+              ? (theme.palette[stat.color] as { main: string }).main
               : undefined
             return (
               <Tooltip
@@ -200,9 +209,12 @@ export default function EntityCard({
                   </Box>
                   <Typography
                     variant="body2"
-                    fontWeight={600}
                     noWrap
-                    sx={{ fontVariantNumeric: 'tabular-nums', fontSize: '0.85rem' }}
+                    sx={{
+                      fontWeight: 600,
+                      fontVariantNumeric: 'tabular-nums',
+                      fontSize: '0.85rem',
+                    }}
                   >
                     {stat.value}
                   </Typography>
@@ -294,7 +306,7 @@ export default function EntityCard({
                 const resolvedSx = actionColor
                   ? {
                       ...iconBtnSx,
-                      color: alpha(actionColor, 0.6),
+                      color: alpha(actionColor, 0.75),
                       '&:hover': {
                         color: actionColor,
                         bgcolor: alpha(actionColor, 0.1),

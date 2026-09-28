@@ -7,7 +7,8 @@ from fastapi.testclient import TestClient
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
-from app.database.models import InstalledPackage, PackageInstallJob
+from app.database.models import InstalledPackage
+from tests.utils.operations import seed_job_operation
 
 
 @pytest.mark.unit
@@ -132,7 +133,12 @@ class TestPackagesAPI:
         test_db.commit()
         test_db.refresh(package)
 
-        job = PackageInstallJob(id=99, package_id=package.id, status="installing")
+        job = seed_job_operation(
+            test_db,
+            "package_install",
+            package_id=package.id,
+            status="installing",
+        )
 
         with patch(
             "app.api.packages.package_service.start_install_job",
@@ -144,7 +150,7 @@ class TestPackagesAPI:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["job_id"] == 99
+        assert data["job_id"] == job.id
         assert data["status"] == "installing"
         start_job.assert_awaited_once()
 
@@ -163,8 +169,9 @@ class TestPackagesAPI:
         test_db.commit()
         test_db.refresh(package)
 
-        existing_job = PackageInstallJob(package_id=package.id, status="pending")
-        test_db.add(existing_job)
+        existing_job = seed_job_operation(
+            test_db, "package_install", package_id=package.id, status="pending"
+        )
         test_db.commit()
         test_db.refresh(existing_job)
 
@@ -287,7 +294,9 @@ class TestPackagesAPI:
         test_db.commit()
         test_db.refresh(package)
 
-        job = PackageInstallJob(
+        job = seed_job_operation(
+            test_db,
+            "package_install",
             package_id=package.id,
             status="installing",
             started_at=datetime(2026, 4, 27, 3, 0, 6),
@@ -296,7 +305,6 @@ class TestPackagesAPI:
             stdout="",
             stderr="",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -329,12 +337,16 @@ class TestPackagesAPI:
         test_db.commit()
         test_db.refresh(package)
 
-        job1 = PackageInstallJob(
+        job1 = seed_job_operation(
+            test_db,
+            "package_install",
             package_id=package.id,
             status="completed",
             started_at=datetime(2026, 4, 27, 3, 0, 6),
         )
-        job2 = PackageInstallJob(package_id=package.id, status="failed")
+        job2 = seed_job_operation(
+            test_db, "package_install", package_id=package.id, status="failed"
+        )
         test_db.add_all([job1, job2])
         test_db.commit()
 
@@ -347,3 +359,141 @@ class TestPackagesAPI:
         completed_job = next(job for job in data if job["id"] == job1.id)
         assert completed_job["started_at"] == "2026-04-27T03:00:06+00:00"
         assert completed_job["created_at"].endswith("+00:00")
+
+
+@pytest.mark.unit
+class TestPackageInstallOperations:
+    """Phase 6: package installs live in `operations` (spec 6.2, 6.3)."""
+
+    def _package(self, test_db, name="ripgrep"):
+        package = InstalledPackage(
+            name=name, install_command=f"apt-get install -y {name}"
+        )
+        test_db.add(package)
+        test_db.commit()
+        test_db.refresh(package)
+        return package
+
+    def _operation(self, test_db, package, *, status="queued", run_id="run-1"):
+        from app.database.models import Operation
+
+        op = Operation(
+            repository_id=None,
+            kind="package_install",
+            category="system",
+            status=status,
+            trigger="manual",
+            priority=0,
+            run_id=run_id,
+            params={"package_id": package.id},
+        )
+        test_db.add(op)
+        test_db.commit()
+        test_db.refresh(op)
+        return op
+
+    def test_install_queues_an_operation(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        from app.database.models import Operation
+
+        package = self._package(test_db)
+
+        response = test_client.post(
+            f"/api/packages/{package.id}/install", headers=admin_headers
+        )
+
+        operation = test_db.query(Operation).one()
+        assert response.status_code == 200
+        assert response.json()["job_id"] == operation.id
+        assert operation.kind == "package_install"
+        assert operation.params == {"package_id": package.id}
+
+    def test_install_returns_the_in_flight_operation_instead_of_a_second_one(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        from app.database.models import Operation
+
+        package = self._package(test_db, name="fd-find")
+        existing = self._operation(test_db, package)
+
+        with patch(
+            "app.api.packages.package_service.start_install_job", new=AsyncMock()
+        ) as start_job:
+            response = test_client.post(
+                f"/api/packages/{package.id}/install", headers=admin_headers
+            )
+
+        assert response.status_code == 200
+        assert response.json()["job_id"] == existing.id
+        assert response.json()["status"] == "pending"
+        assert test_db.query(Operation).count() == 1
+        start_job.assert_not_awaited()
+
+    def test_job_status_serves_an_operation_with_its_captured_output(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        from app.services.operations.package_facade import PackageInstallFacade
+
+        package = self._package(test_db, name="bat")
+        op = self._operation(test_db, package, status="completed")
+        job = PackageInstallFacade(test_db, op)
+        job.exit_code = 0
+        job.write_output("installed", "")
+        test_db.commit()
+
+        response = test_client.get(f"/api/packages/jobs/{op.id}", headers=admin_headers)
+
+        body = response.json()
+        assert response.status_code == 200
+        assert body["id"] == op.id
+        assert body["package_id"] == package.id
+        assert body["status"] == "completed"
+        assert body["exit_code"] == 0
+        assert body["stdout"] == "installed"
+        assert body["stderr"] == ""
+
+    def test_job_status_serves_a_row_seeded_from_the_legacy_columns(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """The legacy table is gone; a caller that used to seed one of its
+        rows seeds the operation it became, and the route still answers with
+        the words and the output the row carried."""
+        package = self._package(test_db, name="tree")
+        job = seed_job_operation(
+            test_db,
+            "package_install",
+            package_id=package.id,
+            status="completed",
+            exit_code=0,
+            stdout="legacy out",
+        )
+        test_db.commit()
+        test_db.refresh(job)
+
+        response = test_client.get(
+            f"/api/packages/jobs/{job.id}", headers=admin_headers
+        )
+
+        body = response.json()
+        assert response.status_code == 200
+        assert body["status"] == "completed"
+        assert body["stdout"] == "legacy out"
+
+    def test_job_list_returns_every_package_install_operation(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        package = self._package(test_db, name="ncdu")
+        op = self._operation(test_db, package, status="completed")
+        other = seed_job_operation(
+            test_db, "package_install", package_id=package.id, status="failed"
+        )
+        test_db.commit()
+        test_db.refresh(other)
+
+        response = test_client.get("/api/packages/jobs", headers=admin_headers)
+
+        body = response.json()
+        assert response.status_code == 200
+        assert {item["status"] for item in body} == {"completed", "failed"}
+        assert {item["id"] for item in body} == {op.id, other.id}

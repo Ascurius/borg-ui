@@ -1,4 +1,6 @@
 import type { RepositoryData } from '../../services/api'
+import type { IndexMode } from '../../types/operations'
+import type { RepositoryStorage } from '../../types'
 
 export interface Repository extends RepositoryData {
   id: number
@@ -11,6 +13,10 @@ export interface Repository extends RepositoryData {
   last_backup: string | null
   last_check: string | null
   last_compact: string | null
+  last_prune?: string | null
+  last_index?: string | null
+  // How much derived data this repository refreshes (spec 6.8).
+  index_mode?: IndexMode
   has_schedule?: boolean
   schedule_enabled?: boolean
   schedule_name?: string | null
@@ -18,6 +24,9 @@ export interface Repository extends RepositoryData {
   next_run?: string | null
   total_size: string | null
   archive_count: number
+  // The stored size figures (#981) and the index work still pending (#1063).
+  storage?: RepositoryStorage | null
+  index_pending_kinds?: string[]
   created_at: string
   updated_at: string | null
   mode: 'full' | 'observe'

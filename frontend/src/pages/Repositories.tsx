@@ -8,8 +8,11 @@ import { Box } from '@mui/material'
 import { backupPlansAPI, repositoriesAPI, RepositoryData } from '../services/api'
 import { BorgApiClient } from '../services/borgApi'
 import { translateBackendKey } from '../utils/translateBackendKey'
+import { resyncStoredArchives } from '../utils/archiveResync'
+import { statsUpdating } from '../utils/repositoryStats'
 import { useAuth } from '../hooks/useAuth'
 import { useLockBreakPermissions } from '../hooks/useLockBreakPermissions'
+import { useOperationEvents } from '../hooks/useOperationEvents'
 import { usePlan } from '../hooks/usePlan'
 import { usePermissions } from '../hooks/usePermissions'
 import { useAppState } from '../context/AppContext'
@@ -37,9 +40,43 @@ import {
 } from './repositories-page/helpers'
 import type { PruneForm, Repository } from './repositories-page/types'
 import type { BackupPlan, RepositoryWipeExecuteRequest, RepositoryWipeJob } from '../types'
+import type { OperationItem } from '../types/operations'
+import { SUCCESS_OPERATION_STATUSES } from '../utils/operationStatus'
 
 const EMPTY_REPOSITORIES: Repository[] = []
 const RUNNING_WIPE_STATUSES = new Set(['pending', 'running'])
+// Operations whose end changes the cards' "Last prune" / "Last index"
+// entries: any index kind, and prune (a deletion shows through its index
+// follow-up), completed successfully, since only successful runs move the
+// values. The list is refetched once per burst of such events, and at
+// least every LIST_REFRESH_MAX_WAIT_MS while a burst keeps going.
+const LIST_REFRESH_DEBOUNCE_MS = 2000
+const LIST_REFRESH_MAX_WAIT_MS = 10000
+// Completions spaced wider than the debounce (a reconcile sweep finishing
+// one repository every few seconds) must not each cost a full list load.
+const LIST_REFRESH_MIN_INTERVAL_MS = 10000
+// The open dialog's figures refetch once per burst of index stages, as the
+// Archives header does.
+const STORAGE_REFRESH_DEBOUNCE_MS = 1500
+
+// The index kinds whose pending state the card renders (#1063): the archive
+// count and the last backup read `archive_sync`, the size reads `stats`.
+const CARD_INDEX_KINDS = new Set(['archive_sync', 'stats'])
+
+function movesCardLastRuns(op: OperationItem): boolean {
+  // Index work the card's placeholders read moves the card when it is
+  // queued (the "indexing" placeholder appears) and when it ends, however
+  // it ends (the placeholder clears, the figures land); a stage's start
+  // changes no card value. Every other index kind moves the card's "Last
+  // Index" when it ends well, like any other last run.
+  if (op.category === 'index' && CARD_INDEX_KINDS.has(op.kind)) {
+    return op.status !== 'running'
+  }
+  if (op.category === 'index') return SUCCESS_OPERATION_STATUSES.has(op.status)
+  if (!SUCCESS_OPERATION_STATUSES.has(op.status)) return false
+  // a prune preview (dry run) removes nothing and moves no value
+  return op.kind === 'prune' && !op.params?.dry_run
+}
 const TERMINAL_WIPE_STATUSES = new Set([
   'completed',
   'completed_compaction_failed',
@@ -153,7 +190,14 @@ export default function Repositories() {
   const announcedWipeJobsRef = useRef<Set<number>>(new Set())
 
   // Filter, sort, and search state
-  const [searchQuery, setSearchQuery] = useState('')
+  // `?q=` lets other pages (the background work hub) land on one repository.
+  const urlQuery = searchParams.get('q') ?? ''
+  const [searchQuery, setSearchQuery] = useState(urlQuery)
+  // The page stays mounted across `/repositories?q=a` -> `/repositories`, so
+  // the initial value alone would leave a stale search in place.
+  React.useEffect(() => {
+    setSearchQuery(urlQuery)
+  }, [urlQuery])
   const [sortBy, setSortBy] = useState<string>(() => {
     return localStorage.getItem('repos_sort') || 'name-asc'
   })
@@ -172,6 +216,71 @@ export default function Repositories() {
     queryKey: ['repositories'],
     queryFn: repositoriesAPI.getRepositories,
   })
+
+  // The cards' "Last prune" and "Last index" ride in the list payload, so
+  // the list is refetched when such work ends, from the shared SSE stream
+  // instead of a timer. Index chains end in bursts (stats, archive sync,
+  // history merge within seconds), hence one debounced refetch per burst;
+  // a nightly window where chains end back to back must still refresh, so
+  // the debounce is capped at a maximum wait.
+  const listRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const listRefreshBurstStart = useRef<number | null>(null)
+  const listRefreshedAt = useRef<number>(0)
+  // one timer per repository: a burst on repository B must not cancel the
+  // refresh repository A's open dialog is waiting for
+  const storageRefreshTimers = useRef(new Map<number, ReturnType<typeof setTimeout>>())
+  useOperationEvents(
+    (op: OperationItem) => {
+      if (op.category === 'index' && op.repository_id != null) {
+        // the info dialog's storage figures and pending kinds come from
+        // the storage route, which nothing else refreshes while it is
+        // open; every index move counts here, since the pending kinds
+        // name every kind, not only the ones the cards read
+        const repositoryId = op.repository_id
+        const timers = storageRefreshTimers.current
+        const pending = timers.get(repositoryId)
+        if (pending) clearTimeout(pending)
+        timers.set(
+          repositoryId,
+          setTimeout(() => {
+            timers.delete(repositoryId)
+            queryClient.invalidateQueries({ queryKey: ['repository-storage', repositoryId] })
+          }, STORAGE_REFRESH_DEBOUNCE_MS)
+        )
+      }
+      if (!movesCardLastRuns(op)) return
+      const now = Date.now()
+      const refetch = () => {
+        listRefreshTimer.current = null
+        listRefreshBurstStart.current = null
+        listRefreshedAt.current = Date.now()
+        queryClient.invalidateQueries({ queryKey: ['repositories'] })
+      }
+      if (listRefreshTimer.current) clearTimeout(listRefreshTimer.current)
+      listRefreshBurstStart.current ??= now
+      const remainingBurstTime = LIST_REFRESH_MAX_WAIT_MS - (now - listRefreshBurstStart.current)
+      const remainingInterval = LIST_REFRESH_MIN_INTERVAL_MS - (now - listRefreshedAt.current)
+      const delay = Math.max(
+        Math.min(LIST_REFRESH_DEBOUNCE_MS, remainingBurstTime),
+        remainingInterval,
+        0
+      )
+      if (delay === 0) {
+        refetch()
+        return
+      }
+      listRefreshTimer.current = setTimeout(refetch, delay)
+    },
+    () => {}
+  )
+  React.useEffect(
+    () => () => {
+      if (listRefreshTimer.current) clearTimeout(listRefreshTimer.current)
+      for (const timer of storageRefreshTimers.current.values()) clearTimeout(timer)
+      storageRefreshTimers.current.clear()
+    },
+    []
+  )
 
   const { canBreakLock, lockBreakingEnabled } = useLockBreakPermissions()
 
@@ -220,30 +329,77 @@ export default function Repositories() {
     return new Set(repositories.filter((link) => link.enabled).map((link) => link.repository_id))
   }, [selectedBackupPlanData, selectedBackupPlanId])
 
-  // Get repository info using borg info command
-  const {
-    data: repositoryInfo,
-    isLoading: loadingInfo,
-    error: infoError,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } = useQuery<AxiosResponse<{ info: any }>>({
-    queryKey: ['repository-info', viewingInfoRepository?.id],
-    queryFn: () => new BorgApiClient(viewingInfoRepository!).getInfo(),
+  // The dialog reads the stored columns; a live `borg info` runs only on
+  // its refresh button. The info syncs the archive columns on the server,
+  // so the list and the dialog's figures are refetched once it answers.
+  const refreshInfoMutation = useMutation({
+    mutationFn: async (repository: Repository) => {
+      await new BorgApiClient(repository).getInfo()
+      // the run that refreshes every figure; it refetches the list and the
+      // dialog's figures itself
+      await resyncStoredArchives(queryClient, repository.id)
+    },
+    onError: (error: unknown, repository) => {
+      if ((error as { response?: { status?: number } })?.response?.status === 423) {
+        setLockError({
+          repositoryId: repository.id,
+          repositoryName: repository.name,
+          borgVersion: repository.borg_version as 1 | 2 | undefined,
+        })
+      }
+    },
+  })
+  // a failed refresh belongs to the repository it ran for, not the next
+  // one the dialog opens
+  const resetRefreshInfo = refreshInfoMutation.reset
+  React.useEffect(() => {
+    resetRefreshInfo()
+  }, [viewingInfoRepository?.id, resetRefreshInfo])
+
+  // The dialog's storage statistics read the stored `storage` payload
+  // (#981) from the storage route: the archive sums the list leaves out.
+  const { data: viewingRepositoryStorageResponse } = useQuery({
+    queryKey: ['repository-storage', viewingInfoRepository?.id],
+    queryFn: () => repositoriesAPI.getStorage(viewingInfoRepository!.id),
     enabled: !!viewingInfoRepository,
     retry: false,
+    // While the dialog says "Updating", poll: the operation events refresh
+    // the list, not this query, and a dropped stream must not leave the
+    // caption stuck.
+    refetchInterval: (query) =>
+      statsUpdating(query.state.data?.data?.index_pending_kinds, query.state.data?.data?.sync_state)
+        ? 3000
+        : false,
   })
+  // `viewingInfoRepository` is the list row as it was when the dialog
+  // opened; the dialog reads the row as the list has it now, so the count
+  // and the stand-in columns below move with the list's refetches.
+  const listedRepositories: Repository[] =
+    repositoriesData?.data?.repositories || EMPTY_REPOSITORIES
+  const viewingRepository = viewingInfoRepository
+    ? (listedRepositories.find((r) => r.id === viewingInfoRepository.id) ?? viewingInfoRepository)
+    : null
+  // The list's columns stand in until the storage route answers. Only an
+  // explicit `null` replaces them; a response without the field (an older
+  // server) leaves them in place.
+  const viewingRepositoryStorage =
+    viewingRepositoryStorageResponse?.data?.storage === undefined
+      ? viewingRepository?.storage
+      : viewingRepositoryStorageResponse.data.storage
+  // The pending index kinds come from the storage route, which the
+  // operation events refresh, so the "indexing" state clears while the
+  // dialog stays open.
+  const viewingRepositoryIndexPending: string[] | undefined =
+    viewingRepositoryStorageResponse?.data?.index_pending_kinds ??
+    viewingRepository?.index_pending_kinds
 
-  // Handle repository info error
-  React.useEffect(() => {
+  // Agent-run info failures carry borg's own reason in detail.message.
+  const infoError = refreshInfoMutation.error
+  const infoErrorMessage = React.useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    if (infoError && (infoError as any)?.response?.status === 423 && viewingInfoRepository) {
-      setLockError({
-        repositoryId: viewingInfoRepository.id,
-        repositoryName: viewingInfoRepository.name,
-        borgVersion: viewingInfoRepository.borg_version as 1 | 2 | undefined,
-      })
-    }
-  }, [infoError, viewingInfoRepository])
+    const detail = (infoError as any)?.response?.data?.detail
+    return typeof detail?.message === 'string' && detail.message ? detail.message : null
+  }, [infoError])
 
   // Mutations
   const deleteRepositoryMutation = useMutation({
@@ -383,14 +539,7 @@ export default function Repositories() {
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onSuccess: (response: any) => {
-      if (response.data.dry_run) {
-        setPruneResults(response.data)
-        toast.success(t('repositories.toasts.dryRunCompleted'))
-        trackMaintenance(EventAction.COMPLETE, 'Prune', pruningRepository || undefined, {
-          mode: 'dry_run',
-          status: 'completed',
-        })
-      } else if (response.data.job_id) {
+      if (response.data.job_id) {
         setPruneResults(null)
         toast.success(t('repositories.toasts.pruneStarted'))
         trackMaintenance(EventAction.START, 'Prune', pruningRepository || undefined)
@@ -401,7 +550,7 @@ export default function Repositories() {
           setRepositoriesWithJobs((prev) => new Set(prev).add(pruningRepository.id))
           queryClient.invalidateQueries({ queryKey: ['running-jobs', pruningRepository.id] })
           queryClient.invalidateQueries({ queryKey: ['repositories'] })
-          queryClient.invalidateQueries({ queryKey: ['repository-archives', pruningRepository.id] })
+          void resyncStoredArchives(queryClient, pruningRepository.id)
         }
         setPruningRepository(null)
       } else {
@@ -414,7 +563,7 @@ export default function Repositories() {
           })
         }
         queryClient.invalidateQueries({ queryKey: ['repositories'] })
-        queryClient.invalidateQueries({ queryKey: ['repository-archives', pruningRepository?.id] })
+        void resyncStoredArchives(queryClient, pruningRepository?.id)
       }
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -566,7 +715,7 @@ export default function Repositories() {
 
   // Event handlers
   const handleDeleteRepository = (repository: Repository) => {
-    if (window.confirm(`Are you sure you want to delete repository "${repository.name}"?`)) {
+    if (window.confirm(t('repositories.deleteConfirmation', { name: repository.name }))) {
       deleteRepositoryMutation.mutate(repository.id)
     }
   }
@@ -723,13 +872,16 @@ export default function Repositories() {
     setPruneResults(null)
   }
 
-  const handlePruneDryRun = async (form: PruneForm) => {
+  const handlePreview = (form: PruneForm) => {
     if (pruningRepository) {
-      pruneRepositoryMutation.mutate({
-        id: pruningRepository.id,
-        data: { ...form, dry_run: true },
+      navigate(`/repositories/${pruningRepository.id}/prune-preview`, {
+        state: { retention: form },
       })
     }
+  }
+
+  const handlePrunePreview = (repository: Repository) => {
+    navigate(`/repositories/${repository.id}/prune-preview`)
   }
 
   const handleConfirmPrune = async (form: PruneForm) => {
@@ -851,7 +1003,7 @@ export default function Repositories() {
     localStorage.setItem('repos_group', groupBy)
   }, [groupBy])
 
-  const repositories: Repository[] = repositoriesData?.data?.repositories || EMPTY_REPOSITORIES
+  const repositories: Repository[] = listedRepositories
   const repositoriesLoading =
     isLoading || (selectedBackupPlanId !== null && loadingSelectedBackupPlan)
 
@@ -912,7 +1064,7 @@ export default function Repositories() {
     })
     queryClient.invalidateQueries({ queryKey: ['repositories'] })
     queryClient.invalidateQueries({ queryKey: ['app-repositories'] })
-    queryClient.invalidateQueries({ queryKey: ['repository-archives', wipingRepository.id] })
+    void resyncStoredArchives(queryClient, wipingRepository.id)
     queryClient.invalidateQueries({ queryKey: ['running-jobs', wipingRepository.id] })
     appState.refetch()
 
@@ -970,6 +1122,7 @@ export default function Repositories() {
         onCheck={handleCheckRepository}
         onCompact={handleCompactRepository}
         onPrune={handlePruneRepository}
+        onPrunePreview={handlePrunePreview}
         onWipeContents={handleWipeRepository}
         onBreakLock={handleBreakLockRepository}
         onEdit={openEditModal}
@@ -1022,15 +1175,24 @@ export default function Repositories() {
       {/* Repository Info Dialog */}
       <RepositoryInfoDialog
         open={!!viewingInfoRepository}
-        repository={viewingInfoRepository}
-        repositoryInfo={repositoryInfo?.data?.info || null}
-        isLoading={loadingInfo}
+        // the row as the list has it now: the count moves with the index
+        // work the dialog's other figures follow, the snapshot at open
+        // time would not
+        repository={viewingRepository}
+        storage={viewingRepositoryStorage}
+        indexPendingKinds={viewingRepositoryIndexPending}
+        lastSyncedAt={viewingRepositoryStorageResponse?.data?.last_synced_at ?? null}
+        syncState={viewingRepositoryStorageResponse?.data?.sync_state}
+        onRefresh={() => viewingRepository && refreshInfoMutation.mutate(viewingRepository)}
+        isRefreshing={refreshInfoMutation.isPending}
+        refreshFailed={refreshInfoMutation.isError}
         onClose={() => setViewingInfoRepository(null)}
         onRunRecoveryCheck={(repository) => handleCheckRepository(repository as Repository)}
         canRunRecoveryCheck={
           viewingInfoRepository ? permissions.canDo(viewingInfoRepository.id, 'maintenance') : false
         }
         isRecoveryCheckStarting={checkRepositoryMutation.isPending}
+        errorMessage={infoErrorMessage}
       />
 
       {/* Prune Repository Dialog */}
@@ -1038,7 +1200,7 @@ export default function Repositories() {
         open={!!pruningRepository}
         repository={pruningRepository}
         onClose={handleClosePruneDialog}
-        onDryRun={handlePruneDryRun}
+        onPreview={handlePreview}
         onConfirmPrune={handleConfirmPrune}
         isLoading={pruneRepositoryMutation.isPending}
         results={pruneResults}
@@ -1076,7 +1238,7 @@ export default function Repositories() {
           canBreakLock={canBreakLock({ repository_id: lockError.repositoryId })}
           lockBreakingEnabled={lockBreakingEnabled}
           onLockBroken={() => {
-            queryClient.invalidateQueries({ queryKey: ['repository-info', lockError.repositoryId] })
+            if (viewingRepository) refreshInfoMutation.mutate(viewingRepository)
           }}
         />
       )}

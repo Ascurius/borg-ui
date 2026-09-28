@@ -9,6 +9,8 @@ import Dashboard from './pages/DashboardV3'
 import Backup from './pages/Backup'
 import BackupPlans from './pages/BackupPlans'
 import Archives from './pages/Archives'
+import ArchiveDetail from './pages/ArchiveDetail'
+import PrunePreview from './pages/PrunePreview'
 import Schedule from './pages/Schedule'
 import Repositories from './pages/Repositories'
 import CloudStorage from './pages/CloudStorage'
@@ -83,7 +85,7 @@ function App() {
       return (
         <div className="min-h-screen flex items-center justify-center">
           {authError ? (
-            <div className="max-w-lg rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
+            <div className="max-w-lg rounded-2xl border border-slate-200 bg-white p-8 shadow-xs">
               <div className="flex items-center gap-2.5">
                 <ShieldAlert size={22} className="shrink-0 text-slate-500" />
                 <h1 className="text-2xl font-semibold text-slate-900">
@@ -123,7 +125,7 @@ function App() {
       return (
         <div className="min-h-screen flex items-center justify-center">
           {authError ? (
-            <div className="max-w-lg rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
+            <div className="max-w-lg rounded-2xl border border-slate-200 bg-white p-8 shadow-xs">
               <div className="flex items-center gap-2.5">
                 <ShieldAlert size={22} className="shrink-0 text-slate-500" />
                 <h1 className="text-2xl font-semibold text-slate-900">
@@ -174,6 +176,22 @@ function App() {
           element={
             <ProtectedRoute requiredTab="archives">
               <Archives />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/archives/:repositoryId/:archiveId"
+          element={
+            <ProtectedRoute requiredTab="archives">
+              <ArchiveDetail />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/repositories/:repositoryId/prune-preview"
+          element={
+            <ProtectedRoute requiredTab="repositories">
+              <PrunePreview />
             </ProtectedRoute>
           }
         />

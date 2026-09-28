@@ -9,8 +9,6 @@ import {
   TableRow,
   TablePagination,
   Paper,
-  IconButton,
-  Tooltip,
   Box,
   Typography,
   Skeleton,
@@ -21,6 +19,9 @@ import {
   useMediaQuery,
   useTheme,
 } from '@mui/material'
+import RowActions, { type ActionButton } from './RowActions'
+
+export type { ActionButton }
 
 export interface Column<T> {
   id: string
@@ -35,16 +36,6 @@ export interface Column<T> {
   mobileFullWidth?: boolean
 }
 
-export interface ActionButton<T> {
-  icon: React.ReactNode
-  label: string
-  onClick: (row: T) => void
-  color?: 'primary' | 'error' | 'warning' | 'success' | 'info' | 'default'
-  disabled?: (row: T) => boolean
-  show?: (row: T) => boolean
-  tooltip?: string | ((row: T) => string)
-}
-
 export interface DataTableProps<T> {
   // Data
   data: T[]
@@ -56,6 +47,10 @@ export interface DataTableProps<T> {
   // Row behavior
   onRowClick?: (row: T) => void
   getRowKey: (row: T) => string | number
+  /** Extra content rendered beneath a row, spanning the full width. Return null/undefined to skip a row. */
+  renderSubRow?: (row: T) => React.ReactNode
+  /** Leading columns the sub-row leaves empty, so its content lines up with the column after them. */
+  subRowIndent?: number
 
   // Styling
   headerBgColor?: string
@@ -89,21 +84,14 @@ export interface DataTableProps<T> {
   mobileBreakpoint?: 'xs' | 'sm' | 'md' | 'lg' | 'xl'
 }
 
-const ACTION_HOVER_BG_BY_COLOR: Record<string, string> = {
-  primary: 'rgba(59,130,246,0.12)',
-  error: 'rgba(239,68,68,0.12)',
-  warning: 'rgba(245,158,11,0.12)',
-  success: 'rgba(34,197,94,0.12)',
-  info: 'rgba(14,165,233,0.12)',
-  default: 'rgba(255,255,255,0.06)',
-}
-
 export default function DataTable<T>({
   data,
   columns,
   actions,
   onRowClick,
   getRowKey,
+  renderSubRow,
+  subRowIndent = 0,
   headerBgColor = 'background.default',
   enableHover = true,
   enablePointer = false,
@@ -328,11 +316,22 @@ export default function DataTable<T>({
           }}
         >
           <Box sx={{ mb: 2, color: 'text.secondary', opacity: 0.6 }}>{emptyState.icon}</Box>
-          <Typography variant="h6" fontWeight={600} gutterBottom>
+          <Typography
+            variant="h6"
+            gutterBottom
+            sx={{
+              fontWeight: 600,
+            }}
+          >
             {emptyState.title}
           </Typography>
           {emptyState.description && (
-            <Typography variant="body2" color="text.secondary">
+            <Typography
+              variant="body2"
+              sx={{
+                color: 'text.secondary',
+              }}
+            >
               {emptyState.description}
             </Typography>
           )}
@@ -345,51 +344,7 @@ export default function DataTable<T>({
     row: T,
     iconOpacity = 0.45,
     justify: 'flex-start' | 'flex-end' = 'flex-end'
-  ) => (
-    <Box sx={{ display: 'flex', gap: 0.5, justifyContent: justify, flexWrap: 'nowrap' }}>
-      {actions?.map((action, idx) => {
-        const shouldShow = action.show ? action.show(row) : true
-        if (!shouldShow) return null
-
-        const isDisabled = action.disabled ? action.disabled(row) : false
-        const tooltipText =
-          typeof action.tooltip === 'function'
-            ? action.tooltip(row)
-            : action.tooltip || action.label
-
-        const hoverBg = ACTION_HOVER_BG_BY_COLOR[action.color || 'default']
-
-        return (
-          <Tooltip key={idx} title={tooltipText} arrow>
-            <span>
-              <IconButton
-                size="small"
-                color={action.color || 'default'}
-                onClick={(e) => {
-                  e.stopPropagation()
-                  action.onClick(row)
-                }}
-                disabled={isDisabled}
-                aria-label={tooltipText}
-                sx={{
-                  borderRadius: 1,
-                  opacity: iconOpacity,
-                  transition: 'opacity 140ms ease, background-color 140ms ease',
-                  '&:hover': {
-                    opacity: 1,
-                    bgcolor: hoverBg,
-                  },
-                  '&.Mui-disabled': { opacity: 0.2 },
-                }}
-              >
-                {action.icon}
-              </IconButton>
-            </span>
-          </Tooltip>
-        )
-      })}
-    </Box>
-  )
+  ) => <RowActions row={row} actions={actions} iconOpacity={iconOpacity} justify={justify} />
 
   if (isMobile) {
     return (
@@ -470,6 +425,7 @@ export default function DataTable<T>({
                   </Box>
                 )}
               </Box>
+              {renderSubRow?.(row)}
             </Box>
           ))}
         </Stack>
@@ -578,60 +534,81 @@ export default function DataTable<T>({
           </TableRow>
         </TableHead>
         <TableBody>
-          {paginatedData.map((row) => (
-            <TableRow
-              key={getRowKey(row)}
-              onClick={onRowClick ? () => onRowClick(row) : undefined}
-              sx={{
-                ...(enableHover && {
-                  '&:hover': {
-                    bgcolor: 'rgba(255,255,255,0.03)',
-                    '& .MuiIconButton-root': {
-                      opacity: 0.7,
-                    },
-                  },
-                }),
-                ...(enablePointer &&
-                  onRowClick && {
-                    cursor: 'pointer',
-                  }),
-                '&:last-child td': {
-                  borderBottom: 0,
-                },
-                transition: 'background-color 180ms ease',
-              }}
-            >
-              {columns.map((column) => (
-                <TableCell
-                  key={column.id}
-                  align={column.align || 'left'}
+          {paginatedData.map((row) => {
+            const subRow = renderSubRow?.(row)
+            return (
+              <React.Fragment key={getRowKey(row)}>
+                <TableRow
+                  onClick={onRowClick ? () => onRowClick(row) : undefined}
                   sx={{
-                    width: column.width,
-                    minWidth: column.minWidth,
-                    maxWidth: column.width,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
+                    ...(enableHover && {
+                      '&:hover': {
+                        bgcolor: 'rgba(255,255,255,0.03)',
+                        '& .MuiIconButton-root': {
+                          opacity: 0.7,
+                        },
+                      },
+                    }),
+                    ...(enablePointer &&
+                      onRowClick && {
+                        cursor: 'pointer',
+                      }),
+                    ...(!subRow && {
+                      '&:last-child td': {
+                        borderBottom: 0,
+                      },
+                    }),
+                    transition: 'background-color 180ms ease',
                   }}
                 >
-                  {column.render
-                    ? column.render(row)
-                    : ((row as Record<string, unknown>)[column.id] as React.ReactNode)}
-                </TableCell>
-              ))}
-              {actions && actions.length > 0 && (
-                <TableCell
-                  align="right"
-                  sx={{
-                    width: bodyActionColumnWidth,
-                    minWidth: bodyActionColumnWidth,
-                    maxWidth: bodyActionColumnWidth,
-                  }}
-                >
-                  {renderActions(row)}
-                </TableCell>
-              )}
-            </TableRow>
-          ))}
+                  {columns.map((column) => (
+                    <TableCell
+                      key={column.id}
+                      align={column.align || 'left'}
+                      sx={{
+                        width: column.width,
+                        minWidth: column.minWidth,
+                        maxWidth: column.width,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        ...(subRow && { borderBottom: 'none' }),
+                      }}
+                    >
+                      {column.render
+                        ? column.render(row)
+                        : ((row as Record<string, unknown>)[column.id] as React.ReactNode)}
+                    </TableCell>
+                  ))}
+                  {actions && actions.length > 0 && (
+                    <TableCell
+                      align="right"
+                      sx={{
+                        width: bodyActionColumnWidth,
+                        minWidth: bodyActionColumnWidth,
+                        maxWidth: bodyActionColumnWidth,
+                        ...(subRow && { borderBottom: 'none' }),
+                      }}
+                    >
+                      {renderActions(row)}
+                    </TableCell>
+                  )}
+                </TableRow>
+                {subRow && (
+                  <TableRow>
+                    {subRowIndent > 0 && <TableCell colSpan={subRowIndent} sx={{ pt: 0 }} />}
+                    <TableCell
+                      colSpan={
+                        columns.length - subRowIndent + (actions && actions.length > 0 ? 1 : 0)
+                      }
+                      sx={{ pt: 0 }}
+                    >
+                      {subRow}
+                    </TableCell>
+                  </TableRow>
+                )}
+              </React.Fragment>
+            )
+          })}
         </TableBody>
       </Table>
       {data.length > 0 && (

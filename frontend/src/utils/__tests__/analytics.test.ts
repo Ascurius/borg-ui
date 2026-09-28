@@ -9,12 +9,14 @@ import {
   trackSiteSearch,
   setCustomDimension,
   setAppVersion,
+  setAnalyticsPlan,
   setUserId,
   resetUserId,
   trackOptOut,
   trackConsentResponse,
   trackLanguageChange,
   getOrCreateInstallId,
+  initAnalyticsIfEnabled,
   resetOptOutCache,
   anonymizeEntityName,
   EventCategory,
@@ -162,6 +164,32 @@ describe('analytics (umami)', () => {
     })
   })
 
+  describe('initAnalyticsIfEnabled', () => {
+    it('loads the Umami script with no referrer so the origin never leaves', async () => {
+      Storage.prototype.getItem = vi.fn().mockReturnValue(null)
+      getAuthConfigMock.mockResolvedValueOnce({
+        data: { proxy_auth_enabled: false, insecure_no_auth_enabled: true },
+      })
+      fetchJsonForAuthModeMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          preferences: { analytics_enabled: true, analytics_consent_given: true },
+        }),
+      } as Response)
+
+      await loadUserPreference()
+      initAnalyticsIfEnabled()
+
+      const script = document.head.querySelector<HTMLScriptElement>(
+        'script[src="https://cloud.umami.is/script.js"]'
+      )
+      expect(script).not.toBeNull()
+      // Without this the browser attaches the instance's own origin to the
+      // request, which is exactly what the payload masking exists to prevent.
+      expect(script?.referrerPolicy).toBe('no-referrer')
+    })
+  })
+
   describe('trackPageView', () => {
     it('does not track when umami is not initialized', () => {
       delete window.umami
@@ -206,6 +234,24 @@ describe('analytics (umami)', () => {
     it('setAppVersion identifies the current app version when umami is available', () => {
       expect(() => setAppVersion('1.2.3')).not.toThrow()
       expect(window.umami?.identify).toHaveBeenCalledWith({ app_version: '1.2.3' })
+    })
+
+    it('setAnalyticsPlan adds the plan to the identity payload', () => {
+      setAppVersion('1.2.3')
+      setAnalyticsPlan('pro')
+      expect(window.umami?.identify).toHaveBeenLastCalledWith(
+        expect.objectContaining({ app_version: '1.2.3', plan: 'pro' })
+      )
+
+      setAnalyticsPlan(null)
+      expect(window.umami?.identify).toHaveBeenLastCalledWith({ app_version: '1.2.3' })
+    })
+
+    it('setAnalyticsPlan does not re-identify when the plan has not changed', () => {
+      setAnalyticsPlan(null)
+      const calls = window.umami?.identify?.mock.calls.length
+      setAnalyticsPlan(null)
+      expect(window.umami?.identify?.mock.calls.length).toBe(calls)
     })
 
     it('setUserId does not throw', () => {

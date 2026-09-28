@@ -330,6 +330,19 @@ const Backup: React.FC = () => {
     }
   }, [legacyBackupRepositories, loadingRepositories, selectedRepository])
 
+  const legacyTabApplies = !loadingRepositories && legacyBackupRepositories.length > 0
+  // Not the same as `!legacyTabApplies`: while the repository list loads there
+  // is no tab yet either, and resetting then would throw away a deep link
+  // into it before its repositories have arrived.
+  const legacyTabGone = !loadingRepositories && legacyBackupRepositories.length === 0
+
+  // Deleting the last legacy repository while its tab is open would leave the
+  // page with a selected tab that no longer exists and a body that renders
+  // nothing.
+  useEffect(() => {
+    if (legacyTabGone) setActiveTab((current) => (current === 'legacy' ? 'plans' : current))
+  }, [legacyTabGone])
+
   useTrackedJobOutcomes<BackupJob>({
     jobs: recentJobs,
     onTerminal: (job) => {
@@ -368,8 +381,20 @@ const Backup: React.FC = () => {
         }}
       >
         <Box>
-          <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
-            <Typography variant="h4" fontWeight={600}>
+          <Stack
+            direction="row"
+            spacing={1}
+            sx={{
+              alignItems: 'center',
+              mb: 1,
+            }}
+          >
+            <Typography
+              variant="h4"
+              sx={{
+                fontWeight: 600,
+              }}
+            >
               {t('backup.title')}
             </Typography>
             {repositoriesData?.data?.repositories?.some(
@@ -398,11 +423,22 @@ const Backup: React.FC = () => {
                 </Tooltip>
               )}
           </Stack>
-          <Typography variant="body2" color="text.secondary">
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+            }}
+          >
             {t('backup.subtitle')}
           </Typography>
         </Box>
-        <Stack direction="row" spacing={2} alignItems="center"></Stack>
+        <Stack
+          direction="row"
+          spacing={2}
+          sx={{
+            alignItems: 'center',
+          }}
+        ></Stack>
       </Box>
 
       <PageTabs
@@ -411,7 +447,12 @@ const Backup: React.FC = () => {
         onChange={(_, value: BackupTab) => setActiveTab(value)}
       >
         <Tab value="plans" label={t('backup.tabs.backupPlans')} />
-        <Tab value="legacy" label={t('backup.tabs.legacyBackup')} />
+        {/* Nothing in this tab works without a legacy repository: the select
+            has nothing to offer, Start Backup stays disabled, and the job
+            history is scoped to a selected repository, so it is empty too.
+            An empty tab named "Backup automations" reads as a feature that
+            is broken rather than one that does not apply. */}
+        {legacyTabApplies && <Tab value="legacy" label={t('backup.tabs.legacyBackup')} />}
       </PageTabs>
 
       {activeTab === 'plans' && (
@@ -419,10 +460,20 @@ const Backup: React.FC = () => {
           <Box>
             <Stack spacing={2.5}>
               <Box>
-                <Typography variant="h6" fontWeight={600}>
+                <Typography
+                  variant="h6"
+                  sx={{
+                    fontWeight: 600,
+                  }}
+                >
                   {t('backup.planRun.title')}
                 </Typography>
-                <Typography variant="body2" color="text.secondary">
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('backup.planRun.description')}
                 </Typography>
               </Box>
@@ -439,16 +490,20 @@ const Backup: React.FC = () => {
                   {t('backup.planRun.empty')}
                 </Alert>
               ) : (
-                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} alignItems="stretch">
+                <Stack
+                  direction={{ xs: 'column', sm: 'row' }}
+                  spacing={2}
+                  sx={{
+                    alignItems: 'stretch',
+                  }}
+                >
                   <BackupPlanSelect
                     label={t('backup.planRun.selectLabel')}
                     value={selectedBackupPlanId}
                     onChange={setSelectedBackupPlanId}
                     plans={runnableBackupPlans}
                     emptyMessage={t('backup.planRun.empty')}
-                    placeholder={t('backup.planRun.selectPlaceholder', {
-                      defaultValue: 'Select a backup plan',
-                    })}
+                    placeholder={t('backup.planRun.selectPlaceholder')}
                     disabled={loadingBackupPlans || runnableBackupPlans.length === 0}
                     formatSecondary={(plan) => {
                       const sourceLabel =
@@ -532,7 +587,13 @@ const Backup: React.FC = () => {
 
           {/* Legacy Manual Backup Control */}
           <Box sx={{ mb: 4 }}>
-            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} alignItems="stretch">
+            <Stack
+              direction={{ xs: 'column', sm: 'row' }}
+              spacing={2}
+              sx={{
+                alignItems: 'stretch',
+              }}
+            >
               <RepoSelect
                 repositories={legacyBackupRepositories}
                 value={selectedRepository}
@@ -572,7 +633,13 @@ const Backup: React.FC = () => {
 
             {repositoriesData?.data?.repositories?.length === 0 && !loadingRepositories && (
               <Alert severity="warning" sx={{ mt: 2 }}>
-                <Typography variant="body2" fontWeight={500} gutterBottom>
+                <Typography
+                  variant="body2"
+                  gutterBottom
+                  sx={{
+                    fontWeight: 500,
+                  }}
+                >
                   {t('backup.manualBackup.noRepositories.title')}
                 </Typography>
                 <Typography variant="body2">
@@ -622,15 +689,29 @@ const Backup: React.FC = () => {
               <Stack
                 direction="row"
                 spacing={1.5}
-                alignItems="center"
-                sx={{ mb: 1, color: 'text.secondary' }}
+                sx={{
+                  alignItems: 'center',
+                  mb: 1,
+                  color: 'text.secondary',
+                }}
               >
                 <Clock size={20} />
-                <Typography variant="h6" fontWeight={600}>
+                <Typography
+                  variant="h6"
+                  sx={{
+                    fontWeight: 600,
+                  }}
+                >
                   {t('backup.recentJobs.title')}
                 </Typography>
               </Stack>
-              <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+              <Typography
+                variant="body2"
+                sx={{
+                  color: 'text.secondary',
+                  mb: 3,
+                }}
+              >
                 {t('backup.recentJobs.subtitle')}
               </Typography>
 

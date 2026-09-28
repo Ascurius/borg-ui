@@ -8,6 +8,7 @@ from typing import List, Optional
 
 from app.core.borg2 import borg2
 from app.database.models import Repository
+from app.utils.borg_env import effective_repository_remote_path
 
 
 class RestoreV2Service:
@@ -17,7 +18,7 @@ class RestoreV2Service:
         archive_name: str,
         paths: Optional[List[str]] = None,
         remote_path: Optional[str] = None,
-        bypass_lock: bool = False,
+        bypass_lock: bool = False,  # noqa: ARG002 - Borg 1 only, see app/core/borg2.py
         strip_components: Optional[int] = None,
     ) -> List[str]:
         cmd = [
@@ -31,8 +32,6 @@ class RestoreV2Service:
         ]
         if remote_path:
             cmd.extend(["--remote-path", remote_path])
-        if bypass_lock:
-            cmd.append("--bypass-lock")
         if strip_components:
             cmd.extend(["--strip-components", str(strip_components)])
         cmd.append(archive_name)
@@ -55,7 +54,7 @@ class RestoreV2Service:
             "destination": destination,
             "dry_run": True,
             "passphrase": repo.passphrase,
-            "remote_path": repo.remote_path,
+            "remote_path": effective_repository_remote_path(repo),
             "bypass_lock": repo.bypass_lock,
         }
         if env is not None:
@@ -76,7 +75,7 @@ class RestoreV2Service:
             "archive": archive,
             "path": path,
             "passphrase": repo.passphrase,
-            "remote_path": repo.remote_path,
+            "remote_path": effective_repository_remote_path(repo),
             "max_lines": max_lines,
             "bypass_lock": repo.bypass_lock,
         }

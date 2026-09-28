@@ -13,21 +13,40 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 from app.database.models import (
-    BackupJob,
-    CompactJob,
-    PruneJob,
+    Operation,
     Repository,
     ScheduledJob,
     ScheduledJobRepository,
 )
 from datetime import datetime, timedelta
 
-from tests.integration.test_helpers import (
+from tests.integration.helpers import (
     parse_archives_payload,
     wait_for_job_terminal_status,
 )
 from tests.utils.borg import make_borg_test_env
 from tests.utils.borg import create_registered_local_repository
+
+
+def _latest_scheduled(db, repository_id, kind):
+    """The newest scheduled operation of one kind on a repository.
+
+    The scheduled flag lives in `operations.params` (spec 6.2), which is a JSON
+    column, so the match happens in Python.
+    """
+    from app.database.models import Operation
+    from app.services.operations.job_facade import MaintenanceJobFacade
+
+    flag = f"scheduled_{kind}"
+    for row in (
+        db.query(Operation)
+        .filter(Operation.kind == kind, Operation.repository_id == repository_id)
+        .order_by(Operation.id.desc())
+        .all()
+    ):
+        if (row.params or {}).get(flag):
+            return MaintenanceJobFacade(db, row)
+    return None
 
 
 def _create_registered_borg_repo(test_db, borg_binary, tmp_path, name: str, slug: str):
@@ -72,7 +91,14 @@ def _create_borg2_registered_repo(test_db, tmp_path, source_root):
     env = make_borg_test_env(str(tmp_path))
 
     init_result = subprocess.run(
-        [borg2_binary, "-r", str(repo_path), "repo-create", "--encryption", "none"],
+        [
+            borg2_binary,
+            "-r",
+            str(repo_path),
+            "repo-create",
+            "--encryption",
+            "none-sha256",
+        ],
         capture_output=True,
         text=True,
         env=env,
@@ -654,10 +680,14 @@ class TestMultiRepositorySchedules:
         matching_jobs = []
         while datetime.now() < deadline:
             test_db.expire_all()
+            # Phase 8: a scheduled backup is an operations row.
             matching_jobs = (
-                test_db.query(BackupJob)
-                .filter(BackupJob.scheduled_job_id == schedule_id)
-                .order_by(BackupJob.id.asc())
+                test_db.query(Operation)
+                .filter(
+                    Operation.kind == "backup",
+                    Operation.scheduled_job_id == schedule_id,
+                )
+                .order_by(Operation.id.asc())
                 .all()
             )
             if len(matching_jobs) == 2 and all(
@@ -775,24 +805,8 @@ class TestMultiRepositorySchedules:
         compact_job = None
         while datetime.now() < deadline:
             test_db.expire_all()
-            prune_job = (
-                test_db.query(PruneJob)
-                .filter(
-                    PruneJob.repository_id == repo.id,
-                    PruneJob.scheduled_prune.is_(True),
-                )
-                .order_by(PruneJob.id.desc())
-                .first()
-            )
-            compact_job = (
-                test_db.query(CompactJob)
-                .filter(
-                    CompactJob.repository_id == repo.id,
-                    CompactJob.scheduled_compact.is_(True),
-                )
-                .order_by(CompactJob.id.desc())
-                .first()
-            )
+            prune_job = _latest_scheduled(test_db, repo.id, "prune")
+            compact_job = _latest_scheduled(test_db, repo.id, "compact")
             if (
                 prune_job
                 and compact_job

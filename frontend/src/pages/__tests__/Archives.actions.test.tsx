@@ -1,25 +1,15 @@
 import { QueryClient } from '@tanstack/react-query'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { renderWithProviders, screen, userEvent, waitFor } from '../../test/test-utils'
 import Archives from '../Archives'
 import * as apiModule from '../../services/api'
 import { toast } from 'react-hot-toast'
 
 const trackArchive = vi.fn()
-const borgListArchivesMock = vi.fn()
+const listStoredMock = vi.fn()
 const borgGetInfoMock = vi.fn()
 const borgDeleteArchiveMock = vi.fn()
 const { downloadArchiveFileMock } = vi.hoisted(() => ({ downloadArchiveFileMock: vi.fn() }))
-
-function createDeferred<T>() {
-  let resolve!: (value: T) => void
-  let reject!: (reason?: unknown) => void
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res
-    reject = rej
-  })
-  return { promise, resolve, reject }
-}
 
 vi.mock('../../components/RepositorySelectorCard', () => ({
   default: ({ onChange }: { onChange: (id: number | string) => void }) => (
@@ -27,7 +17,9 @@ vi.mock('../../components/RepositorySelectorCard', () => ({
   ),
 }))
 
-vi.mock('../../components/RepositoryStatsGrid', () => ({ default: () => <div>Stats</div> }))
+vi.mock('../../components/RepositoryStats', () => ({
+  default: ({ freeSpaceHref }: { freeSpaceHref?: string }) => <div>Stats {freeSpaceHref}</div>,
+}))
 vi.mock('../../components/LastRestoreSection', () => ({ default: () => null }))
 vi.mock('../../components/LockErrorDialog', () => ({ default: () => null }))
 
@@ -113,10 +105,6 @@ vi.mock('../../components/RestoreWizard', () => ({
     ) : null,
 }))
 
-vi.mock('../../hooks/useRepositoryStats', () => ({
-  useRepositoryStats: () => ({ totalSize: 1 }),
-}))
-
 vi.mock('../../hooks/usePermissions', () => ({
   usePermissions: () => ({
     canAccess: (repoId: number) => repoId === 1,
@@ -129,12 +117,15 @@ vi.mock('../../hooks/usePermissions', () => ({
 vi.mock('../../services/borgApi', () => ({
   BorgApiClient: vi.fn(function MockBorgApiClient() {
     return {
-      listArchives: borgListArchivesMock,
       getInfo: borgGetInfoMock,
       deleteArchive: borgDeleteArchiveMock,
     }
   }),
 }))
+
+vi.mock('../../components/archives/SyncStateChip', () => ({ default: () => null }))
+vi.mock('../../components/archives/ArchiveSearchField', () => ({ default: () => null }))
+vi.mock('../../components/archives/ArchiveSeriesHeatmap', () => ({ default: () => null }))
 
 vi.mock('../../utils/downloadArchiveFile', () => ({
   downloadArchiveFile: downloadArchiveFileMock,
@@ -144,9 +135,13 @@ vi.mock('../../services/api', () => ({
   archivesAPI: {
     deleteArchive: vi.fn(),
     downloadFile: vi.fn(),
+    listStored: vi.fn(),
+    getHeatmap: vi.fn(),
+    rebuild: vi.fn(),
   },
   repositoriesAPI: {
     getRepositories: vi.fn(),
+    getStorage: vi.fn().mockRejectedValue(new Error('not mocked')),
   },
   mountsAPI: {
     mountBorgArchive: vi.fn(),
@@ -203,6 +198,9 @@ describe('Archives page actions', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.stubGlobal('open', vi.fn())
+    // The list actions this suite drives come from the (mocked) list view;
+    // force it so the heatmap, which defaults on, doesn't hide them.
+    localStorage.setItem('archives-view-mode', 'list')
     vi.mocked(apiModule.repositoriesAPI.getRepositories).mockResolvedValue({
       data: { repositories: [repository] },
     } as never)
@@ -215,14 +213,47 @@ describe('Archives page actions', () => {
     vi.mocked(apiModule.mountsAPI.mountBorgArchive).mockResolvedValue({
       data: { mount_point: '/mnt/archive-1' },
     } as never)
-    borgListArchivesMock.mockResolvedValue({
+    listStoredMock.mockResolvedValue({
       data: {
-        archives: [{ id: 'a1', name: 'archive-1', start: '2026-01-01T00:00:00Z' }],
+        archives: [
+          {
+            id: 1,
+            repository_id: 1,
+            borg_id: 'a1',
+            name: 'archive-1',
+            series: 'default',
+            start: '2026-01-01T00:00:00Z',
+            end: null,
+            duration_seconds: null,
+            nfiles: null,
+            original_size: null,
+            compressed_size: null,
+            deduplicated_size: null,
+            hostname: null,
+            username: null,
+            comment: null,
+            backup_operation_id: null,
+            history_state: 'indexed',
+            history_indexed_at: null,
+            history_rows: null,
+            history_truncated: false,
+            first_seen_at: null,
+            last_seen_at: null,
+          },
+        ],
+        series: ['default'],
+        sync_state: 'fresh',
+        last_synced_at: null,
       },
     })
+    vi.mocked(apiModule.archivesAPI.listStored).mockImplementation(listStoredMock)
     borgGetInfoMock.mockResolvedValue({ data: { info: {} } })
     borgDeleteArchiveMock.mockResolvedValue({ data: { job_id: 7 } })
     downloadArchiveFileMock.mockResolvedValue(undefined)
+  })
+
+  afterEach(() => {
+    localStorage.clear()
   })
 
   it('tracks filter/view and calls download, restore, and mount APIs from archive actions', async () => {
@@ -236,8 +267,7 @@ describe('Archives page actions', () => {
     await user.click(await screen.findByText('Select Repo'))
 
     await waitFor(() => {
-      expect(borgListArchivesMock).toHaveBeenCalledTimes(1)
-      expect(borgGetInfoMock).toHaveBeenCalledTimes(1)
+      expect(listStoredMock).toHaveBeenCalledTimes(1)
       expect(trackArchive).toHaveBeenCalledWith('Filter', repository, {
         surface: 'archives_page',
       })
@@ -298,7 +328,11 @@ describe('Archives page actions', () => {
       expect(apiModule.mountsAPI.mountBorgArchive).toHaveBeenCalledWith({
         repository_id: 1,
         archive_name: 'archive-1',
-        mount_point: 'archive-1',
+        // Borg 2 series disambiguation: the id travels with the mount request,
+        // and the default mount point carries the start time so archives of
+        // one series never share a mount directory.
+        archive_id: 'a1',
+        mount_point: 'archive-1-2026-01-01T00_00_00',
       })
     })
   })
@@ -324,29 +358,31 @@ describe('Archives page actions', () => {
     expect(trackArchive).not.toHaveBeenCalledWith('Start', repository)
   })
 
-  it('loads repository info before requesting archives', async () => {
+  it('requests the stored archives without a live borg info', async () => {
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     })
     const user = userEvent.setup()
-    const repoInfoDeferred = createDeferred<{ data: { info: Record<string, never> } }>()
-
-    borgGetInfoMock.mockImplementation(() => repoInfoDeferred.promise)
 
     renderWithProviders(<Archives />, { queryClient })
 
     await user.click(await screen.findByText('Select Repo'))
 
     await waitFor(() => {
-      expect(borgGetInfoMock).toHaveBeenCalledTimes(1)
+      expect(listStoredMock).toHaveBeenCalledTimes(1)
     })
-    expect(borgListArchivesMock).not.toHaveBeenCalled()
+    expect(borgGetInfoMock).not.toHaveBeenCalled()
+  })
 
-    repoInfoDeferred.resolve({ data: { info: {} } })
-
-    await waitFor(() => {
-      expect(borgListArchivesMock).toHaveBeenCalledTimes(1)
+  it('offers the prune preview from the storage figures', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     })
+    const user = userEvent.setup()
+    renderWithProviders(<Archives />, { queryClient })
+    await user.click(await screen.findByText('Select Repo'))
+    // the grid is stubbed here; the tile itself is covered by its own test
+    expect(await screen.findByText('Stats /repositories/1/prune-preview')).toBeInTheDocument()
   })
 
   it('shows translated backend errors when archive deletion fails', async () => {

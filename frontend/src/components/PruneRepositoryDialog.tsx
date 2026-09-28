@@ -11,7 +11,6 @@ import {
   CircularProgress,
   Chip,
   Tooltip,
-  InputBase,
   alpha,
   useTheme,
 } from '@mui/material'
@@ -21,26 +20,16 @@ import {
   FlaskConical,
   TriangleAlert,
   Info,
-  Clock,
-  Sun,
-  CalendarDays,
-  CalendarRange,
-  Calendar,
   CheckCircle2,
   XCircle,
   Terminal,
 } from 'lucide-react'
 import { Repository } from '../types'
+import PruneRetentionFields from './prune/PruneRetentionFields'
+import { DEFAULT_RETENTION } from './prune/defaultRetention'
+import type { PruneRetention } from '../types/archives'
 
-interface PruneForm {
-  keep_within: string
-  keep_hourly: number
-  keep_daily: number
-  keep_weekly: number
-  keep_monthly: number
-  keep_quarterly: number
-  keep_yearly: number
-}
+type PruneForm = PruneRetention
 
 interface PruneResults {
   dry_run: boolean
@@ -52,22 +41,14 @@ interface PruneRepositoryDialogProps {
   open: boolean
   repository: Repository | null
   onClose: () => void
-  onDryRun: (form: PruneForm) => Promise<void>
+  onPreview: (form: PruneForm) => void
   onConfirmPrune: (form: PruneForm) => Promise<void>
   isLoading: boolean
   results: PruneResults | null
   initialForm?: Partial<PruneForm>
 }
 
-const defaultPruneForm: PruneForm = {
-  keep_within: '',
-  keep_hourly: 0,
-  keep_daily: 7,
-  keep_weekly: 4,
-  keep_monthly: 6,
-  keep_quarterly: 0,
-  keep_yearly: 1,
-}
+const defaultPruneForm: PruneForm = DEFAULT_RETENTION
 
 type IntlListFormatConstructor = new (
   locale: string,
@@ -225,9 +206,10 @@ function ColorizedOutput({ text, isFailed = false }: ColorizedOutputProps) {
           : theme.palette.error.dark,
     rule: isDark ? theme.palette.warning.light : '#b45309',
     name: isDark ? alpha('#fff', 0.82) : alpha('#000', 0.82),
-    date: isDark ? alpha('#fff', 0.45) : alpha('#000', 0.42),
-    hash: isDark ? alpha('#fff', 0.25) : alpha('#000', 0.28),
-    plain: isDark ? alpha('#fff', 0.55) : alpha('#000', 0.55),
+    // Quieter than the name, but every span stays at 4.5:1 or better.
+    date: isDark ? alpha('#fff', 0.66) : alpha('#000', 0.62),
+    hash: isDark ? alpha('#fff', 0.6) : alpha('#000', 0.58),
+    plain: isDark ? alpha('#fff', 0.66) : alpha('#000', 0.62),
   }
 
   return (
@@ -367,7 +349,13 @@ function PruneResultsDialog({
     <ResponsiveDialog open={open} onClose={onClose} maxWidth="md" fullWidth>
       {/* ── Title ── */}
       <DialogTitle sx={{ pb: 1.5 }}>
-        <Stack direction="row" spacing={1.5} alignItems="flex-start">
+        <Stack
+          direction="row"
+          spacing={1.5}
+          sx={{
+            alignItems: 'flex-start',
+          }}
+        >
           <Box
             sx={{
               display: 'flex',
@@ -384,8 +372,21 @@ function PruneResultsDialog({
             {headerIcon}
           </Box>
           <Box sx={{ minWidth: 0, flex: 1 }}>
-            <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap">
-              <Typography variant="h6" fontWeight={600} lineHeight={1.3}>
+            <Stack
+              direction="row"
+              spacing={1}
+              sx={{
+                alignItems: 'center',
+                flexWrap: 'wrap',
+              }}
+            >
+              <Typography
+                variant="h6"
+                sx={{
+                  fontWeight: 600,
+                  lineHeight: 1.3,
+                }}
+              >
                 {title}
               </Typography>
               <Chip
@@ -404,9 +405,13 @@ function PruneResultsDialog({
             {repository?.name && (
               <Typography
                 variant="body2"
-                color="text.secondary"
                 noWrap
-                sx={{ fontFamily: 'ui-monospace, monospace', fontSize: '0.72rem', mt: 0.25 }}
+                sx={{
+                  color: 'text.secondary',
+                  fontFamily: 'ui-monospace, monospace',
+                  fontSize: '0.72rem',
+                  mt: 0.25,
+                }}
               >
                 {repository.name}
               </Typography>
@@ -519,8 +524,13 @@ function PruneResultsDialog({
         {!isFailed && (
           <Typography
             variant="caption"
-            color="text.secondary"
-            sx={{ display: 'block', mt: 1.5, px: 0.25, lineHeight: 1.5 }}
+            sx={{
+              color: 'text.secondary',
+              display: 'block',
+              mt: 1.5,
+              px: 0.25,
+              lineHeight: 1.5,
+            }}
           >
             {isDryRun ? t('dialogs.prune.dryRunNote') : t('dialogs.prune.pruneNote')}
           </Typography>
@@ -566,7 +576,7 @@ export default function PruneRepositoryDialog({
   open,
   repository,
   onClose,
-  onDryRun,
+  onPreview,
   onConfirmPrune,
   isLoading,
   results,
@@ -614,46 +624,15 @@ export default function PruneRepositoryDialog({
   }
 
   const retentionFields = [
-    {
-      key: 'keep_hourly' as const,
-      icon: <Clock size={14} />,
-      label: t('dialogs.prune.keepHourly'),
-      unit: t('dialogs.prune.retentionUnits.hourly'),
-    },
-    {
-      key: 'keep_daily' as const,
-      icon: <Sun size={14} />,
-      label: t('dialogs.prune.keepDaily'),
-      unit: t('dialogs.prune.retentionUnits.daily'),
-    },
-    {
-      key: 'keep_weekly' as const,
-      icon: <CalendarDays size={14} />,
-      label: t('dialogs.prune.keepWeekly'),
-      unit: t('dialogs.prune.retentionUnits.weekly'),
-    },
-    {
-      key: 'keep_monthly' as const,
-      icon: <CalendarRange size={14} />,
-      label: t('dialogs.prune.keepMonthly'),
-      unit: t('dialogs.prune.retentionUnits.monthly'),
-    },
-    {
-      key: 'keep_quarterly' as const,
-      icon: <CalendarRange size={14} />,
-      label: t('dialogs.prune.keepQuarterly'),
-      unit: t('dialogs.prune.retentionUnits.quarterly'),
-    },
-    {
-      key: 'keep_yearly' as const,
-      icon: <Calendar size={14} />,
-      label: t('dialogs.prune.keepYearly'),
-      unit: t('dialogs.prune.retentionUnits.yearly'),
-    },
+    { key: 'keep_hourly' as const, unit: t('dialogs.prune.retentionUnits.hourly') },
+    { key: 'keep_daily' as const, unit: t('dialogs.prune.retentionUnits.daily') },
+    { key: 'keep_weekly' as const, unit: t('dialogs.prune.retentionUnits.weekly') },
+    { key: 'keep_monthly' as const, unit: t('dialogs.prune.retentionUnits.monthly') },
+    { key: 'keep_quarterly' as const, unit: t('dialogs.prune.retentionUnits.quarterly') },
+    { key: 'keep_yearly' as const, unit: t('dialogs.prune.retentionUnits.yearly') },
   ]
   const keepWithinValue = pruneForm.keep_within.trim()
 
-  const borderColor = isDark ? alpha('#fff', 0.08) : alpha('#000', 0.09)
   const retentionSummary = formatRetentionList(
     [
       ...(keepWithinValue
@@ -671,7 +650,13 @@ export default function PruneRepositoryDialog({
       <ResponsiveDialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
         {/* ── Title ── */}
         <DialogTitle sx={{ pb: 1.5 }}>
-          <Stack direction="row" spacing={1.5} alignItems="flex-start">
+          <Stack
+            direction="row"
+            spacing={1.5}
+            sx={{
+              alignItems: 'flex-start',
+            }}
+          >
             <Box
               sx={{
                 display: 'flex',
@@ -688,15 +673,24 @@ export default function PruneRepositoryDialog({
               <Scissors size={18} />
             </Box>
             <Box sx={{ minWidth: 0 }}>
-              <Typography variant="h6" fontWeight={600} lineHeight={1.3}>
+              <Typography
+                variant="h6"
+                sx={{
+                  fontWeight: 600,
+                  lineHeight: 1.3,
+                }}
+              >
                 {t('dialogs.pruneRepository.title')}
               </Typography>
               {repository?.name && (
                 <Typography
                   variant="body2"
-                  color="text.secondary"
                   noWrap
-                  sx={{ fontFamily: 'ui-monospace, monospace', fontSize: '0.72rem' }}
+                  sx={{
+                    color: 'text.secondary',
+                    fontFamily: 'ui-monospace, monospace',
+                    fontSize: '0.72rem',
+                  }}
                 >
                   {repository.name}
                 </Typography>
@@ -705,13 +699,24 @@ export default function PruneRepositoryDialog({
             <Tooltip
               title={
                 <Box>
-                  <Typography variant="body2" fontWeight={600} gutterBottom>
+                  <Typography
+                    variant="body2"
+                    gutterBottom
+                    sx={{
+                      fontWeight: 600,
+                    }}
+                  >
                     {t('dialogs.prune.whatDoesPruningDo')}
                   </Typography>
                   <Typography variant="body2" gutterBottom>
                     {t('dialogs.prune.explanation')}
                   </Typography>
-                  <Typography variant="body2" fontWeight={600}>
+                  <Typography
+                    variant="body2"
+                    sx={{
+                      fontWeight: 600,
+                    }}
+                  >
                     {t('dialogs.prune.dryRunTip')}
                   </Typography>
                 </Box>
@@ -752,136 +757,16 @@ export default function PruneRepositoryDialog({
             {t('dialogs.prune.retentionPolicy')}
           </Typography>
 
-          <Box
-            sx={{
-              border: '1px solid',
-              borderColor,
-              borderRadius: 1.5,
-              overflow: 'hidden',
-              mb: 0.75,
-            }}
-          >
-            <Box
-              sx={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 1.5,
-                px: 1.75,
-                py: 0.9,
-                borderBottom: '1px solid',
-                borderColor,
-                bgcolor: isDark ? alpha('#fff', 0.015) : alpha('#000', 0.012),
-                '&:hover': {
-                  bgcolor: isDark ? alpha('#fff', 0.03) : alpha('#000', 0.025),
-                },
-                transition: 'background-color 150ms',
-              }}
-            >
-              <Box sx={{ color: 'text.disabled', display: 'flex', flexShrink: 0 }}>
-                <Clock size={14} />
-              </Box>
-              <Box sx={{ flex: 1, minWidth: 0 }}>
-                <Typography variant="body2" sx={{ fontSize: '0.8rem' }}>
-                  {t('dialogs.prune.keepWithin')}
-                </Typography>
-                <Typography variant="caption" color="text.disabled">
-                  {t('dialogs.prune.keepWithinHelper')}
-                </Typography>
-              </Box>
-              <Box
-                sx={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  border: '1px solid',
-                  borderColor,
-                  borderRadius: 1,
-                  px: 1,
-                  py: 0.35,
-                  bgcolor: 'background.paper',
-                  width: 96,
-                }}
-              >
-                <InputBase
-                  value={pruneForm.keep_within}
-                  onChange={(e) => setPruneForm({ ...pruneForm, keep_within: e.target.value })}
-                  inputProps={{
-                    'aria-label': t('dialogs.prune.keepWithin'),
-                    style: { textAlign: 'center', padding: 0 },
-                  }}
-                  placeholder={t('dialogs.prune.keepWithinPlaceholder')}
-                  sx={{
-                    fontSize: '0.85rem',
-                    fontWeight: 600,
-                    fontVariantNumeric: 'tabular-nums',
-                    flex: 1,
-                  }}
-                />
-              </Box>
-            </Box>
-            {retentionFields.map((field, i) => (
-              <Box
-                key={field.key}
-                sx={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 1.5,
-                  px: 1.75,
-                  py: 0.9,
-                  borderBottom: i < retentionFields.length - 1 ? '1px solid' : 0,
-                  borderColor,
-                  bgcolor: isDark ? alpha('#fff', 0.015) : alpha('#000', 0.012),
-                  '&:hover': {
-                    bgcolor: isDark ? alpha('#fff', 0.03) : alpha('#000', 0.025),
-                  },
-                  transition: 'background-color 150ms',
-                }}
-              >
-                <Box sx={{ color: 'text.disabled', display: 'flex', flexShrink: 0 }}>
-                  {field.icon}
-                </Box>
-                <Typography variant="body2" sx={{ flex: 1, fontSize: '0.8rem' }}>
-                  {field.label}
-                </Typography>
-                <Box
-                  sx={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    border: '1px solid',
-                    borderColor,
-                    borderRadius: 1,
-                    px: 1,
-                    py: 0.35,
-                    bgcolor: 'background.paper',
-                    width: 72,
-                  }}
-                >
-                  <InputBase
-                    type="number"
-                    value={pruneForm[field.key]}
-                    onChange={(e) =>
-                      setPruneForm({ ...pruneForm, [field.key]: parseInt(e.target.value) || 0 })
-                    }
-                    inputProps={{
-                      min: 0,
-                      'aria-label': field.label,
-                      style: { textAlign: 'center', padding: 0 },
-                    }}
-                    sx={{
-                      fontSize: '0.85rem',
-                      fontWeight: 600,
-                      fontVariantNumeric: 'tabular-nums',
-                      flex: 1,
-                    }}
-                  />
-                </Box>
-              </Box>
-            ))}
-          </Box>
+          <PruneRetentionFields value={pruneForm} onChange={setPruneForm} disabled={isLoading} />
 
           <Typography
             variant="caption"
-            color="text.disabled"
-            sx={{ display: 'block', mb: 2, px: 0.25 }}
+            sx={{
+              color: 'text.disabled',
+              display: 'block',
+              mb: 2,
+              px: 0.25,
+            }}
           >
             {retentionSummary
               ? t('dialogs.prune.exampleExplanation', { retention: retentionSummary })
@@ -909,8 +794,11 @@ export default function PruneRepositoryDialog({
             <Box sx={{ minWidth: 0 }}>
               <Typography
                 variant="body2"
-                fontWeight={600}
-                sx={{ fontSize: '0.8rem', color: isDark ? 'warning.light' : 'warning.dark' }}
+                sx={{
+                  fontWeight: 600,
+                  fontSize: '0.8rem',
+                  color: isDark ? 'warning.light' : 'warning.dark',
+                }}
               >
                 {t('dialogs.prune.warningTitle')}
               </Typography>
@@ -924,22 +812,13 @@ export default function PruneRepositoryDialog({
         {/* ── Actions ── */}
         <DialogActions sx={{ px: 3, pb: 2.5, gap: 1 }}>
           <Button
-            onClick={() => {
-              setActiveOp('dry_run')
-              onDryRun(pruneForm)
-            }}
+            onClick={() => onPreview(pruneForm)}
             variant="outlined"
             disabled={isLoading}
-            startIcon={
-              activeOp === 'dry_run' ? (
-                <CircularProgress size={15} color="inherit" />
-              ) : (
-                <FlaskConical size={15} />
-              )
-            }
+            startIcon={<FlaskConical size={15} />}
             sx={{ whiteSpace: 'nowrap' }}
           >
-            {activeOp === 'dry_run' ? t('status.running') : t('dialogs.prune.dryRunButton')}
+            {t('dialogs.prune.dryRunButton')}
           </Button>
           <Button
             onClick={() => {

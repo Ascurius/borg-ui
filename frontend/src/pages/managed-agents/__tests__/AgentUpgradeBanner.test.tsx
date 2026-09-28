@@ -1,0 +1,170 @@
+import { describe, expect, it, vi } from 'vitest'
+import { screen } from '@testing-library/react'
+import { renderWithProviders, userEvent } from '../../../test/test-utils'
+import AgentUpgradeBanner from '../AgentUpgradeBanner'
+import type { AgentMachineResponse } from '../../../services/api'
+
+const agent = (overrides: Partial<AgentMachineResponse>): AgentMachineResponse =>
+  ({
+    id: 1,
+    agent_id: 'agt_1',
+    name: 'node',
+    status: 'online',
+    created_at: '2026-05-10T08:00:00.000Z',
+    updated_at: '2026-09-07T08:00:00.000Z',
+    ...overrides,
+  }) as AgentMachineResponse
+
+describe('AgentUpgradeBanner', () => {
+  it('renders nothing when no agent is behind', () => {
+    renderWithProviders(
+      <AgentUpgradeBanner
+        agents={[
+          agent({ upgrade_status: 'up_to_date', available_agent_version: '0.1.3' }),
+          agent({ id: 2, upgrade_status: 'pinned', available_agent_version: '0.1.3' }),
+        ]}
+      />
+    )
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('names the served version when every outdated agent shares it', () => {
+    renderWithProviders(
+      <AgentUpgradeBanner
+        agents={[
+          agent({
+            upgrade_status: 'outdated',
+            agent_version: '0.1.2',
+            available_agent_version: '0.1.3',
+          }),
+          agent({
+            id: 2,
+            upgrade_status: 'outdated',
+            agent_version: '0.1.1',
+            available_agent_version: '0.1.3',
+          }),
+        ]}
+      />
+    )
+    expect(screen.getByText(/2 endpoints are running an older agent/i)).toBeInTheDocument()
+    expect(screen.getByText(/current agent version is 0\.1\.3/i)).toBeInTheDocument()
+  })
+
+  it('does not name one version when outdated agents have different targets', () => {
+    // A pinned agent that is behind its own pin is outdated against the pin,
+    // not against the version the server serves. Naming the served version
+    // here would tell the operator to install something the pin forbids.
+    renderWithProviders(
+      <AgentUpgradeBanner
+        agents={[
+          agent({
+            upgrade_status: 'outdated',
+            agent_version: '0.1.2',
+            available_agent_version: '0.1.3',
+          }),
+          agent({
+            id: 2,
+            upgrade_status: 'outdated',
+            agent_version: '0.1.1',
+            desired_agent_version: '0.1.2',
+            available_agent_version: '0.1.3',
+          }),
+        ]}
+      />
+    )
+    expect(screen.getByText(/2 endpoints are running an older agent/i)).toBeInTheDocument()
+    expect(screen.queryByText(/current agent version is 0\.1\.3/i)).not.toBeInTheDocument()
+    expect(screen.getByText(/each one targets its own configured version/i)).toBeInTheDocument()
+  })
+
+  it('names the pinned target when every outdated agent shares that pin', () => {
+    renderWithProviders(
+      <AgentUpgradeBanner
+        agents={[
+          agent({
+            upgrade_status: 'outdated',
+            agent_version: '0.1.1',
+            desired_agent_version: '0.1.2',
+            available_agent_version: '0.1.3',
+          }),
+        ]}
+      />
+    )
+    expect(screen.getByText(/current agent version is 0\.1\.2/i)).toBeInTheDocument()
+  })
+})
+
+describe('AgentUpgradeBanner upgrade all', () => {
+  const outdated = (overrides: Partial<AgentMachineResponse> = {}): AgentMachineResponse =>
+    ({
+      id: 1,
+      agent_id: 'agt_1',
+      name: 'node',
+      status: 'online',
+      upgrade_status: 'outdated',
+      agent_version: '0.1.2',
+      available_agent_version: '0.1.3',
+      self_upgrade_supported: true,
+      created_at: '2026-05-10T08:00:00.000Z',
+      updated_at: '2026-09-07T08:00:00.000Z',
+      ...overrides,
+    }) as AgentMachineResponse
+
+  it('counts only the endpoints the action will actually move', () => {
+    renderWithProviders(
+      <AgentUpgradeBanner
+        agents={[outdated(), outdated({ id: 2, self_upgrade_supported: false })]}
+        onUpgradeAll={() => {}}
+      />
+    )
+    expect(screen.getByRole('button', { name: /upgrade all \(1\)/i })).toBeInTheDocument()
+  })
+
+  it('calls out the endpoints that need a manual reinstall', () => {
+    renderWithProviders(
+      <AgentUpgradeBanner
+        agents={[outdated({ self_upgrade_supported: false })]}
+        onUpgradeAll={() => {}}
+      />
+    )
+    expect(screen.getByText(/1 endpoint needs a manual reinstall/i)).toBeInTheDocument()
+  })
+
+  it('shows no action when nothing can be upgraded remotely', () => {
+    renderWithProviders(
+      <AgentUpgradeBanner
+        agents={[outdated({ self_upgrade_supported: false })]}
+        onUpgradeAll={() => {}}
+      />
+    )
+    expect(screen.queryByRole('button', { name: /upgrade all/i })).toBeNull()
+  })
+
+  it('excludes an endpoint that is already upgrading', () => {
+    renderWithProviders(
+      <AgentUpgradeBanner
+        agents={[outdated(), outdated({ id: 2, upgrade_state: 'queued' })]}
+        onUpgradeAll={() => {}}
+      />
+    )
+    expect(screen.getByRole('button', { name: /upgrade all \(1\)/i })).toBeInTheDocument()
+  })
+
+  it('does not call an endpoint that is already upgrading a manual one', () => {
+    renderWithProviders(
+      <AgentUpgradeBanner
+        agents={[outdated(), outdated({ id: 2, upgrade_state: 'requested' })]}
+        onUpgradeAll={() => {}}
+      />
+    )
+    expect(screen.queryByText(/manual reinstall/i)).toBeNull()
+  })
+
+  it('hands every upgradable endpoint to the handler', async () => {
+    const onUpgradeAll = vi.fn()
+    const agents = [outdated()]
+    renderWithProviders(<AgentUpgradeBanner agents={agents} onUpgradeAll={onUpgradeAll} />)
+    await userEvent.click(screen.getByRole('button', { name: /upgrade all \(1\)/i }))
+    expect(onUpgradeAll).toHaveBeenCalledWith(agents)
+  })
+})

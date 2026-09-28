@@ -28,7 +28,7 @@ import { usePlan } from '../hooks/usePlan'
 import { translateBackendKey } from '../utils/translateBackendKey'
 import PlanGate from './shared/PlanGate'
 import SchedulePicker from './shared/SchedulePicker'
-import { getBrowserTimeZone } from '../utils/dateUtils'
+import { getBrowserTimeZone, parseBackendDate } from '../utils/dateUtils'
 
 type ReportFrequency = 'daily' | 'weekly' | 'monthly'
 
@@ -209,10 +209,22 @@ const MonitoringReportsTab: React.FC = () => {
           }}
         >
           <Box>
-            <Typography variant="h5" component="h1" fontWeight={700} gutterBottom>
+            <Typography
+              variant="h5"
+              component="h1"
+              gutterBottom
+              sx={{
+                fontWeight: 700,
+              }}
+            >
               {t('monitoringReports.title')}
             </Typography>
-            <Typography variant="body2" color="text.secondary">
+            <Typography
+              variant="body2"
+              sx={{
+                color: 'text.secondary',
+              }}
+            >
               {t('monitoringReports.subtitle')}
             </Typography>
           </Box>
@@ -231,10 +243,20 @@ const MonitoringReportsTab: React.FC = () => {
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
               <BellRing size={18} />
               <Box>
-                <Typography variant="subtitle1" fontWeight={700}>
+                <Typography
+                  variant="subtitle1"
+                  sx={{
+                    fontWeight: 700,
+                  }}
+                >
                   {t('monitoringReports.alertsTitle')}
                 </Typography>
-                <Typography variant="body2" color="text.secondary">
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('monitoringReports.alertsDescription')}
                 </Typography>
               </Box>
@@ -271,9 +293,11 @@ const MonitoringReportsTab: React.FC = () => {
                 value={staleAfterDays}
                 onChange={(event) => setStaleAfterDays(Number(event.target.value))}
                 disabled={!canUseAlertingMonitoring}
-                inputProps={{ min: 1, max: 3650, step: 1 }}
                 error={staleAfterDays < 1}
                 helperText={t('monitoringReports.staleAfterHelper')}
+                slotProps={{
+                  htmlInput: { min: 1, max: 3650, step: 1 },
+                }}
               />
               <TextField
                 label={t('monitoringReports.checkIntervalHours')}
@@ -281,9 +305,11 @@ const MonitoringReportsTab: React.FC = () => {
                 value={intervalHours}
                 onChange={(event) => setIntervalHours(Number(event.target.value))}
                 disabled={!canUseAlertingMonitoring}
-                inputProps={{ min: 1, max: 720, step: 1 }}
                 error={intervalHours < 1}
                 helperText={t('monitoringReports.checkIntervalHelper')}
+                slotProps={{
+                  htmlInput: { min: 1, max: 720, step: 1 },
+                }}
               />
               <TextField
                 label={t('monitoringReports.cooldownHours')}
@@ -291,9 +317,11 @@ const MonitoringReportsTab: React.FC = () => {
                 value={cooldownHours}
                 onChange={(event) => setCooldownHours(Number(event.target.value))}
                 disabled={!canUseAlertingMonitoring}
-                inputProps={{ min: 0, max: 720, step: 1 }}
                 error={cooldownHours < 0}
                 helperText={t('monitoringReports.cooldownHelper')}
+                slotProps={{
+                  htmlInput: { min: 0, max: 720, step: 1 },
+                }}
               />
             </Box>
 
@@ -353,10 +381,20 @@ const MonitoringReportsTab: React.FC = () => {
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
               <FileText size={18} />
               <Box>
-                <Typography variant="subtitle1" fontWeight={700}>
+                <Typography
+                  variant="subtitle1"
+                  sx={{
+                    fontWeight: 700,
+                  }}
+                >
                   {t('monitoringReports.reportsTitle')}
                 </Typography>
-                <Typography variant="body2" color="text.secondary">
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('monitoringReports.reportsDescription')}
                 </Typography>
               </Box>
@@ -397,7 +435,13 @@ const MonitoringReportsTab: React.FC = () => {
                 </Select>
               </FormControl>
 
-              <Typography variant="body2" color="text.secondary" sx={{ mt: -1 }}>
+              <Typography
+                variant="body2"
+                sx={{
+                  color: 'text.secondary',
+                  mt: -1,
+                }}
+              >
                 {t('monitoringReports.cadenceHelper')}
               </Typography>
 
@@ -422,7 +466,12 @@ const MonitoringReportsTab: React.FC = () => {
             <Divider />
 
             <Stack spacing={0.5}>
-              <Typography variant="subtitle2" fontWeight={700}>
+              <Typography
+                variant="subtitle2"
+                sx={{
+                  fontWeight: 700,
+                }}
+              >
                 {t('monitoringReports.reportContent')}
               </Typography>
               <FormControlLabel
@@ -482,7 +531,7 @@ const MonitoringReportsTab: React.FC = () => {
             {settings?.backup_reports_last_sent_at && (
               <Alert severity="info">
                 {t('monitoringReports.lastReport')}{' '}
-                {new Date(settings.backup_reports_last_sent_at).toLocaleString()}
+                {parseBackendDate(settings.backup_reports_last_sent_at).toLocaleString()}
               </Alert>
             )}
           </Stack>

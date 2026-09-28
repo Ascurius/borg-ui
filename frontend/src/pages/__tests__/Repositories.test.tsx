@@ -1,13 +1,15 @@
 import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { renderWithProviders } from '../../test/test-utils'
 import Repositories from '../Repositories'
 import { backupPlansAPI, repositoriesAPI } from '../../services/api'
+import type { OperationItem } from '../../types/operations'
 import { toast } from 'react-hot-toast'
 
-const { mockCheckRepository } = vi.hoisted(() => ({
+const { mockCheckRepository, mockGetInfo } = vi.hoisted(() => ({
   mockCheckRepository: vi.fn(),
+  mockGetInfo: vi.fn(),
 }))
 
 const mockRepository = {
@@ -114,6 +116,7 @@ vi.mock('../../hooks/useAnalytics', () => ({
 vi.mock('../../services/api', () => ({
   repositoriesAPI: {
     getRepositories: vi.fn(),
+    getStorage: vi.fn(),
     getRepositoryCheckJobs: vi.fn(),
     permanentlyDeleteRepository: vi.fn(),
   },
@@ -124,11 +127,21 @@ vi.mock('../../services/api', () => ({
   },
 }))
 
+const operationEventHandlers: { onUpdated: ((op: OperationItem) => void) | null } = {
+  onUpdated: null,
+}
+
+vi.mock('../../hooks/useOperationEvents', () => ({
+  useOperationEvents: (onUpdated: (op: OperationItem) => void) => {
+    operationEventHandlers.onUpdated = onUpdated
+  },
+}))
+
 vi.mock('../../services/borgApi', () => ({
   BorgApiClient: vi.fn(function BorgApiClientMock() {
     return {
       checkRepository: mockCheckRepository,
-      getInfo: vi.fn().mockResolvedValue({ data: { info: null } }),
+      getInfo: mockGetInfo,
     }
   }),
 }))
@@ -168,17 +181,34 @@ vi.mock('../../components/RepositoryInfoDialog', () => ({
   default: ({
     open,
     repository,
+    storage,
+    indexPendingKinds,
     onRunRecoveryCheck,
     canRunRecoveryCheck,
+    onRefresh,
+    refreshFailed,
   }: {
     open: boolean
     repository: typeof mockRepository | null
+    storage?: { size_bytes: number | null } | null
+    indexPendingKinds?: string[] | null
     onRunRecoveryCheck?: (repository: typeof mockRepository) => void
     canRunRecoveryCheck?: boolean
+    onRefresh?: () => void
+    refreshFailed?: boolean
   }) =>
     open && repository ? (
       <div>
         <span>{repository.name} info dialog</span>
+        <span data-testid="dialog-storage">
+          {storage === undefined ? 'undefined' : storage === null ? 'null' : storage.size_bytes}
+        </span>
+        <span data-testid="dialog-pending">{(indexPendingKinds ?? []).join(',')}</span>
+        <span data-testid="dialog-archives">{repository.archive_count}</span>
+        <span data-testid="dialog-refresh-failed">{String(refreshFailed)}</span>
+        <button type="button" onClick={onRefresh}>
+          refresh info
+        </button>
         {onRunRecoveryCheck ? (
           <button
             type="button"
@@ -257,6 +287,7 @@ vi.mock('../repositories-page/RepositoryGroups', () => ({
 
 describe('Repositories', () => {
   beforeEach(() => {
+    mockGetInfo.mockResolvedValue({ data: { info: null } })
     vi.clearAllMocks()
     vi.mocked(repositoriesAPI.getRepositories).mockResolvedValue({
       data: { repositories: [mockRepository] },
@@ -266,6 +297,9 @@ describe('Repositories', () => {
     } as Awaited<ReturnType<typeof backupPlansAPI.list>>)
     mockLatestCheckJob(buildCheckJob())
     mockCheckRepository.mockResolvedValue({ data: { job_id: 23 } })
+    vi.mocked(repositoriesAPI.getStorage).mockResolvedValue({
+      data: { repository_id: 1, storage: { size_bytes: 4096 }, index_pending_kinds: ['stats'] },
+    } as never)
     vi.mocked(repositoriesAPI.permanentlyDeleteRepository).mockResolvedValue({
       data: { success: true },
     } as Awaited<ReturnType<typeof repositoriesAPI.permanentlyDeleteRepository>>)
@@ -286,6 +320,123 @@ describe('Repositories', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'complete check' }))
   }
+
+  describe('list refresh from operation events', () => {
+    const event = (overrides: Partial<OperationItem>) =>
+      ({
+        id: 1,
+        kind: 'stats',
+        category: 'index',
+        status: 'completed',
+        ...overrides,
+      }) as OperationItem
+
+    async function renderAndSettle() {
+      vi.useFakeTimers({ shouldAdvanceTime: true })
+      renderWithProviders(<Repositories />)
+      await screen.findByText('Broken Repo')
+      await waitFor(() => expect(repositoriesAPI.getRepositories).toHaveBeenCalledTimes(1))
+    }
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it("ignores events that do not move the cards' last-run entries", async () => {
+      await renderAndSettle()
+
+      operationEventHandlers.onUpdated?.(event({ kind: 'backup', category: 'backup' }))
+      operationEventHandlers.onUpdated?.(event({ kind: 'check', category: 'maintenance' }))
+      operationEventHandlers.onUpdated?.(
+        event({ kind: 'prune', category: 'maintenance', params: { dry_run: true } })
+      )
+      await vi.advanceTimersByTimeAsync(5000)
+
+      expect(repositoriesAPI.getRepositories).toHaveBeenCalledTimes(1)
+    })
+
+    it('refetches when index work ends in failure, so "indexing" placeholders clear', async () => {
+      await renderAndSettle()
+
+      operationEventHandlers.onUpdated?.(event({ kind: 'archive_sync', status: 'failed' }))
+      await vi.advanceTimersByTimeAsync(2500)
+
+      await waitFor(() => expect(repositoriesAPI.getRepositories).toHaveBeenCalledTimes(2))
+    })
+
+    it('does not refetch for a stage starting or a history stage queued', async () => {
+      await renderAndSettle()
+
+      operationEventHandlers.onUpdated?.(event({ kind: 'archive_sync', status: 'running' }))
+      operationEventHandlers.onUpdated?.(event({ kind: 'history_index', status: 'queued' }))
+      operationEventHandlers.onUpdated?.(event({ kind: 'history_index', status: 'failed' }))
+      await vi.advanceTimersByTimeAsync(2500)
+
+      expect(repositoriesAPI.getRepositories).toHaveBeenCalledTimes(1)
+    })
+
+    it('refetches when a history stage ends well, which moves the last index', async () => {
+      await renderAndSettle()
+
+      operationEventHandlers.onUpdated?.(event({ kind: 'history_merge', status: 'completed' }))
+      await vi.advanceTimersByTimeAsync(2500)
+
+      await waitFor(() => expect(repositoriesAPI.getRepositories).toHaveBeenCalledTimes(2))
+    })
+
+    it('refetches when index work is queued, so "indexing" placeholders appear', async () => {
+      await renderAndSettle()
+
+      operationEventHandlers.onUpdated?.(event({ kind: 'archive_sync', status: 'queued' }))
+      await vi.advanceTimersByTimeAsync(2500)
+
+      await waitFor(() => expect(repositoriesAPI.getRepositories).toHaveBeenCalledTimes(2))
+    })
+
+    it('refetches once per burst of finished index and prune operations', async () => {
+      await renderAndSettle()
+
+      operationEventHandlers.onUpdated?.(event({}))
+      await vi.advanceTimersByTimeAsync(500)
+      operationEventHandlers.onUpdated?.(event({ id: 2, kind: 'archive_sync' }))
+      await vi.advanceTimersByTimeAsync(500)
+      operationEventHandlers.onUpdated?.(event({ id: 3, kind: 'prune', category: 'maintenance' }))
+      await vi.advanceTimersByTimeAsync(1500)
+      expect(repositoriesAPI.getRepositories).toHaveBeenCalledTimes(1)
+
+      await vi.advanceTimersByTimeAsync(1000)
+      await waitFor(() => expect(repositoriesAPI.getRepositories).toHaveBeenCalledTimes(2))
+    })
+
+    it('refetches at most once per minimum interval when completions are spaced out', async () => {
+      await renderAndSettle()
+
+      operationEventHandlers.onUpdated?.(event({ status: 'completed_with_warnings' }))
+      await vi.advanceTimersByTimeAsync(2100)
+      await waitFor(() => expect(repositoriesAPI.getRepositories).toHaveBeenCalledTimes(2))
+
+      // completions 3 s apart, each wider than the debounce
+      for (let i = 0; i < 3; i += 1) {
+        await vi.advanceTimersByTimeAsync(3000)
+        operationEventHandlers.onUpdated?.(event({ id: 10 + i }))
+      }
+      expect(repositoriesAPI.getRepositories).toHaveBeenCalledTimes(2)
+
+      await vi.advanceTimersByTimeAsync(3000)
+      await waitFor(() => expect(repositoriesAPI.getRepositories).toHaveBeenCalledTimes(3))
+    })
+
+    it('still refetches during a burst that never pauses', async () => {
+      await renderAndSettle()
+
+      for (let i = 0; i < 12; i += 1) {
+        operationEventHandlers.onUpdated?.(event({ id: i }))
+        await vi.advanceTimersByTimeAsync(1000)
+      }
+
+      await waitFor(() => expect(repositoriesAPI.getRepositories).toHaveBeenCalledTimes(2))
+    })
+  })
 
   it('announces stored error details when a manual check job fails after the spinner stops', async () => {
     await runManualCheckToCompletion()
@@ -412,5 +563,148 @@ describe('Repositories', () => {
     expect(
       within(screen.getByTestId('repository-list')).getByText('Broken Repo')
     ).toBeInTheDocument()
+  })
+
+  describe('info dialog refresh', () => {
+    it('runs no live info on open, and refetches the list and figures after a refresh', async () => {
+      renderWithProviders(<Repositories />)
+      fireEvent.click(await screen.findByRole('button', { name: 'view info' }))
+      await waitFor(() => expect(repositoriesAPI.getStorage).toHaveBeenCalledWith(1))
+      expect(mockGetInfo).not.toHaveBeenCalled()
+      const listCalls = vi.mocked(repositoriesAPI.getRepositories).mock.calls.length
+
+      fireEvent.click(screen.getByRole('button', { name: 'refresh info' }))
+
+      await waitFor(() => expect(mockGetInfo).toHaveBeenCalledTimes(1))
+      await waitFor(() =>
+        expect(vi.mocked(repositoriesAPI.getRepositories).mock.calls.length).toBeGreaterThan(
+          listCalls
+        )
+      )
+      expect(screen.getByTestId('dialog-refresh-failed')).toHaveTextContent('false')
+    })
+
+    it('tells the dialog when the refresh failed', async () => {
+      mockGetInfo.mockRejectedValueOnce({ response: { status: 500, data: {} } })
+      renderWithProviders(<Repositories />)
+      fireEvent.click(await screen.findByRole('button', { name: 'view info' }))
+      fireEvent.click(await screen.findByRole('button', { name: 'refresh info' }))
+
+      await waitFor(() =>
+        expect(screen.getByTestId('dialog-refresh-failed')).toHaveTextContent('true')
+      )
+    })
+  })
+
+  describe('info dialog storage figures', () => {
+    it('hands the dialog the detail storage and pending kinds, refreshed when index work ends', async () => {
+      renderWithProviders(<Repositories />)
+      fireEvent.click(await screen.findByRole('button', { name: 'view info' }))
+
+      await waitFor(() => expect(screen.getByTestId('dialog-storage')).toHaveTextContent('4096'))
+      expect(screen.getByTestId('dialog-pending')).toHaveTextContent('stats')
+      expect(repositoriesAPI.getStorage).toHaveBeenCalledWith(1)
+
+      vi.mocked(repositoriesAPI.getStorage).mockResolvedValue({
+        data: { repository_id: 1, storage: { size_bytes: 8192 }, index_pending_kinds: [] },
+      } as never)
+      operationEventHandlers.onUpdated?.({
+        id: 9,
+        kind: 'stats',
+        category: 'index',
+        status: 'failed',
+        repository_id: 1,
+      } as OperationItem)
+
+      await waitFor(() => expect(screen.getByTestId('dialog-storage')).toHaveTextContent('8192'), {
+        timeout: 4000,
+      })
+      expect(screen.getByTestId('dialog-pending')).toHaveTextContent('')
+    })
+
+    it('hands the dialog the list row as refetched, so its archive count moves too', async () => {
+      renderWithProviders(<Repositories />)
+      fireEvent.click(await screen.findByRole('button', { name: 'view info' }))
+      await waitFor(() => expect(screen.getByTestId('dialog-archives')).toHaveTextContent('0'))
+
+      vi.mocked(repositoriesAPI.getRepositories).mockResolvedValue({
+        data: { repositories: [{ ...mockRepository, archive_count: 5 }] },
+      } as Awaited<ReturnType<typeof repositoriesAPI.getRepositories>>)
+      operationEventHandlers.onUpdated?.({
+        id: 41,
+        kind: 'archive_sync',
+        category: 'index',
+        status: 'completed',
+        repository_id: 1,
+      } as OperationItem)
+
+      await waitFor(() => expect(screen.getByTestId('dialog-archives')).toHaveTextContent('5'), {
+        timeout: 4000,
+      })
+    })
+
+    it('refreshes the open dialog when a history stage ends, which moves no card', async () => {
+      renderWithProviders(<Repositories />)
+      fireEvent.click(await screen.findByRole('button', { name: 'view info' }))
+      await waitFor(() => expect(screen.getByTestId('dialog-pending')).toHaveTextContent('stats'))
+
+      vi.mocked(repositoriesAPI.getStorage).mockResolvedValue({
+        data: { repository_id: 1, storage: { size_bytes: 4096 }, index_pending_kinds: [] },
+      } as never)
+      operationEventHandlers.onUpdated?.({
+        id: 51,
+        kind: 'history_merge',
+        category: 'index',
+        status: 'completed',
+        repository_id: 1,
+      } as OperationItem)
+
+      await waitFor(
+        () => expect(screen.getByTestId('dialog-pending')).not.toHaveTextContent('stats'),
+        { timeout: 4000 }
+      )
+    })
+
+    it('refreshes the open dialog even when another repository ends a burst', async () => {
+      renderWithProviders(<Repositories />)
+      fireEvent.click(await screen.findByRole('button', { name: 'view info' }))
+      await waitFor(() => expect(screen.getByTestId('dialog-storage')).toHaveTextContent('4096'))
+
+      vi.mocked(repositoriesAPI.getStorage).mockResolvedValue({
+        data: { repository_id: 1, storage: { size_bytes: 8192 }, index_pending_kinds: [] },
+      } as never)
+      operationEventHandlers.onUpdated?.({
+        id: 31,
+        kind: 'stats',
+        category: 'index',
+        status: 'completed',
+        repository_id: 1,
+      } as OperationItem)
+      // repository 2's event lands inside repository 1's debounce window
+      operationEventHandlers.onUpdated?.({
+        id: 32,
+        kind: 'stats',
+        category: 'index',
+        status: 'completed',
+        repository_id: 2,
+      } as OperationItem)
+
+      await waitFor(() => expect(screen.getByTestId('dialog-storage')).toHaveTextContent('8192'), {
+        timeout: 4000,
+      })
+    })
+
+    it('keeps an explicit null from the detail instead of the list row', async () => {
+      vi.mocked(repositoriesAPI.getRepositories).mockResolvedValue({
+        data: { repositories: [{ ...mockRepository, storage: { size_bytes: 1 } }] },
+      } as Awaited<ReturnType<typeof repositoriesAPI.getRepositories>>)
+      vi.mocked(repositoriesAPI.getStorage).mockResolvedValue({
+        data: { repository_id: 1, storage: null, index_pending_kinds: [] },
+      } as never)
+      renderWithProviders(<Repositories />)
+      fireEvent.click(await screen.findByRole('button', { name: 'view info' }))
+
+      await waitFor(() => expect(screen.getByTestId('dialog-storage')).toHaveTextContent('null'))
+    })
   })
 })

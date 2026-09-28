@@ -4,8 +4,10 @@ import json
 import os
 import structlog
 from typing import Dict, List
-from datetime import datetime, timezone
 from app.config import settings
+from app.core.borg_stream import CommandByteStream, CommandLineStream
+from app.utils.borg_env import with_lock_wait
+from app.utils.ssh_host_keys import host_key_ssh_opts
 from app.utils.ssh_utils import public_key_only_ssh_args
 
 logger = structlog.get_logger()
@@ -63,13 +65,10 @@ class BorgInterface:
 
         return os.path.expanduser("~/.cache/borg")
 
-    async def _execute_command(
-        self, cmd: List[str], timeout: int = 3600, cwd: str = None, env: dict = None
-    ) -> Dict:
-        """Execute a command with real-time output capture"""
-        logger.info("Executing command", command=" ".join(cmd), cwd=cwd)
-
-        # Set up environment with SSH options for remote repositories
+    def _build_exec_env(self, env: dict = None) -> dict:
+        """Process environment for a borg invocation: the inherited
+        environment, the lock and hostname settings every call needs, and
+        the caller's overrides on top."""
         exec_env = os.environ.copy()
 
         # Configure lock behavior with quick timeout
@@ -80,6 +79,12 @@ class BorgInterface:
         # Mark this container's hostname as unique to avoid lock conflicts
         exec_env["BORG_HOSTNAME_IS_UNIQUE"] = "yes"
 
+        # Borg's modern exit codes: specific errors (2-99) and warnings
+        # (100-127) instead of the legacy 0/1/2, so a Borg 1 failure names
+        # itself the way the same failure does under Borg 2. Same default and
+        # override semantics as setup_borg_env (app/utils/borg_env.py).
+        exec_env.setdefault("BORG_EXIT_CODES", "modern")
+
         # Allow non-interactive access to unencrypted and relocated repositories
         exec_env["BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK"] = "yes"
         exec_env["BORG_RELOCATED_REPO_ACCESS_IS_OK"] = "yes"
@@ -88,10 +93,7 @@ class BorgInterface:
         # This allows automatic connection to new hosts without manual intervention
         ssh_opts = [
             *public_key_only_ssh_args(),
-            "-o",
-            "StrictHostKeyChecking=no",  # Don't check host keys
-            "-o",
-            "UserKnownHostsFile=/dev/null",  # Don't save host keys
+            *host_key_ssh_opts(None),
             "-o",
             "LogLevel=ERROR",  # Reduce SSH verbosity
         ]
@@ -101,9 +103,19 @@ class BorgInterface:
         if env:
             exec_env.update(env)
 
+        return exec_env
+
+    async def _execute_command(
+        self, cmd: List[str], timeout: int = 3600, cwd: str = None, env: dict = None
+    ) -> Dict:
+        """Execute a command with real-time output capture"""
+        logger.info("Executing command", command=" ".join(cmd), cwd=cwd)
+
+        exec_env = self._build_exec_env(env)
+
         try:
             process = await asyncio.create_subprocess_exec(
-                *cmd,
+                *with_lock_wait(cmd, exec_env),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
@@ -181,13 +193,12 @@ class BorgInterface:
         exec_env = os.environ.copy()
         exec_env["BORG_LOCK_WAIT"] = "20"
         exec_env["BORG_HOSTNAME_IS_UNIQUE"] = "yes"
+        # modern exit codes, as _build_exec_env sets above
+        exec_env.setdefault("BORG_EXIT_CODES", "modern")
 
         ssh_opts = [
             *public_key_only_ssh_args(),
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
+            *host_key_ssh_opts(None),
             "-o",
             "LogLevel=ERROR",
         ]
@@ -199,7 +210,7 @@ class BorgInterface:
 
         try:
             process = await asyncio.create_subprocess_exec(
-                *cmd,
+                *with_lock_wait(cmd, exec_env),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
@@ -529,8 +540,11 @@ class BorgInterface:
         exec_env = env.copy() if env else {}
         if passphrase:
             exec_env["BORG_PASSPHRASE"] = passphrase
+        # This output is machine-parsed; borg renders timestamps naive in the
+        # process zone, so pin it to UTC and parse with timezone_name="UTC".
+        exec_env["TZ"] = "UTC"
 
-        return await self._execute_command(cmd, env=exec_env if exec_env else None)
+        return await self._execute_command(cmd, env=exec_env)
 
     async def info_archive(
         self,
@@ -552,8 +566,10 @@ class BorgInterface:
         exec_env = env.copy() if env else {}
         if passphrase:
             exec_env["BORG_PASSPHRASE"] = passphrase
+        # Machine-parsed output: render timestamps in UTC (see list_archives).
+        exec_env["TZ"] = "UTC"
 
-        return await self._execute_command(cmd, env=exec_env if exec_env else None)
+        return await self._execute_command(cmd, env=exec_env)
 
     async def list_archive_contents(
         self,
@@ -594,11 +610,88 @@ class BorgInterface:
         exec_env = env.copy() if env else {}
         if passphrase:
             exec_env["BORG_PASSPHRASE"] = passphrase
+        # Machine-parsed output: render file mtimes in UTC (see list_archives).
+        exec_env["TZ"] = "UTC"
 
         # Use streaming execution to prevent OOM on large archives
         return await self._execute_command_streaming(
-            cmd, max_lines=max_lines, env=exec_env if exec_env else None
+            cmd, max_lines=max_lines, env=exec_env
         )
+
+    def diff_archives(
+        self,
+        repository: str,
+        archive_a: str,
+        archive_b: str,
+        *,
+        remote_path: str = None,
+        passphrase: str = None,
+        bypass_lock: bool = False,
+        env: dict = None,
+        timeout: int = 3600,
+    ) -> "CommandLineStream":
+        """Stream `borg diff --json-lines` between two archives (spec 8.3)."""
+        cmd = [self.borg_cmd, "diff"]
+        if remote_path:
+            cmd.extend(["--remote-path", remote_path])
+        if bypass_lock:
+            cmd.append("--bypass-lock")
+        cmd.extend(["--json-lines", f"{repository}::{archive_a}", archive_b])
+        exec_env = self._build_exec_env(env)
+        if passphrase:
+            exec_env["BORG_PASSPHRASE"] = passphrase
+        return CommandLineStream(cmd, env=exec_env, timeout=timeout)
+
+    def list_archive_lines(
+        self,
+        repository: str,
+        archive: str,
+        *,
+        remote_path: str = None,
+        passphrase: str = None,
+        bypass_lock: bool = False,
+        env: dict = None,
+        timeout: int = 3600,
+    ) -> "CommandLineStream":
+        """Stream `borg list --json-lines` for one archive (first archive of
+        a series, spec 8.3)."""
+        cmd = [self.borg_cmd, "list"]
+        if remote_path:
+            cmd.extend(["--remote-path", remote_path])
+        if bypass_lock:
+            cmd.append("--bypass-lock")
+        cmd.extend(["--json-lines", f"{repository}::{archive}"])
+        exec_env = self._build_exec_env(env)
+        if passphrase:
+            exec_env["BORG_PASSPHRASE"] = passphrase
+        return CommandLineStream(cmd, env=exec_env, timeout=timeout)
+
+    def export_archive_tar(
+        self,
+        repository: str,
+        archive: str,
+        directory_path: str,
+        *,
+        remote_path: str = None,
+        passphrase: str = None,
+        bypass_lock: bool = False,
+        env: dict = None,
+        timeout: int = 3600,
+        strip_components: int = 0,
+    ) -> "CommandByteStream":
+        """Stream one archived directory as an uncompressed tar to stdout."""
+        cmd = [self.borg_cmd, "export-tar"]
+        if remote_path:
+            cmd.extend(["--remote-path", remote_path])
+        if bypass_lock:
+            cmd.append("--bypass-lock")
+        if strip_components:
+            cmd.extend(["--strip-components", str(strip_components)])
+        cmd.extend([f"{repository}::{archive}", "-", "--", directory_path.strip("/")])
+        exec_env = self._build_exec_env(env)
+        if passphrase:
+            exec_env["BORG_PASSPHRASE"] = passphrase
+        return CommandByteStream(cmd, env=exec_env, timeout=timeout)
 
     async def extract_archive(
         self,
@@ -765,115 +858,6 @@ class BorgInterface:
             env["BORG_PASSPHRASE"] = passphrase
 
         return await self._execute_command(cmd, env=env if env else None)
-
-    async def get_repository_info(
-        self, repository_path: str, remote_path: str = None, bypass_lock: bool = False
-    ) -> Dict:
-        """Get detailed information about a specific repository"""
-        try:
-            # Get repository info using borg info
-            cmd = ["borg", "info"]
-            if remote_path:
-                cmd.extend(["--remote-path", remote_path])
-            if bypass_lock:
-                cmd.append("--bypass-lock")
-            cmd.extend([repository_path, "--json"])
-            result = await self._execute_command(cmd, timeout=60)
-
-            if not result["success"]:
-                return {
-                    "success": False,
-                    "error": result["stderr"],
-                    "last_backup": None,
-                    "backup_count": 0,
-                    "total_size": 0,
-                    "compression_ratio": 0,
-                    "integrity_check": False,
-                    "disk_usage": 0,
-                }
-
-            # Parse JSON output
-            try:
-                info_data = json.loads(result["stdout"])
-                archives = info_data.get("archives", [])
-
-                # Calculate total size
-                total_size = sum(
-                    archive.get("stats", {}).get("size", 0) for archive in archives
-                )
-
-                # Get compression ratio (average)
-                compression_ratios = []
-                for archive in archives:
-                    stats = archive.get("stats", {})
-                    if stats.get("size") and stats.get("csize"):
-                        ratio = stats["csize"] / stats["size"]
-                        compression_ratios.append(ratio)
-
-                avg_compression_ratio = (
-                    sum(compression_ratios) / len(compression_ratios)
-                    if compression_ratios
-                    else 0
-                )
-
-                # Get last backup time
-                last_backup = None
-                if archives:
-                    latest_archive = max(archives, key=lambda x: x.get("time", 0))
-                    # Convert Unix timestamp to timezone-aware UTC datetime, then to ISO format
-                    last_backup = datetime.fromtimestamp(
-                        latest_archive["time"], tz=timezone.utc
-                    ).isoformat()
-
-                # Check disk usage
-                disk_usage = 0
-                try:
-                    import psutil
-
-                    disk = psutil.disk_usage(os.path.dirname(repository_path))
-                    disk_usage = disk.percent
-                except:
-                    pass
-
-                return {
-                    "success": True,
-                    "last_backup": last_backup,
-                    "backup_count": len(archives),
-                    "total_size": total_size,
-                    "compression_ratio": avg_compression_ratio,
-                    "integrity_check": True,  # If we can read the repo, it's likely intact
-                    "disk_usage": disk_usage,
-                }
-
-            except json.JSONDecodeError as e:
-                logger.error("Failed to parse repository info JSON", error=str(e))
-                return {
-                    "success": False,
-                    "error": "Failed to parse repository information",
-                    "last_backup": None,
-                    "backup_count": 0,
-                    "total_size": 0,
-                    "compression_ratio": 0,
-                    "integrity_check": False,
-                    "disk_usage": 0,
-                }
-
-        except Exception as e:
-            logger.error(
-                "Failed to get repository info",
-                repository=repository_path,
-                error=str(e),
-            )
-            return {
-                "success": False,
-                "error": str(e),
-                "last_backup": None,
-                "backup_count": 0,
-                "total_size": 0,
-                "compression_ratio": 0,
-                "integrity_check": False,
-                "disk_usage": 0,
-            }
 
     def get_version(self) -> str:
         """Get Borg version"""

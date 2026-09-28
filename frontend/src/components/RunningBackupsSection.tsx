@@ -85,7 +85,7 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
         label: t('backup.runningJobs.progress.originalSize'),
         value: job.progress_details?.original_size
           ? formatBytesUtil(job.progress_details.original_size)
-          : job.processed_size || 'Unknown',
+          : job.processed_size || t('common.unknown'),
       },
       {
         key: 'compressed',
@@ -110,7 +110,7 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
         value:
           job.progress_details?.total_expected_size && job.progress_details.total_expected_size > 0
             ? formatBytesUtil(job.progress_details.total_expected_size)
-            : 'Unknown',
+            : t('common.unknown'),
         valueColor: 'success.main',
       },
       {
@@ -119,7 +119,7 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
         value:
           job.status === 'running' && job.progress_details?.backup_speed
             ? `${job.progress_details.backup_speed.toFixed(2)} MB/s`
-            : 'N/A',
+            : t('common.na'),
         valueColor: 'primary.main',
       },
       {
@@ -128,7 +128,7 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
         value:
           (job.progress_details?.estimated_time_remaining || 0) > 0
             ? formatDurationSeconds(job.progress_details?.estimated_time_remaining || 0)
-            : 'N/A',
+            : t('common.na'),
         valueColor: 'success.main',
       },
     ].filter((stat) => stat.value !== null)
@@ -139,11 +139,23 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
     <Card sx={{ mb: 3 }}>
       <CardContent>
         {/* Section Header */}
-        <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.75 }}>
+        <Stack
+          direction="row"
+          spacing={1}
+          sx={{
+            alignItems: 'center',
+            mb: 0.75,
+          }}
+        >
           <Box sx={{ color: ACCENT_BACKUP, display: 'flex' }}>
             <RefreshCw size={16} className="animate-spin" />
           </Box>
-          <Typography variant="h6" fontWeight={600}>
+          <Typography
+            variant="h6"
+            sx={{
+              fontWeight: 600,
+            }}
+          >
             {t('backup.runningJobs.title')}
           </Typography>
           <Box
@@ -162,7 +174,13 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
             </Typography>
           </Box>
         </Stack>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 2.5 }}>
+        <Typography
+          variant="body2"
+          sx={{
+            color: 'text.secondary',
+            mb: 2.5,
+          }}
+        >
           {t('backup.runningJobs.subtitle')}
         </Typography>
 
@@ -227,8 +245,12 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
                       <Stack
                         direction="row"
                         spacing={0.75}
-                        alignItems="center"
-                        sx={{ mb: 0.5, flexWrap: 'wrap', gap: 0.5 }}
+                        sx={{
+                          alignItems: 'center',
+                          mb: 0.5,
+                          flexWrap: 'wrap',
+                          gap: 0.5,
+                        }}
                       >
                         {/* Live pulse dot */}
                         <Box
@@ -245,7 +267,13 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
                             },
                           }}
                         />
-                        <Typography variant="body1" fontWeight={700} sx={{ lineHeight: 1.3 }}>
+                        <Typography
+                          variant="body1"
+                          sx={{
+                            fontWeight: 700,
+                            lineHeight: 1.3,
+                          }}
+                        >
                           {t('backup.runningJobs.jobTitle', { id: job.id })}
                         </Typography>
                         {/* Stage badge */}
@@ -312,11 +340,21 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
                     </Box>
 
                     {/* Right: Actions */}
-                    <Stack direction="row" spacing={0.75} alignItems="center" flexShrink={0}>
+                    <Stack
+                      direction="row"
+                      spacing={0.75}
+                      sx={{
+                        alignItems: 'center',
+                        flexShrink: 0,
+                      }}
+                    >
                       <Typography
                         variant="caption"
-                        color="text.secondary"
-                        sx={{ display: { xs: 'none', sm: 'block' }, mr: 0.5 }}
+                        sx={{
+                          color: 'text.secondary',
+                          display: { xs: 'none', sm: 'block' },
+                          mr: 0.5,
+                        }}
                       >
                         {formatTimeRange(job.started_at, job.completed_at, job.status)}
                       </Typography>
@@ -371,9 +409,11 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
                       <Box sx={{ mb: 1.5 }}>
                         <Stack
                           direction="row"
-                          justifyContent="space-between"
-                          alignItems="center"
-                          sx={{ mb: 0.5 }}
+                          sx={{
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            mb: 0.5,
+                          }}
                         >
                           <Typography
                             sx={{
@@ -459,7 +499,7 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
                             >
                               <Box
                                 sx={{
-                                  color: alpha(statColor, 0.7),
+                                  color: alpha(statColor, 0.75),
                                   display: 'flex',
                                   alignItems: 'center',
                                 }}
@@ -472,7 +512,7 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
                                   fontWeight: 700,
                                   textTransform: 'uppercase',
                                   letterSpacing: '0.07em',
-                                  color: alpha(statColor, 0.7),
+                                  color: statColor,
                                   lineHeight: 1,
                                 }}
                               >
@@ -481,9 +521,9 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
                             </Box>
                             <Typography
                               variant="body2"
-                              fontWeight={600}
                               noWrap
                               sx={{
+                                fontWeight: 600,
                                 fontVariantNumeric: 'tabular-nums',
                                 fontSize: '0.85rem',
                                 color: stat.valueColor || 'text.primary',
@@ -515,7 +555,7 @@ const RunningBackupsSection: React.FC<RunningBackupsSectionProps> = ({
                     >
                       <Box
                         sx={{
-                          color: alpha(ACCENT_BACKUP, 0.65),
+                          color: alpha(ACCENT_BACKUP, 0.75),
                           display: 'flex',
                           flexShrink: 0,
                         }}

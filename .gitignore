@@ -14,6 +14,8 @@
 /node_modules
 /package-lock.json
 /package.json
+# ...except the dependency-free scripts file that fronts ./scripts/dev.sh
+!/package.json
 
 # Built static files (generated during Docker build)
 /app/static/*
@@ -151,4 +153,16 @@ trivy-*.sarif
 .planning/
 
 .worktrees/
-.github-token
+
+# Native install artifacts: scripts/build-native-tarball.sh output, and the
+# agent wheel build it runs on the way there.
+dist/
+build/
+*.egg-info/
+
+# pytest artifact: a mocked log path resolved to a real directory
+MagicMock/
+
+# Local lint/typecheck output (contains absolute paths)
+frontend/lint_report.txt
+frontend/lint_results.txt

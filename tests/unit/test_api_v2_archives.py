@@ -5,14 +5,15 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from fastapi.responses import StreamingResponse
 
 from app.database.models import (
-    DeleteArchiveJob,
     LicensingState,
     Repository,
     SystemSettings,
 )
 from app.services.archive_browse_service import parse_archive_items
+from tests.utils.operations import seed_job_operation
 
 
 def _enable_borg_v2(test_db, *, fast_browse=False):
@@ -70,6 +71,58 @@ class TestV2ArchiveRoutes:
             response.json()["detail"]["key"]
             == "backend.errors.plan.featureNotAvailable"
         )
+
+    # Reading an existing Borg 2 archive is not the Pro feature: a Community
+    # install must still be able to browse it and get its files back. The
+    # routes that do that carry no gate; every other route in the module does,
+    # and a route added without a decision fails this test rather than
+    # shipping open (spec 2026-09-21, section 1.2).
+    OPEN_ON_EVERY_PLAN = {
+        ("GET", "/{archive_id}/contents"),
+        ("GET", "/download"),
+        ("GET", "/download-folder"),
+    }
+
+    def test_only_the_read_routes_are_open_on_community(self):
+        """Read the module's own router, not the composed application.
+
+        The routes and their dependencies are declared here; going through
+        `app.main` only adds an import graph whose state differs between a
+        full run and one shard of it. That the application serves these
+        routes, gate and all, is what the two request tests around this one
+        already prove.
+        """
+        from app.api.v2 import archives as v2_archives
+
+        def gates_borg2(dependency) -> bool:
+            # `require_feature` builds a new closure per call, so the feature
+            # it closed over identifies the gate; the object does not.
+            closure = getattr(dependency.dependency, "__closure__", None) or ()
+            return any(cell.cell_contents == "borg_v2" for cell in closure)
+
+        open_routes = set()
+        for route in v2_archives.router.routes:
+            if not any(gates_borg2(d) for d in route.dependencies):
+                for method in route.methods - {"HEAD", "OPTIONS"}:
+                    open_routes.add((method, route.path))
+
+        assert open_routes == self.OPEN_ON_EVERY_PLAN
+
+    def test_community_can_browse_and_download_a_borg2_archive(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        """No entitlement is active in this database, so this is Community."""
+        repo = _create_v2_repo(test_db)
+        with patch(
+            "app.api.v2.archives.borg2.list_archive_contents",
+            new=AsyncMock(return_value={"success": True, "stdout": ""}),
+        ):
+            response = test_client.get(
+                f"/api/v2/archives/aid:abc/contents?repository={repo.id}",
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200, response.text
 
     def test_list_archives_by_repository_id(
         self, test_client: TestClient, admin_headers, test_db
@@ -359,7 +412,8 @@ class TestV2ArchiveRoutes:
                 "user": "root",
                 "group": "root",
                 "size": 11,
-                "mtime": "2026-04-04T00:00:00",
+                # Server-side listing ran under TZ=UTC; mtime carries the offset.
+                "mtime": "2026-04-04T00:00:00+00:00",
                 "healthy": True,
             }
         ]
@@ -530,12 +584,49 @@ class TestV2ArchiveRoutes:
         assert sub_dir["type"] == "directory"
         assert sub_dir["size"] == 18
 
+    def test_get_archive_contents_names_an_unsupported_repository_version(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """Borg 2 betas changed the repository format. A repository written
+        by an older beta fails with a raw borgstore trace; the route turns it
+        into a translated message that names the version."""
+        _enable_borg_v2(test_db)
+        repo = _create_v2_repo(test_db)
+        stderr = (
+            "borgstore: cache cleanup failed for namespace 'packs/': "
+            "ObjectNotFound('packs')\nproto='file', path='/x' does not have a "
+            "valid config. Check the repository config [repository version 3 "
+            "is not supported by this borg version].\n"
+        )
+        with (
+            patch(
+                "app.api.v2.archives.archive_cache.get",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.api.v2.archives.borg2.list_archive_contents",
+                new=AsyncMock(
+                    return_value={"success": False, "stdout": "", "stderr": stderr}
+                ),
+            ),
+        ):
+            response = test_client.get(
+                f"/api/v2/archives/archive-1/contents?repository={repo.path}",
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == {
+            "key": "backend.errors.archives.unsupportedRepositoryVersion",
+            "params": {"version": 3},
+        }
+
     def test_get_archive_contents_passes_requested_path_to_borg2(
         self, test_client: TestClient, admin_headers, test_db
     ):
         _enable_borg_v2(test_db)
         repo = _create_v2_repo(
-            test_db, source_directories=["/local/Users/karanhudia/Downloads"]
+            test_db, source_directories=["/local/Users/alex/Downloads"]
         )
 
         with (
@@ -574,7 +665,7 @@ class TestV2ArchiveRoutes:
     ):
         _enable_borg_v2(test_db, fast_browse=True)
         repo = _create_v2_repo(
-            test_db, source_directories=["/local/Users/karanhudia/Downloads"]
+            test_db, source_directories=["/local/Users/alex/Downloads"]
         )
 
         with (
@@ -609,7 +700,7 @@ class TestV2ArchiveRoutes:
             browse_depth=6,
         )
         mock_cache_set.assert_awaited_once_with(
-            repo.id, "archive-1::managed-path::docs/sub::fast", []
+            repo.id, "v2-utc-mtime::archive-1::managed-path::docs/sub::fast", []
         )
 
     def test_get_archive_contents_hides_directory_size_when_fast_mode_enabled(
@@ -670,7 +761,7 @@ class TestV2ArchiveRoutes:
     ):
         _enable_borg_v2(test_db)
         repo = _create_v2_repo(
-            test_db, source_directories=["/local/Users/karanhudia/Downloads"]
+            test_db, source_directories=["/local/Users/alex/Downloads"]
         )
         archive_id = "10614da295b13209b207fc2499d67e7f10c24f4a1745e482bd3fc2595e4ec7fd"
 
@@ -738,7 +829,7 @@ class TestV2ArchiveRoutes:
         assert response.status_code == 200
         assert response.json()["items"] == cached_items
         mock_cache_get.assert_awaited_once_with(
-            repo.id, "archive-1::managed-path::docs"
+            repo.id, "v2-utc-mtime::archive-1::managed-path::docs"
         )
         mock_contents.assert_not_called()
 
@@ -776,7 +867,7 @@ class TestV2ArchiveRoutes:
         assert response.status_code == 200
         assert response.json()["items"] == cached_items
         mock_cache_get.assert_awaited_once_with(
-            repo.id, f"aid:{archive_id}::managed-path::docs"
+            repo.id, f"v2-utc-mtime::aid:{archive_id}::managed-path::docs"
         )
         mock_contents.assert_not_called()
 
@@ -830,11 +921,15 @@ class TestV2ArchiveRoutes:
         assert response.status_code == 200
         assert mock_cache_set.await_count == 3
         calls = [call.args for call in mock_cache_set.await_args_list]
-        assert calls[0] == (repo.id, "archive-1::raw", parse_archive_items(stdout))
+        assert calls[0] == (
+            repo.id,
+            "v2-utc-mtime::archive-1::raw",
+            parse_archive_items(stdout, timezone_name="UTC"),
+        )
         assert calls[1][0] == repo.id
-        assert calls[1][1] == "archive-1::managed-root"
+        assert calls[1][1] == "v2-utc-mtime::archive-1::managed-root"
         assert calls[2][0] == repo.id
-        assert calls[2][1] == "archive-1::managed-path::docs"
+        assert calls[2][1] == "v2-utc-mtime::archive-1::managed-path::docs"
         assert calls[2][2] == response.json()["items"]
 
     def test_download_file_success(
@@ -864,6 +959,64 @@ class TestV2ArchiveRoutes:
 
         assert response.status_code == 200
         assert response.content == b"hello borg2"
+
+    def test_download_folder_streams_a_tar_from_borg2(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        _enable_borg_v2(test_db)
+        repo = _create_v2_repo(test_db)
+
+        class TarStream:
+            return_code = 0
+            stderr = ""
+
+            def __aiter__(self):
+                async def chunks():
+                    yield b"tar-bytes"
+
+                return chunks()
+
+            async def close(self):
+                return None
+
+        with patch(
+            "app.api.v2.archives.borg2.export_archive_tar", return_value=TarStream()
+        ) as export:
+            response = test_client.get(
+                f"/api/v2/archives/download-folder?repository={repo.id}&archive=archive-1&directory_path=/documents/Projects",
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.content == b"tar-bytes"
+        assert response.headers["content-type"].startswith("application/x-tar")
+        assert 'filename="Projects.tar"' in response.headers["content-disposition"]
+        assert export.call_args.kwargs["strip_components"] == 1
+
+    def test_download_folder_delegates_agent_repositories(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        _enable_borg_v2(test_db)
+        repo = _create_v2_repo(test_db)
+        agent_response = StreamingResponse(iter([b"agent-tar"]))
+
+        with (
+            patch("app.api.v2.archives.is_agent_executor", return_value=True),
+            patch(
+                "app.api.v2.archives._stream_agent_archive_tar",
+                new=AsyncMock(return_value=agent_response),
+            ) as stream_agent,
+            patch("app.api.v2.archives.borg2.export_archive_tar") as export,
+        ):
+            response = test_client.get(
+                f"/api/v2/archives/download-folder?repository={repo.id}&archive=archive-1&directory_path=/Documents",
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.content == b"agent-tar"
+        stream_agent.assert_awaited_once_with(test_db, repo, "archive-1", "/Documents")
+        export.assert_not_called()
 
     def test_download_file_uses_archive_id_selector(
         self, test_client: TestClient, admin_headers, test_db, tmp_path
@@ -973,41 +1126,37 @@ class TestV2ArchiveRoutes:
     def test_delete_archive_success_creates_job(
         self, test_client: TestClient, admin_headers, test_db
     ):
+        from app.database.models import Operation
+
         _enable_borg_v2(test_db)
         repo = _create_v2_repo(test_db)
 
-        with patch(
-            "app.api.v2.archives.asyncio.create_task", return_value=object()
-        ) as mock_create_task:
-            response = test_client.delete(
-                f"/api/v2/archives/archive-1?repository={repo.id}",
-                headers=admin_headers,
-            )
-
-            scheduled = mock_create_task.call_args.args[0]
-            scheduled.close()
+        response = test_client.delete(
+            f"/api/v2/archives/archive-1?repository={repo.id}",
+            headers=admin_headers,
+        )
 
         assert response.status_code == 200
         assert response.json()["status"] == "pending"
-        job = test_db.query(DeleteArchiveJob).first()
-        assert job is not None
-        assert job.archive_name == "archive-1"
-        assert job.repository_id == repo.id
+        op = test_db.get(Operation, response.json()["job_id"])
+        assert op.kind == "delete_archive"
+        assert op.params["archive_name"] == "archive-1"
+        assert op.repository_id == repo.id
 
     def test_delete_archive_rejects_duplicate_running_job(
         self, test_client: TestClient, admin_headers, test_db
     ):
+        from app.services.operations.enqueue import enqueue
+
         _enable_borg_v2(test_db)
         repo = _create_v2_repo(test_db)
-        test_db.add(
-            DeleteArchiveJob(
-                repository_id=repo.id,
-                repository_path=repo.path,
-                archive_name="archive-1",
-                status="running",
-            )
+        enqueue(
+            test_db,
+            "delete_archive",
+            repository_id=repo.id,
+            trigger="manual",
+            params={"archive_name": "archive-1"},
         )
-        test_db.commit()
 
         response = test_client.delete(
             f"/api/v2/archives/archive-1?repository={repo.id}",
@@ -1028,8 +1177,10 @@ class TestV2ArchiveRoutes:
         settings.log_save_policy = "all_jobs"
         log_file = tmp_path / "delete.log"
         log_file.write_text("archive deleted")
-        job = DeleteArchiveJob(
-            repository_id=1,
+        job = seed_job_operation(
+            test_db,
+            "delete_archive",
+            repository_id=_create_v2_repo(test_db).id,
             repository_path="/tmp/v2-archive-repo",
             archive_name="archive-1",
             status="completed",
@@ -1038,7 +1189,6 @@ class TestV2ArchiveRoutes:
             log_file_path=str(log_file),
             has_logs=True,
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -1062,8 +1212,10 @@ class TestV2ArchiveRoutes:
         settings.log_save_policy = "failed_only"
         log_file = tmp_path / "delete.log"
         log_file.write_text("archive deleted", encoding="utf-8")
-        job = DeleteArchiveJob(
-            repository_id=1,
+        job = seed_job_operation(
+            test_db,
+            "delete_archive",
+            repository_id=_create_v2_repo(test_db).id,
             repository_path="/tmp/v2-archive-repo",
             archive_name="archive-1",
             status="completed",
@@ -1072,7 +1224,6 @@ class TestV2ArchiveRoutes:
             log_file_path=str(log_file),
             has_logs=True,
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 

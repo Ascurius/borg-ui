@@ -103,7 +103,7 @@ function MountCard({
     width: 28,
     height: 28,
     borderRadius: 1.5,
-    color: alpha(color, isDark ? 0.6 : 0.5),
+    color: alpha(color, 0.75),
     '&:hover': {
       bgcolor: alpha(color, isDark ? 0.12 : 0.09),
       color: color,
@@ -388,7 +388,13 @@ export default function MountsManagementTab() {
         >
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25, flexShrink: 0 }}>
             <HardDrive size={16} style={{ opacity: 0.7 }} />
-            <Typography variant="h6" fontWeight={700} sx={{ fontSize: '0.95rem' }}>
+            <Typography
+              variant="h6"
+              sx={{
+                fontWeight: 700,
+                fontSize: '0.95rem',
+              }}
+            >
               {t('mountsManagement.title')}
             </Typography>
             <Skeleton variant="rounded" width={22} height={20} sx={{ borderRadius: 1 }} />
@@ -437,7 +443,13 @@ export default function MountsManagementTab() {
       >
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25, flexShrink: 0 }}>
           <HardDrive size={16} style={{ opacity: 0.7 }} />
-          <Typography variant="h6" fontWeight={700} sx={{ fontSize: '0.95rem' }}>
+          <Typography
+            variant="h6"
+            sx={{
+              fontWeight: 700,
+              fontSize: '0.95rem',
+            }}
+          >
             {t('mountsManagement.title')}
           </Typography>
           <Typography

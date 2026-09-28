@@ -1,5 +1,9 @@
+import { useEffect, type ComponentProps } from 'react'
 import type { Meta, StoryObj } from '@storybook/react-vite'
 import { Box } from '@mui/material'
+import MockAdapter from 'axios-mock-adapter'
+import api from '../services/api'
+import i18n from '../i18n'
 import BackupJobsTable from './BackupJobsTable'
 import type { Job } from '../types/jobs'
 
@@ -80,6 +84,61 @@ const nonRetryableDestructiveJobs: Job[] = [
   },
 ]
 
+const availabilityCheckJobs: Job[] = [
+  {
+    id: 203,
+    repository: '/backups/accounting',
+    repository_path: '/backups/accounting',
+    repository_id: 31,
+    type: 'availability_check',
+    status: 'skipped',
+    skip_reason: 'source_unavailable',
+    started_at: '2026-05-22T09:30:00Z',
+    completed_at: '2026-05-22T09:30:00Z',
+    triggered_by: 'schedule',
+    execution_mode: 'local',
+    error_message: 'SSH source unavailable for accounting source',
+  },
+]
+
+const statusComparisonJobs: Job[] = [
+  {
+    id: 301,
+    repository: '/backups/accounting',
+    repository_path: '/backups/accounting',
+    type: 'backup',
+    status: 'completed',
+    started_at: '2026-05-22T08:00:00Z',
+    completed_at: '2026-05-22T08:07:00Z',
+    triggered_by: 'manual',
+    execution_mode: 'local',
+  },
+  {
+    id: 302,
+    repository: '/backups/accounting',
+    repository_path: '/backups/accounting',
+    type: 'backup',
+    status: 'completed_with_warnings',
+    started_at: '2026-05-22T08:15:00Z',
+    completed_at: '2026-05-22T08:22:00Z',
+    triggered_by: 'manual',
+    execution_mode: 'local',
+  },
+  {
+    id: 303,
+    repository: '/backups/accounting',
+    repository_path: '/backups/accounting',
+    type: 'backup',
+    status: 'failed',
+    started_at: '2026-05-22T08:30:00Z',
+    completed_at: '2026-05-22T08:31:00Z',
+    triggered_by: 'manual',
+    execution_mode: 'local',
+    error_message: 'Archive finalization failed',
+  },
+  availabilityCheckJobs[0],
+]
+
 const meta = {
   title: 'Components/BackupJobsTable',
   component: BackupJobsTable,
@@ -99,6 +158,51 @@ export const TransportModes: Story = {
     actions: { breakLock: true },
     canBreakLocks: (job) => job.repository_id === 3,
     lockBreakingEnabled: true,
+  },
+  render: (args) => (
+    <Box sx={{ p: 3 }}>
+      <BackupJobsTable {...args} />
+    </Box>
+  ),
+}
+
+const prunedArchiveJobs: Job[] = [
+  {
+    id: 301,
+    repository: '/backups/server',
+    repository_path: '/backups/server',
+    type: 'backup',
+    status: 'completed',
+    started_at: '2026-05-20T02:00:00Z',
+    completed_at: '2026-05-20T02:06:00Z',
+    triggered_by: 'schedule',
+    scheduled_job_id: 8,
+    execution_mode: 'local',
+    archive_name: 'server-2026-05-20T02:00',
+    // the nightly prune removed this archive two days later
+    archive_pruned_at: '2026-05-22T03:00:00Z',
+  },
+  {
+    id: 302,
+    repository: '/backups/server',
+    repository_path: '/backups/server',
+    type: 'backup',
+    status: 'completed',
+    started_at: '2026-05-22T02:00:00Z',
+    completed_at: '2026-05-22T02:05:00Z',
+    triggered_by: 'schedule',
+    scheduled_job_id: 8,
+    execution_mode: 'local',
+    archive_name: 'server-2026-05-22T02:00',
+  },
+]
+
+/** A run whose archive was pruned keeps its row; "View Archive" stays but is disabled. */
+export const PrunedArchive: Story = {
+  args: {
+    jobs: prunedArchiveJobs,
+    showTriggerColumn: true,
+    actions: { viewArchive: true },
   },
   render: (args) => (
     <Box sx={{ p: 3 }}>
@@ -143,4 +247,264 @@ export const NonRetryableDestructiveJob: Story = {
       <BackupJobsTable {...args} />
     </Box>
   ),
+}
+
+export const AvailabilityCheckSkipped: Story = {
+  args: {
+    jobs: availabilityCheckJobs,
+    showTypeColumn: true,
+    showTriggerColumn: true,
+    actions: { runNow: true, delete: true },
+    onRunNow: () => {},
+    canDeleteJobs: true,
+  },
+  render: (args) => (
+    <Box sx={{ p: 3 }}>
+      <BackupJobsTable {...args} />
+    </Box>
+  ),
+}
+
+export const StatusComparison: Story = {
+  args: {
+    jobs: statusComparisonJobs,
+    showTypeColumn: true,
+    showTriggerColumn: true,
+  },
+  render: (args) => (
+    <Box sx={{ p: 3 }}>
+      <BackupJobsTable {...args} />
+    </Box>
+  ),
+}
+
+// A run whose follow-up chain rides under the row, which is where DataTable's
+// sub-row hook is used: a desktop table row and a mobile card both mount it.
+const runWithFollowups: Job[] = [
+  {
+    id: 301,
+    repository_id: 4,
+    repository: '/backups/nas',
+    repository_path: '/backups/nas',
+    type: 'backup',
+    kind: 'backup',
+    category: 'backup',
+    trigger: 'plan',
+    status: 'completed',
+    started_at: '2026-09-05T02:00:00Z',
+    completed_at: '2026-09-05T02:12:00Z',
+    triggered_by: 'backup_plan',
+    execution_mode: 'local',
+    followups: [
+      {
+        id: 302,
+        type: 'operation',
+        kind: 'archive_sync',
+        status: 'completed',
+        trigger: 'followup',
+        depends_on_id: 301,
+      },
+      {
+        id: 303,
+        type: 'operation',
+        kind: 'history_merge',
+        status: 'completed',
+        trigger: 'followup',
+        depends_on_id: 302,
+      },
+      {
+        id: 304,
+        type: 'operation',
+        kind: 'history_index',
+        status: 'running',
+        trigger: 'followup',
+        depends_on_id: 303,
+        progress_current: 14,
+        progress_total: 38,
+      },
+    ],
+  },
+  {
+    id: 305,
+    repository_id: 4,
+    repository: '/backups/nas',
+    repository_path: '/backups/nas',
+    type: 'backup',
+    kind: 'backup',
+    category: 'backup',
+    trigger: 'plan',
+    status: 'completed',
+    started_at: '2026-09-05T01:00:00Z',
+    completed_at: '2026-09-05T01:02:12Z',
+    triggered_by: 'backup_plan',
+    execution_mode: 'local',
+    // A backup that ran an inline prune and compact: each stage fans out
+    // its own refresh chain, so the same step names recur per stage.
+    followups: [
+      {
+        id: 306,
+        type: 'operation',
+        kind: 'prune',
+        status: 'completed',
+        trigger: 'manual',
+        depends_on_id: 305,
+        started_at: '2026-09-05T01:02:09Z',
+        completed_at: '2026-09-05T01:02:12Z',
+      },
+      {
+        id: 307,
+        type: 'operation',
+        kind: 'archive_sync',
+        status: 'completed',
+        trigger: 'followup',
+        depends_on_id: 305,
+        started_at: '2026-09-05T01:02:15Z',
+        completed_at: '2026-09-05T01:02:16Z',
+      },
+      {
+        id: 308,
+        type: 'operation',
+        kind: 'history_merge',
+        status: 'completed',
+        trigger: 'followup',
+        depends_on_id: 307,
+        started_at: '2026-09-05T01:02:16Z',
+        completed_at: '2026-09-05T01:02:16Z',
+      },
+      {
+        id: 309,
+        type: 'operation',
+        kind: 'history_index',
+        status: 'completed',
+        trigger: 'followup',
+        depends_on_id: 308,
+        started_at: '2026-09-05T01:02:16Z',
+        completed_at: '2026-09-05T01:02:17Z',
+      },
+      {
+        id: 310,
+        type: 'operation',
+        kind: 'stats',
+        status: 'completed',
+        trigger: 'followup',
+        depends_on_id: 309,
+        started_at: '2026-09-05T01:02:17Z',
+        completed_at: '2026-09-05T01:02:17Z',
+      },
+      {
+        id: 311,
+        type: 'operation',
+        kind: 'archive_sync',
+        status: 'completed',
+        trigger: 'followup',
+        depends_on_id: 306,
+        started_at: '2026-09-05T01:02:15Z',
+        completed_at: '2026-09-05T01:02:16Z',
+      },
+      {
+        id: 312,
+        type: 'operation',
+        kind: 'history_merge',
+        status: 'completed',
+        trigger: 'followup',
+        depends_on_id: 311,
+        started_at: '2026-09-05T01:02:17Z',
+        completed_at: '2026-09-05T01:02:17Z',
+      },
+      {
+        id: 313,
+        type: 'operation',
+        kind: 'stats',
+        status: 'completed',
+        trigger: 'followup',
+        depends_on_id: 312,
+        started_at: '2026-09-05T01:02:17Z',
+        completed_at: '2026-09-05T01:02:17Z',
+      },
+      {
+        id: 314,
+        type: 'operation',
+        kind: 'compact',
+        status: 'completed',
+        trigger: 'manual',
+        depends_on_id: 305,
+        started_at: '2026-09-05T01:02:12Z',
+        completed_at: '2026-09-05T01:02:15Z',
+      },
+      {
+        id: 315,
+        type: 'operation',
+        kind: 'stats',
+        status: 'completed',
+        trigger: 'followup',
+        depends_on_id: 314,
+        started_at: '2026-09-05T01:02:17Z',
+        completed_at: '2026-09-05T01:02:17Z',
+      },
+    ],
+  },
+]
+
+export const RunWithFollowups: Story = {
+  args: {
+    jobs: runWithFollowups,
+    showTypeColumn: true,
+    showTriggerColumn: true,
+  },
+  render: (args) => (
+    <Box sx={{ p: 3 }}>
+      <BackupJobsTable {...args} />
+    </Box>
+  ),
+}
+
+// The delete request never answers, so the row stays in its waiting state.
+function PendingDeleteTable(props: ComponentProps<typeof BackupJobsTable>) {
+  useEffect(() => {
+    const mock = new MockAdapter(api, { onNoMatch: 'passthrough' })
+    mock.onDelete(/\/activity\/backup\/\d+$/).reply(() => new Promise(() => {}))
+    return () => {
+      mock.restore()
+    }
+  }, [])
+  return (
+    <Box sx={{ p: 3 }}>
+      <BackupJobsTable {...props} />
+    </Box>
+  )
+}
+
+const waitFor = async <T,>(what: string, find: () => T | null | undefined): Promise<T> => {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const found = find()
+    if (found) return found
+    await new Promise((resolve) => window.setTimeout(resolve, 20))
+  }
+  throw new Error(`${what} did not appear`)
+}
+
+/** While a row's delete is out, its Delete is disabled and says it is deleting. */
+export const DeleteInProgress: Story = {
+  args: {
+    jobs: jobs.filter((job) => job.status !== 'running'),
+    showTypeColumn: true,
+    actions: { delete: true },
+    canDeleteJobs: true,
+  },
+  render: (args) => <PendingDeleteTable {...args} />,
+  play: async ({ canvasElement }) => {
+    const remove = await waitFor('Delete button', () =>
+      canvasElement.querySelector<HTMLButtonElement>(
+        `button[aria-label="${i18n.t('backupJobsTable.actions.delete')}"]`
+      )
+    )
+    remove.click()
+    // The confirmation dialog renders in a portal, outside the canvas.
+    const confirm = await waitFor('Delete confirmation', () =>
+      Array.from(document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')).find(
+        (button) => button.textContent === i18n.t('dialogs.deleteJob.confirm')
+      )
+    )
+    confirm.click()
+  },
 }

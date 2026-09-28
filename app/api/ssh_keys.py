@@ -7,7 +7,9 @@ import math
 import structlog
 import os
 import subprocess
+import sys
 import asyncio
+from pathlib import Path
 import tempfile
 import time
 
@@ -17,17 +19,35 @@ from app.database.models import (
     SSHKey,
     SSHConnection,
     Repository,
-    BackupJob,
-    RestoreJob,
+    OperationBackupDetails,
+    OperationRestoreDetails,
     ScheduledJob,
 )
 from app.core.authorization import authorize_request
+from app.services.storage_usage import format_bytes
 from app.core.security import get_current_user, encrypt_secret, decrypt_secret
 from app.config import settings
+from app.utils.ssh_host_keys import (
+    HOST_KEY_STATUS_UNKNOWN,
+    HostKeyScanError,
+    describe_host_key_status,
+    forget_known_hosts_file,
+    host_key_ssh_opts,
+    key_fingerprint,
+    pin_host_key,
+    scan_host_key_async,
+    sort_host_key_lines,
+)
 from app.utils.datetime_utils import serialize_datetime
 from app.utils.ssh_host_validation import normalize_ssh_host
 from app.utils.ssh_utils import ssh_key_auth_args, write_ssh_key_to_tempfile
 import hashlib
+
+# Located relative to this package rather than a fixed /app/... path so the
+# deploy step also works when the app is installed somewhere else (LXC).
+DEPLOY_SSH_KEY_SCRIPT = (
+    Path(__file__).resolve().parents[1] / "scripts" / "deploy_ssh_key.py"
+)
 
 logger = structlog.get_logger()
 router = APIRouter(tags=["ssh-keys"], dependencies=[Depends(authorize_request)])
@@ -57,15 +77,6 @@ def _is_ssh_dns_resolution_error(error_msg: str) -> bool:
     )
 
 
-def format_bytes(bytes_size: int) -> str:
-    """Format bytes to human readable string (e.g., '1.23 GB')"""
-    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
-        if bytes_size < 1024.0:
-            return f"{bytes_size:.2f} {unit}"
-        bytes_size /= 1024.0
-    return f"{bytes_size:.2f} EB"
-
-
 async def _run_df_command(
     connection: SSHConnection, temp_key_file: str, check_path: str, use_locale: bool
 ) -> Optional[Dict[str, Any]]:
@@ -78,10 +89,7 @@ async def _run_df_command(
     df_cmd = [
         "ssh",
         *ssh_key_auth_args(temp_key_file),
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
+        *host_key_ssh_opts(connection),
         "-o",
         "LogLevel=ERROR",
         "-o",
@@ -92,8 +100,12 @@ async def _run_df_command(
         df_command,
     ]
 
+    # Closed stdin: a forced `borg serve` key would otherwise hold this open.
     process = await asyncio.create_subprocess_exec(
-        *df_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        *df_cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
 
@@ -529,12 +541,6 @@ async def create_ssh_key(
         )
 
 
-class SSHKeyGenerate(BaseModel):
-    name: str
-    key_type: str = "rsa"
-    description: Optional[str] = None
-
-
 class SSHKeyImport(BaseModel):
     name: str
     private_key_path: str
@@ -619,7 +625,7 @@ async def generate_ssh_key(
         # Deploy SSH key immediately to filesystem
         try:
             deploy_result = subprocess.run(
-                ["python3", "/app/app/scripts/deploy_ssh_key.py"],
+                [sys.executable, str(DEPLOY_SSH_KEY_SCRIPT)],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -794,17 +800,18 @@ async def import_ssh_key(
             user=current_user.username,
         )
 
-        # Deploy SSH key to filesystem (this will write to /home/borg/.ssh)
+        # Deploy SSH key to filesystem (writes to settings.ssh_home_dir)
         try:
             deploy_result = subprocess.run(
-                ["python3", "/app/app/scripts/deploy_ssh_key.py"],
+                [sys.executable, str(DEPLOY_SSH_KEY_SCRIPT)],
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
             if deploy_result.returncode == 0:
                 logger.info(
-                    "Imported SSH key deployed to /home/borg/.ssh",
+                    "Imported SSH key deployed to filesystem",
+                    ssh_home_dir=settings.ssh_home_dir,
                     stdout=deploy_result.stdout,
                 )
             else:
@@ -1132,10 +1139,13 @@ async def get_ssh_connections(
                     "ssh_path_prefix": conn.ssh_path_prefix,
                     "mount_point": conn.mount_point,
                     "status": conn.status,
+                    "shell_restricted": bool(conn.shell_restricted),
                     "last_test": serialize_datetime(conn.last_test),
                     "last_success": serialize_datetime(conn.last_success),
                     "error_message": conn.error_message,
                     "storage": storage,
+                    "host_key_verified": bool(conn.known_host_key),
+                    "host_key_fingerprint": key_fingerprint(conn.known_host_key),
                     "created_at": serialize_datetime(conn.created_at),
                 }
             )
@@ -1173,6 +1183,11 @@ def _ssh_connect_timeout(timeout_seconds: float) -> str:
     return str(max(1, math.ceil(timeout_seconds)))
 
 
+# ssh(1) exits 255 for its own errors; otherwise it returns the remote
+# command's exit status, which means the key authenticated.
+SSH_CLIENT_FAILURE_EXIT_CODE = 255
+
+
 def _ssh_command_base(
     connection: SSHConnection, key_file_path: str, timeout_seconds: float
 ) -> list[str]:
@@ -1180,10 +1195,7 @@ def _ssh_command_base(
         "ssh",
         "-i",
         key_file_path,
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
+        *host_key_ssh_opts(connection),
         "-o",
         "LogLevel=ERROR",
         "-o",
@@ -1311,8 +1323,12 @@ async def _run_ssh_latency_probe(
         )
 
     elapsed = _elapsed_ms(started_at)
-    if return_code == 0:
+    if return_code != SSH_CLIENT_FAILURE_EXIT_CODE:
+        # The session was established; a refused `pwd` (restricted shell or
+        # forced-command key) still measures the round trip.
         result: dict[str, Any] = {"status": "success", "elapsed_ms": elapsed}
+        if return_code != 0:
+            result["restricted"] = True
         output = stdout.decode(errors="replace").strip()
         if output:
             result["output"] = output
@@ -1707,6 +1723,14 @@ async def test_ssh_connection(
             connection.status = "connected"
             connection.last_success = datetime.utcnow()
             connection.error_message = None
+            connection.shell_restricted = bool(test_result.get("restricted"))
+            if connection.shell_restricted:
+                # df cannot run here any more; drop numbers we can no longer refresh.
+                connection.storage_total = None
+                connection.storage_used = None
+                connection.storage_available = None
+                connection.storage_percent_used = None
+                connection.last_storage_check = None
         else:
             connection.status = "failed"
             connection.error_message = test_result.get(
@@ -1718,7 +1742,7 @@ async def test_ssh_connection(
 
         return {
             "success": test_result["success"],
-            "message": "backend.success.ssh.connectionTestSuccess"
+            "message": test_result["message"]
             if test_result["success"]
             else "backend.success.ssh.connectionTestFailed",
             "connection": {
@@ -1727,6 +1751,7 @@ async def test_ssh_connection(
                 "username": connection.username,
                 "port": connection.port,
                 "status": connection.status,
+                "shell_restricted": bool(connection.shell_restricted),
                 "error_message": connection.error_message,
             },
         }
@@ -1989,6 +2014,14 @@ async def test_existing_connection(
             connection.status = "connected"
             connection.last_success = datetime.utcnow()
             connection.error_message = None
+            connection.shell_restricted = bool(test_result.get("restricted"))
+            if connection.shell_restricted:
+                # df cannot run here any more; drop numbers we can no longer refresh.
+                connection.storage_total = None
+                connection.storage_used = None
+                connection.storage_available = None
+                connection.storage_percent_used = None
+                connection.last_storage_check = None
             logger.info(
                 "SSH connection test successful",
                 connection_id=connection_id,
@@ -2011,7 +2044,7 @@ async def test_existing_connection(
 
         return {
             "success": test_result["success"],
-            "message": "backend.success.ssh.connectionTestSuccess"
+            "message": test_result["message"]
             if test_result["success"]
             else "backend.success.ssh.connectionTestFailed",
             "status": connection.status,
@@ -2031,6 +2064,173 @@ async def test_existing_connection(
                 "params": {"error": str(e)},
             },
         )
+
+
+def _host_key_response(connection, observed: str | None) -> Dict[str, Any]:
+    """Shape one connection's host-key state for the UI."""
+    return {
+        "connection_id": connection.id,
+        "host": connection.host,
+        "port": connection.port,
+        "status": describe_host_key_status(connection, observed),
+        "trusted_fingerprint": key_fingerprint(connection.known_host_key),
+        "observed_fingerprint": key_fingerprint(observed),
+        "observed_key": observed,
+    }
+
+
+@router.get("/connections/{connection_id}/host-key")
+async def get_connection_host_key(
+    connection_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Report what host key a connection trusts and what the host offers now."""
+    connection = (
+        db.query(SSHConnection).filter(SSHConnection.id == connection_id).first()
+    )
+    if not connection:
+        raise HTTPException(
+            status_code=404,
+            detail={"key": "backend.errors.ssh.sshConnectionNotFound"},
+        )
+
+    try:
+        observed = await scan_host_key_async(connection.host, connection.port or 22)
+    except HostKeyScanError as exc:
+        logger.warning(
+            "Could not read the host key of an SSH connection",
+            connection_id=connection_id,
+            host=connection.host,
+            error=str(exc),
+        )
+        observed = None
+
+    return _host_key_response(connection, observed)
+
+
+class HostKeyTrustRequest(BaseModel):
+    """The key the user confirmed in the dialog.
+
+    Required: without it there is nothing to compare a fresh scan against, and
+    "trust whatever answers right now" is the behaviour this feature exists to
+    remove.
+    """
+
+    key: str = Field(min_length=1)
+
+
+@router.post("/connections/{connection_id}/host-key/trust")
+async def trust_connection_host_key(
+    connection_id: int,
+    payload: HostKeyTrustRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Trust the host key the user just confirmed.
+
+    The key is always re-read from the host and the confirmed key must still
+    match, so one that changed between showing the dialog and pressing the
+    button is refused rather than pinned.
+    """
+    connection = (
+        db.query(SSHConnection).filter(SSHConnection.id == connection_id).first()
+    )
+    if not connection:
+        raise HTTPException(
+            status_code=404,
+            detail={"key": "backend.errors.ssh.sshConnectionNotFound"},
+        )
+
+    try:
+        observed = await scan_host_key_async(connection.host, connection.port or 22)
+    except HostKeyScanError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "key": "backend.errors.ssh.failedReadHostKey",
+                "params": {"error": str(exc)},
+            },
+        )
+
+    # Compare the keys as a set, not as text. A host offering several key
+    # types is the normal case, and the confirmed blob and the fresh scan only
+    # have to describe the same keys, not the same string.
+    if set(sort_host_key_lines(payload.key.splitlines())) != set(
+        sort_host_key_lines(observed.splitlines())
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"key": "backend.errors.ssh.hostKeyChangedWhileConfirming"},
+        )
+
+    try:
+        pin_host_key(connection, db, observed)
+    except Exception as exc:
+        logger.error(
+            "Failed to store a trusted host key",
+            connection_id=connection_id,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "key": "backend.errors.ssh.failedStoreHostKey",
+                "params": {"error": str(exc)},
+            },
+        )
+    db.refresh(connection)
+
+    logger.info(
+        "Trusted the host key of an SSH connection",
+        connection_id=connection_id,
+        host=connection.host,
+        fingerprint=key_fingerprint(observed),
+    )
+
+    return {
+        "success": True,
+        "message": "backend.success.ssh.hostKeyTrusted",
+        **_host_key_response(connection, observed),
+    }
+
+
+@router.delete("/connections/{connection_id}/host-key")
+async def forget_connection_host_key(
+    connection_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Forget a pinned host key so the next connection has to verify again."""
+    connection = (
+        db.query(SSHConnection).filter(SSHConnection.id == connection_id).first()
+    )
+    if not connection:
+        raise HTTPException(
+            status_code=404,
+            detail={"key": "backend.errors.ssh.sshConnectionNotFound"},
+        )
+
+    connection.known_host_key = None
+    # Forgetting means the user wants to verify again, so a connection old
+    # enough to pin silently must not do that on its next use either.
+    connection.host_key_trust_on_first_use = False
+    connection.updated_at = datetime.utcnow()
+    db.commit()
+    forget_known_hosts_file(connection)
+
+    logger.info(
+        "Forgot the pinned host key of an SSH connection",
+        connection_id=connection_id,
+        host=connection.host,
+    )
+
+    return {
+        "success": True,
+        "message": "backend.success.ssh.hostKeyForgotten",
+        "connection_id": connection_id,
+        "status": HOST_KEY_STATUS_UNKNOWN,
+    }
 
 
 @router.post("/connections/{connection_id}/diagnostics")
@@ -2200,11 +2400,11 @@ async def delete_ssh_connection(
         db.query(Repository).filter(
             Repository.source_ssh_connection_id == connection_id
         ).update({"source_ssh_connection_id": None}, synchronize_session=False)
-        db.query(BackupJob).filter(
-            BackupJob.source_ssh_connection_id == connection_id
+        db.query(OperationBackupDetails).filter(
+            OperationBackupDetails.source_ssh_connection_id == connection_id
         ).update({"source_ssh_connection_id": None}, synchronize_session=False)
-        db.query(RestoreJob).filter(
-            RestoreJob.destination_connection_id == connection_id
+        db.query(OperationRestoreDetails).filter(
+            OperationRestoreDetails.destination_connection_id == connection_id
         ).update({"destination_connection_id": None}, synchronize_session=False)
         db.query(ScheduledJob).filter(
             ScheduledJob.source_ssh_connection_id == connection_id
@@ -2407,7 +2607,7 @@ async def delete_ssh_key(
 
         # Remove key files from filesystem
         try:
-            ssh_dir = os.path.join(settings.ssh_keys_dir or "/home/borg/.ssh")
+            ssh_dir = settings.ssh_home_dir
             private_key_path = os.path.join(ssh_dir, f"id_{key_type}")
             public_key_path = os.path.join(ssh_dir, f"id_{key_type}.pub")
 
@@ -2595,8 +2795,7 @@ async def deploy_ssh_key_with_copy_id(
             [
                 "-i",
                 key_file_path,
-                "-o",
-                "StrictHostKeyChecking=no",
+                *host_key_ssh_opts(None),
                 "-o",
                 "ConnectTimeout=10",
                 "-p",
@@ -2766,10 +2965,7 @@ async def test_ssh_key_connection(
             "ssh",
             "-i",
             key_file_path,
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
+            *host_key_ssh_opts(None),
             "-o",
             "LogLevel=ERROR",
             "-o",
@@ -2800,8 +2996,14 @@ async def test_ssh_key_connection(
         )
 
         try:
+            # stdin must be closed: a key forced to `command="borg serve ..."`
+            # runs borg serve for this probe too, and borg serve waits on
+            # stdin until EOF.
             process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
 
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
@@ -2820,21 +3022,34 @@ async def test_ssh_key_connection(
                     "output": stdout.decode().strip(),
                     "key_file": key_file_path,
                 }
+            elif process.returncode != SSH_CLIENT_FAILURE_EXIT_CODE:
+                # ssh itself failed (auth, DNS, refused, host key) only on 255.
+                # Any other status is the remote side refusing `pwd`: a
+                # restricted shell (Hetzner, rsync.net) or a forced-command key
+                # that only allows `borg serve`. The key authenticated, so the
+                # connection is fine for Borg; browsing and storage info are not.
+                logger.info(
+                    "ssh_connection_test_successful_restricted",
+                    host=host,
+                    username=username,
+                    port=port,
+                    return_code=process.returncode,
+                    stderr=stderr.decode(errors="replace")[:500] if stderr else None,
+                )
+                return {
+                    "success": True,
+                    "restricted": True,
+                    "message": "backend.success.ssh.connectionTestSuccessRestricted",
+                    "output": stdout.decode(errors="replace").strip(),
+                    "key_file": key_file_path,
+                }
             else:
                 stdout_str = stdout.decode() if stdout else ""
                 stderr_str = stderr.decode() if stderr else ""
                 error_msg = stderr_str or stdout_str or "SSH connection failed"
 
                 # Parse common errors with helpful hints
-                if (
-                    "Command not found" in error_msg
-                    or "Command not found" in stdout_str
-                ):
-                    error_summary = (
-                        f"SSH connection works but remote shell is restricted"
-                    )
-                    helpful_hint = "Server uses restricted shell (e.g., Hetzner Storage Box). Connection is valid for borg/rsync/sftp operations."
-                elif _is_ssh_dns_resolution_error(error_msg):
+                if _is_ssh_dns_resolution_error(error_msg):
                     error_summary = f"Host did not resolve: {host}"
                     helpful_hint = "Check the saved host value, DNS records/resolvers, provider sub-account existence, and container/runtime DNS."
                 elif "Connection refused" in error_msg:

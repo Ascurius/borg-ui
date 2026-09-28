@@ -18,6 +18,7 @@ export const FEATURES = {
   container_backups: 'pro',
   backup_reports: 'pro',
   alerting_monitoring: 'pro',
+  archive_history: 'pro',
   multi_user: 'community',
   extra_users: 'pro',
   rbac: 'enterprise',
@@ -31,10 +32,11 @@ export const PLAN_LABEL: Record<Plan, string> = {
   enterprise: 'Enterprise',
 }
 
-export const PLAN_COLOR: Record<Plan, string> = {
-  community: '#64748b',
-  pro: '#6366f1',
-  enterprise: '#f59e0b',
+/** The tier directly above the current plan, or null on the top tier. */
+export function nextPlanAbove(plan: Plan): 'pro' | 'enterprise' | null {
+  if (plan === 'community') return 'pro'
+  if (plan === 'pro') return 'enterprise'
+  return null
 }
 
 export function planIncludes(current: Plan, required: Plan): boolean {

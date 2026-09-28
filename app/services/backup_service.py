@@ -9,15 +9,25 @@ from datetime import datetime
 from pathlib import Path
 import structlog
 from sqlalchemy.orm import Session
-from app.database.models import BackupJob, Repository, RepositoryScript, SystemSettings
+from app.services.storage_usage import format_bytes
+from app.database.models import Repository, RepositoryScript, SystemSettings
 from app.database.database import SessionLocal
 from app.config import settings
 from app.core.borg_router import BorgRouter
-from app.core.borg_errors import format_error_message, is_lock_error
+from app.core.borg_errors import (
+    format_error_message,
+    is_borg_warning_exit_code,
+    is_lock_error,
+)
 from app.services.notification_service import notification_service
 from app.services.script_executor import execute_script
 from app.services.script_library_executor import ScriptLibraryExecutor
 from app.services.mqtt_service import mqtt_service
+from app.services.mount_service import stable_sshfs_temp_root
+from app.services.operations.backup_facade import (
+    refresh_backup_job,
+    resolve_backup_job,
+)
 from app.services.rclone_repository_service import rclone_repository_service
 from app.services.restore_check_canary import (
     ensure_restore_canary,
@@ -28,6 +38,7 @@ from app.services.filesystem_snapshot_service import (
     PreparedFilesystemSnapshot,
     build_filesystem_snapshot_plans,
 )
+from app.utils.fs import remove_tree_without_crossing_mounts
 from app.utils.ssh_paths import resolve_sshfs_source_path
 from app.utils.source_locations import (
     decode_source_locations,
@@ -37,6 +48,7 @@ from app.utils.borg_env import (
     build_repository_borg_env,
     cleanup_temp_key_file,
     setup_borg_env,
+    with_lock_wait,
 )
 from app.services.repository_command_lock import (
     acquire_repository_command_lock,
@@ -47,25 +59,20 @@ from app.utils.ssh_utils import (
     resolve_ssh_key_file_by_id,
 )  # Backward-compatible patch target for tests
 
+from app.services.process_cancel import (
+    terminate_process,
+    terminate_tracked_process,
+)
+
 logger = structlog.get_logger()
 
 REMOTE_EXECUTION_MODES = {"remote_ssh", "remote_direct"}
 
 
-def _uses_remote_execution(job: BackupJob) -> bool:
+def _uses_remote_execution(job) -> bool:
     return (job.execution_mode or "").strip().lower() in REMOTE_EXECUTION_MODES or (
         job.route_strategy or ""
     ).strip().lower() == "remote_direct"
-
-
-def _stable_sshfs_temp_root(repository_id: int | None) -> str | None:
-    if repository_id is None:
-        return None
-    return os.path.join(
-        settings.data_dir,
-        "sshfs-cache",
-        f"repository-{repository_id}",
-    )
 
 
 class BackupService:
@@ -303,7 +310,7 @@ class BackupService:
         self,
         db: Session,
         repo_record: Repository | None,
-        job: BackupJob,
+        job,
     ) -> bool:
         if (
             not repo_record
@@ -478,7 +485,7 @@ class BackupService:
     ):
         """Update backup job with final archive statistics"""
         try:
-            job = db.query(BackupJob).filter(BackupJob.id == job_id).first()
+            job = resolve_backup_job(db, job_id)
             if not job:
                 logger.warning("Job not found for stats update", job_id=job_id)
                 return
@@ -502,7 +509,7 @@ class BackupService:
                     repository_path, archive_name
                 )
                 info_process = await asyncio.create_subprocess_exec(
-                    *info_cmd,
+                    *with_lock_wait(info_cmd, env),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
@@ -561,109 +568,6 @@ class BackupService:
             logger.warning("Timeout while updating archive stats", job_id=job_id)
         except Exception as e:
             logger.error("Failed to update archive stats", job_id=job_id, error=str(e))
-
-    async def _update_repository_stats(
-        self, db: Session, repository_path: str, env: dict
-    ):
-        """Update repository statistics after a successful backup"""
-        try:
-            repo_record = (
-                db.query(Repository).filter(Repository.path == repository_path).first()
-            )
-            if not repo_record:
-                logger.warning(
-                    "Repository record not found for stats update",
-                    repository=repository_path,
-                )
-                return
-            router = BorgRouter(repo_record)
-
-            # Get timeouts from DB settings (with fallback to config)
-            timeouts = self._get_operation_timeouts(db)
-
-            async def _operation():
-                list_cmd = router.build_repo_list_command(repository_path)
-                list_process = await asyncio.create_subprocess_exec(
-                    *list_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                )
-                list_stdout, list_stderr = await asyncio.wait_for(
-                    list_process.communicate(), timeout=timeouts["list_timeout"]
-                )
-
-                if list_process.returncode == 0:
-                    try:
-                        archives_data = json.loads(list_stdout.decode())
-                        archive_count = len(archives_data.get("archives", []))
-                        repo_record.archive_count = archive_count
-                        logger.info(
-                            "Updated archive count",
-                            repository=repository_path,
-                            count=archive_count,
-                        )
-                    except json.JSONDecodeError as e:
-                        logger.warning("Failed to parse borg list output", error=str(e))
-
-                info_cmd = router.build_repo_info_command(repository_path)
-                info_process = await asyncio.create_subprocess_exec(
-                    *info_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                )
-                info_stdout, info_stderr = await asyncio.wait_for(
-                    info_process.communicate(), timeout=timeouts["info_timeout"]
-                )
-
-                if info_process.returncode == 0:
-                    try:
-                        info_data = json.loads(info_stdout.decode())
-                        cache_stats = info_data.get("cache", {}).get("stats", {})
-
-                        # Get total repository size (unique_size is deduplicated size)
-                        unique_size = cache_stats.get("unique_size", 0)
-                        if unique_size > 0:
-                            # Format size to human readable
-                            repo_record.total_size = self._format_bytes(unique_size)
-                            logger.info(
-                                "Updated repository size",
-                                repository=repository_path,
-                                size=repo_record.total_size,
-                            )
-                    except json.JSONDecodeError as e:
-                        logger.warning("Failed to parse borg info output", error=str(e))
-
-                # Update last_backup timestamp
-                repo_record.last_backup = datetime.utcnow()
-
-                db.commit()
-                logger.info("Repository statistics updated", repository=repository_path)
-
-                # Publish a full DB-derived MQTT snapshot immediately after stats changes.
-                mqtt_service.sync_state_with_db(db, reason="repository stats updated")
-
-            await run_serialized_repository_command(repo_record.id, _operation)
-
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Timeout while updating repository stats", repository=repository_path
-            )
-        except Exception as e:
-            logger.error(
-                "Failed to update repository stats",
-                repository=repository_path,
-                error=str(e),
-            )
-
-    def _format_bytes(self, bytes_value: int) -> str:
-        """Format bytes to human readable string"""
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if bytes_value < 1024.0:
-                return f"{bytes_value:.2f} {unit}"
-            bytes_value /= 1024.0
-        return f"{bytes_value:.2f} PB"
 
     async def _calculate_source_size(
         self,
@@ -823,7 +727,7 @@ class BackupService:
                 # Update the job record with the calculated size
                 db = SessionLocal()
                 try:
-                    job = db.query(BackupJob).filter(BackupJob.id == job_id).first()
+                    job = resolve_backup_job(db, job_id)
                     if job and job.status == "running":
                         job.total_expected_size = total_expected_size
                         db.commit()
@@ -831,7 +735,7 @@ class BackupService:
                             "Background size calculation completed and job updated",
                             job_id=job_id,
                             total_expected_size=total_expected_size,
-                            size_formatted=self._format_bytes(total_expected_size),
+                            size_formatted=format_bytes(total_expected_size),
                         )
                     else:
                         logger.info(
@@ -1175,8 +1079,8 @@ class BackupService:
 
         # Sort by mount point path length (longer = deeper = unmount first)
         # This correctly handles parent-child relationships:
-        # - /tmp/.../home/karanhudia/test-backup-source (longer)
-        # - /tmp/.../home/karanhudia (shorter, is parent, unmount last)
+        # - /tmp/.../home/alex/test-backup-source (longer)
+        # - /tmp/.../home/alex (shorter, is parent, unmount last)
         mount_infos.sort(key=lambda x: len(x[1].mount_point), reverse=True)
 
         logger.debug(
@@ -1226,12 +1130,7 @@ class BackupService:
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
         except asyncio.TimeoutError as exc:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
+            await terminate_process(process, job_id, f"filesystem snapshot {action}")
             raise RuntimeError(
                 f"Filesystem snapshot {action} timed out after 300 seconds"
             ) from exc
@@ -1318,14 +1217,13 @@ class BackupService:
         )
         cleanup_paths.sort(key=len, reverse=True)
         for cleanup_path in cleanup_paths:
-            try:
-                shutil.rmtree(cleanup_path, ignore_errors=True)
-            except Exception as e:
+            # A snapshot whose cleanup command failed is still its own
+            # filesystem under here; the guard leaves it alone.
+            if not remove_tree_without_crossing_mounts(cleanup_path):
                 logger.warning(
-                    "Filesystem snapshot staging cleanup failed",
+                    "Filesystem snapshot staging cleanup incomplete",
                     job_id=job_id,
                     path=cleanup_path,
-                    error=str(e),
                 )
 
     def _resolve_backup_command_paths(
@@ -1440,7 +1338,7 @@ class BackupService:
 
         try:
             # Get job
-            job = db.query(BackupJob).filter(BackupJob.id == job_id).first()
+            job = resolve_backup_job(db, job_id)
             if not job:
                 logger.error("Job not found", job_id=job_id)
                 return
@@ -1558,7 +1456,7 @@ class BackupService:
 
             # Store archive name on the job for later reference
             try:
-                job = db.query(BackupJob).filter(BackupJob.id == job_id).first()
+                job = resolve_backup_job(db, job_id)
                 if job:
                     job.archive_name = archive_name
                     db.commit()
@@ -1569,11 +1467,6 @@ class BackupService:
 
             # Set environment variables for borg
             env = setup_borg_env()
-
-            # Use modern exit codes for better error handling
-            # 0 = success, 1 = warning, 2+ = error
-            # Modern: 0 = success, 1-99 reserved, 3-99 = errors, 100-127 = warnings
-            env["BORG_EXIT_CODES"] = "modern"
 
             # Look up repository record to get passphrase and repository-specific settings.
             # Backup plans may override source/config while still targeting the repository.
@@ -1949,7 +1842,7 @@ class BackupService:
                     job_id=job_id,
                     repository_id=repo_record.id,
                 )
-                db.refresh(job)
+                refresh_backup_job(db, job)
                 if job.status == "cancelled":
                     logger.info(
                         "Backup cancelled while waiting for repository SSHFS cache lock",
@@ -1984,7 +1877,7 @@ class BackupService:
                 source_paths,
                 job_id,
                 source_connection_id=effective_source_ssh_connection_id,
-                stable_sshfs_temp_root=_stable_sshfs_temp_root(
+                stable_sshfs_temp_root=stable_sshfs_temp_root(
                     repo_record.id if repo_record else None
                 ),
             )
@@ -2002,6 +1895,19 @@ class BackupService:
                 mqtt_service.sync_state_with_db(
                     db, reason="backup failed: no valid source paths"
                 )
+
+                # This early return never reaches the shared failure epilogue,
+                # so the notification has to go out here.
+                try:
+                    await notification_service.send_backup_failure(
+                        db, repository, job.error_message, job_id, job_name
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to send backup failure notification",
+                        error=str(e),
+                    )
+
                 return
             logger.info(
                 "Source paths prepared",
@@ -2083,7 +1989,7 @@ class BackupService:
                     job_id=job_id,
                     repository_id=repo_record.id,
                 )
-                db.refresh(job)
+                refresh_backup_job(db, job)
                 if job.status == "cancelled":
                     logger.info(
                         "Backup cancelled while waiting for repository command lock",
@@ -2094,7 +2000,7 @@ class BackupService:
 
             # Execute command - NO LOG FILE FOR MAXIMUM PERFORMANCE
             process = await asyncio.create_subprocess_exec(
-                *cmd,
+                *with_lock_wait(cmd, env),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,  # Merge stderr into stdout
                 env=env,
@@ -2174,22 +2080,14 @@ class BackupService:
                         break
                     except asyncio.TimeoutError:
                         pass
-                    db.refresh(job)
+                    refresh_backup_job(db, job)
                     if job.status == "cancelled":
                         logger.info(
                             "Backup job cancelled (heartbeat), terminating process",
                             job_id=job_id,
                         )
                         cancelled = True
-                        process.terminate()
-                        try:
-                            await asyncio.wait_for(process.wait(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "Process didn't terminate, killing it", job_id=job_id
-                            )
-                            process.kill()
-                            await process.wait()
+                        await terminate_process(process, job_id, "backup")
                         break
 
             async def stream_logs():
@@ -2550,8 +2448,7 @@ class BackupService:
             except asyncio.CancelledError:
                 logger.info("Backup task cancelled", job_id=job_id)
                 cancelled = True
-                process.terminate()
-                await process.wait()
+                await terminate_process(process, job_id, "backup")
                 raise
 
             # Wait for process to complete if not already terminated
@@ -2635,8 +2532,6 @@ class BackupService:
                 await self._update_archive_stats(
                     db, job_id, repository, archive_name, env
                 )
-                # Update repository statistics after successful backup
-                await self._update_repository_stats(db, repository, env)
                 rclone_sync_ok = await self._sync_rclone_after_borg(
                     db, repo_record, job
                 )
@@ -2729,7 +2624,7 @@ class BackupService:
                             "Failed to send backup notification", error=str(e)
                         )
 
-            elif actual_returncode == 1 or (100 <= actual_returncode <= 127):
+            elif is_borg_warning_exit_code(actual_returncode):
                 # Warning (legacy exit code 1 or modern exit codes 100-127)
                 job.status = "completed_with_warnings"
                 job.progress = 100
@@ -2751,8 +2646,6 @@ class BackupService:
                 await self._update_archive_stats(
                     db, job_id, repository, archive_name, env
                 )
-                # Update repository statistics even with warnings
-                await self._update_repository_stats(db, repository, env)
                 await self._sync_rclone_after_borg(db, repo_record, job)
 
                 # Run post-backup hooks even with warnings (script library or inline)
@@ -3156,9 +3049,7 @@ class BackupService:
                 db.rollback()
                 retry_db = SessionLocal()
                 try:
-                    retry_job = (
-                        retry_db.query(BackupJob).filter(BackupJob.id == job_id).first()
-                    )
+                    retry_job = resolve_backup_job(retry_db, job_id)
                     if retry_job:
                         retry_job.status = "failed"
                         try:
@@ -3277,46 +3168,8 @@ class BackupService:
                 db.close()
 
     async def cancel_backup(self, job_id: int) -> bool:
-        """
-        Cancel a running backup job by terminating its process
-
-        Args:
-            job_id: The backup job ID to cancel
-
-        Returns:
-            True if the process was found and terminated, False otherwise
-        """
-        if job_id not in self.running_processes:
-            logger.warning("No running process found for job", job_id=job_id)
-            return False
-
-        process = self.running_processes[job_id]
-
-        try:
-            # Try to terminate the process gracefully first
-            process.terminate()
-            logger.info(
-                "Sent SIGTERM to backup process", job_id=job_id, pid=process.pid
-            )
-
-            # Wait up to 5 seconds for graceful termination
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5.0)
-                logger.info("Backup process terminated gracefully", job_id=job_id)
-            except asyncio.TimeoutError:
-                # Force kill if it doesn't terminate gracefully
-                process.kill()
-                logger.warning(
-                    "Force killed backup process (SIGKILL)",
-                    job_id=job_id,
-                    pid=process.pid,
-                )
-                await process.wait()
-
-            return True
-        except Exception as e:
-            logger.error("Failed to cancel backup process", job_id=job_id, error=str(e))
-            return False
+        """Cancel a running backup job by terminating its tracked process."""
+        return await terminate_tracked_process(self.running_processes, job_id, "backup")
 
 
 # Global instance

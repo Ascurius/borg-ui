@@ -6,61 +6,78 @@ import os
 import shlex
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import structlog
 from fastapi import HTTPException
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, joinedload
 
-from app.api.maintenance_jobs import create_started_maintenance_job
 from app.config import settings
 from app.core.borg_router import BorgRouter
 from app.core.security import decrypt_secret
 from app.database.database import SessionLocal
 from app.database.models import (
     AgentMachine,
-    BackupJob,
     BackupPlan,
     BackupPlanRepository,
     BackupPlanScript,
     BackupPlanRun,
     BackupPlanRunRetryLineage,
     BackupPlanRunRepository,
-    CheckJob,
-    CompactJob,
-    PruneJob,
+    Operation,
     Repository,
     Script,
     ScriptExecution,
     SSHConnection,
     SSHKey,
 )
-from app.services.backup_service import backup_service
+from app.services.operations.maintenance_start import (
+    fail_inline_maintenance,
+    failure_text,
+    finish_inline_maintenance,
+    start_inline_maintenance,
+)
 from app.services.backup_plan_policy import evaluate_backup_plan_access
 from app.services.backup_route_planner import (
     execution_mode_for_route,
     plan_repository_route,
 )
 from app.services.agent_job_dispatcher import dispatch_agent_job_best_effort
-from app.services.job_admission import OPERATION_BACKUP, ensure_repository_admission
+from app.services.job_admission import (
+    OPERATION_BACKUP,
+    PLAN_BACKUP_READ_WAIT_SECONDS,
+    READ_WORK_CANCELLED,
+    admit_repository_with_read_work_wait,
+)
 from app.services.repository_executor import (
-    cancel_agent_backup_job,
     is_agent_executor,
-    queue_agent_backup_job,
     queue_agent_script_job,
-    wait_for_agent_backup_job,
     wait_for_agent_script_job,
 )
 from app.services.upload_ratelimit_policies import resolve_scheduled_upload_ratelimit
+from app.services.notification_service import notification_service
 from app.services.script_executor import execute_script
 from app.services.template_service import get_system_variables
+from app.services.operations.backup_facade import (
+    create_backup_operation,
+    refresh_backup_job,
+    resolve_backup_job,
+    wait_out_backup_operation,
+)
+from app.services.operations.enqueue import wake_runner
+from app.services.operations.events import broadcast_operation_updated
+from app.services.operations.runner import operation_runner
+from app.services.operations.vocab import TERMINAL_STATUSES
 from app.utils.archive_names import build_archive_name
 from app.utils.script_params import SYSTEM_VARIABLE_PREFIX
+from app.utils.ssh_host_keys import host_key_ssh_opts
 from app.utils.ssh_utils import ssh_key_auth_args, write_ssh_key_to_tempfile
-from app.utils.source_locations import decode_source_locations
 from app.utils.schedule_time import calculate_next_cron_run, to_utc_naive
+from app.utils.source_locations import decode_source_locations
+from app.services.schedule_availability import source_locations_available
 
 logger = structlog.get_logger()
 
@@ -69,6 +86,14 @@ TERMINAL_PLAN_RUN_STATUSES = {
     "completed",
     "completed_with_warnings",
     "partial",
+    "failed",
+    "cancelled",
+}
+# A repository row nothing may reopen: its run is over, or `cancel_run`
+# closed it.
+TERMINAL_PLAN_RUN_REPOSITORY_STATUSES = {
+    "completed",
+    "completed_with_warnings",
     "failed",
     "cancelled",
 }
@@ -545,6 +570,67 @@ def _classify_agent_script_outcome(
     )
 
 
+def _update_children(
+    db: Session,
+    run_id: int,
+    values: dict,
+    *,
+    repository_id: Optional[int] = None,
+    from_statuses: tuple[str, ...] = ("pending",),
+) -> None:
+    """Move a run's repository rows on, in one statement, and only from the
+    statuses they are allowed to move from.
+
+    A cancellation can commit between a reader's look and its write: a plan
+    worker that decided to skip a repository must not then overwrite the
+    "cancelled" someone else already recorded. The WHERE clause is what makes
+    that safe, so this has to stay one UPDATE rather than a read and a write.
+    """
+    q = db.query(BackupPlanRunRepository).filter(
+        BackupPlanRunRepository.backup_plan_run_id == run_id,
+        BackupPlanRunRepository.status.in_(from_statuses),
+    )
+    if repository_id is not None:
+        q = q.filter(BackupPlanRunRepository.repository_id == repository_id)
+    q.update(values, synchronize_session=False)
+
+
+def _write_bookkeeping(
+    work: Callable[[Session], None], *, attempts: int = 4, delay: float = 0.5
+) -> None:
+    """Run one plan-run status write, waiting out a transiently locked database.
+
+    These writes happen while a run is recording what went wrong, often while
+    the index operations of other repositories hold the SQLite write lock.
+    Losing one costs more than the wait: the row's real reason is replaced by
+    "database is locked", and the repositories it was about to mark failed
+    stay at `pending` forever.
+
+    The whole read-and-mutate runs again on each attempt, in a session of its
+    own. Retrying the commit alone would do nothing: a rollback expires the
+    instances and discards their pending changes, so the second commit emits
+    no UPDATE and returns as if it had written.
+    """
+    for attempt in range(attempts):
+        db = SessionLocal()
+        try:
+            work(db)
+            db.commit()
+            return
+        except OperationalError as exc:
+            db.rollback()
+            if "database is locked" not in str(exc).lower() or attempt == attempts - 1:
+                raise
+            logger.warning(
+                "Plan run bookkeeping write locked, retrying",
+                attempt=attempt + 1,
+                error=str(exc),
+            )
+            time.sleep(delay * (attempt + 1))
+        finally:
+            db.close()
+
+
 def _http_detail_message(exc: HTTPException) -> Optional[str]:
     """A human-ish string from an HTTPException detail (which is usually a
     ``{"key": ..., "params": ...}`` dict) for logging/recording."""
@@ -574,7 +660,20 @@ def _remote_script_body(script: str, env: dict[str, str]) -> str:
 
 
 class BackupPlanExecutionService:
-    def dispatch_due_runs(self, db: Session, now: datetime) -> int:
+    @staticmethod
+    def _next_plan_run(plan: BackupPlan, now: datetime) -> Optional[datetime]:
+        """Return the next due time for either scheduling mode."""
+        if plan.schedule_mode == "availability":
+            return now + timedelta(minutes=plan.availability_check_interval_minutes)
+        if not plan.cron_expression:
+            return None
+        return calculate_next_cron_run(
+            plan.cron_expression,
+            base_time=now,
+            schedule_timezone=plan.timezone,
+        )
+
+    async def dispatch_due_runs(self, db: Session, now: datetime) -> int:
         now = to_utc_naive(now)
         due_plans = (
             db.query(BackupPlan)
@@ -596,6 +695,66 @@ class BackupPlanExecutionService:
         for plan in due_plans:
             if self.has_active_run(db, plan.id):
                 continue
+            if plan.schedule_mode == "availability":
+                last_success = (
+                    db.query(BackupPlanRun.completed_at)
+                    .filter(
+                        BackupPlanRun.backup_plan_id == plan.id,
+                        BackupPlanRun.status.in_(SUCCESS_BACKUP_STATUSES),
+                        BackupPlanRun.completed_at.isnot(None),
+                    )
+                    .order_by(BackupPlanRun.completed_at.desc())
+                    .first()
+                )
+                if last_success and plan.min_success_interval_minutes:
+                    allowed_at = to_utc_naive(last_success[0]) + timedelta(
+                        minutes=plan.min_success_interval_minutes
+                    )
+                    if now < allowed_at:
+                        plan.next_run = min(
+                            allowed_at,
+                            now
+                            + timedelta(
+                                minutes=plan.availability_check_interval_minutes
+                            ),
+                        )
+                        self._record_availability_skip(
+                            db,
+                            plan,
+                            now,
+                            reason="minimum_interval_not_elapsed",
+                            detail="Minimum interval after the last successful backup has not elapsed.",
+                        )
+                        db.commit()
+                        logger.info(
+                            "Availability schedule skipped: minimum success interval",
+                            backup_plan_id=plan.id,
+                        )
+                        continue
+                decision = await source_locations_available(
+                    db,
+                    decode_source_locations(plan.source_locations),
+                    fallback_source_type=plan.source_type,
+                    fallback_ssh_connection_id=plan.source_ssh_connection_id,
+                )
+                if not decision.available:
+                    plan.next_run = now + timedelta(
+                        minutes=plan.availability_check_interval_minutes
+                    )
+                    self._record_availability_skip(
+                        db,
+                        plan,
+                        now,
+                        reason="source_unavailable",
+                        detail=decision.reason or "The backup source is unavailable.",
+                    )
+                    db.commit()
+                    logger.info(
+                        "Availability schedule skipped: source unavailable",
+                        backup_plan_id=plan.id,
+                        reason=decision.reason,
+                    )
+                    continue
             access_decision = evaluate_backup_plan_access(db, plan)
             if not access_decision.allowed:
                 logger.warning(
@@ -606,29 +765,13 @@ class BackupPlanExecutionService:
                     current=access_decision.current.value,
                     reason=access_decision.reason,
                 )
-                plan.next_run = (
-                    calculate_next_cron_run(
-                        plan.cron_expression,
-                        base_time=now,
-                        schedule_timezone=plan.timezone,
-                    )
-                    if plan.cron_expression
-                    else None
-                )
+                plan.next_run = self._next_plan_run(plan, now)
                 db.commit()
                 continue
             try:
                 self.start_run(db, plan, trigger="schedule")
                 plan.last_run = now
-                plan.next_run = (
-                    calculate_next_cron_run(
-                        plan.cron_expression,
-                        base_time=now,
-                        schedule_timezone=plan.timezone,
-                    )
-                    if plan.cron_expression
-                    else None
-                )
+                plan.next_run = self._next_plan_run(plan, now)
                 db.commit()
                 dispatched += 1
             except Exception as exc:
@@ -639,6 +782,43 @@ class BackupPlanExecutionService:
                 )
                 db.rollback()
         return dispatched
+
+    @staticmethod
+    def _record_availability_skip(
+        db: Session,
+        plan: BackupPlan,
+        now: datetime,
+        *,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """Persist a neutral availability decision for the plan run history.
+
+        A skipped poll is useful operator evidence, but it must not look like a
+        failed backup or affect the successful-run interval calculation.
+        """
+        run = BackupPlanRun(
+            backup_plan_id=plan.id,
+            trigger="availability",
+            status="skipped",
+            started_at=now,
+            completed_at=now,
+            skip_reason=reason,
+            created_at=now,
+        )
+        db.add(run)
+        db.flush()
+        for link in plan.repositories:
+            if link.enabled:
+                db.add(
+                    BackupPlanRunRepository(
+                        backup_plan_run_id=run.id,
+                        repository_id=link.repository_id,
+                        status="skipped",
+                        started_at=now,
+                        completed_at=now,
+                    )
+                )
 
     def has_active_run(self, db: Session, plan_id: int) -> bool:
         return (
@@ -656,7 +836,7 @@ class BackupPlanExecutionService:
             db.query(BackupPlanRun)
             .options(
                 joinedload(BackupPlanRun.repositories).joinedload(
-                    BackupPlanRunRepository.backup_job
+                    BackupPlanRunRepository.backup_operation
                 )
             )
             .filter(BackupPlanRun.id == run_id)
@@ -682,34 +862,23 @@ class BackupPlanExecutionService:
         run.error_message = CANCELLED_MESSAGE
 
         for child in run.repositories:
-            if child.status in {
-                "completed",
-                "completed_with_warnings",
-                "failed",
-                "cancelled",
-            }:
+            if child.status in TERMINAL_PLAN_RUN_REPOSITORY_STATUSES:
                 continue
 
-            job = child.backup_job
-            if job and job.execution_mode == "agent":
-                cancel_agent_backup_job(db, job, now=now)
-                cancelled_backup_jobs += 1
-            elif job and job.status == "running":
-                process_killed = await backup_service.cancel_backup(job.id)
-                if process_killed:
-                    processes_terminated += 1
-                job.status = "cancelled"
-                job.completed_at = now
-                job.error_message = CANCELLED_MESSAGE
-                cancelled_backup_jobs += 1
-            elif job and job.maintenance_status in {"running_prune", "running_compact"}:
-                if await self._cancel_running_maintenance(db, job):
-                    processes_terminated += 1
-            elif job and job.status in {"pending"}:
-                job.status = "cancelled"
-                job.completed_at = now
-                job.error_message = CANCELLED_MESSAGE
-                cancelled_backup_jobs += 1
+            # Every child's backup is an operation. The runner owns the kill,
+            # so raise its flag and let the executor's watcher do the rest
+            # (spec 7.7); the plan's own waiter would only get there on its
+            # next poll, and not at all if this backend restarted.
+            if child.backup_operation_id:
+                job = resolve_backup_job(db, child.backup_operation_id)
+                if job is not None and job.status not in TERMINAL_STATUSES:
+                    was_running = job.status == "running"
+                    if (
+                        await operation_runner.request_cancel(child.backup_operation_id)
+                        and was_running
+                    ):
+                        processes_terminated += 1
+                    cancelled_backup_jobs += 1
 
             child.status = "cancelled"
             child.completed_at = now
@@ -723,76 +892,6 @@ class BackupPlanExecutionService:
             "processes_terminated": processes_terminated,
             "already_terminal": False,
         }
-
-    async def _cancel_running_maintenance(
-        self, db: Session, backup_job: BackupJob
-    ) -> bool:
-        repo = (
-            db.query(Repository)
-            .filter(
-                (Repository.id == backup_job.repository_id)
-                | (Repository.path == backup_job.repository)
-            )
-            .first()
-        )
-        if not repo:
-            return False
-
-        if backup_job.maintenance_status == "running_prune":
-            maintenance_job = (
-                db.query(PruneJob)
-                .filter(
-                    PruneJob.repository_id == repo.id,
-                    PruneJob.status == "running",
-                )
-                .order_by(PruneJob.id.desc())
-                .first()
-            )
-            if not maintenance_job:
-                return False
-            if getattr(repo, "borg_version", 1) == 2:
-                from app.services.v2.prune_service import prune_v2_service
-
-                process_killed = await prune_v2_service.cancel_prune(maintenance_job.id)
-            else:
-                from app.services.prune_service import prune_service
-
-                process_killed = await prune_service.cancel_prune(maintenance_job.id)
-            maintenance_job.status = "cancelled"
-            maintenance_job.completed_at = datetime.utcnow()
-            backup_job.maintenance_status = "prune_failed"
-            return process_killed
-
-        if backup_job.maintenance_status == "running_compact":
-            maintenance_job = (
-                db.query(CompactJob)
-                .filter(
-                    CompactJob.repository_id == repo.id,
-                    CompactJob.status == "running",
-                )
-                .order_by(CompactJob.id.desc())
-                .first()
-            )
-            if not maintenance_job:
-                return False
-            if getattr(repo, "borg_version", 1) == 2:
-                from app.services.v2.compact_service import compact_v2_service
-
-                process_killed = await compact_v2_service.cancel_compact(
-                    maintenance_job.id
-                )
-            else:
-                from app.services.compact_service import compact_service
-
-                process_killed = await compact_service.cancel_compact(
-                    maintenance_job.id
-                )
-            maintenance_job.status = "cancelled"
-            maintenance_job.completed_at = datetime.utcnow()
-            backup_job.maintenance_status = "compact_failed"
-            return process_killed
-
-        return False
 
     def start_run(self, db: Session, plan: BackupPlan, *, trigger: str) -> int:
         enabled_links = [
@@ -873,7 +972,12 @@ class BackupPlanExecutionService:
             ),
         )
         for child in source_children:
-            backup_status = child.backup_job.status if child.backup_job else None
+            child_backup = (
+                resolve_backup_job(db, child.backup_operation_id)
+                if child.backup_operation_id
+                else None
+            )
+            backup_status = child_backup.status if child_backup else None
             failed = child.status == "failed" or backup_status == "failed"
             if not failed or child.repository_id is None:
                 continue
@@ -961,7 +1065,9 @@ class BackupPlanExecutionService:
                 return
             if not pre_script_ok:
                 error_message = pre_script_error or "Plan pre-backup script failed"
-                self._mark_pending_repositories_failed(run_id, error_message)
+                await self._fail_pending_repositories_before_backup(
+                    run_id, context, error_message
+                )
                 raise ValueError(error_message)
             # A successful pre-backup hook can still carry a warning (agent rc==1);
             # keep it so it reaches the final run state alongside post-hook warnings.
@@ -977,7 +1083,9 @@ class BackupPlanExecutionService:
                 error_message = (
                     source_pre_error or "Database source pre-backup script failed"
                 )
-                self._mark_pending_repositories_failed(run_id, error_message)
+                await self._fail_pending_repositories_before_backup(
+                    run_id, context, error_message
+                )
                 raise ValueError(error_message)
 
             if context.repository_run_mode == "parallel":
@@ -1759,10 +1867,7 @@ class BackupPlanExecutionService:
             ssh_cmd = [
                 "ssh",
                 *ssh_key_auth_args(key_file_path),
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
+                *host_key_ssh_opts(source_connection, db),
                 "-o",
                 "ServerAliveInterval=60",
                 "-o",
@@ -1858,6 +1963,7 @@ class BackupPlanExecutionService:
         context: PlanRunContext,
         repository_context: RepositoryRunContext,
     ) -> str:
+        """Run one repository backup and record its terminal plan-run status."""
         db = SessionLocal()
         try:
             child = (
@@ -1881,29 +1987,27 @@ class BackupPlanExecutionService:
             if not route.supported:
                 raise ValueError(route.reason_key or "Unsupported backup route")
 
-            ensure_repository_admission(db, repo, OPERATION_BACKUP)
-
-            backup_job = BackupJob(
-                repository=repo.path,
-                repository_id=repo.id,
-                backup_plan_id=context.plan_id,
-                backup_plan_run_id=run_id,
-                status="pending",
-                route_strategy=route.strategy,
-                source_ssh_connection_id=(
-                    context.source_ssh_connection_id
-                    if context.source_type == "remote"
-                    else None
-                ),
-                created_at=datetime.utcnow(),
+            # Read work on the repository (an agent listing, a repository
+            # info, the history index's `repository.diff`) refuses a write
+            # at admission. Failing the repository for work that is about
+            # to finish turns a late backup into a failed one, so wait it
+            # out first, as the plan's prune and compact already do. The
+            # refusal still reaches the `except` below once the budget is
+            # spent.
+            admission = await admit_repository_with_read_work_wait(
+                db,
+                repo,
+                OPERATION_BACKUP,
+                timeout_seconds=PLAN_BACKUP_READ_WAIT_SECONDS,
+                transient_only=False,
+                is_cancelled=lambda: self._is_run_cancelled(run_id),
             )
-            db.add(backup_job)
-            db.flush()
-
-            child.backup_job_id = backup_job.id
-            child.status = "running"
-            child.started_at = datetime.utcnow()
-            db.commit()
+            if admission == READ_WORK_CANCELLED:
+                child.status = "cancelled"
+                child.completed_at = datetime.utcnow()
+                child.error_message = CANCELLED_MESSAGE
+                db.commit()
+                return "cancelled"
 
             archive_name = build_archive_name(
                 job_name=context.plan_name,
@@ -1916,59 +2020,91 @@ class BackupPlanExecutionService:
                 stable_series=getattr(repo, "borg_version", 1) == 2,
             )
 
-            if is_agent_executor(repo):
-                agent_job = queue_agent_backup_job(
-                    db,
-                    backup_job,
-                    repo,
-                    archive_name=archive_name,
-                    source_directories=context.source_directories,
-                    source_locations=context.source_locations,
-                    exclude_patterns=context.exclude_patterns,
-                    compression=repository_context.compression,
-                    custom_flags=repository_context.custom_flags,
-                    upload_ratelimit_kib=repository_context.upload_ratelimit_kib,
-                )
-                await dispatch_agent_job_best_effort(
-                    db,
-                    agent_job,
-                    source="backup_plan_run",
-                    run_id=run_id,
-                    backup_job_id=backup_job.id,
-                    repository_id=repo.id,
-                )
-                final_status = await wait_for_agent_backup_job(
-                    db,
-                    agent_job.id,
-                    backup_job.id,
-                    lambda: self._is_run_cancelled(run_id),
-                )
-                backup_job.route_strategy = route.strategy
-                db.commit()
-            else:
-                backup_job.execution_mode = execution_mode_for_route(route)
-                db.commit()
-                await backup_service.execute_backup(
-                    backup_job.id,
-                    repo.path,
-                    db,
-                    archive_name=archive_name,
-                    skip_hooks=not context.run_repository_scripts,
-                    source_directories=context.source_directories,
-                    source_ssh_connection_id=(
+            backup_job = create_backup_operation(
+                db,
+                repo,
+                trigger="plan",
+                executor="agent" if is_agent_executor(repo) else "server",
+                backup_plan_run_id=run_id,
+                params={
+                    "archive_name": archive_name,
+                    "skip_hooks": not context.run_repository_scripts,
+                    "source_directories": context.source_directories,
+                    "source_ssh_connection_id": (
                         context.source_ssh_connection_id
                         if context.source_type == "remote"
                         else None
                     ),
-                    source_locations=context.source_locations,
-                    exclude_patterns_override=context.exclude_patterns,
-                    compression_override=repository_context.compression,
-                    custom_flags_override=repository_context.custom_flags,
-                    upload_ratelimit_kib=repository_context.upload_ratelimit_kib,
-                )
+                    "source_locations": context.source_locations,
+                    "exclude_patterns_override": context.exclude_patterns,
+                    "compression_override": repository_context.compression,
+                    "custom_flags_override": repository_context.custom_flags,
+                    "upload_ratelimit_kib": repository_context.upload_ratelimit_kib,
+                },
+                commit=False,
+            )
+            if not is_agent_executor(repo):
+                backup_job.execution_mode = execution_mode_for_route(route)
+            backup_job.route_strategy = route.strategy
+            # The plan's source connection, which need not be the repository's.
+            backup_job.source_ssh_connection_id = (
+                context.source_ssh_connection_id
+                if context.source_type == "remote"
+                else None
+            )
 
-                db.refresh(backup_job)
-                final_status = backup_job.status or "failed"
+            # `cancel_run` may have closed this row while the backup was
+            # being prepared -- a window the read-work wait above can hold
+            # open for minutes. It closes a child it finds without a linked
+            # operation and has nothing to cancel, so claiming the row
+            # unconditionally would resurrect a cancelled repository and
+            # hand the runner a backup no one can stop. Claim it only while
+            # it is still open; the database re-checks the condition against
+            # whatever `cancel_run` committed.
+            claimed = (
+                db.query(BackupPlanRunRepository)
+                .filter(
+                    BackupPlanRunRepository.id == child.id,
+                    BackupPlanRunRepository.status.notin_(
+                        tuple(TERMINAL_PLAN_RUN_REPOSITORY_STATUSES)
+                    ),
+                )
+                .update(
+                    {
+                        BackupPlanRunRepository.backup_operation_id: backup_job.id,
+                        BackupPlanRunRepository.status: "running",
+                        BackupPlanRunRepository.started_at: datetime.utcnow(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if not claimed:
+                # The rollback takes the uncommitted backup operation with
+                # it, so the runner never sees it.
+                db.rollback()
+                logger.info(
+                    "Backup plan repository was cancelled while its backup "
+                    "was being prepared",
+                    run_id=run_id,
+                    repository_id=repository_context.repository_id,
+                )
+                return "cancelled"
+            # Read before the commit expires the row, so reaching the wait
+            # below needs no database read of its own.
+            operation_id = backup_job.id
+            db.commit()
+            wake_runner()
+
+            # A failed read of the operation is waited out, not taken for a
+            # failed backup; the run id names the plan in every line logged
+            # while waiting.
+            with structlog.contextvars.bound_contextvars(run_id=run_id):
+                final_status = await wait_out_backup_operation(
+                    operation_id,
+                    is_cancelled=lambda: self._is_run_cancelled(run_id),
+                )
+            refresh_backup_job(db, backup_job)
+
             if final_status in SUCCESS_BACKUP_STATUSES:
                 if self._is_run_cancelled(run_id):
                     child.status = "cancelled"
@@ -1995,23 +2131,104 @@ class BackupPlanExecutionService:
             db.commit()
             return final_status
         except Exception as exc:
+            # The failure is written through a session of its own. Whatever
+            # this one still holds (a flushed operation, a write lock) would
+            # make that write wait on this very task, so let it go first.
+            try:
+                db.rollback()
+            except Exception as rollback_error:
+                # A dead connection cannot roll back; dropping it releases
+                # the lock all the same, and the failure still gets recorded.
+                logger.warning(
+                    "Could not roll back the failed repository's session",
+                    run_id=run_id,
+                    repository_id=repository_context.repository_id,
+                    error=str(rollback_error),
+                )
+                db.invalidate()
             logger.error(
                 "Backup plan repository execution failed",
                 run_id=run_id,
                 repository_id=repository_context.repository_id,
                 error=str(exc),
             )
-            self._mark_repository_failed(
-                run_id, repository_context.repository_id, str(exc)
-            )
+            try:
+                error_message = failure_text(exc)
+                await self._notify_backup_failures(
+                    run_id,
+                    context,
+                    self._mark_repository_failed(
+                        run_id, repository_context.repository_id, error_message
+                    ),
+                    error_message,
+                )
+            except Exception as bookkeeping_error:
+                # The repository failed; recording that must not take the rest
+                # of the run with it, or one locked write turns "check is
+                # active on the repository" into "database is locked" and the
+                # repositories still to run never get their turn.
+                logger.error(
+                    "Could not record backup plan repository failure",
+                    run_id=run_id,
+                    repository_id=repository_context.repository_id,
+                    error=str(bookkeeping_error),
+                )
             return "failed"
         finally:
             db.close()
 
+    async def _run_inline_maintenance(
+        self,
+        db: Session,
+        backup_job: Any,
+        operation: Operation,
+        run_id: int,
+        step: Callable[[], Awaitable[Any]],
+    ) -> None:
+        """Drive one inline maintenance operation to a terminal status.
+
+        The router writes the status itself when the step runs. When it
+        raises instead (an agent job refused by admission, a lost database),
+        the operation the plan created `running` would otherwise stay that
+        way and block the repository until the next restart: it is closed
+        with the cause unless an agent is still working on it, the backup's
+        maintenance state records the failed step, and the error propagates
+        so the repository's run ends failed with that cause, as it did
+        before, instead of starting the next step on a repository whose
+        state is unknown."""
+        operation_id, kind = operation.id, operation.kind
+        try:
+            await step()
+        except Exception as exc:
+            closed = await fail_inline_maintenance(db, operation, exc)
+            try:
+                backup_job.maintenance_status = f"{kind}_failed"
+                db.commit()
+            except Exception as commit_error:
+                # the cause below must reach the run, not this commit's error
+                db.rollback()
+                logger.warning(
+                    "Could not record the failed maintenance step",
+                    run_id=run_id,
+                    operation_id=operation_id,
+                    error=str(commit_error),
+                )
+            logger.error(
+                "Backup plan maintenance step failed",
+                run_id=run_id,
+                operation_id=operation_id,
+                kind=kind,
+                operation_closed=closed,
+                error=str(exc),
+            )
+            raise
+        db.refresh(operation)
+        finish_inline_maintenance(db, operation)
+
     async def _run_maintenance(
         self,
         db: Session,
-        backup_job: BackupJob,
+        backup_job: Any,
         repo: Repository,
         context: PlanRunContext,
         run_id: int,
@@ -2021,26 +2238,45 @@ class BackupPlanExecutionService:
         if context.run_prune_after:
             if self._is_run_cancelled(run_id):
                 return "cancelled"
-            prune_job = create_started_maintenance_job(
+            prune_job = start_inline_maintenance(
                 db,
-                PruneJob,
                 repo,
-                extra_fields={"scheduled_prune": False},
+                "prune",
+                params={
+                    "keep_hourly": context.prune_keep_hourly,
+                    "keep_daily": context.prune_keep_daily,
+                    "keep_weekly": context.prune_keep_weekly,
+                    "keep_monthly": context.prune_keep_monthly,
+                    "keep_quarterly": context.prune_keep_quarterly,
+                    "keep_yearly": context.prune_keep_yearly,
+                    "keep_within": context.prune_keep_within,
+                    "scheduled_prune": False,
+                },
+                user_id=None,
+                run_id=backup_job.operation.run_id,
+                depends_on_id=backup_job.id,
             )
             backup_job.maintenance_status = "running_prune"
             db.commit()
-            await BorgRouter(repo).prune(
-                job_id=prune_job.id,
-                keep_hourly=context.prune_keep_hourly,
-                keep_daily=context.prune_keep_daily,
-                keep_weekly=context.prune_keep_weekly,
-                keep_monthly=context.prune_keep_monthly,
-                keep_quarterly=context.prune_keep_quarterly,
-                keep_yearly=context.prune_keep_yearly,
-                dry_run=False,
-                keep_within=context.prune_keep_within,
+            await self._run_inline_maintenance(
+                db,
+                backup_job,
+                prune_job,
+                run_id,
+                lambda: BorgRouter(repo).prune(
+                    job_id=prune_job.id,
+                    keep_hourly=context.prune_keep_hourly,
+                    keep_daily=context.prune_keep_daily,
+                    keep_weekly=context.prune_keep_weekly,
+                    keep_monthly=context.prune_keep_monthly,
+                    keep_quarterly=context.prune_keep_quarterly,
+                    keep_yearly=context.prune_keep_yearly,
+                    dry_run=False,
+                    keep_within=context.prune_keep_within,
+                    is_cancelled=lambda: self._is_run_cancelled(run_id),
+                    wait_for_read_work=True,
+                ),
             )
-            db.refresh(prune_job)
             if self._is_run_cancelled(run_id):
                 return "cancelled"
             if prune_job.status == "completed":
@@ -2053,16 +2289,28 @@ class BackupPlanExecutionService:
         if context.run_compact_after:
             if self._is_run_cancelled(run_id):
                 return "cancelled"
-            compact_job = create_started_maintenance_job(
+            compact_job = start_inline_maintenance(
                 db,
-                CompactJob,
                 repo,
-                extra_fields={"scheduled_compact": False},
+                "compact",
+                params={"scheduled_compact": False},
+                user_id=None,
+                run_id=backup_job.operation.run_id,
+                depends_on_id=backup_job.id,
             )
             backup_job.maintenance_status = "running_compact"
             db.commit()
-            await BorgRouter(repo).compact(compact_job.id)
-            db.refresh(compact_job)
+            await self._run_inline_maintenance(
+                db,
+                backup_job,
+                compact_job,
+                run_id,
+                lambda: BorgRouter(repo).compact(
+                    compact_job.id,
+                    is_cancelled=lambda: self._is_run_cancelled(run_id),
+                    wait_for_read_work=True,
+                ),
+            )
             if self._is_run_cancelled(run_id):
                 return "cancelled"
             if compact_job.status == "completed":
@@ -2075,20 +2323,28 @@ class BackupPlanExecutionService:
         if context.run_check_after:
             if self._is_run_cancelled(run_id):
                 return "cancelled"
-            check_job = create_started_maintenance_job(
+            check_job = start_inline_maintenance(
                 db,
-                CheckJob,
                 repo,
-                extra_fields={
+                "check",
+                params={
                     "scheduled_check": False,
                     "max_duration": context.check_max_duration,
                     "extra_flags": context.check_extra_flags,
                 },
+                user_id=None,
+                run_id=backup_job.operation.run_id,
+                depends_on_id=backup_job.id,
             )
             backup_job.maintenance_status = "running_check"
             db.commit()
-            await BorgRouter(repo).check(check_job.id)
-            db.refresh(check_job)
+            await self._run_inline_maintenance(
+                db,
+                backup_job,
+                check_job,
+                run_id,
+                lambda: BorgRouter(repo).check(check_job.id),
+            )
             if self._is_run_cancelled(run_id):
                 return "cancelled"
             if check_job.status == "completed":
@@ -2108,109 +2364,235 @@ class BackupPlanExecutionService:
         return "completed" if maintenance_ok else "completed_with_warnings"
 
     def _mark_repository_skipped(self, run_id: int, repository_id: int) -> None:
-        db = SessionLocal()
-        try:
-            child = (
-                db.query(BackupPlanRunRepository)
-                .filter(
-                    BackupPlanRunRepository.backup_plan_run_id == run_id,
-                    BackupPlanRunRepository.repository_id == repository_id,
-                    BackupPlanRunRepository.status == "pending",
-                )
-                .first()
+        """Mark a pending repository child as skipped."""
+
+        def work(db: Session) -> None:
+            """Apply the skipped state in a fresh retryable session."""
+            _update_children(
+                db,
+                run_id,
+                {"status": "skipped", "completed_at": datetime.utcnow()},
+                repository_id=repository_id,
             )
-            if child:
-                child.status = "skipped"
-                child.completed_at = datetime.utcnow()
-                child.error_message = "Skipped after an earlier repository failed"
-                db.commit()
-        finally:
-            db.close()
+
+        _write_bookkeeping(work)
 
     def _mark_repository_cancelled(self, run_id: int, repository_id: int) -> None:
-        db = SessionLocal()
-        try:
-            child = (
-                db.query(BackupPlanRunRepository)
-                .filter(
-                    BackupPlanRunRepository.backup_plan_run_id == run_id,
-                    BackupPlanRunRepository.repository_id == repository_id,
-                    BackupPlanRunRepository.status == "pending",
-                )
-                .first()
+        """Mark a pending repository child as cancelled."""
+
+        def work(db: Session) -> None:
+            """Apply the cancelled state in a fresh retryable session."""
+            _update_children(
+                db,
+                run_id,
+                {
+                    "status": "cancelled",
+                    "completed_at": datetime.utcnow(),
+                    "error_message": CANCELLED_MESSAGE,
+                },
+                repository_id=repository_id,
             )
-            if child:
-                child.status = "cancelled"
-                child.completed_at = datetime.utcnow()
-                child.error_message = CANCELLED_MESSAGE
-                db.commit()
-        finally:
-            db.close()
+
+        _write_bookkeeping(work)
 
     def _mark_repository_failed(
         self, run_id: int, repository_id: int, error_message: str
-    ) -> None:
-        db = SessionLocal()
-        try:
-            child = (
-                db.query(BackupPlanRunRepository)
-                .filter(
-                    BackupPlanRunRepository.backup_plan_run_id == run_id,
-                    BackupPlanRunRepository.repository_id == repository_id,
-                )
-                .first()
-            )
-            if child:
-                child.status = "failed"
-                child.completed_at = datetime.utcnow()
-                child.error_message = error_message
-                db.commit()
-        finally:
-            db.close()
+    ) -> list[tuple[int, str]]:
+        """Mark a pending or running repository child as failed."""
+        return self._fail_repositories(
+            run_id,
+            error_message,
+            repository_id=repository_id,
+            # This one runs after the repository's backup raised, so the
+            # child is running rather than pending by then.
+            from_statuses=("pending", "running"),
+        )
 
     def _mark_pending_repositories_failed(
         self, run_id: int, error_message: str
+    ) -> list[tuple[int, str]]:
+        """Fail every pending repository child for a plan run."""
+        return self._fail_repositories(run_id, error_message)
+
+    def _fail_repositories(
+        self,
+        run_id: int,
+        error_message: str,
+        *,
+        repository_id: Optional[int] = None,
+        from_statuses: tuple[str, ...] = ("pending",),
+    ) -> list[tuple[int, str]]:
+        """Fail a run's repository children and give each one that has no
+        backup operation yet a failed one.
+
+        The dashboard, the repository status and the notifications read
+        operations and never the plan run, so a repository that failed before
+        its backup was created would otherwise show nowhere. Returns the
+        operation id and repository path of each operation created. A
+        cancelled run gets none: a cancellation is not a failed backup.
+        """
+        recorded: list[tuple[int, str]] = []
+
+        def work(db: Session) -> None:
+            """Apply the failed state in a fresh retryable session."""
+            recorded.clear()
+            now = datetime.utcnow()
+            values = {
+                "status": "failed",
+                "completed_at": now,
+                "error_message": error_message,
+            }
+            if self._run_status(db, run_id) == "cancelled":
+                _update_children(
+                    db,
+                    run_id,
+                    values,
+                    repository_id=repository_id,
+                    from_statuses=from_statuses,
+                )
+                return
+            q = db.query(
+                BackupPlanRunRepository.id,
+                BackupPlanRunRepository.repository_id,
+                BackupPlanRunRepository.backup_operation_id,
+            ).filter(
+                BackupPlanRunRepository.backup_plan_run_id == run_id,
+                BackupPlanRunRepository.status.in_(from_statuses),
+            )
+            if repository_id is not None:
+                q = q.filter(BackupPlanRunRepository.repository_id == repository_id)
+            for child_id, child_repository_id, operation_id in q.order_by(
+                BackupPlanRunRepository.id
+            ).all():
+                # The same conditional claim as `_update_children`: a child
+                # someone cancelled since the read keeps its status and gets
+                # no operation.
+                claimed = (
+                    db.query(BackupPlanRunRepository)
+                    .filter(
+                        BackupPlanRunRepository.id == child_id,
+                        BackupPlanRunRepository.status.in_(from_statuses),
+                    )
+                    .update(values, synchronize_session=False)
+                )
+                repo = (
+                    db.get(Repository, child_repository_id)
+                    if child_repository_id
+                    else None
+                )
+                # A child with an operation failed during or after its
+                # backup, which has a row and a notification of its own.
+                if not claimed or operation_id is not None or repo is None:
+                    continue
+                # Created uncommitted and failed at once, so the runner never
+                # sees it queued. `started_at` is what the dashboard window
+                # filters on; a row without it stays invisible.
+                backup_job = create_backup_operation(
+                    db,
+                    repo,
+                    trigger="plan",
+                    executor="agent" if is_agent_executor(repo) else "server",
+                    backup_plan_run_id=run_id,
+                    commit=False,
+                )
+                backup_job.status = "failed"
+                backup_job.error_message = error_message
+                backup_job.started_at = now
+                backup_job.completed_at = now
+                db.query(BackupPlanRunRepository).filter(
+                    BackupPlanRunRepository.id == child_id
+                ).update(
+                    {BackupPlanRunRepository.backup_operation_id: backup_job.id},
+                    synchronize_session=False,
+                )
+                recorded.append((backup_job.id, repo.path))
+
+        _write_bookkeeping(work)
+        return recorded
+
+    async def _fail_pending_repositories_before_backup(
+        self, run_id: int, context: PlanRunContext, error_message: str
     ) -> None:
+        """Fail the repositories of a run a pre-backup script aborted and send
+        the backup-failure notification for each."""
+        await self._notify_backup_failures(
+            run_id,
+            context,
+            self._mark_pending_repositories_failed(run_id, error_message),
+            error_message,
+        )
+
+    async def _notify_backup_failures(
+        self,
+        run_id: int,
+        context: PlanRunContext,
+        recorded: list[tuple[int, str]],
+        error_message: str,
+    ) -> None:
+        """Announce the operations `_fail_repositories` created: an
+        `operation.updated` event, since the runner never saw them and so
+        never broadcast them, and the backup-failure notification."""
+        if not recorded:
+            return
         db = SessionLocal()
         try:
-            children = (
-                db.query(BackupPlanRunRepository)
-                .filter(
-                    BackupPlanRunRepository.backup_plan_run_id == run_id,
-                    BackupPlanRunRepository.status == "pending",
-                )
-                .all()
-            )
-            now = datetime.utcnow()
-            for child in children:
-                child.status = "failed"
-                child.completed_at = now
-                child.error_message = error_message
-            db.commit()
+            for operation_id, repository_path in recorded:
+                try:
+                    operation = db.get(Operation, operation_id)
+                    if operation is not None:
+                        await broadcast_operation_updated(operation, db)
+                except Exception as exc:
+                    # the event is a courtesy to open pages; the notification
+                    # below must still go out, and the run keeps its reason
+                    logger.warning(
+                        "Failed to broadcast plan failure operation",
+                        run_id=run_id,
+                        operation_id=operation_id,
+                        error=str(exc),
+                    )
+                # The broadcast only reads, but a failed read it swallowed
+                # itself leaves the transaction aborted; start the
+                # notification from a clean one.
+                db.rollback()
+                try:
+                    await notification_service.send_backup_failure(
+                        db,
+                        repository_path,
+                        error_message,
+                        operation_id,
+                        context.plan_name,
+                    )
+                except Exception as exc:
+                    # a failed write leaves the session unusable for the
+                    # repositories still to notify
+                    db.rollback()
+                    logger.warning(
+                        "Failed to send backup failure notification",
+                        run_id=run_id,
+                        operation_id=operation_id,
+                        error=str(exc),
+                    )
         finally:
             db.close()
 
     def _mark_pending_repositories_skipped(
         self, run_id: int, error_message: str
     ) -> None:
-        db = SessionLocal()
-        try:
-            children = (
-                db.query(BackupPlanRunRepository)
-                .filter(
-                    BackupPlanRunRepository.backup_plan_run_id == run_id,
-                    BackupPlanRunRepository.status == "pending",
-                )
-                .all()
+        """Skip every pending repository child for a plan run."""
+
+        def work(db: Session) -> None:
+            """Apply the skipped state to pending children in a fresh session."""
+            _update_children(
+                db,
+                run_id,
+                {
+                    "status": "skipped",
+                    "completed_at": datetime.utcnow(),
+                    "error_message": error_message,
+                },
             )
-            now = datetime.utcnow()
-            for child in children:
-                child.status = "skipped"
-                child.completed_at = now
-                child.error_message = error_message
-            db.commit()
-        finally:
-            db.close()
+
+        _write_bookkeeping(work)
 
     def _plan_backup_result(self, run_id: int) -> str:
         db = SessionLocal()
@@ -2273,33 +2655,35 @@ class BackupPlanExecutionService:
         finally:
             db.close()
 
+    @staticmethod
+    def _run_status(db: Session, run_id: int) -> Optional[str]:
+        return (
+            db.query(BackupPlanRun.status).filter(BackupPlanRun.id == run_id).scalar()
+        )
+
     def _is_run_cancelled(self, run_id: int) -> bool:
         db = SessionLocal()
         try:
-            return (
-                db.query(BackupPlanRun.status)
-                .filter(BackupPlanRun.id == run_id)
-                .scalar()
-                == "cancelled"
-            )
+            return self._run_status(db, run_id) == "cancelled"
         finally:
             db.close()
 
     def _mark_run_failed(self, run_id: int, error_message: str) -> None:
-        db = SessionLocal()
-        try:
+        """Fail a plan run unless it has already been cancelled."""
+
+        def work(db: Session) -> None:
+            """Apply the run failure in a fresh retryable session."""
             run = db.query(BackupPlanRun).filter(BackupPlanRun.id == run_id).first()
             # A cancellation surfaces here as a generic hook/backup failure (the
             # agent script outcome classifies "canceled" as failed and raises).
-            # Don't overwrite the run's "cancelled" status with "failed" — same
+            # Don't overwrite the run's "cancelled" status with "failed" -- same
             # guard as _finalize_run.
             if run and run.status != "cancelled":
                 run.status = "failed"
                 run.error_message = error_message
                 run.completed_at = datetime.utcnow()
-                db.commit()
-        finally:
-            db.close()
+
+        _write_bookkeeping(work)
 
 
 backup_plan_execution_service = BackupPlanExecutionService()

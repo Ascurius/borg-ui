@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.borg_ui_agent.backup import _terminate_process
+from agent.borg_ui_agent.cancel import cancel_requested
 
 DEFAULT_SCRIPTS_DIR = "/etc/borg-ui-agent/scripts.d"
 
@@ -163,7 +164,11 @@ def resolve_allowed_script(name: Any) -> Path:
     # hidden (which also excludes the ``..data`` volume internals).
     if name in (".", "..") or name.startswith("."):
         raise ScriptNotAllowed(f"invalid script name: {name!r}")
-    if name != os.path.basename(name) or os.sep in name or (os.altsep and os.altsep in name):
+    if (
+        name != os.path.basename(name)
+        or os.sep in name
+        or (os.altsep and os.altsep in name)
+    ):
         raise ScriptNotAllowed(f"invalid script name: {name!r}")
 
     root = scripts_dir()
@@ -243,6 +248,15 @@ def execute_script_run_job(
     def log(stream: str, message: str) -> None:
         client.send_log(job_id, sequence=next_seq(), stream=stream, message=message)
 
+    if cancel_requested(should_cancel):
+        # Cancelled between dispatch and start: the script is not started.
+        client.cancel_job(job_id)
+        return ScriptRunResult(
+            job_id=job_id,
+            status="canceled",
+            message="script.run canceled before it started",
+        )
+
     try:
         resolved = resolve_allowed_script(name)
     except ScriptNotAllowed as exc:
@@ -305,10 +319,14 @@ def execute_script_run_job(
                 pass
 
     out_thread = threading.Thread(
-        target=pump, args=("stdout", process.stdout, stdout_buf, stdout_size), daemon=True
+        target=pump,
+        args=("stdout", process.stdout, stdout_buf, stdout_size),
+        daemon=True,
     )
     err_thread = threading.Thread(
-        target=pump, args=("stderr", process.stderr, stderr_buf, stderr_size), daemon=True
+        target=pump,
+        args=("stderr", process.stderr, stderr_buf, stderr_size),
+        daemon=True,
     )
     out_thread.start()
     err_thread.start()

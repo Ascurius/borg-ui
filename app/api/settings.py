@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import Optional
@@ -11,6 +12,7 @@ from app.database.models import User, Repository, SystemSettings
 from app.services import backup_monitoring_service
 from app.core.authorization import authorize_request
 from app.core.security import (
+    BcryptPassword,
     encrypt_secret,
     get_current_user,
     get_password_hash,
@@ -24,7 +26,6 @@ from app.core.permissions import (
     default_repository_role_for_global_role,
     normalize_repository_role_for_global_role,
 )
-from app.core.borg import BorgInterface
 from app.config import get_runtime_app_version, settings as app_settings
 from app.services.cache_service import archive_cache
 from app.utils.datetime_utils import serialize_datetime
@@ -38,8 +39,38 @@ from app.utils.schedule_time import (
 logger = structlog.get_logger()
 router = APIRouter(tags=["settings"], dependencies=[Depends(authorize_request)])
 
-# Initialize Borg interface
-borg = BorgInterface()
+
+def _off_loop(fn, *args, **kwargs):
+    """Run a blocking call in the threadpool. A module-local hop, so that a
+    test can patch it without touching `asyncio.to_thread` for the process."""
+    return asyncio.to_thread(fn, *args, **kwargs)
+
+
+# One cleanup pass at a time in this process: two passes over the same files
+# would report each other's deletions as errors. (Per event loop; a second
+# worker process would not see it.)
+_log_cleanup_lock = asyncio.Lock()
+
+
+def _cleanup_logs_off_request(bind, max_age_days: int, max_total_size_mb: int) -> dict:
+    """The log cleanup pass with a session of its own on the request's
+    engine (`bind`), for the threadpool: the pass stats and deletes every
+    log file past the limits, and the request's session stays with the
+    request. The pass takes its snapshot of running jobs at its start, as
+    it always did."""
+    from app.services.log_manager import log_manager
+
+    db = Session(bind=bind)
+    try:
+        return log_manager.cleanup_logs_combined(
+            db=db,
+            max_age_days=max_age_days,
+            max_total_size_mb=max_total_size_mb,
+            dry_run=False,
+        )
+    finally:
+        db.close()
+
 
 # Default timeout values (built-in)
 DEFAULT_TIMEOUTS = {
@@ -162,12 +193,12 @@ def _validate_report_cron_expression(cron_expression: str) -> None:
 
 
 # Pydantic models for request/response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class UserCreate(BaseModel):
     username: str
-    password: str
+    password: BcryptPassword
     email: Optional[str] = None
     role: str = "viewer"
     full_name: Optional[str] = None
@@ -185,11 +216,11 @@ class UserUpdate(BaseModel):
 
 class PasswordChange(BaseModel):
     current_password: str
-    new_password: str
+    new_password: BcryptPassword
 
 
 class PasswordReset(BaseModel):
-    new_password: str
+    new_password: BcryptPassword
 
 
 class UserPreferencesUpdate(BaseModel):
@@ -232,6 +263,7 @@ class SystemSettingsUpdate(BaseModel):
     stats_refresh_interval_minutes: Optional[int] = (
         None  # How often to refresh repository stats (0 = disabled)
     )
+    auto_prune_preview: Optional[bool] = None
     dashboard_backup_warning_days: Optional[int] = None
     dashboard_backup_critical_days: Optional[int] = None
     dashboard_check_warning_days: Optional[int] = None
@@ -336,39 +368,9 @@ async def get_system_settings(
             db.commit()
             db.refresh(settings)
 
-        # Get log storage statistics
-        from app.services.log_manager import log_manager
-
-        try:
-            log_storage = log_manager.calculate_log_storage()
-            usage_percent = 0
-            if settings.log_max_total_size_mb and settings.log_max_total_size_mb > 0:
-                usage_percent = min(
-                    100,
-                    int(
-                        (log_storage["total_size_mb"] / settings.log_max_total_size_mb)
-                        * 100
-                    ),
-                )
-
-            log_storage_info = {
-                "total_size_mb": log_storage["total_size_mb"],
-                "file_count": log_storage["file_count"],
-                "oldest_log_date": serialize_datetime(log_storage["oldest_log_date"]),
-                "newest_log_date": serialize_datetime(log_storage["newest_log_date"]),
-                "usage_percent": usage_percent,
-                "files_by_type": log_storage["files_by_type"],
-            }
-        except Exception as e:
-            logger.warning("Failed to calculate log storage", error=str(e))
-            log_storage_info = {
-                "total_size_mb": 0,
-                "file_count": 0,
-                "oldest_log_date": None,
-                "newest_log_date": None,
-                "usage_percent": 0,
-                "files_by_type": {},
-            }
+        # The log storage figures are not part of this answer: they cost a
+        # stat of every log file, this route is requested on every page, and
+        # the log tab reads them from /system/logs/storage.
 
         # Calculate effective timeout values and their sources
         mount_timeout, mount_source = get_effective_timeout(
@@ -447,6 +449,7 @@ async def get_system_settings(
                 if settings.stats_refresh_interval_minutes is not None
                 else 60,
                 "last_stats_refresh": serialize_datetime(settings.last_stats_refresh),
+                "auto_prune_preview": settings.auto_prune_preview is not False,
                 **{
                     field_name: get_effective_dashboard_health_threshold(
                         settings, field_name
@@ -492,7 +495,6 @@ async def get_system_settings(
                 "backup_reports_last_sent_at": serialize_datetime(
                     settings.backup_reports_last_sent_at
                 ),
-                "borg_version": borg.get_version(),
                 "app_version": get_runtime_app_version(),
                 # MQTT settings
                 "mqtt_enabled": settings.mqtt_enabled,
@@ -543,7 +545,6 @@ async def get_system_settings(
                 or "viewer",
                 "oidc_active_admin_count": _active_oidc_admin_count(db),
             },
-            "log_storage": log_storage_info,
         }
     except Exception as e:
         logger.error("Failed to get system settings", error=str(e))
@@ -589,7 +590,8 @@ async def update_system_settings(
             from app.services.log_manager import log_manager
 
             try:
-                log_storage = log_manager.calculate_log_storage()
+                # a stat of every log file: off the event loop
+                log_storage = await _off_loop(log_manager.calculate_log_storage)
                 if log_storage["total_size_mb"] > settings_update.log_max_total_size_mb:
                     warnings.append(
                         f"Warning: Current log storage ({log_storage['total_size_mb']} MB) exceeds new limit "
@@ -861,6 +863,8 @@ async def update_system_settings(
             settings.stats_refresh_interval_minutes = (
                 settings_update.stats_refresh_interval_minutes
             )
+        if settings_update.auto_prune_preview is not None:
+            settings.auto_prune_preview = settings_update.auto_prune_preview
         for field_name, value in dashboard_threshold_updates.items():
             if value is not None:
                 setattr(settings, field_name, value)
@@ -1194,9 +1198,12 @@ async def update_system_settings(
 
 
 async def _run_stats_refresh_background(repo_ids: list, username: str):
-    """Background task to refresh stats for all repositories"""
-    from app.core.borg_router import BorgRouter
+    """Background task to refresh stats for all repositories.
+
+    The refresh is the `stats` and `archive_sync` index chain (spec 8.1, 8.2),
+    which the operations runner executes; this only enqueues it."""
     from app.database.database import SessionLocal
+    from app.services.operations.enqueue import enqueue_chain
 
     db = SessionLocal()
     try:
@@ -1208,12 +1215,19 @@ async def _run_stats_refresh_background(repo_ids: list, username: str):
             if not repo:
                 continue
             try:
-                result = await BorgRouter(repo).update_stats(db)
-                if result:
-                    success_count += 1
-                else:
-                    error_count += 1
+                enqueue_chain(
+                    db,
+                    ["stats", "archive_sync"],
+                    repository_id=repo.id,
+                    trigger="manual",
+                )
+                success_count += 1
             except Exception as e:
+                # `enqueue_chain` commits, so a failed commit leaves this
+                # session unusable: without the rollback the next
+                # repository's query raises and the rest of the list is
+                # never enqueued.
+                db.rollback()
                 logger.error(
                     "Error refreshing stats for repository",
                     repo_id=repo.id,
@@ -1222,16 +1236,14 @@ async def _run_stats_refresh_background(repo_ids: list, username: str):
                 )
                 error_count += 1
 
-        # Update last_stats_refresh timestamp
-        settings = db.query(SystemSettings).first()
-        if settings:
-            settings.last_stats_refresh = datetime.utcnow()
-            db.commit()
-
+        # `last_stats_refresh` is not written here: the frontend reads it as
+        # the signal that statistics have actually been refreshed, and the
+        # `stats` executor sets it when the work finishes. Writing it at
+        # enqueue time would stop the polling and show the old sizes as new.
         logger.info(
-            "Background stats refresh completed",
+            "Background stats refresh enqueued",
             user=username,
-            success=success_count,
+            enqueued=success_count,
             errors=error_count,
         )
     except Exception as e:
@@ -1250,8 +1262,6 @@ async def refresh_all_stats(
     Check last_stats_refresh timestamp to know when it completed.
     """
     try:
-        import asyncio
-
         logger.info("Manual stats refresh triggered", user=current_user.username)
 
         # Get all repository IDs
@@ -1871,7 +1881,6 @@ async def cleanup_system(
         # Apply the DB retention windows now (log content after
         # log_retention_days, finished job rows after cleanup_retention_days —
         # the same pass the daily scheduler runs).
-        import asyncio
 
         from app.services.job_history_retention import run_retention_once
 
@@ -1947,8 +1956,8 @@ async def get_log_storage_stats(
             db.add(settings)
             db.commit()
 
-        # Calculate log storage
-        log_storage = log_manager.calculate_log_storage()
+        # Calculate log storage: a stat of every log file, off the event loop
+        log_storage = await _off_loop(log_manager.calculate_log_storage)
 
         # Calculate usage percentage
         usage_percent = 0
@@ -2020,16 +2029,19 @@ async def manual_log_cleanup(
             max_total_size_mb=max_total_size_mb,
         )
 
-        # Run cleanup
-        result = log_manager.cleanup_logs_combined(
-            db=db,
-            max_age_days=max_age_days,
-            max_total_size_mb=max_total_size_mb,
-            dry_run=False,
-        )
+        # Off the event loop: the pass stats and deletes every log file past
+        # the limits, which stalled every other request while it ran. One
+        # pass at a time; a second request waits for the first.
+        async with _log_cleanup_lock:
+            result = await _off_loop(
+                _cleanup_logs_off_request,
+                db.get_bind(),
+                max_age_days,
+                max_total_size_mb,
+            )
 
-        # Get updated storage stats
-        log_storage = log_manager.calculate_log_storage()
+        # Get updated storage stats (a stat of every log file, off the loop)
+        log_storage = await _off_loop(log_manager.calculate_log_storage)
 
         logger.info(
             "Manual log cleanup completed",
@@ -2221,8 +2233,19 @@ async def clear_cache(
         )
 
 
+class CacheSettingsUpdate(BaseModel):
+    cache_ttl_minutes: Optional[int] = Field(None, ge=1, le=10080)
+    cache_max_size_mb: Optional[int] = Field(None, ge=100, le=10240)
+    redis_url: Optional[str] = None
+    browse_max_items: Optional[int] = Field(None, ge=100_000, le=50_000_000)
+    browse_max_memory_mb: Optional[int] = Field(None, ge=100, le=16384)
+
+
 @router.put("/cache/settings")
 async def update_cache_settings(
+    body: Optional[CacheSettingsUpdate] = None,
+    # Query parameters are kept for older clients. redis_url can carry a
+    # password, so new clients send everything in the JSON body instead.
     cache_ttl_minutes: Optional[int] = Query(
         None, ge=1, le=10080, description="Cache TTL in minutes (1-10080)"
     ),
@@ -2230,7 +2253,9 @@ async def update_cache_settings(
         None, ge=100, le=10240, description="Max cache size in MB (100-10240)"
     ),
     redis_url: Optional[str] = Query(
-        None, description="External Redis URL (e.g., redis://host:6379/0)"
+        None,
+        deprecated=True,
+        description="Deprecated: send redis_url in the JSON body, the URL may carry a password",
     ),
     browse_max_items: Optional[int] = Query(
         None,
@@ -2250,6 +2275,9 @@ async def update_cache_settings(
     """
     Update cache settings.
 
+    Settings are read from the JSON body; query parameters are a deprecated
+    fallback. A value in the body wins over the same query parameter.
+
     Parameters:
     - cache_ttl_minutes: Cache time-to-live in minutes (1 minute to 7 days)
     - cache_max_size_mb: Maximum cache size in megabytes (100MB to 10GB)
@@ -2266,6 +2294,14 @@ async def update_cache_settings(
     - Updated settings
     - Redis connection result if redis_url was changed
     """
+    if body is not None:
+        cache_ttl_minutes = body.cache_ttl_minutes or cache_ttl_minutes
+        cache_max_size_mb = body.cache_max_size_mb or cache_max_size_mb
+        if body.redis_url is not None:
+            redis_url = body.redis_url
+        browse_max_items = body.browse_max_items or browse_max_items
+        browse_max_memory_mb = body.browse_max_memory_mb or browse_max_memory_mb
+
     if (
         cache_ttl_minutes is None
         and cache_max_size_mb is None
@@ -2293,7 +2329,8 @@ async def update_cache_settings(
         if redis_url is not None:
             old_url = settings.redis_url
             settings.redis_url = redis_url if redis_url.strip() else None
-            changes["redis_url"] = {"old": old_url, "new": settings.redis_url}
+            if old_url != settings.redis_url:
+                changes["redis_url"] = {"old": old_url, "new": settings.redis_url}
 
             # Reconfigure cache service with new Redis URL
             try:

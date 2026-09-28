@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from '../../test/test-utils'
 import BackupJobsTable from '../BackupJobsTable'
@@ -172,6 +172,29 @@ describe('BackupJobsTable', () => {
       )
 
       expect(screen.getByText('Remote SSH')).toBeInTheDocument()
+    })
+
+    it('renders a RunChainRow beneath a row whose operation has follow-ups', () => {
+      renderWithProviders(
+        <BackupJobsTable
+          jobs={[
+            {
+              ...mockJobs[0],
+              id: 46,
+              followups: [{ id: 461, type: 'archive_sync', status: 'completed' }],
+            } as MockBackupJob,
+          ]}
+        />
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /2 steps/ }))
+      expect(screen.getByText('Sync archive list')).toBeInTheDocument()
+    })
+
+    it('renders no RunChainRow beneath a row with no follow-ups', () => {
+      renderWithProviders(<BackupJobsTable jobs={mockJobs} />)
+
+      expect(screen.queryByText('Sync archive list')).not.toBeInTheDocument()
     })
   })
 
@@ -610,6 +633,29 @@ describe('BackupJobsTable', () => {
     expect(runNowButtons.length).toBe(2)
   })
 
+  it('does not offer Run Now for immutable availability decisions', () => {
+    const availabilityCheck = {
+      ...mockJobs[0],
+      id: 4,
+      type: 'availability_check',
+      status: 'skipped',
+      skip_reason: 'source_unavailable' as const,
+    }
+
+    renderWithProviders(
+      <BackupJobsTable
+        jobs={[availabilityCheck]}
+        actions={{ runNow: true, delete: true }}
+        onRunNow={mockCallbacks.onRunNow}
+        canDeleteJobs
+      />
+    )
+
+    expect(screen.queryByRole('button', { name: 'Run Now' })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Delete')).not.toBeInTheDocument()
+    expect(screen.queryByText('Source unavailable')).not.toBeInTheDocument()
+  })
+
   it('calls onRunNow when Run Now is clicked', async () => {
     const user = userEvent.setup()
 
@@ -665,6 +711,36 @@ describe('BackupJobsTable', () => {
 
       expect(screen.getByText('borg-backup-v2')).toBeInTheDocument()
       expect(screen.getByText('Package Install')).toBeInTheDocument()
+    })
+  })
+
+  describe('View Archive action', () => {
+    const completedJob = {
+      id: 41,
+      type: 'backup',
+      repository: '/backup/repo1',
+      status: 'completed',
+      archive_name: 'host-2026-09-01',
+      started_at: '2026-09-01T02:00:00Z',
+      completed_at: '2026-09-01T02:10:00Z',
+    }
+
+    it('is offered while the archive exists', () => {
+      renderWithProviders(<BackupJobsTable jobs={[completedJob]} repositories={mockRepositories} />)
+      expect(screen.getByRole('button', { name: /View Archive/i })).toBeInTheDocument()
+    })
+
+    it('stays visible but disabled once the archive was pruned, and says so', () => {
+      renderWithProviders(
+        <BackupJobsTable
+          jobs={[{ ...completedJob, archive_pruned_at: '2026-09-02T03:00:00Z' }]}
+          repositories={mockRepositories}
+        />
+      )
+      expect(screen.getAllByText('/backup/repo1').length).toBeGreaterThan(0)
+      const button = screen.getByRole('button', { name: /Archive pruned/i })
+      expect(button).toBeDisabled()
+      expect(screen.queryByRole('button', { name: /^View Archive$/i })).not.toBeInTheDocument()
     })
   })
 

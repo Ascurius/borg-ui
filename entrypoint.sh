@@ -5,7 +5,7 @@ set -e
 PUID=${PUID:-1001}
 PGID=${PGID:-1001}
 
-echo "[$(date)] Borg Web UI Entrypoint"
+echo "[$(date)] Borg UI Entrypoint"
 echo "[$(date)] PUID: $PUID | PGID: $PGID"
 
 # Get current borg user UID/GID
@@ -66,7 +66,11 @@ echo "[$(date)] Borg cache directory setup complete"
 
 # Setup SSH home directory to persist across container updates.
 # Plain ssh commands in pre/post-backup hooks use ~/.ssh/known_hosts by default.
-SSH_HOME_DIR=/home/borg/.ssh
+# Exported: app.config reads SSH_HOME_DIR as the directory the system key is
+# deployed to (deploy_ssh_key.py, key deletion cleanup). Without it the app
+# falls back to $DATA_DIR/ssh_keys, which is the same directory here unless
+# the user bind-mounted /home/borg/.ssh.
+export SSH_HOME_DIR=/home/borg/.ssh
 PERSISTENT_SSH_DIR=/data/ssh_keys
 
 is_mountpoint() {
@@ -187,7 +191,30 @@ else
     echo "[$(date)] Docker socket not mounted, skipping docker group setup"
 fi
 
-# Deploy SSH keys from database to filesystem
+# Bring the database up to date BEFORE anything reads it -- deploy_ssh_key below
+# reads the SSH keys from it. On a first migration into an empty Postgres the
+# tables do not exist until this runs, so reading keys first fails with
+# "relation ssh_keys does not exist" and no key is deployed until the next boot.
+#
+# Runs once here, not inside the app: gunicorn forks workers that would each run
+# it and race over the same database. As the user that will own the database
+# afterwards (an upgrade may replace the file; one written by root would be
+# unwritable for the app), mirroring the PUID=0 branch used to start the server.
+#
+# A failure here stops the boot on purpose -- serving from a database in an
+# unknown state is worse than not starting.
+echo "[$(date)] Checking database..."
+if [ "$PUID" = "0" ]; then
+    DB_UPGRADE_CMD="python3 -m app.database.db_upgrade"
+else
+    DB_UPGRADE_CMD="gosu borg python3 -m app.database.db_upgrade"
+fi
+if ! $DB_UPGRADE_CMD; then
+    echo "[$(date)] ERROR: database upgrade failed -- refusing to start"
+    exit 1
+fi
+
+# Deploy SSH keys from database to filesystem (now populated by the upgrade above)
 echo "[$(date)] Deploying SSH keys..."
 python3 /app/app/scripts/deploy_ssh_key.py || echo "[$(date)] Warning: SSH key deployment failed"
 
@@ -250,9 +277,10 @@ for GID in $(id -G); do
     fi
 done
 
-# Switch to borg user and start the application
-echo "[$(date)] Starting Borg Web UI as user borg (${PUID}:${PGID})..."
 cd /app
+
+# Switch to borg user and start the application
+echo "[$(date)] Starting Borg UI as user borg (${PUID}:${PGID})..."
 PORT=${PORT:-8081}
 
 # Start package installation in background (non-blocking)
@@ -286,7 +314,7 @@ if [ "$PUID" = "0" ]; then
     exec gunicorn app.main:app \
         --bind 0.0.0.0:${PORT} \
         --workers 1 \
-        --worker-class uvicorn.workers.UvicornWorker \
+        --worker-class app.gunicorn_worker.BorgUIWorker \
         --timeout 0 \
         --graceful-timeout 30 \
         --worker-tmp-dir /dev/shm \
@@ -296,7 +324,7 @@ else
     exec gosu borg gunicorn app.main:app \
         --bind 0.0.0.0:${PORT} \
         --workers 1 \
-        --worker-class uvicorn.workers.UvicornWorker \
+        --worker-class app.gunicorn_worker.BorgUIWorker \
         --timeout 0 \
         --graceful-timeout 30 \
         --worker-tmp-dir /dev/shm \

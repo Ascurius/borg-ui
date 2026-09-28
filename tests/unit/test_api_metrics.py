@@ -12,12 +12,10 @@ Tests cover:
 
 import pytest
 from datetime import timedelta
+from tests.utils.operations import seed_job_operation
 
 from app.database.models import (
     Repository,
-    BackupJob,
-    RestoreJob,
-    CheckJob,
     SystemSettings,
     ScheduledJob,
     utc_now,
@@ -276,10 +274,13 @@ class TestBackupJobMetrics:
         statuses = ["completed", "failed", "running", "completed_with_warnings"]
         for status in statuses:
             for _ in range(3):
-                job = BackupJob(
-                    repository=repo.path, status=status, started_at=utc_now()
+                job = seed_job_operation(
+                    test_db,
+                    "backup",
+                    repository=repo.path,
+                    status=status,
+                    started_at=utc_now(),
                 )
-                test_db.add(job)
 
         test_db.commit()
 
@@ -301,11 +302,21 @@ class TestBackupJobMetrics:
         test_db.commit()
 
         # Successful backup
-        job1 = BackupJob(
-            repository=repo1.path, status="completed", started_at=utc_now()
+        job1 = seed_job_operation(
+            test_db,
+            "backup",
+            repository=repo1.path,
+            status="completed",
+            started_at=utc_now(),
         )
         # Failed backup
-        job2 = BackupJob(repository=repo2.path, status="failed", started_at=utc_now())
+        job2 = seed_job_operation(
+            test_db,
+            "backup",
+            repository=repo2.path,
+            status="failed",
+            started_at=utc_now(),
+        )
         test_db.add_all([job1, job2])
         test_db.commit()
 
@@ -324,10 +335,14 @@ class TestBackupJobMetrics:
         start = utc_now()
         end = start + timedelta(seconds=125)  # 2 min 5 sec
 
-        job = BackupJob(
-            repository=repo.path, status="completed", started_at=start, completed_at=end
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository=repo.path,
+            status="completed",
+            started_at=start,
+            completed_at=end,
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get("/metrics")
@@ -342,13 +357,14 @@ class TestBackupJobMetrics:
         test_db.add(repo)
         test_db.commit()
 
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository=repo.path,
             status="completed",
             original_size=1000000000,  # 1 GB
             deduplicated_size=500000000,  # 500 MB
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get("/metrics")
@@ -363,22 +379,27 @@ class TestBackupJobMetrics:
             in content
         )
 
-    def test_orphaned_backup_jobs(self, test_client, test_db):
-        """Backup jobs without matching repos should appear in orphaned metric"""
-        # Create a job without a matching repository
-        job = BackupJob(
-            repository="/orphaned/path", status="completed", started_at=utc_now()
-        )
-        test_db.add(job)
+    def test_orphaned_backup_jobs_family_is_empty(self, test_client, test_db):
+        """A backup is an operation, which cascades with its repository, so a
+        job for a deleted repository cannot exist. The family is kept with its
+        two header lines and no samples so dashboards keep parsing."""
+        repo = Repository(name="Present", path="/present/path")
+        test_db.add(repo)
         test_db.commit()
+        seed_job_operation(
+            test_db,
+            "backup",
+            repository=repo.path,
+            status="completed",
+            started_at=utc_now(),
+        )
 
         response = test_client.get("/metrics")
         content = response.text
 
-        # Should show in orphaned jobs metric with repository_path label
-        assert "borg_backup_orphaned_jobs_total" in content
-        assert 'repository_path="/orphaned/path"' in content
-        assert 'status="completed"' in content
+        assert "# HELP borg_backup_orphaned_jobs_total" in content
+        assert "# TYPE borg_backup_orphaned_jobs_total gauge" in content
+        assert "borg_backup_orphaned_jobs_total{" not in content
 
 
 class TestLabelConsistency:
@@ -391,13 +412,17 @@ class TestLabelConsistency:
         test_db.commit()
 
         # Create various jobs
-        backup_job = BackupJob(
+        backup_job = seed_job_operation(
+            test_db,
+            "backup",
             repository=repo.path,
             status="completed",
             started_at=utc_now(),
             completed_at=utc_now(),
         )
-        check_job = CheckJob(
+        check_job = seed_job_operation(
+            test_db,
+            "check",
             repository_id=repo.id,
             status="completed",
             started_at=utc_now(),
@@ -436,12 +461,13 @@ class TestSystemMetrics:
     def test_scheduled_jobs_metrics(self, test_client, test_db):
         """Scheduled job metrics should show total and enabled counts"""
         for i in range(3):
-            job = ScheduledJob(
-                name=f"Job {i}",
-                cron_expression="0 2 * * *",
-                enabled=(i < 2),  # 2 enabled, 1 disabled
+            test_db.add(
+                ScheduledJob(
+                    name=f"Job {i}",
+                    cron_expression="0 2 * * *",
+                    enabled=(i < 2),  # 2 enabled, 1 disabled
+                )
             )
-            test_db.add(job)
         test_db.commit()
 
         response = test_client.get("/metrics")
@@ -457,11 +483,20 @@ class TestSystemMetrics:
         test_db.commit()
 
         # Create running jobs of different types
-        backup = BackupJob(repository=repo.path, status="running")
-        restore = RestoreJob(
-            repository=repo.path, archive="test", destination="/dest", status="running"
+        backup = seed_job_operation(
+            test_db, "backup", repository=repo.path, status="running"
         )
-        check = CheckJob(repository_id=repo.id, status="running")
+        restore = seed_job_operation(
+            test_db,
+            "restore",
+            repository=repo.path,
+            archive="test",
+            destination="/dest",
+            status="running",
+        )
+        check = seed_job_operation(
+            test_db, "check", repository_id=repo.id, status="running"
+        )
 
         test_db.add_all([backup, restore, check])
         test_db.commit()
@@ -482,12 +517,13 @@ class TestEdgeCases:
         repo = Repository(name="Huge Repo", path="/huge", total_size="999 TB")
         test_db.add(repo)
 
-        job = BackupJob(
+        job = seed_job_operation(
+            test_db,
+            "backup",
             repository=repo.path,
             status="completed",
             original_size=999999999999999,  # ~1 PB
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get("/metrics")
@@ -554,13 +590,14 @@ class TestEdgeCases:
         repos = test_db.query(Repository).all()
         for i in range(500):
             repo = repos[i % len(repos)]
-            job = BackupJob(
+            job = seed_job_operation(
+                test_db,
+                "backup",
                 repository=repo.path,
                 status="completed",
                 started_at=utc_now(),
                 completed_at=utc_now(),
             )
-            test_db.add(job)
 
         test_db.commit()
 
@@ -583,10 +620,13 @@ class TestMetricValues:
         test_db.add(repo)
         test_db.commit()
 
-        job = BackupJob(
-            repository=repo.path, status="completed_with_warnings", started_at=utc_now()
+        job = seed_job_operation(
+            test_db,
+            "backup",
+            repository=repo.path,
+            status="completed_with_warnings",
+            started_at=utc_now(),
         )
-        test_db.add(job)
         test_db.commit()
 
         response = test_client.get("/metrics")
@@ -607,6 +647,8 @@ class TestMetricValues:
         content = response.text
 
         assert 'borg_repository_archive_count{repository="Empty Repo"} 0' in content
+        # "0" is not a size the parser accepts as measured... it is: a bare
+        # byte count, so the gauge carries it
         assert 'borg_repository_size_bytes{repository="Empty Repo"} 0' in content
 
     def test_metrics_sorted_consistently(self, test_client, test_db):
@@ -627,3 +669,31 @@ class TestMetricValues:
 
         # Should be in same order
         assert names1 == names2
+
+
+@pytest.mark.unit
+def test_repository_size_gauge_reports_the_stored_number(test_client, test_db):
+    """The gauge and the MQTT size topic read the same stored number; the
+    formatted string is only the fallback for a row without one."""
+    from app.database.models import Repository
+
+    measured = Repository(
+        name="measured",
+        path="/repos/measured",
+        total_size="2.19 GB",
+        total_size_bytes=2_350_000_000,
+    )
+    legacy = Repository(name="legacy", path="/repos/legacy", total_size="1.00 KB")
+    test_db.add_all([measured, legacy])
+    test_db.commit()
+
+    unmeasured = Repository(name="unmeasured", path="/repos/unmeasured")
+    test_db.add(unmeasured)
+    test_db.commit()
+
+    content = test_client.get("/metrics").text
+    assert 'borg_repository_size_bytes{repository="measured"} 2350000000' in content
+    assert 'borg_repository_size_bytes{repository="legacy"} 1024' in content
+    # a repository nobody measured has no sample at all, so an alert on a
+    # size of zero cannot fire on it
+    assert 'borg_repository_size_bytes{repository="unmeasured"}' not in content

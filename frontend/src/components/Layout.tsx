@@ -1,13 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { hasConsentBeenGiven, loadUserPreference } from '../utils/analytics'
+import { hasConsentBeenGiven, loadUserPreference, setAnalyticsPlan } from '../utils/analytics'
 import AnalyticsConsentBanner from './AnalyticsConsentBanner'
 import AnnouncementModal from './AnnouncementModal'
 import AppHeader from './AppHeader'
 import AppSidebar from './AppSidebar'
 import { useAuth } from '../hooks/useAuth'
 import { useAnnouncementSurface } from '../hooks/useAnnouncementSurface'
+import { useSystemInfo } from '../hooks/useSystemInfo'
 import PasskeyEnrollmentPrompt from './PasskeyEnrollmentPrompt'
+import { forgetPendingDeletes } from './jobs/jobCache'
 import { useActiveBackendTarget } from '../services/remoteBackends/context'
 import {
   clearPasskeyPromptIgnore,
@@ -34,6 +36,14 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   } = useAuth()
   const { announcement, acknowledgeAnnouncement, snoozeAnnouncement, trackAnnouncementCtaClick } =
     useAnnouncementSurface()
+  const { data: systemInfo } = useSystemInfo()
+
+  // Segment Umami visitors by plan. Read straight from the query so a loading
+  // or failed system-info never reports a paid install as community, and so
+  // switching backend target (which clears the cache) drops the old plan.
+  useEffect(() => {
+    setAnalyticsPlan(systemInfo?.plan ?? null)
+  }, [systemInfo?.plan])
   const [mobileOpen, setMobileOpen] = useState(false)
   const [showConsentBanner, setShowConsentBanner] = useState(false)
   const [showPasskeyPrompt, setShowPasskeyPrompt] = useState(false)
@@ -59,6 +69,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     }
 
     previousBackendTargetId.current = activeBackendTarget.id
+    forgetPendingDeletes(queryClient)
     queryClient.clear()
   }, [activeBackendTarget.id, queryClient])
 

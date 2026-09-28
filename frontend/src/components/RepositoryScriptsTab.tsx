@@ -376,7 +376,9 @@ export default function RepositoryScriptsTab({
                   })}
                 >
                   <Chip
-                    label={`${script.parameters.length} param${script.parameters.length > 1 ? 's' : ''}`}
+                    label={t('repositoryScripts.parameterCount', {
+                      count: script.parameters.length,
+                    })}
                     size="small"
                     color="info"
                     variant="outlined"
@@ -401,11 +403,7 @@ export default function RepositoryScriptsTab({
                   size="small"
                   color={
                     getRunOnColor(effectiveRunOn) as
-                      | 'success'
-                      | 'error'
-                      | 'warning'
-                      | 'info'
-                      | 'default'
+                      'success' | 'error' | 'warning' | 'info' | 'default'
                   }
                   sx={{ height: 20, fontSize: '0.7rem' }}
                 />
@@ -432,14 +430,19 @@ export default function RepositoryScriptsTab({
               {/* Timeout */}
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
                 <Clock size={12} style={{ opacity: 0.6 }} />
-                <Typography variant="caption" color="text.secondary">
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {effectiveTimeout}s
                 </Typography>
               </Box>
 
               {/* Actions */}
               <Box sx={{ display: 'flex', gap: 0.25, ml: 'auto' }}>
-                <Tooltip title={t('repositoryScripts.tooltips.testScript', 'Test run this script')}>
+                <Tooltip title={t('repositoryScripts.tooltips.testScript')}>
                   <IconButton
                     size="small"
                     onClick={() => handleTestScript(script)}
@@ -601,7 +604,7 @@ function RepositoryScriptDialog({
         <Box sx={{ pt: 2, display: 'flex', flexDirection: 'column', gap: 2 }}>
           {isPreBackup && hasInlineScript && scriptsCount === 0 && (
             <Alert severity="warning">
-              Adding a library script will replace your current inline script for this hook.
+              {t('repositoryScripts.dialog.inlineScriptReplacementWarning')}
             </Alert>
           )}
           <FormControl fullWidth>
@@ -615,9 +618,11 @@ function RepositoryScriptDialog({
                 return s ? s.name : ''
               }}
               MenuProps={{
-                PaperProps: {
-                  style: {
-                    maxHeight: 400,
+                slotProps: {
+                  paper: {
+                    style: {
+                      maxHeight: 400,
+                    },
                   },
                 },
               }}
@@ -627,7 +632,13 @@ function RepositoryScriptDialog({
                   <Box>
                     <Typography variant="body2">{script.name}</Typography>
                     {script.description && (
-                      <Typography variant="caption" color="text.secondary" display="block">
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: 'text.secondary',
+                          display: 'block',
+                        }}
+                      >
                         {script.description}
                       </Typography>
                     )}
@@ -795,23 +806,39 @@ function ScriptTestDialog({ open, onClose, scriptName, running, result }: Script
   return (
     <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
       <DialogTitle>
-        <Box display="flex" alignItems="center" justifyContent="space-between">
-          <Typography variant="h6">Test: {scriptName}</Typography>
+        <Box
+          sx={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+          }}
+        >
+          <Typography variant="h6">
+            {t('repositoryScripts.testDialog.title', { scriptName })}
+          </Typography>
           {running && <CircularProgress size={20} />}
           {result && (
-            <Box display="flex" alignItems="center" gap={1}>
+            <Box
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 1,
+              }}
+            >
               {result.success ? (
                 <CheckCircle size={20} color="#4caf50" />
               ) : (
                 <XCircle size={20} color="#f44336" />
               )}
               <Chip
-                label={`Exit: ${result.exit_code}`}
+                label={t('repositoryScripts.testDialog.exitCode', { code: result.exit_code })}
                 size="small"
                 color={result.exit_code === 0 ? 'success' : 'error'}
               />
               <Chip
-                label={`${result.execution_time.toFixed(2)}s`}
+                label={t('repositoryScripts.testDialog.duration', {
+                  seconds: result.execution_time.toFixed(2),
+                })}
                 size="small"
                 variant="outlined"
               />
@@ -821,7 +848,13 @@ function ScriptTestDialog({ open, onClose, scriptName, running, result }: Script
       </DialogTitle>
       <DialogContent dividers>
         {running && (
-          <Box display="flex" justifyContent="center" py={4}>
+          <Box
+            sx={{
+              display: 'flex',
+              justifyContent: 'center',
+              py: 4,
+            }}
+          >
             <CircularProgress />
           </Box>
         )}
@@ -831,9 +864,11 @@ function ScriptTestDialog({ open, onClose, scriptName, running, result }: Script
               <Box>
                 <Typography
                   variant="caption"
-                  color="text.secondary"
-                  display="block"
-                  sx={{ mb: 0.5 }}
+                  sx={{
+                    color: 'text.secondary',
+                    display: 'block',
+                    mb: 0.5,
+                  }}
                 >
                   {t('scriptEditor.stdout')}
                 </Typography>
@@ -858,9 +893,11 @@ function ScriptTestDialog({ open, onClose, scriptName, running, result }: Script
               <Box>
                 <Typography
                   variant="caption"
-                  color="text.secondary"
-                  display="block"
-                  sx={{ mb: 0.5 }}
+                  sx={{
+                    color: 'text.secondary',
+                    display: 'block',
+                    mb: 0.5,
+                  }}
                 >
                   {t('scriptEditor.stderr')}
                 </Typography>

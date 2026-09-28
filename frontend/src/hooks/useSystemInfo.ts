@@ -15,7 +15,13 @@ export interface EntitlementInfo {
   key_id?: string | null
   license_id?: string | null
   customer_id?: string | null
+  /** The tier as sold. Lite is gated as Pro but named for the reader. */
+  license_plan?: 'lite' | Plan | null
   ui_state?: 'full_access_active' | 'full_access_expired' | 'paid_active' | 'community'
+  /** Features a per-feature trial grants right now, and the ones whose
+   *  trial has run out (spec 2026-09-21, section 3). */
+  trial_features?: { feature: string; expires_at: string | null }[]
+  expired_trial_features?: string[]
   last_refresh_at: string | null
   last_refresh_error: string | null
 }

@@ -5,10 +5,17 @@ Unit tests for MountService
 import pytest
 import tempfile
 import os
+import stat
 from unittest.mock import Mock, patch, AsyncMock
 from datetime import datetime, timezone
 
-from app.services.mount_service import MountService, MountType, MountInfo
+from app.services.mount_service import (
+    MountService,
+    MountType,
+    MountInfo,
+    stable_sshfs_temp_root,
+    _ensure_sshfs_cache_root,
+)
 from app.database.models import SSHConnection, SSHKey, Repository
 
 
@@ -33,11 +40,34 @@ class TestMountService:
 
     def test_sshfs_symlink_options_preserve_is_faithful(self):
         """Backup sources disable the contain_symlinks sandbox and do not follow."""
-        from app.services.mount_service import _sshfs_symlink_options
+        from app.services import mount_service as ms
 
-        opts = _sshfs_symlink_options(True)
+        ms._sshfs_has_contain_symlinks.cache_clear()
+        try:
+            with patch(
+                "app.services.mount_service.subprocess.run",
+                return_value=Mock(stdout="    -o no_contain_symlinks\n", stderr=""),
+            ):
+                opts = ms._sshfs_symlink_options(True)
+        finally:
+            ms._sshfs_has_contain_symlinks.cache_clear()
         assert "no_contain_symlinks" in opts
         assert "follow_symlinks" not in opts
+
+    def test_sshfs_symlink_options_skip_option_sshfs_does_not_know(self):
+        # Ubuntu 24.04's sshfs 3.7.3 lacks the contain_symlinks patch and
+        # fails the whole mount on the unknown option.
+        from app.services import mount_service as ms
+
+        ms._sshfs_has_contain_symlinks.cache_clear()
+        try:
+            with patch(
+                "app.services.mount_service.subprocess.run",
+                return_value=Mock(stdout="    -o follow_symlinks\n", stderr=""),
+            ):
+                assert ms._sshfs_symlink_options(True) == []
+        finally:
+            ms._sshfs_has_contain_symlinks.cache_clear()
 
     def test_sshfs_symlink_options_default_follows(self):
         """Browse/restore/cloud-mirror keep the historical follow_symlinks."""
@@ -83,7 +113,11 @@ class TestMountService:
     async def test_execute_sshfs_mount_backup_source_preserves_symlinks(
         self, mount_service
     ):
-        argv = await self._capture_sshfs_argv(mount_service, preserve_symlinks=True)
+        with patch(
+            "app.services.mount_service._sshfs_has_contain_symlinks",
+            return_value=True,
+        ):
+            argv = await self._capture_sshfs_argv(mount_service, preserve_symlinks=True)
         assert "no_contain_symlinks" in argv
         assert "follow_symlinks" not in argv
 
@@ -243,6 +277,65 @@ class TestMountService:
         assert not orphaned_root.exists()
         assert tracked_root.exists()
 
+    def test_stable_sshfs_temp_root_stays_under_tmp(self):
+        # Ubuntu 25.04+ AppArmor only allows FUSE mounts under /tmp/**/ and a few
+        # other roots; moving this off /tmp breaks SSHFS backups there (#760).
+        assert stable_sshfs_temp_root(3) == "/tmp/borg-ui/sshfs-cache/repository-3"
+        assert stable_sshfs_temp_root(None) is None
+
+    def test_ensure_sshfs_cache_root_rejects_symlinked_parent(
+        self, tmp_path, monkeypatch
+    ):
+        # /tmp is world-writable, so a hijacked parent must not be followed.
+        elsewhere = tmp_path / "attacker"
+        elsewhere.mkdir()
+        hijacked_parent = tmp_path / "borg-ui"
+        hijacked_parent.symlink_to(elsewhere)
+        cache_base = hijacked_parent / "sshfs-cache"
+        monkeypatch.setattr(
+            "app.services.mount_service.SSHFS_CACHE_BASE", str(cache_base)
+        )
+
+        with pytest.raises(Exception, match="symlink"):
+            _ensure_sshfs_cache_root(str(cache_base / "repository-3"))
+
+        assert not (elsewhere / "sshfs-cache").exists()
+
+    def test_ensure_sshfs_cache_root_creates_private_dirs(self, tmp_path, monkeypatch):
+        cache_base = tmp_path / "borg-ui" / "sshfs-cache"
+        monkeypatch.setattr(
+            "app.services.mount_service.SSHFS_CACHE_BASE", str(cache_base)
+        )
+        temp_root = cache_base / "repository-3"
+
+        _ensure_sshfs_cache_root(str(temp_root))
+
+        assert temp_root.is_dir()
+        assert stat.S_IMODE(temp_root.stat().st_mode) == 0o700
+        assert stat.S_IMODE(cache_base.parent.stat().st_mode) == 0o700
+
+    def test_cleanup_orphaned_temp_dirs_removes_roots_under_cache_base(
+        self, mount_service, tmp_path, monkeypatch
+    ):
+        cache_base = tmp_path / "borg-ui" / "sshfs-cache"
+        orphaned_root = cache_base / "repository-7"
+        orphaned_root.mkdir(parents=True)
+        monkeypatch.setattr(
+            "app.services.mount_service.SSHFS_CACHE_BASE", str(cache_base)
+        )
+
+        def glob_side_effect(pattern):
+            if pattern == "/tmp/sshfs_mount_*":
+                return []
+            if pattern.startswith(str(cache_base)):
+                return [str(orphaned_root)]
+            return []
+
+        with patch("glob.glob", side_effect=glob_side_effect):
+            mount_service._cleanup_orphaned_temp_dirs()
+
+        assert not orphaned_root.exists()
+
     def test_cleanup_orphaned_temp_dirs_preserves_mounted_stable_sshfs_cache_root(
         self, mount_service
     ):
@@ -258,15 +351,89 @@ class TestMountService:
 
         with (
             patch("glob.glob", side_effect=glob_side_effect),
-            patch.object(
-                mount_service,
-                "_get_active_mount_points",
+            patch(
+                "app.utils.fs.active_mount_points",
                 return_value={str(mounted_path)},
             ),
         ):
             mount_service._cleanup_orphaned_temp_dirs()
 
         assert mounted_root.exists()
+
+    def test_cleanup_orphaned_temp_dirs_preserves_mounted_legacy_temp_root(
+        self, mount_service, tmp_path
+    ):
+        legacy_root = tmp_path / "sshfs_mount_7_abc"
+        mounted_path = legacy_root / "srv"
+        (mounted_path / "data").mkdir(parents=True)
+
+        def glob_side_effect(pattern):
+            return [str(legacy_root)] if pattern == "/tmp/sshfs_mount_*" else []
+
+        with (
+            patch("glob.glob", side_effect=glob_side_effect),
+            patch(
+                "app.utils.fs.active_mount_points",
+                return_value={str(mounted_path)},
+            ),
+        ):
+            mount_service._cleanup_orphaned_temp_dirs()
+
+        assert (mounted_path / "data").exists()
+
+    @pytest.mark.asyncio
+    async def test_failed_unmount_never_deletes_through_the_live_mount(
+        self, mount_service, tmp_path
+    ):
+        # Discord report: a shell inside the SSHFS source kept the mount busy,
+        # the unmount failed, and cleanup rmtree'd the remote machine through it.
+        temp_root = tmp_path / "repository-1"
+        mount_point = temp_root / "srv" / "data"
+        mount_point.mkdir(parents=True)
+        (mount_point / "remote-file").write_text("remote data")
+        mount_service.active_mounts["m1"] = MountInfo(
+            mount_id="m1",
+            mount_type=MountType.SSHFS,
+            mount_point=str(mount_point),
+            source="ssh://root@host/srv/data",
+            created_at=datetime.now(timezone.utc),
+            temp_root=str(temp_root),
+        )
+
+        with (
+            patch.object(mount_service, "_unmount_fuse", AsyncMock(return_value=False)),
+            patch(
+                "app.utils.fs.active_mount_points",
+                return_value={str(mount_point)},
+            ),
+        ):
+            assert await mount_service.unmount("m1") is False
+
+        assert (mount_point / "remote-file").read_text() == "remote data"
+
+    @pytest.mark.asyncio
+    async def test_busy_fuse_unmount_falls_back_to_lazy_detach(self, mount_service):
+        busy = Mock(returncode=1)
+        busy.communicate = AsyncMock(return_value=(b"", b"Device or resource busy"))
+        detached = Mock(returncode=0)
+        detached.communicate = AsyncMock(return_value=(b"", b""))
+        commands = []
+
+        async def fake_exec(*cmd, **kwargs):
+            commands.append(cmd)
+            return detached if "-uz" in cmd or "-f" in cmd else busy
+
+        with (
+            patch("app.services.mount_service.platform.system", return_value="Linux"),
+            patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+            patch("asyncio.sleep", AsyncMock()),
+        ):
+            assert await mount_service._unmount_fuse("/tmp/x") is True
+
+        assert commands[-1] == ("fusermount", "-uz", "/tmp/x")
+        assert [c for c in commands if "-u" in c] == [
+            ("fusermount", "-u", "/tmp/x")
+        ] * 3
 
     def test_list_mounts(self, mount_service):
         """Test listing active mounts"""
@@ -433,6 +600,182 @@ class TestMountService:
             assert mock_exec.called, "create_subprocess_exec was not called"
             assert "--remote-path" in captured_args
             assert "borg14" in captured_args
+
+    @pytest.mark.asyncio
+    async def test_borg2_mount_addresses_series_archive_by_aid(self, mount_service):
+        """Borg 2 series archives share one name; `-a <name>` mounts every
+        archive of the series. With the id supplied, the mount must address
+        exactly one archive via the aid: selector."""
+        with (
+            patch("app.services.mount_service.SessionLocal") as mock_session,
+            patch(
+                "app.services.mount_service.asyncio.create_subprocess_exec"
+            ) as mock_exec,
+            patch("app.services.mount_service.os.makedirs"),
+            patch("app.services.mount_service.os.path.exists", return_value=False),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            mock_db = Mock()
+            mock_session.return_value = mock_db
+            mock_repo = Mock(spec=Repository)
+            mock_repo.id = 1
+            mock_repo.name = "b2-repo"
+            mock_repo.path = "/backup/b2-repo"
+            mock_repo.passphrase = None
+            mock_repo.connection_id = None
+            mock_repo.bypass_lock = False
+            mock_repo.remote_path = None
+            mock_repo.borg_version = 2
+            mock_db.query.return_value.filter.return_value.first.side_effect = [
+                mock_repo,
+                None,
+            ]
+            mock_db.query.return_value.first.return_value = None
+
+            captured_args = []
+
+            async def fake_exec(*args, **kwargs):
+                captured_args.extend(args)
+                proc = AsyncMock()
+                proc.pid = 12345
+                proc.stdout = AsyncMock()
+                proc.stdout.readline = AsyncMock(return_value=b"")
+                proc.stderr = AsyncMock()
+                proc.stderr.read = AsyncMock(return_value=b"")
+                proc.wait = AsyncMock(return_value=0)
+                return proc
+
+            mock_exec.side_effect = fake_exec
+
+            try:
+                await mount_service.mount_borg_archive(
+                    repository_id=1,
+                    archive_name="myplan-daily",
+                    archive_id="ab12cd34ef567890",
+                )
+            except Exception:
+                pass
+
+            assert mock_exec.called
+            assert "aid:ab12cd34ef567890" in captured_args
+            # The bare series name must not be the -a value.
+            assert "myplan-daily" not in captured_args
+
+    @pytest.mark.asyncio
+    async def test_borg2_mount_id_only_request_still_addresses_by_aid(
+        self, mount_service
+    ):
+        """An id without a name must mount that one archive by aid:, not fall
+        back to the whole repository."""
+        with (
+            patch("app.services.mount_service.SessionLocal") as mock_session,
+            patch(
+                "app.services.mount_service.asyncio.create_subprocess_exec"
+            ) as mock_exec,
+            patch("app.services.mount_service.os.makedirs"),
+            patch("app.services.mount_service.os.path.exists", return_value=False),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            mock_db = Mock()
+            mock_session.return_value = mock_db
+            mock_repo = Mock(spec=Repository)
+            mock_repo.id = 1
+            mock_repo.name = "b2-repo"
+            mock_repo.path = "/backup/b2-repo"
+            mock_repo.passphrase = None
+            mock_repo.connection_id = None
+            mock_repo.bypass_lock = False
+            mock_repo.remote_path = None
+            mock_repo.borg_version = 2
+            mock_db.query.return_value.filter.return_value.first.side_effect = [
+                mock_repo,
+                None,
+            ]
+            mock_db.query.return_value.first.return_value = None
+
+            captured_args = []
+
+            async def fake_exec(*args, **kwargs):
+                captured_args.extend(args)
+                proc = AsyncMock()
+                proc.pid = 12345
+                proc.stdout = AsyncMock()
+                proc.stdout.readline = AsyncMock(return_value=b"")
+                proc.stderr = AsyncMock()
+                proc.stderr.read = AsyncMock(return_value=b"")
+                proc.wait = AsyncMock(return_value=0)
+                return proc
+
+            mock_exec.side_effect = fake_exec
+
+            try:
+                await mount_service.mount_borg_archive(
+                    repository_id=1,
+                    archive_name=None,
+                    archive_id="ab12cd34ef567890",
+                )
+            except Exception:
+                pass
+
+            assert mock_exec.called
+            assert "aid:ab12cd34ef567890" in captured_args
+
+    @pytest.mark.asyncio
+    async def test_borg1_mount_keeps_name_addressing(self, mount_service):
+        """Borg 1 names are unique; a supplied id must not change addressing."""
+        with (
+            patch("app.services.mount_service.SessionLocal") as mock_session,
+            patch(
+                "app.services.mount_service.asyncio.create_subprocess_exec"
+            ) as mock_exec,
+            patch("app.services.mount_service.os.makedirs"),
+            patch("app.services.mount_service.os.path.exists", return_value=False),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            mock_db = Mock()
+            mock_session.return_value = mock_db
+            mock_repo = Mock(spec=Repository)
+            mock_repo.id = 1
+            mock_repo.name = "b1-repo"
+            mock_repo.path = "/backup/b1-repo"
+            mock_repo.passphrase = None
+            mock_repo.connection_id = None
+            mock_repo.bypass_lock = False
+            mock_repo.remote_path = None
+            mock_repo.borg_version = 1
+            mock_db.query.return_value.filter.return_value.first.side_effect = [
+                mock_repo,
+                None,
+            ]
+            mock_db.query.return_value.first.return_value = None
+
+            captured_args = []
+
+            async def fake_exec(*args, **kwargs):
+                captured_args.extend(args)
+                proc = AsyncMock()
+                proc.pid = 12345
+                proc.stdout = AsyncMock()
+                proc.stdout.readline = AsyncMock(return_value=b"")
+                proc.stderr = AsyncMock()
+                proc.stderr.read = AsyncMock(return_value=b"")
+                proc.wait = AsyncMock(return_value=0)
+                return proc
+
+            mock_exec.side_effect = fake_exec
+
+            try:
+                await mount_service.mount_borg_archive(
+                    repository_id=1,
+                    archive_name="backup-2026-01-01",
+                    archive_id="ab12cd34ef567890",
+                )
+            except Exception:
+                pass
+
+            assert mock_exec.called
+            assert "/backup/b1-repo::backup-2026-01-01" in captured_args
+            assert not any(str(a).startswith("aid:") for a in captured_args)
 
     @pytest.mark.asyncio
     async def test_mount_borg_archive_no_remote_path(self, mount_service):
@@ -608,7 +951,7 @@ class TestMountService:
     ):
         connection = Mock(spec=SSHConnection)
         connection.host = "192.168.1.150"
-        connection.username = "karanhudia"
+        connection.username = "alex"
         connection.port = 22
         connection.use_sudo = False
         connection.default_path = "/"
@@ -618,7 +961,7 @@ class TestMountService:
         first_process.communicate = AsyncMock(
             return_value=(
                 b"",
-                b"karanhudia@192.168.1.150:/test-backup-source: No such file or directory\n",
+                b"alex@192.168.1.150:/test-backup-source: No such file or directory\n",
             )
         )
         second_process = AsyncMock()
@@ -642,8 +985,8 @@ class TestMountService:
         assert mock_exec.await_count == 2
         first_cmd = mock_exec.await_args_list[0].args
         second_cmd = mock_exec.await_args_list[1].args
-        assert first_cmd[1] == "karanhudia@192.168.1.150:/test-backup-source"
-        assert second_cmd[1] == "karanhudia@192.168.1.150:test-backup-source"
+        assert first_cmd[1] == "alex@192.168.1.150:/test-backup-source"
+        assert second_cmd[1] == "alex@192.168.1.150:test-backup-source"
 
     @pytest.mark.asyncio
     async def test_execute_sshfs_mount_does_not_retry_relative_path_for_explicit_default_path(
@@ -651,17 +994,17 @@ class TestMountService:
     ):
         connection = Mock(spec=SSHConnection)
         connection.host = "192.168.1.150"
-        connection.username = "karanhudia"
+        connection.username = "alex"
         connection.port = 22
         connection.use_sudo = False
-        connection.default_path = "/home/karanhudia"
+        connection.default_path = "/home/alex"
 
         process = AsyncMock()
         process.returncode = 1
         process.communicate = AsyncMock(
             return_value=(
                 b"",
-                b"karanhudia@192.168.1.150:/missing: No such file or directory\n",
+                b"alex@192.168.1.150:/missing: No such file or directory\n",
             )
         )
 

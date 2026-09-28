@@ -43,12 +43,14 @@ const withAppVersion = (data?: Record<string, unknown>): Record<string, unknown>
 }
 
 let currentUserId: string | null = null
+let currentPlan: string | null = null
 
 const identifySession = (): void => {
   if (!window.umami?.identify) return
   const data: Record<string, unknown> = {}
   if (currentUserId) data.user_id = currentUserId
   if (currentAppVersion) data.app_version = currentAppVersion
+  if (currentPlan) data.plan = currentPlan
   if (Object.keys(data).length) window.umami.identify(data)
 }
 
@@ -68,6 +70,10 @@ const initUmamiScript = (): void => {
 
   const script = document.createElement('script')
   script.defer = true
+  // Without this the browser attaches the instance's own origin to the script
+  // request, which hands Umami the private hostname the payload masking exists
+  // to keep from it.
+  script.referrerPolicy = 'no-referrer'
   script.src = UMAMI_SCRIPT_URL
   script.setAttribute('data-website-id', UMAMI_WEBSITE_ID)
   // Disable auto page tracking — we handle it via trackPageView so it respects opt-out
@@ -221,6 +227,19 @@ export const setCustomDimension = (_dimensionId: number, _value: string): void =
 
 export const setAppVersion = (version: string): void => {
   currentAppVersion = version || null
+  identifySession()
+}
+
+/**
+ * Set the effective subscription plan so Umami can segment visitors by plan.
+ * Only the plan name is sent, never licence keys or customer details.
+ */
+export const setAnalyticsPlan = (plan: string | null): void => {
+  const next = plan || null
+  // The plan starts unknown, so the first render would otherwise re-identify
+  // the session with nothing new to say.
+  if (next === currentPlan) return
+  currentPlan = next
   identifySession()
 }
 

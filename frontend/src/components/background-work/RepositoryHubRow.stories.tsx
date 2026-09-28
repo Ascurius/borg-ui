@@ -1,0 +1,189 @@
+import type { Meta, StoryObj } from '@storybook/react-vite'
+import { Box } from '@mui/material'
+import RepositoryHubRow from './RepositoryHubRow'
+import { deriveTrack } from './repositoryTrack'
+import { busyQueue, hubRepositories, hubRepository, op } from './storyFixtures'
+
+const trackFor = (repositoryId: number) => {
+  const group = busyQueue.repositories.find((r) => r.repository_id === repositoryId)
+  return group ? deriveTrack(group, busyQueue.limits, busyQueue.paused_stages) : null
+}
+
+const meta = {
+  title: 'BackgroundWork/RepositoryHubRow',
+  component: RepositoryHubRow,
+  parameters: { layout: 'fullscreen' },
+  decorators: [
+    (Story) => (
+      <Box sx={{ p: 3, maxWidth: 1100 }}>
+        <Story />
+      </Box>
+    ),
+  ],
+  args: {
+    repository: hubRepository(),
+    track: null,
+    onOpen: () => {},
+    onRetry: () => {},
+  },
+} satisfies Meta<typeof RepositoryHubRow>
+
+export default meta
+
+type Story = StoryObj<typeof meta>
+
+export const AtRest: Story = {}
+
+export const WithProblems: Story = {
+  args: { repository: hubRepositories[3] },
+}
+
+export const NeverBuilt: Story = {
+  args: { repository: hubRepositories[0] },
+}
+
+// Spec 6.8: an opted-out repository reads as a choice, not a problem.
+export const ArchivesOnly: Story = {
+  args: { repository: hubRepository({ index_mode: 'archives' }) },
+}
+
+export const NotIndexed: Story = {
+  args: {
+    repository: hubRepository({ index_mode: 'off', sync_state: 'stale' }),
+  },
+}
+
+export const Running: Story = {
+  args: { repository: hubRepositories[2], track: trackFor(3) },
+}
+
+export const BackupHoldsTheLane: Story = {
+  args: { repository: hubRepositories[1], track: trackFor(2) },
+}
+
+// A stats refresh of the repository is still running: its queued listing
+// waits for it (one index operation per repository) although a worker is
+// free, and the stage says so.
+export const IndexWorkHoldsTheRepository: Story = {
+  args: { repository: hubRepositories[5], track: trackFor(6) },
+}
+
+// Backup and prune follow-ups share a run, but their stats jobs are siblings.
+// The queued sibling must name the index contention even when it hides the
+// older running stats job in the one-cell-per-stage display.
+export const SiblingBranchesWaitWithinOneRun: Story = {
+  args: {
+    repository: hubRepositories[5],
+    track: deriveTrack(
+      {
+        repository_id: 6,
+        repository_name: 'media',
+        lane_busy: false,
+        index_holder_ids: [7],
+        operations: [
+          op({
+            id: 7,
+            kind: 'stats',
+            status: 'running',
+            repository_id: 6,
+            repository: 'media',
+            depends_on_id: 5,
+          }),
+          op({
+            id: 8,
+            kind: 'stats',
+            status: 'queued',
+            repository_id: 6,
+            repository: 'media',
+            depends_on_id: 6,
+          }),
+        ],
+      },
+      busyQueue.limits,
+      []
+    ),
+  },
+}
+
+// The archive list is paused, so the stats queued behind it say so rather
+// than "next in line".
+export const WaitingOnAPausedStage: Story = {
+  args: {
+    repository: hubRepositories[2],
+    track: deriveTrack(
+      {
+        repository_id: 3,
+        repository_name: hubRepositories[2].repository_name,
+        lane_busy: false,
+        index_holder_ids: [],
+        operations: [
+          op({ id: 21, kind: 'archive_sync', status: 'queued', repository_id: 3 }),
+          op({ id: 22, kind: 'stats', status: 'queued', repository_id: 3, depends_on_id: 21 }),
+        ],
+      },
+      busyQueue.limits,
+      ['archives']
+    ),
+  },
+}
+
+// The retention comparison is a stage of the chain, not a foreground job.
+export const RetentionPreviewRunning: Story = {
+  args: {
+    repository: hubRepositories[2],
+    track: deriveTrack(
+      {
+        repository_id: 3,
+        repository_name: hubRepositories[2].repository_name,
+        lane_busy: false,
+        index_holder_ids: [],
+        operations: [
+          op({
+            id: 31,
+            kind: 'prune_compare',
+            category: 'maintenance',
+            status: 'running',
+            repository_id: 3,
+            started_at: new Date(Date.now() - 40 * 1000).toISOString(),
+          }),
+        ],
+      },
+      busyQueue.limits,
+      []
+    ),
+  },
+}
+
+export const FailedStage: Story = {
+  args: { repository: hubRepositories[3], track: trackFor(4) },
+}
+
+export const SystemLane: Story = {
+  args: {
+    repository: null,
+    track: {
+      repositoryId: null,
+      repositoryName: 'System',
+      foreground: null,
+      stages: [
+        { key: 'connect', status: 'idle', operation: null, reason: null },
+        { key: 'archives', status: 'idle', operation: null, reason: null },
+        { key: 'retention', status: 'idle', operation: null, reason: null },
+        { key: 'history', status: 'idle', operation: null, reason: null },
+        { key: 'stats', status: 'idle', operation: null, reason: null },
+      ],
+    },
+  },
+}
+
+// A repository executed by a managed agent has no history stage: the cell
+// says so instead of showing a plan chip or "no file history yet".
+export const AgentRepository: Story = {
+  args: {
+    repository: hubRepository({
+      repository_name: 'k8s-node',
+      history: { indexed: 0, pending: 0, failed: 0, skipped: 18, truncated: 0, rows: 0 },
+      history_capability: 'agent_unsupported',
+    }),
+  },
+}

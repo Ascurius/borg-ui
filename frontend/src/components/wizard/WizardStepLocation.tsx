@@ -249,8 +249,14 @@ export default function WizardStepLocation({
         >
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
-              <Typography variant="body2" color="text.secondary" sx={{ flexShrink: 0 }}>
-                Borg Version
+              <Typography
+                variant="body2"
+                sx={{
+                  color: 'text.secondary',
+                  flexShrink: 0,
+                }}
+              >
+                {t('wizard.location.borgVersion')}
               </Typography>
               <Box
                 sx={{
@@ -289,7 +295,7 @@ export default function WizardStepLocation({
               {(data.borgVersion ?? 1) === 2 && (
                 <Tooltip title={t('wizard.location.borgV2Warning')} arrow placement="right">
                   <Chip
-                    label="Beta"
+                    label={t('wizard.location.beta')}
                     size="small"
                     color="warning"
                     variant="outlined"
@@ -313,20 +319,40 @@ export default function WizardStepLocation({
           >
             <MenuItem value="full">
               <Box>
-                <Typography variant="body2" fontWeight={600}>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    fontWeight: 600,
+                  }}
+                >
                   {t('wizard.location.fullRepository')}
                 </Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('wizard.location.fullRepositoryDesc')}
                 </Typography>
               </Box>
             </MenuItem>
             <MenuItem value="observe">
               <Box>
-                <Typography variant="body2" fontWeight={600}>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    fontWeight: 600,
+                  }}
+                >
                   {t('wizard.location.observabilityOnly')}
                 </Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('wizard.location.observabilityOnlyDesc')}
                 </Typography>
               </Box>
@@ -336,7 +362,12 @@ export default function WizardStepLocation({
       )}
 
       {mode === 'import' && data.repositoryMode === 'observe' && (
-        <Typography variant="body2" color="text.secondary">
+        <Typography
+          variant="body2"
+          sx={{
+            color: 'text.secondary',
+          }}
+        >
           {t('wizard.location.observabilityInfo')}
         </Typography>
       )}
@@ -353,7 +384,12 @@ export default function WizardStepLocation({
           label={
             <Box>
               <Typography variant="body2">{t('wizard.location.readOnlyStorageLabel')}</Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography
+                variant="caption"
+                sx={{
+                  color: 'text.secondary',
+                }}
+              >
                 {t('wizard.location.readOnlyStorageDesc')}
               </Typography>
             </Box>
@@ -373,7 +409,12 @@ export default function WizardStepLocation({
       )}
 
       {isRemoteLocationDisabled && (
-        <Typography variant="body2" color="text.secondary">
+        <Typography
+          variant="body2"
+          sx={{
+            color: 'text.secondary',
+          }}
+        >
           <strong>{t('wizard.dataSource.remoteToRemoteTitle')}</strong>{' '}
           {t('wizard.location.remoteDisabledInfo')}
         </Typography>
@@ -390,7 +431,12 @@ export default function WizardStepLocation({
             emptyMessage={t('wizard.location.noActiveManagedAgents')}
             labelId="managed-agent-select-label"
           />
-          <Typography variant="body2" color="text.secondary">
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+            }}
+          >
             {t('wizard.location.agentStorageNote')}
           </Typography>
         </Stack>
@@ -428,11 +474,16 @@ export default function WizardStepLocation({
           }}
         >
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
-            <Typography variant="subtitle2" fontWeight={700}>
+            <Typography
+              variant="subtitle2"
+              sx={{
+                fontWeight: 700,
+              }}
+            >
               {t('wizard.location.directRcloneAdvancedTitle')}
             </Typography>
             <Chip
-              label="Borg 2"
+              label={t('wizard.location.borg2')}
               size="small"
               variant="outlined"
               color="warning"
@@ -449,10 +500,20 @@ export default function WizardStepLocation({
             }
             label={
               <Box>
-                <Typography variant="body2" fontWeight={600}>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    fontWeight: 600,
+                  }}
+                >
                   {t('wizard.location.directRcloneLabel')}
                 </Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('wizard.location.directRcloneHelper')}
                 </Typography>
               </Box>
@@ -539,34 +600,36 @@ export default function WizardStepLocation({
             ? t('wizard.location.directRclonePathHelper')
             : t('wizard.location.repositoryPathHelper')
         }
-        InputProps={{
-          endAdornment: (
-            <InputAdornment position="end">
-              <IconButton
-                onClick={isDirectRclone ? onBrowseDirectRclonePath : onBrowsePath}
-                edge="end"
-                size="small"
-                title={
-                  isDirectRclone
-                    ? t('wizard.cloudMirror.browseRemote')
-                    : t('wizard.location.browseFilesystem')
-                }
-                aria-label={
-                  isDirectRclone
-                    ? t('wizard.cloudMirror.browseRemote')
-                    : t('wizard.location.browseFilesystem')
-                }
-                disabled={
-                  isDirectRclone
-                    ? !directRcloneBrowseEnabled
-                    : (isAgentExecution && !data.agentMachineId) ||
-                      (data.repositoryLocation === 'ssh' && !data.repoSshConnectionId)
-                }
-              >
-                <FolderOpenIcon fontSize="small" />
-              </IconButton>
-            </InputAdornment>
-          ),
+        slotProps={{
+          input: {
+            endAdornment: (
+              <InputAdornment position="end">
+                <IconButton
+                  onClick={isDirectRclone ? onBrowseDirectRclonePath : onBrowsePath}
+                  edge="end"
+                  size="small"
+                  title={
+                    isDirectRclone
+                      ? t('wizard.cloudMirror.browseRemote')
+                      : t('wizard.location.browseFilesystem')
+                  }
+                  aria-label={
+                    isDirectRclone
+                      ? t('wizard.cloudMirror.browseRemote')
+                      : t('wizard.location.browseFilesystem')
+                  }
+                  disabled={
+                    isDirectRclone
+                      ? !directRcloneBrowseEnabled
+                      : (isAgentExecution && !data.agentMachineId) ||
+                        (data.repositoryLocation === 'ssh' && !data.repoSshConnectionId)
+                  }
+                >
+                  <FolderOpenIcon fontSize="small" />
+                </IconButton>
+              </InputAdornment>
+            ),
+          },
         }}
       />
     </Box>
@@ -585,7 +648,12 @@ function renderRcloneRemoteRow(remote: RcloneRemote) {
         sx={{ height: 20, fontSize: '0.65rem' }}
       />
       {remote.last_test_status && (
-        <Typography variant="caption" color="text.secondary">
+        <Typography
+          variant="caption"
+          sx={{
+            color: 'text.secondary',
+          }}
+        >
           {remote.last_test_status}
         </Typography>
       )}

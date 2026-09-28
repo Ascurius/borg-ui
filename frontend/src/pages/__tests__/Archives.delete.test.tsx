@@ -2,7 +2,7 @@
  * Regression tests for archive deletion cache invalidation (issue #352)
  *
  * After deleting an archive, the UI was showing stale repository statistics
- * because `repository-info` was not being invalidated alongside `repository-archives`.
+ * because the stored list was not being invalidated after the delete job finished.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor } from '@testing-library/react'
@@ -13,7 +13,6 @@ import Archives from '../Archives'
 import * as apiModule from '../../services/api'
 
 const deleteArchiveMock = vi.fn()
-const listArchivesMock = vi.fn()
 const getInfoMock = vi.fn()
 const getDeleteJobStatusMock = vi.fn()
 
@@ -23,7 +22,7 @@ vi.mock('../../components/RepositorySelectorCard', () => ({
     <button onClick={() => onChange(1)}>Select Repo</button>
   ),
 }))
-vi.mock('../../components/RepositoryStatsGrid', () => ({
+vi.mock('../../components/RepositoryStats', () => ({
   default: () => <div data-testid="stats-grid" />,
 }))
 vi.mock('../../components/ArchivesList', () => ({
@@ -45,11 +44,22 @@ vi.mock('../../components/ArchiveContentsDialog', () => ({ default: () => null }
 vi.mock('../../components/MountArchiveDialog', () => ({ default: () => null }))
 vi.mock('../../components/LockErrorDialog', () => ({ default: () => null }))
 vi.mock('../../components/RestoreWizard', () => ({ default: () => null }))
+vi.mock('../../components/archives/SyncStateChip', () => ({ default: () => null }))
+vi.mock('../../components/archives/ArchiveSearchField', () => ({ default: () => null }))
+vi.mock('../../components/archives/ArchiveSeriesHeatmap', () => ({ default: () => null }))
 
 vi.mock('../../services/api', () => ({
-  archivesAPI: { deleteArchive: vi.fn(), downloadFile: vi.fn() },
+  archivesAPI: {
+    deleteArchive: vi.fn(),
+    downloadFile: vi.fn(),
+    listStored: vi.fn(),
+    getHeatmap: vi.fn(),
+    rebuild: vi.fn(),
+    resync: vi.fn(),
+  },
   repositoriesAPI: {
     getRepositories: vi.fn(),
+    getStorage: vi.fn().mockRejectedValue(new Error('not mocked')),
     listRepositoryArchives: vi.fn(),
     getRepositoryInfo: vi.fn(),
   },
@@ -60,7 +70,6 @@ vi.mock('../../services/api', () => ({
 vi.mock('../../services/borgApi', () => ({
   BorgApiClient: vi.fn(function MockBorgApiClient() {
     return {
-      listArchives: listArchivesMock,
       getInfo: getInfoMock,
       deleteArchive: deleteArchiveMock,
       getDeleteJobStatus: getDeleteJobStatusMock,
@@ -108,6 +117,10 @@ describe('Archives page — delete cache invalidation (regression #352)', () => 
   let queryClient: QueryClient
 
   beforeEach(() => {
+    // The delete flow is exercised through the (mocked) list view; force it
+    // so the heatmap, which defaults on, doesn't hide the trigger button.
+    localStorage.setItem('archives-view-mode', 'list')
+
     queryClient = new QueryClient({
       defaultOptions: {
         queries: { retry: false, gcTime: Infinity },
@@ -117,8 +130,9 @@ describe('Archives page — delete cache invalidation (regression #352)', () => 
 
     // Seed query cache
     queryClient.setQueryData(['repositories'], { data: { repositories: [mockRepository] } })
-    queryClient.setQueryData(['repository-archives', 1], { data: { archives: [] } })
-    queryClient.setQueryData(['repository-info', 1], { data: { info: {} } })
+    queryClient.setQueryData(['repository-archives-stored', 1], {
+      data: { archives: [], series: [], sync_state: 'never', last_synced_at: null },
+    })
     queryClient.setQueryData(['restore-jobs'], { data: { jobs: [] } })
 
     vi.mocked(apiModule.repositoriesAPI.getRepositories).mockResolvedValue({
@@ -127,15 +141,12 @@ describe('Archives page — delete cache invalidation (regression #352)', () => 
     vi.mocked(apiModule.repositoriesAPI.listRepositoryArchives).mockResolvedValue({
       data: { archives: [] },
     } as never)
-    vi.mocked(apiModule.repositoriesAPI.getRepositoryInfo).mockResolvedValue({
-      data: { info: {} },
-    } as never)
     vi.mocked(apiModule.restoreAPI.getRestoreJobs).mockResolvedValue({
       data: { jobs: [] },
     } as never)
-    listArchivesMock.mockResolvedValue({
-      data: { archives: [] },
-    })
+    vi.mocked(apiModule.archivesAPI.listStored).mockResolvedValue({
+      data: { archives: [], series: [], sync_state: 'never', last_synced_at: null },
+    } as never)
     getInfoMock.mockResolvedValue({
       data: { info: {} },
     })
@@ -147,14 +158,16 @@ describe('Archives page — delete cache invalidation (regression #352)', () => 
     getDeleteJobStatusMock.mockResolvedValue({
       data: { status: 'completed' },
     })
+    vi.mocked(apiModule.archivesAPI.resync).mockResolvedValue({ data: {} } as never)
   })
 
   afterEach(() => {
+    localStorage.clear()
     vi.restoreAllMocks()
     vi.clearAllMocks()
   })
 
-  it('invalidates both repository-archives AND repository-info after successful deletion', async () => {
+  it('invalidates the stored archive list after successful deletion', async () => {
     const user = userEvent.setup()
     const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries')
 
@@ -188,11 +201,30 @@ describe('Archives page — delete cache invalidation (regression #352)', () => 
       () => {
         expect(getDeleteJobStatusMock).toHaveBeenCalledWith(123)
         expect(invalidateSpy).toHaveBeenCalledWith(
-          expect.objectContaining({ queryKey: ['repository-archives', 1] })
+          expect.objectContaining({ queryKey: ['repository-archives-stored', 1] })
         )
-        expect(invalidateSpy).toHaveBeenCalledWith(
-          expect.objectContaining({ queryKey: ['repository-info', 1] })
-        )
+      },
+      { timeout: 4000 }
+    )
+  })
+
+  it('asks the backend to resync the stored list, which a refetch alone cannot fix', async () => {
+    const user = userEvent.setup()
+
+    renderWithProviders(<Archives />, { queryClient })
+    await user.click(screen.getByText('Select Repo'))
+    await waitFor(() => {
+      expect(screen.getByTestId('delete-archive-btn')).toBeInTheDocument()
+    })
+    await user.click(screen.getByTestId('delete-archive-btn'))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /^Delete Archive$/i })).toBeInTheDocument()
+    })
+    await user.click(screen.getByRole('button', { name: /^Delete Archive$/i }))
+
+    await waitFor(
+      () => {
+        expect(apiModule.archivesAPI.resync).toHaveBeenCalledWith(1)
       },
       { timeout: 4000 }
     )

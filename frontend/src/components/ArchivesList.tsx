@@ -38,6 +38,9 @@ interface ArchivesListProps {
   repositoryName: string
   loading: boolean
   onViewArchive: (archive: Archive) => void
+  onOpenArchive?: (archive: Archive) => void
+  /** The detail route for an archive, when the page knows it. */
+  archiveHref?: (archive: Archive) => string | undefined
   onRestoreArchive: (archive: Archive) => void
   onMountArchive: (archive: Archive) => void
   onDeleteArchive: (archive: Archive) => void
@@ -51,6 +54,8 @@ export default function ArchivesList({
   archives,
   loading,
   onViewArchive,
+  onOpenArchive,
+  archiveHref,
   onRestoreArchive,
   onMountArchive,
   onDeleteArchive,
@@ -202,10 +207,10 @@ export default function ArchivesList({
         color: 'text.disabled',
       }}
     >
-      <span>{t('archivesList.columnArchive', 'Archive')}</span>
-      <span>{t('archivesList.columnType', 'Type')}</span>
-      <span>{t('archivesList.columnDate', 'Date')}</span>
-      <Box sx={{ textAlign: 'right' }}>{t('archivesList.columnActions', 'Actions')}</Box>
+      <span>{t('archivesList.columnArchive')}</span>
+      <span>{t('archivesList.columnType')}</span>
+      <span>{t('archivesList.columnDate')}</span>
+      <Box sx={{ textAlign: 'right' }}>{t('archivesList.columnActions')}</Box>
     </Box>
   )
 
@@ -276,7 +281,12 @@ export default function ArchivesList({
         }}
       >
         <FolderOpen size={48} style={{ marginBottom: 16 }} />
-        <Typography variant="body1" color="text.secondary">
+        <Typography
+          variant="body1"
+          sx={{
+            color: 'text.secondary',
+          }}
+        >
           {t('archivesList.empty')}
         </Typography>
       </Box>
@@ -308,8 +318,14 @@ export default function ArchivesList({
         }}
       >
         <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1.25, flexShrink: 0 }}>
-          <Typography variant="h6" fontWeight={700} sx={{ fontSize: '0.95rem' }}>
-            Archives
+          <Typography
+            variant="h6"
+            sx={{
+              fontWeight: 700,
+              fontSize: '0.95rem',
+            }}
+          >
+            {t('archivesList.archives')}
           </Typography>
           <Typography
             variant="body2"
@@ -563,12 +579,23 @@ export default function ArchivesList({
           }}
         >
           <FolderOpen size={48} style={{ marginBottom: 16 }} />
-          <Typography variant="body1" color="text.secondary">
+          <Typography
+            variant="body1"
+            sx={{
+              color: 'text.secondary',
+            }}
+          >
             {filter === 'scheduled'
               ? t('archivesList.noScheduledArchives')
               : t('archivesList.noManualArchives')}
           </Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+              mt: 1,
+            }}
+          >
             {t('archivesList.tryDifferentFilter')}
           </Typography>
         </Box>
@@ -600,7 +627,13 @@ export default function ArchivesList({
                   ) : (
                     <ArchiveIcon size={20} />
                   )}
-                  <Typography variant="h6" fontSize="1rem" fontWeight={600}>
+                  <Typography
+                    variant="h6"
+                    sx={{
+                      fontSize: '1rem',
+                      fontWeight: 600,
+                    }}
+                  >
                     {group.label}
                   </Typography>
                   <Chip label={group.archives.length} size="small" sx={{ ml: 'auto', mr: 2 }} />
@@ -612,6 +645,8 @@ export default function ArchivesList({
                     key={archive.id}
                     archive={archive}
                     onView={onViewArchive}
+                    onOpen={onOpenArchive}
+                    openHref={archiveHref?.(archive)}
                     onRestore={onRestoreArchive}
                     onMount={onMountArchive}
                     onDelete={onDeleteArchive}
@@ -642,6 +677,8 @@ export default function ArchivesList({
                   key={archive.id}
                   archive={archive}
                   onView={onViewArchive}
+                  onOpen={onOpenArchive}
+                  openHref={archiveHref?.(archive)}
                   onRestore={onRestoreArchive}
                   onMount={onMountArchive}
                   onDelete={onDeleteArchive}

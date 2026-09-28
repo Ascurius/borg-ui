@@ -1,30 +1,39 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import case, exists, func, or_
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import psutil
 import structlog
+import threading
+import time
 from dataclasses import dataclass, fields
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import List, Dict, Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.database.database import get_db
 from app.database.models import (
     User,
-    BackupJob,
     BackupPlan,
     BackupPlanRepository,
+    Operation,
     Repository,
     ScheduledJob,
     ScheduledJobRepository,
-    CheckJob,
-    CompactJob,
-    RestoreCheckJob,
     SSHConnection,
     SystemSettings,
 )
 from app.core.security import get_current_user
 from app.services.log_policy import get_log_save_policy, job_has_logs_by_policy
+from app.services.operations.backup_facade import recent_backup_jobs
+from app.services.operations.job_facade import (
+    UNSETTLED_STATUSES,
+    MaintenanceJobFacade,
+    NEEDS_BACKUP,
+    latest_maintenance_jobs_by_repository,
+    legacy_status,
+)
+from app.services.storage_usage import format_bytes, stored_size_bytes
 from app.utils.datetime_utils import serialize_datetime
 from app.utils.schedule_time import (
     DEFAULT_SCHEDULE_TIMEZONE,
@@ -34,6 +43,61 @@ from app.utils.schedule_time import (
 
 logger = structlog.get_logger()
 router = APIRouter()
+
+
+class CpuSampler:
+    """CPU load as the share of busy time between two `psutil.cpu_times()`
+    snapshots, one reading per `MIN_SECONDS` shared by every caller.
+
+    Not `psutil.cpu_percent(interval=None)`: that keeps its baseline per
+    thread, and the overview runs on whichever threadpool worker takes the
+    request, so a worker's first reading would be a meaningless 0.0 and
+    two requests in one tick would show the second one an idle CPU. Not
+    `interval=1` either, which slept a second on the event loop. The first
+    reading after start averages the time since import."""
+
+    MIN_SECONDS = 2.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._read_at: Optional[float] = None
+        self._value = 0.0
+        try:
+            self._times = psutil.cpu_times()
+        except Exception:  # pragma: no cover - a host without CPU counters
+            self._times = None
+
+    @staticmethod
+    def _busy_and_total(times) -> tuple[float, float]:
+        """Busy and total CPU seconds of a `cpu_times` tuple, as psutil
+        counts them: idle and I/O wait are not busy, guest time is already
+        inside user time."""
+        total = sum(times)
+        total -= getattr(times, "guest", 0) + getattr(times, "guest_nice", 0)
+        busy = total - times.idle - getattr(times, "iowait", 0)
+        return busy, total
+
+    def read(self) -> float:
+        with self._lock:
+            now = time.monotonic()
+            if self._read_at is not None and now - self._read_at < self.MIN_SECONDS:
+                return self._value
+            times = psutil.cpu_times()
+            if self._times is not None:
+                busy_before, total_before = self._busy_and_total(self._times)
+                busy, total = self._busy_and_total(times)
+                elapsed = total - total_before
+                if elapsed > 0:
+                    self._value = round(
+                        min(100.0, max(0.0, (busy - busy_before) / elapsed * 100)), 1
+                    )
+            self._times = times
+            self._read_at = now
+            return self._value
+
+
+_cpu_sampler = CpuSampler()
+
 
 RESTORE_CHECK_WARNING_DAYS = 14
 RESTORE_CHECK_CRITICAL_DAYS = 30
@@ -173,13 +237,23 @@ def classify_day_age(days: int, warning_days: int, critical_days: int) -> str:
     return "healthy"
 
 
+# A restore check row, as the facade over its `operations` row.
+LatestRestoreCheck = MaintenanceJobFacade
+
+
 def build_restore_check_health(
     repo: Repository,
     now: datetime,
-    latest_restore_check: Optional[RestoreCheckJob] = None,
+    latest_restore_check: Optional[LatestRestoreCheck] = None,
     thresholds: Optional[DashboardHealthThresholds] = None,
+    last_verdict: Optional[LatestRestoreCheck] = None,
 ) -> Dict[str, Any]:
-    """Build restore-verification health without penalizing unconfigured repos."""
+    """Build restore-verification health without penalizing unconfigured repos.
+
+    `latest_restore_check` is the newest row and drives the live status;
+    `last_verdict` is the newest row that finished and drives the severity,
+    so a run still queued or running does not hide the failure before it.
+    Without it the newest row is the verdict when it has one."""
     thresholds = thresholds or DashboardHealthThresholds()
     # "Configured" requires both a cron expression AND the user-facing toggle
     # being on. Pausing via the toggle should not penalize dashboard health.
@@ -188,20 +262,36 @@ def build_restore_check_health(
         schedule_enabled = True
     configured = bool(repo.restore_check_cron_expression) and bool(schedule_enabled)
     latest_status = latest_restore_check.status if latest_restore_check else None
-    latest_error = latest_restore_check.error_message if latest_restore_check else None
+    if last_verdict is None and latest_status not in UNSETTLED_STATUSES:
+        last_verdict = latest_restore_check
+    verdict_status = last_verdict.status if last_verdict else None
+    verdict_error = last_verdict.error_message if last_verdict else None
+    # An operation that did not run says why in its reason (spec 6.3); the
+    # facade already reads the restore check's `needs_backup` back as such.
+    verdict_reason = getattr(last_verdict, "skip_reason", None)
+    # The live row rarely carries a message; the verdict's is what the
+    # tooltip should show while a critical or warning reading stands.
+    latest_error = (
+        latest_restore_check.error_message if latest_restore_check else None
+    ) or verdict_error
     last_success = repo.last_restore_check
+    # The repository column is what the service stamps on success; the verdict
+    # row is the same fact, so whichever is newer is the last success.
+    if verdict_status == "completed" and last_verdict and last_verdict.completed_at:
+        if not last_success or last_verdict.completed_at > last_success:
+            last_success = last_verdict.completed_at
 
-    if latest_status == "failed":
+    if verdict_status == "failed":
         return {
             "dimension": "critical",
             "severity": "critical",
-            "warning": f"Restore check failed: {latest_error or 'unknown error'}",
+            "warning": f"Restore check failed: {verdict_error or 'unknown error'}",
             "configured": configured,
             "latest_status": latest_status,
             "latest_error": latest_error,
         }
 
-    if latest_status == "completed_with_warnings":
+    if verdict_status == "completed_with_warnings":
         return {
             "dimension": "warning",
             "severity": "warning",
@@ -211,21 +301,32 @@ def build_restore_check_health(
             "latest_error": latest_error,
         }
 
-    if latest_status == "needs_backup":
+    if verdict_status == "needs_backup":
         return {
             "dimension": "warning",
             "severity": "warning",
-            "warning": latest_error or "Restore check needs a backup first",
+            "warning": verdict_error or "Restore check needs a backup first",
             "configured": configured,
             "latest_status": latest_status,
             "latest_error": latest_error,
         }
 
-    if latest_status == "cancelled":
+    if verdict_status == "cancelled":
         return {
             "dimension": "warning",
             "severity": "warning",
-            "warning": "Latest restore check was cancelled",
+            "warning": "Last restore check run was cancelled",
+            "configured": configured,
+            "latest_status": latest_status,
+            "latest_error": latest_error,
+        }
+
+    if verdict_status == "skipped":
+        return {
+            "dimension": "warning",
+            "severity": "warning",
+            "warning": "Restore check skipped"
+            + (f": {verdict_reason.replace('_', ' ')}" if verdict_reason else ""),
             "configured": configured,
             "latest_status": latest_status,
             "latest_error": latest_error,
@@ -240,9 +341,6 @@ def build_restore_check_health(
             "latest_status": latest_status,
             "latest_error": latest_error,
         }
-
-    if latest_status == "completed" and not last_success and latest_restore_check:
-        last_success = latest_restore_check.completed_at
 
     if last_success:
         days_since_restore_check = (now - last_success).days
@@ -301,8 +399,9 @@ def build_restore_check_health(
 def build_full_repository_health(
     repo: Repository,
     now: datetime,
-    latest_restore_check: Optional[RestoreCheckJob] = None,
+    latest_restore_check: Optional[LatestRestoreCheck] = None,
     thresholds: Optional[DashboardHealthThresholds] = None,
+    last_verdict: Optional[LatestRestoreCheck] = None,
 ) -> Dict[str, Any]:
     """Build health signals for repositories managed directly by Borg UI."""
     thresholds = thresholds or DashboardHealthThresholds()
@@ -352,7 +451,7 @@ def build_full_repository_health(
         compact_dim = "critical"
 
     restore_check_health = build_restore_check_health(
-        repo, now, latest_restore_check, thresholds
+        repo, now, latest_restore_check, thresholds, last_verdict=last_verdict
     )
     if restore_check_health["severity"]:
         health_status, health_color = promote_repository_health(
@@ -380,8 +479,9 @@ def build_full_repository_health(
 def build_observe_repository_health(
     repo: Repository,
     now: datetime,
-    latest_restore_check: Optional[RestoreCheckJob] = None,
+    latest_restore_check: Optional[LatestRestoreCheck] = None,
     thresholds: Optional[DashboardHealthThresholds] = None,
+    last_verdict: Optional[LatestRestoreCheck] = None,
 ) -> Dict[str, Any]:
     """Build monitoring-oriented health signals for observe-only repositories."""
     thresholds = thresholds or DashboardHealthThresholds()
@@ -435,7 +535,7 @@ def build_observe_repository_health(
             health_color = "warning"
 
     restore_check_health = build_restore_check_health(
-        repo, now, latest_restore_check, thresholds
+        repo, now, latest_restore_check, thresholds, last_verdict=last_verdict
     )
     if restore_check_health["severity"]:
         health_status, health_color = promote_repository_health(
@@ -483,7 +583,7 @@ def get_system_metrics() -> SystemMetrics:
     """Get system resource metrics"""
     try:
         try:
-            cpu_usage = psutil.cpu_percent(interval=1)
+            cpu_usage = _cpu_sampler.read()
             cpu_count = psutil.cpu_count(logical=True) or 1
         except Exception as e:
             logger.warning("Failed to read CPU metrics", error=str(e))
@@ -547,9 +647,7 @@ def get_recent_jobs(db: Session, limit: int = 10) -> List[Dict[str, Any]]:
     """Get recent backup jobs"""
     try:
         log_save_policy = get_log_save_policy(db)
-        jobs = (
-            db.query(BackupJob).order_by(BackupJob.started_at.desc()).limit(limit).all()
-        )
+        jobs = recent_backup_jobs(db, limit)
         job_list = []
 
         for job in jobs:
@@ -625,8 +723,8 @@ async def get_dashboard_status(
 async def get_dashboard_metrics(current_user: User = Depends(get_current_user)):
     """Get system metrics for dashboard"""
     try:
-        # CPU usage
-        cpu_usage = psutil.cpu_percent(interval=1)
+        # CPU usage, the shared non-blocking reading
+        cpu_usage = _cpu_sampler.read()
 
         # Memory usage
         memory = psutil.virtual_memory()
@@ -684,18 +782,264 @@ async def get_dashboard_schedule(
         )
 
 
+ACTIVITY_KINDS = ("backup", "check", "compact", "prune", "restore_check")
+ACTIVITY_LABELS = {
+    "backup": "Backup",
+    "check": "Check",
+    "compact": "Compact",
+    "prune": "Prune",
+    "restore_check": "Restore check",
+}
+TIMELINE_DAYS = 14
+TREND_WEEKS = 4
+# a later run of these outcomes settles an earlier failure of the same kind
+# on the same repository
+RESOLVING_STATUSES = frozenset({"completed", "completed_with_warnings"})
+
+
+def resolve_timezone(name: Optional[str]) -> tzinfo:
+    """The zone the timeline buckets days in: the viewer's, or UTC for a name
+    the host does not know (UTC without the zone database, which a host
+    may lack)."""
+    if name:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            # a key that names a directory of the zone database ("America")
+            # raises IsADirectoryError rather than the not-found error
+            pass
+    return timezone.utc
+
+
+def _feed_status(kind: str, status: Optional[str], skip_reason: Optional[str]) -> str:
+    """The status word the feed always used: the facades' legacy vocabulary,
+    with the restore check's "run a backup first" verdict as its own word."""
+    if kind == "backup":
+        return "pending" if status == "queued" else (status or "unknown")
+    if status == "skipped" and skip_reason == NEEDS_BACKUP:
+        return NEEDS_BACKUP
+    return legacy_status(status or "unknown")
+
+
+def _repository_name(
+    repository_id: Optional[int],
+    path: Optional[str],
+    repo_id_map: dict,
+    repo_name_map: dict,
+) -> str:
+    """The repository name for a feed entry: by id, then by the path the row
+    captured (exact or without the trailing slash), then the path's last
+    segment. The id wins over a captured path (the feed used to try the path
+    first): a row with an id names the repository row, whatever path it had
+    when the run started."""
+    if repository_id and repository_id in repo_id_map:
+        return repo_id_map[repository_id]
+    if path in repo_name_map:
+        return repo_name_map[path]
+    if path and path.rstrip("/") in repo_name_map:
+        return repo_name_map[path.rstrip("/")]
+    return path.rstrip("/").split("/")[-1] if path else "Unknown"
+
+
+def backup_run_counts(db: Session, now: datetime) -> list:
+    """`(week, status, count)` over the backups started in the last 30 days,
+    grouped in SQL. `week` is the trend bucket, 0 the oldest and 3 the last
+    seven days; None for a run older than the four weeks but inside the 30
+    days, which counts toward the success rate only."""
+    week = case(
+        # a run dated after now (a skewed clock) belongs to no week
+        (Operation.started_at > now, None),
+        (Operation.started_at >= now - timedelta(days=7), 3),
+        (Operation.started_at >= now - timedelta(days=14), 2),
+        (Operation.started_at >= now - timedelta(days=21), 1),
+        (Operation.started_at >= now - timedelta(days=28), 0),
+        else_=None,
+    )
+    return (
+        db.query(week, Operation.status, func.count(Operation.id))
+        .filter(
+            Operation.kind == "backup",
+            Operation.started_at >= now - timedelta(days=30),
+        )
+        .group_by(week, Operation.status)
+        .all()
+    )
+
+
+def activity_rows(db: Session, since: datetime, until: datetime) -> list:
+    """One row per operation of a feed kind started between `since` and
+    `until`, the columns the timeline and the failure list read and nothing
+    else; the error text only where a failure shows it. A run dated after
+    `until` (a skewed clock) is in neither panel."""
+    return (
+        db.query(
+            Operation.id,
+            Operation.kind,
+            Operation.status,
+            Operation.skip_reason,
+            Operation.repository_id,
+            Operation.started_at,
+            case(
+                (Operation.status == "failed", Operation.error_message), else_=None
+            ).label("error_message"),
+        )
+        .filter(
+            Operation.kind.in_(ACTIVITY_KINDS),
+            Operation.started_at >= since,
+            Operation.started_at <= until,
+        )
+        .all()
+    )
+
+
+def orphan_params(db: Session, since: datetime, until: datetime) -> dict:
+    """`operations.params` by id for the window's rows whose repository the
+    repository table does not know (no id, or a repository since deleted),
+    limited to the statuses the failure list compares. One statement
+    whatever the count: the rows are selected in the database, not by an
+    id list."""
+    unknown_repository = or_(
+        Operation.repository_id.is_(None),
+        ~exists().where(Repository.id == Operation.repository_id),
+    )
+    rows = (
+        db.query(Operation.id, Operation.params)
+        .filter(
+            Operation.kind.in_(ACTIVITY_KINDS),
+            Operation.started_at >= since,
+            Operation.started_at <= until,
+            Operation.status.in_(("failed", *RESOLVING_STATUSES)),
+            unknown_repository,
+        )
+        .all()
+    )
+    return {row_id: row_params or {} for row_id, row_params in rows}
+
+
+def _local_date(value: datetime, zone: tzinfo) -> date:
+    """The calendar day of a stored (naive UTC) timestamp in `zone`."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(zone).date()
+
+
+def activity_timeline(rows, now: datetime, zone: tzinfo) -> list:
+    """Per day and kind, how many runs started and how many of them failed,
+    for the last TIMELINE_DAYS calendar days in `zone` (today included).
+    That is what the timeline draws; the rows themselves stay on the server."""
+    today = _local_date(now, zone)
+    cells: dict[tuple[date, str], list[int]] = {}
+    for row in rows:
+        if row.started_at is None:
+            continue
+        day = _local_date(row.started_at, zone)
+        age = (today - day).days
+        if age < 0 or age >= TIMELINE_DAYS:
+            continue
+        cell = cells.setdefault((day, row.kind), [0, 0])
+        cell[0] += 1
+        if _feed_status(row.kind, row.status, row.skip_reason) == "failed":
+            cell[1] += 1
+    return [
+        {"date": day.isoformat(), "type": kind, "total": total, "failed": failed}
+        for (day, kind), (total, failed) in sorted(cells.items())
+    ]
+
+
+def current_failures(
+    rows, params: dict, repo_id_map: dict, repo_name_map: dict, repo_path_map: dict
+) -> list:
+    """The failed runs among `rows` (the timeline window, as the page's own
+    filter over the feed always saw it) that no later completed run of the
+    same kind on the same repository has resolved, newest first, in the
+    shape of a feed entry. Runs match by repository path, the row's own id
+    resolved to the path it has now (`repo_path_map`) or the path a row
+    without an id captured (`params`, from `orphan_params`); a row with
+    neither resolves nothing and is resolved by nothing."""
+    statuses = {
+        row.id: _feed_status(row.kind, row.status, row.skip_reason) for row in rows
+    }
+    failed = [row for row in rows if statuses[row.id] == "failed"]
+    if not failed:
+        return []
+
+    def path_of(row) -> Optional[str]:
+        row_params = params.get(row.id, {})
+        return row_params.get("repository_path") or row_params.get("repository")
+
+    def key_of(row) -> tuple:
+        if row.repository_id is not None:
+            # a known repository by the path it has now; a deleted one by id,
+            # so that its rows match each other whatever they captured
+            path = repo_path_map.get(row.repository_id)
+            if path:
+                return (row.kind, "path", path.rstrip("/"))
+            return (row.kind, "id", row.repository_id)
+        path = path_of(row)
+        if path:
+            return (row.kind, "path", path.rstrip("/"))
+        return (row.kind, "row", row.id)
+
+    resolved_at: dict[tuple, datetime] = {}
+    for row in rows:
+        if statuses[row.id] in RESOLVING_STATUSES and row.started_at is not None:
+            key = key_of(row)
+            if key not in resolved_at or row.started_at > resolved_at[key]:
+                resolved_at[key] = row.started_at
+    entries = []
+    for row in failed:
+        name = _repository_name(
+            row.repository_id, path_of(row), repo_id_map, repo_name_map
+        )
+        later = resolved_at.get(key_of(row))
+        if later is not None and row.started_at is not None and later >= row.started_at:
+            continue
+        entries.append(
+            {
+                "id": row.id,
+                "type": row.kind,
+                "status": "failed",
+                "repository": name,
+                "timestamp": serialize_datetime(row.started_at),
+                "message": f"{ACTIVITY_LABELS[row.kind]} failed",
+                "error": row.error_message,
+            }
+        )
+    entries.sort(
+        key=lambda entry: (entry["timestamp"] or "", entry["id"]), reverse=True
+    )
+    return entries
+
+
 @router.get("/overview")
-async def get_dashboard_overview(
-    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+def get_dashboard_overview(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    tz_name: Optional[str] = Query(default=None, alias="timezone"),
 ):
-    """Get comprehensive dashboard overview with repository health, trends, and maintenance alerts"""
+    """Get comprehensive dashboard overview with repository health, trends, and maintenance alerts.
+
+    A plain `def`: the database work is synchronous and runs in the
+    threadpool, so it does not hold the event loop for the other requests of
+    the page."""
     try:
         now = datetime.utcnow()
+        zone = resolve_timezone(tz_name)
         settings = db.query(SystemSettings).first()
         health_thresholds = DashboardHealthThresholds.from_settings(settings)
 
         # Get all repositories
         repositories = db.query(Repository).all()
+        # Lookup maps for naming feed entries and schedules (paths stored
+        # with and without a trailing slash)
+        repo_name_map = {}
+        repo_id_map = {}
+        repo_path_map = {}
+        for repo in repositories:
+            repo_name_map[repo.path] = repo.name
+            repo_name_map[repo.path.rstrip("/")] = repo.name
+            repo_id_map[repo.id] = repo.name
+            repo_path_map[repo.id] = repo.path
 
         # Separate full-mode repos (for health/maintenance) from observe-only repos
         full_mode_repos = [r for r in repositories if r.mode != "observe"]
@@ -727,27 +1071,23 @@ async def get_dashboard_overview(
         # Get SSH connections
         ssh_connections = db.query(SSHConnection).all()
 
-        latest_restore_checks = {}
+        # Multi-repository schedules, read once for every repository below
+        schedule_repository_ids: dict[int, list[int]] = {}
+        for scheduled_job_id, repository_id in db.query(
+            ScheduledJobRepository.scheduled_job_id,
+            ScheduledJobRepository.repository_id,
+        ):
+            schedule_repository_ids.setdefault(scheduled_job_id, []).append(
+                repository_id
+            )
+
         repository_ids = [repo.id for repo in repositories]
-        if repository_ids:
-            latest_restore_check_ids = (
-                db.query(func.max(RestoreCheckJob.id).label("id"))
-                .filter(RestoreCheckJob.repository_id.in_(repository_ids))
-                .group_by(RestoreCheckJob.repository_id)
-                .subquery()
-            )
-            restore_check_jobs = (
-                db.query(RestoreCheckJob)
-                .join(
-                    latest_restore_check_ids,
-                    RestoreCheckJob.id == latest_restore_check_ids.c.id,
-                )
-                .all()
-            )
-            for restore_check_job in restore_check_jobs:
-                latest_restore_checks[restore_check_job.repository_id] = (
-                    restore_check_job
-                )
+        latest_restore_checks = latest_maintenance_jobs_by_repository(
+            db, "restore_check", repository_ids
+        )
+        restore_check_verdicts = latest_maintenance_jobs_by_repository(
+            db, "restore_check", repository_ids, settled=True
+        )
 
         # Calculate repository health (only for full-mode repos that do backups)
         repo_health = []
@@ -756,37 +1096,31 @@ async def get_dashboard_overview(
 
         # Include all repos for size/archive totals
         for repo in repositories:
-            size_bytes = parse_size_to_bytes(repo.total_size)
+            size_bytes = repository_size_bytes(repo)
             total_size_bytes += size_bytes
             total_archives += repo.archive_count or 0
 
         # Show health for both repo modes, but with mode-specific semantics.
         for repo in full_mode_repos:
             # Parse size for this repo
-            size_bytes = parse_size_to_bytes(repo.total_size)
+            size_bytes = repository_size_bytes(repo)
             latest_restore_check = latest_restore_checks.get(repo.id)
             health = build_full_repository_health(
-                repo, now, latest_restore_check, health_thresholds
+                repo,
+                now,
+                latest_restore_check,
+                health_thresholds,
+                last_verdict=restore_check_verdicts.get(repo.id),
             )
 
             # Get associated schedule — prefer enabled over disabled when multiple match
             repo_schedule = None
             fallback_schedule = None
             for schedule in schedules:
-                matched = False
-                if schedule.repository_id == repo.id:
-                    matched = True
-                else:
-                    multi_repos = (
-                        db.query(ScheduledJobRepository)
-                        .filter(
-                            ScheduledJobRepository.scheduled_job_id == schedule.id,
-                            ScheduledJobRepository.repository_id == repo.id,
-                        )
-                        .first()
-                    )
-                    if multi_repos:
-                        matched = True
+                matched = (
+                    schedule.repository_id == repo.id
+                    or repo.id in schedule_repository_ids.get(schedule.id, ())
+                )
                 if matched:
                     if schedule.enabled:
                         repo_schedule = schedule
@@ -796,18 +1130,6 @@ async def get_dashboard_overview(
             if repo_schedule is None:
                 repo_schedule = fallback_schedule
             repo_backup_plans = backup_plans_by_repo.get(repo.id, [])
-
-            # Calculate dedup ratio (if we have the data)
-            dedup_ratio = None
-            if (
-                hasattr(repo, "deduplicated_size")
-                and repo.deduplicated_size
-                and size_bytes > 0
-            ):
-                dedup_bytes = parse_size_to_bytes(repo.deduplicated_size)
-                dedup_ratio = (
-                    int((1 - (dedup_bytes / size_bytes)) * 100) if size_bytes > 0 else 0
-                )
 
             repo_health.append(
                 {
@@ -831,7 +1153,8 @@ async def get_dashboard_overview(
                         "latest_restore_check_status"
                     ],
                     "latest_restore_check_error": health["latest_restore_check_error"],
-                    "dedup_ratio": dedup_ratio,
+                    # nothing stores a per-repository deduplicated size
+                    "dedup_ratio": None,
                     "has_schedule": repo_schedule is not None,
                     "schedule_enabled": repo_schedule.enabled
                     if repo_schedule
@@ -850,10 +1173,14 @@ async def get_dashboard_overview(
             )
 
         for repo in observe_only_repos:
-            size_bytes = parse_size_to_bytes(repo.total_size)
+            size_bytes = repository_size_bytes(repo)
             latest_restore_check = latest_restore_checks.get(repo.id)
             health = build_observe_repository_health(
-                repo, now, latest_restore_check, health_thresholds
+                repo,
+                now,
+                latest_restore_check,
+                health_thresholds,
+                last_verdict=restore_check_verdicts.get(repo.id),
             )
             repo_backup_plans = backup_plans_by_repo.get(repo.id, [])
 
@@ -889,38 +1216,44 @@ async def get_dashboard_overview(
                 }
             )
 
-        # Calculate backup success rate (last 30 days)
-        thirty_days_ago = now - timedelta(days=30)
-        recent_jobs = (
-            db.query(BackupJob).filter(BackupJob.started_at >= thirty_days_ago).all()
-        )
-
-        # Only count terminal jobs — running/pending skew the rate and don't match passed+failed
-        terminal_jobs = [j for j in recent_jobs if j.status in ("completed", "failed")]
-        total_jobs = len(terminal_jobs)
-        successful_jobs = len([j for j in terminal_jobs if j.status == "completed"])
-        failed_jobs = len([j for j in terminal_jobs if j.status == "failed"])
+        # Backup success rate (last 30 days) and the weekly trend, counted
+        # in the database; only terminal runs make up the rate
+        week_counts: dict[int, dict[str, int]] = {
+            week: {"total": 0, "successful": 0, "failed": 0}
+            for week in range(TREND_WEEKS)
+        }
+        successful_jobs = 0
+        failed_jobs = 0
+        for week, job_status, count in backup_run_counts(db, now):
+            if job_status == "completed":
+                successful_jobs += count
+            elif job_status == "failed":
+                failed_jobs += count
+            if week is None:
+                continue
+            week_counts[week]["total"] += count
+            if job_status == "completed":
+                week_counts[week]["successful"] += count
+            elif job_status == "failed":
+                week_counts[week]["failed"] += count
+        total_jobs = successful_jobs + failed_jobs
         success_rate = (successful_jobs / total_jobs * 100) if total_jobs > 0 else 0
 
-        # Group jobs by week for trend
         backup_trends = []
-        for week in range(4):
-            week_start = now - timedelta(days=(4 - week) * 7)
-            week_end = week_start + timedelta(days=7)
-            week_jobs = [
-                j for j in recent_jobs if week_start <= j.started_at < week_end
-            ]
-            week_success = len([j for j in week_jobs if j.status == "completed"])
-            week_total = len(week_jobs)
-            week_rate = (week_success / week_total * 100) if week_total > 0 else 0
-
+        for week in range(TREND_WEEKS):
+            counts = week_counts[week]
+            week_rate = (
+                (counts["successful"] / counts["total"] * 100)
+                if counts["total"] > 0
+                else 0
+            )
             backup_trends.append(
                 {
                     "week": f"Week {week + 1}",
                     "success_rate": round(week_rate, 1),
-                    "successful": week_success,
-                    "failed": len([j for j in week_jobs if j.status == "failed"]),
-                    "total": week_total,
+                    "successful": counts["successful"],
+                    "failed": counts["failed"],
+                    "total": counts["total"],
                 }
             )
 
@@ -932,32 +1265,17 @@ async def get_dashboard_overview(
             if not next_run_dt or next_run_dt > end_time:
                 continue
 
-            # Get repository info for this schedule
-            repo_names = []
+            # Repository names for this schedule, from the rows already loaded
             if schedule.repository_id:
-                # Single-repo schedule
-                repo = (
-                    db.query(Repository)
-                    .filter(Repository.id == schedule.repository_id)
-                    .first()
-                )
-                if repo:
-                    repo_names.append(repo.name)
+                repo_names = [
+                    name for name in (repo_id_map.get(schedule.repository_id),) if name
+                ]
             else:
-                # Multi-repo schedule - get all associated repos
-                multi_repos = (
-                    db.query(ScheduledJobRepository)
-                    .filter(ScheduledJobRepository.scheduled_job_id == schedule.id)
-                    .all()
-                )
-                for mr in multi_repos:
-                    repo = (
-                        db.query(Repository)
-                        .filter(Repository.id == mr.repository_id)
-                        .first()
-                    )
-                    if repo:
-                        repo_names.append(repo.name)
+                repo_names = [
+                    repo_id_map[repository_id]
+                    for repository_id in schedule_repository_ids.get(schedule.id, ())
+                    if repository_id in repo_id_map
+                ]
 
             upcoming_tasks.append(
                 {
@@ -1031,170 +1349,18 @@ async def get_dashboard_overview(
                     }
                 )
 
-        # Get activity for the last 14 days — matches the timeline window exactly
-        fourteen_days_ago = now - timedelta(days=14)
-        recent_backups = (
-            db.query(BackupJob).filter(BackupJob.started_at >= fourteen_days_ago).all()
+        # Activity of the last 14 days: the timeline counts per day and kind,
+        # and the failures nothing has resolved since. The rows stay here.
+        fourteen_days_ago = now - timedelta(days=TIMELINE_DAYS)
+        recent_rows = activity_rows(db, fourteen_days_ago, now)
+        timeline = activity_timeline(recent_rows, now, zone)
+        failures = current_failures(
+            recent_rows,
+            orphan_params(db, fourteen_days_ago, now),
+            repo_id_map,
+            repo_name_map,
+            repo_path_map,
         )
-        recent_checks = (
-            db.query(CheckJob).filter(CheckJob.started_at >= fourteen_days_ago).all()
-        )
-        recent_compacts = (
-            db.query(CompactJob)
-            .filter(CompactJob.started_at >= fourteen_days_ago)
-            .all()
-        )
-        recent_restore_checks = (
-            db.query(RestoreCheckJob)
-            .filter(RestoreCheckJob.started_at >= fourteen_days_ago)
-            .all()
-        )
-
-        # Create a lookup map for repository paths to names (with normalized paths)
-        repo_name_map = {}
-        repo_id_map = {}
-        for repo in repositories:
-            # Store by exact path and normalized path (no trailing slash)
-            repo_name_map[repo.path] = repo.name
-            repo_name_map[repo.path.rstrip("/")] = repo.name
-            repo_id_map[repo.id] = repo.name
-
-        activity_feed = []
-
-        for job in recent_backups:
-            # Try multiple ways to get repo name
-            repo_name = None
-            # Try exact match
-            if job.repository in repo_name_map:
-                repo_name = repo_name_map[job.repository]
-            # Try normalized
-            elif job.repository and job.repository.rstrip("/") in repo_name_map:
-                repo_name = repo_name_map[job.repository.rstrip("/")]
-            # Try by repository_id if it exists
-            elif (
-                hasattr(job, "repository_id")
-                and job.repository_id
-                and job.repository_id in repo_id_map
-            ):
-                repo_name = repo_id_map[job.repository_id]
-            # Fallback: use last part of path as name
-            else:
-                repo_name = (
-                    job.repository.rstrip("/").split("/")[-1]
-                    if job.repository
-                    else "Unknown"
-                )
-
-            activity_feed.append(
-                {
-                    "id": job.id,
-                    "type": "backup",
-                    "status": job.status,
-                    "repository": repo_name,
-                    "timestamp": serialize_datetime(job.started_at),
-                    "message": f"Backup {job.status}",
-                    "error": job.error_message if job.status == "failed" else None,
-                }
-            )
-
-        for job in recent_checks:
-            # Try multiple ways to get repo name
-            repo_name = None
-            if job.repository_path in repo_name_map:
-                repo_name = repo_name_map[job.repository_path]
-            elif (
-                job.repository_path and job.repository_path.rstrip("/") in repo_name_map
-            ):
-                repo_name = repo_name_map[job.repository_path.rstrip("/")]
-            elif (
-                hasattr(job, "repository_id")
-                and job.repository_id
-                and job.repository_id in repo_id_map
-            ):
-                repo_name = repo_id_map[job.repository_id]
-            else:
-                repo_name = (
-                    job.repository_path.rstrip("/").split("/")[-1]
-                    if job.repository_path
-                    else "Unknown"
-                )
-
-            activity_feed.append(
-                {
-                    "id": job.id,
-                    "type": "check",
-                    "status": job.status,
-                    "repository": repo_name,
-                    "timestamp": serialize_datetime(job.started_at),
-                    "message": f"Check {job.status}",
-                    "error": job.error_message if job.status == "failed" else None,
-                }
-            )
-
-        for job in recent_compacts:
-            # Try multiple ways to get repo name
-            repo_name = None
-            if job.repository_path in repo_name_map:
-                repo_name = repo_name_map[job.repository_path]
-            elif (
-                job.repository_path and job.repository_path.rstrip("/") in repo_name_map
-            ):
-                repo_name = repo_name_map[job.repository_path.rstrip("/")]
-            elif (
-                hasattr(job, "repository_id")
-                and job.repository_id
-                and job.repository_id in repo_id_map
-            ):
-                repo_name = repo_id_map[job.repository_id]
-            else:
-                repo_name = (
-                    job.repository_path.rstrip("/").split("/")[-1]
-                    if job.repository_path
-                    else "Unknown"
-                )
-
-            activity_feed.append(
-                {
-                    "id": job.id,
-                    "type": "compact",
-                    "status": job.status,
-                    "repository": repo_name,
-                    "timestamp": serialize_datetime(job.started_at),
-                    "message": f"Compact {job.status}",
-                    "error": job.error_message if job.status == "failed" else None,
-                }
-            )
-
-        for job in recent_restore_checks:
-            repo_name = None
-            if job.repository_path in repo_name_map:
-                repo_name = repo_name_map[job.repository_path]
-            elif (
-                job.repository_path and job.repository_path.rstrip("/") in repo_name_map
-            ):
-                repo_name = repo_name_map[job.repository_path.rstrip("/")]
-            elif job.repository_id and job.repository_id in repo_id_map:
-                repo_name = repo_id_map[job.repository_id]
-            else:
-                repo_name = (
-                    job.repository_path.rstrip("/").split("/")[-1]
-                    if job.repository_path
-                    else "Unknown"
-                )
-
-            activity_feed.append(
-                {
-                    "id": job.id,
-                    "type": "restore_check",
-                    "status": job.status,
-                    "repository": repo_name,
-                    "timestamp": serialize_datetime(job.started_at),
-                    "message": f"Restore check {job.status}",
-                    "error": job.error_message if job.status == "failed" else None,
-                }
-            )
-
-        activity_feed.sort(key=lambda x: x["timestamp"] or "", reverse=True)
 
         # Count SSH connections (active = status is "connected")
         ssh_active = len([c for c in ssh_connections if c.status == "connected"])
@@ -1202,6 +1368,10 @@ async def get_dashboard_overview(
 
         # Get system metrics
         system_metrics = get_system_metrics()
+
+        from app.services.prune_compare import space_savings
+
+        savings = space_savings(db, full_mode_repos)
 
         return {
             "summary": {
@@ -1235,13 +1405,9 @@ async def get_dashboard_overview(
                         {
                             "name": repo.name,
                             "size": repo.total_size,
-                            "size_bytes": parse_size_to_bytes(repo.total_size),
+                            "size_bytes": repository_size_bytes(repo),
                             "percentage": round(
-                                (
-                                    parse_size_to_bytes(repo.total_size)
-                                    / total_size_bytes
-                                    * 100
-                                ),
+                                (repository_size_bytes(repo) / total_size_bytes * 100),
                                 1,
                             )
                             if total_size_bytes > 0
@@ -1281,7 +1447,15 @@ async def get_dashboard_overview(
             ),
             "backup_trends": backup_trends,
             "upcoming_tasks": upcoming_tasks,
-            "activity_feed": activity_feed,
+            "space_savings": savings,
+            "activity_timeline": timeline,
+            "current_failures": failures,
+            # For one release: the previous release's page, served by an older
+            # server and pointed at this one as a remote backend, reads
+            # `activity_feed` and would crash without it. The failures are
+            # feed-shaped, so that page keeps its failure strip; its timeline
+            # shows the failures only.
+            "activity_feed": failures,
             "system_metrics": system_metrics.dict(),
             "last_updated": serialize_datetime(now),
         }
@@ -1294,48 +1468,10 @@ async def get_dashboard_overview(
         )
 
 
-def parse_size_to_bytes(size_str: str) -> int:
-    """Parse human-readable size string to bytes"""
-    if not size_str:
-        return 0
-
-    size_str = size_str.strip().upper()
-
-    # Remove spaces
-    size_str = size_str.replace(" ", "")
-
-    # Check units from longest to shortest to avoid matching 'B' in 'GB'
-    multipliers = [
-        ("PB", 1024**5),
-        ("TB", 1024**4),
-        ("GB", 1024**3),
-        ("MB", 1024**2),
-        ("KB", 1024),
-        ("B", 1),
-    ]
-
-    for unit, multiplier in multipliers:
-        if size_str.endswith(unit):
-            try:
-                number = float(size_str[: -len(unit)])
-                return int(number * multiplier)
-            except ValueError:
-                return 0
-
-    # Try parsing as plain number
-    try:
-        return int(float(size_str))
-    except ValueError:
-        return 0
-
-
-def format_bytes(bytes_value: int) -> str:
-    """Format bytes to human-readable string"""
-    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
-        if bytes_value < 1024.0:
-            return f"{bytes_value:.1f} {unit}"
-        bytes_value /= 1024.0
-    return f"{bytes_value:.1f} PB"
+def repository_size_bytes(repo) -> int:
+    """The repository's measured size in bytes, by the one rule every size
+    reader applies (`storage_usage.stored_size_bytes`); 0 when unknown."""
+    return stored_size_bytes(repo) or 0
 
 
 def calculate_average_dedup(repositories: List[Repository]) -> int:

@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.integration.test_helpers import DockerPathHelper, parse_archives_payload
+from tests.integration.helpers import DockerPathHelper, parse_archives_payload
 from tests.utils.jobs import wait_for_payload_status
 
 
@@ -329,14 +329,26 @@ class SmokeClient:
         )
 
     def start_backup(self, repository_path: str, *, token: Optional[str] = None) -> int:
-        response = self.request_ok(
-            "POST",
-            "/api/backup/start",
-            token=token,
-            headers=self._headers(token=token, json_body=True),
-            json={"repository": repository_path},
-            expected=(200, 201, 202),
-        )
+        # A listing's follow-ups (the retention comparison's dry runs) hold
+        # the repository for a few seconds after a backup; admission answers
+        # 409 meanwhile, so a start right after a backup waits it out.
+        deadline = time.monotonic() + 60
+        while True:
+            response = self.request(
+                "POST",
+                "/api/backup/start",
+                token=token,
+                headers=self._headers(token=token, json_body=True),
+                json={"repository": repository_path},
+            )
+            if response.status_code in (200, 201, 202):
+                break
+            if response.status_code == 409 and time.monotonic() < deadline:
+                time.sleep(2)
+                continue
+            raise SmokeFailure(
+                f"POST /api/backup/start returned {response.status_code}: {response.text}"
+            )
         job_id = response.json()["job_id"]
         self.log(f"Started backup job {job_id}")
         return job_id
@@ -496,6 +508,14 @@ class SmokeClient:
         return parse_archives_payload(response.json())
 
     def generate_ssh_key(self, *, name: str = "SSH Smoke Key") -> dict:
+        """The server's system SSH key, generated on first use.
+
+        There is only one, so a smoke run against a server an earlier smoke
+        already used gets that key back instead of a 400.
+        """
+        existing = self.request_ok("GET", "/api/ssh-keys/system-key").json()
+        if existing.get("exists"):
+            return existing["ssh_key"]
         response = self.request_ok(
             "POST",
             "/api/ssh-keys/generate",

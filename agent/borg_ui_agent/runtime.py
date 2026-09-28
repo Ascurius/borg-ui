@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -8,11 +9,16 @@ from typing import Optional
 from agent.borg_ui_agent import __version__
 from agent.borg_ui_agent.backup import execute_backup_create_job
 from agent.borg_ui_agent.borg import detect_borg_binaries, detect_platform
+from agent.borg_ui_agent.cancel import CANCEL_CAPABILITY
 from agent.borg_ui_agent.client import AgentClient
 from agent.borg_ui_agent.config import AgentConfig
 from agent.borg_ui_agent.filesystem import execute_filesystem_browse_job
-from agent.borg_ui_agent.repository_ops import execute_repository_operation_job
+from agent.borg_ui_agent.repository_ops import (
+    execute_repository_operation_job,
+    execute_storage_usage_job,
+)
 from agent.borg_ui_agent.scripts import execute_script_run_job
+from agent.borg_ui_agent.self_upgrade import can_self_upgrade
 
 DEFAULT_REPOSITORY_OPERATION_HANDLER = execute_repository_operation_job
 
@@ -36,11 +42,19 @@ DEFAULT_CAPABILITIES = [
     "repository.break_lock",
     "repository.list_archive_contents",
     "repository.extract_archive_file",
+    "repository.export_archive_tar",
     "repository.restore",
     "repository.check",
     "repository.prune",
     "repository.compact",
     "repository.rclone_sync",
+    "repository.disk_usage",
+    "repository.storage_usage",
+    "repository.diff",
+    # the kinds in cancel.SELF_CANCELLING_JOB_KINDS stop when the job is
+    # cancelled while running, whatever Borg prints (0.1.7); an older agent
+    # finishes a silent one anyway
+    CANCEL_CAPABILITY,
     "agent.list_scripts",
     "script.run",
 ]
@@ -58,11 +72,14 @@ JOB_HANDLERS = {
     "repository.break_lock": execute_repository_operation_job,
     "repository.list_archive_contents": execute_repository_operation_job,
     "repository.extract_archive_file": execute_repository_operation_job,
+    "repository.export_archive_tar": execute_repository_operation_job,
     "repository.restore": execute_repository_operation_job,
     "repository.check": execute_repository_operation_job,
     "repository.prune": execute_repository_operation_job,
     "repository.compact": execute_repository_operation_job,
     "repository.rclone_sync": execute_repository_operation_job,
+    "repository.disk_usage": execute_repository_operation_job,
+    "repository.storage_usage": execute_storage_usage_job,
 }
 
 
@@ -74,7 +91,12 @@ class RunOnceResult:
 
 
 def get_capabilities() -> list[str]:
-    return list(DEFAULT_CAPABILITIES)
+    # Detected, not assumed: an agent upgraded from an install that predates
+    # the helper has to report honestly so the UI routes it to the manual path.
+    capabilities = list(DEFAULT_CAPABILITIES)
+    if can_self_upgrade():
+        capabilities.append("self_upgrade")
+    return capabilities
 
 
 def get_job_handler(job_kind: str):
@@ -107,6 +129,7 @@ class AgentRuntime:
             borg_versions=borg_versions,
             capabilities=get_capabilities(),
             running_job_ids=running_job_ids or [],
+            timezone=machine.get("timezone"),
         )
 
     def run_once(self) -> RunOnceResult:
@@ -160,13 +183,17 @@ class AgentRuntime:
 
     def _build_cancel_checker(self, job_id: int) -> Callable[[], bool]:
         last_checked_at = 0.0
+        # The worker's per-line check and the cancel poller call this from
+        # two threads.
+        lock = threading.Lock()
 
         def should_cancel() -> bool:
             nonlocal last_checked_at
-            now = time.monotonic()
-            if now - last_checked_at < 5:
-                return False
-            last_checked_at = now
+            with lock:
+                now = time.monotonic()
+                if now - last_checked_at < 5:
+                    return False
+                last_checked_at = now
             response = self.heartbeat(running_job_ids=[job_id])
             return job_id in response.get("cancel_job_ids", [])
 

@@ -5,8 +5,10 @@ import pytest
 from sqlalchemy.orm import sessionmaker
 
 from app.core.borg2 import borg2
-from app.database.models import PruneJob, Repository
+from app.database.models import Repository
 from app.services.v2.prune_service import PruneV2Service
+from app.services.operations.job_facade import resolve_maintenance_job
+from tests.utils.operations import seed_job_operation
 
 
 @pytest.mark.unit
@@ -25,8 +27,13 @@ async def test_execute_prune_marks_job_complete_and_updates_repo(db_engine):
     session.commit()
     session.refresh(repo)
 
-    job = PruneJob(repository_id=repo.id, repository_path=repo.path, status="pending")
-    session.add(job)
+    job = seed_job_operation(
+        session,
+        "prune",
+        repository_id=repo.id,
+        repository_path=repo.path,
+        status="pending",
+    )
     session.commit()
     session.refresh(job)
     repo_id = repo.id
@@ -56,20 +63,15 @@ async def test_execute_prune_marks_job_complete_and_updates_repo(db_engine):
             "app.services.v2.prune_service.asyncio.create_subprocess_exec",
             new=AsyncMock(return_value=FakeProcess(0, stdout=b"pruned")),
         ),
-        patch(
-            "app.services.v2.prune_service.BorgRouter.update_stats",
-            new=AsyncMock(return_value=True),
-        ) as mock_update_stats,
     ):
         await service.execute_prune(job_id, repo_id, 0, 7, 4, 6, 0, 1, dry_run=False)
 
     verification = testing_session_local()
-    refreshed_job = verification.query(PruneJob).filter(PruneJob.id == job_id).first()
+    refreshed_job = resolve_maintenance_job(verification, job_id, "prune")
 
     assert refreshed_job.status == "completed"
     assert refreshed_job.completed_at is not None
     assert refreshed_job.has_logs is True
-    mock_update_stats.assert_awaited_once()
     verification.close()
 
 
@@ -89,8 +91,13 @@ async def test_execute_prune_marks_job_failed_on_borg_error(db_engine):
     session.commit()
     session.refresh(repo)
 
-    job = PruneJob(repository_id=repo.id, repository_path=repo.path, status="pending")
-    session.add(job)
+    job = seed_job_operation(
+        session,
+        "prune",
+        repository_id=repo.id,
+        repository_path=repo.path,
+        status="pending",
+    )
     session.commit()
     session.refresh(job)
     repo_id = repo.id
@@ -124,7 +131,7 @@ async def test_execute_prune_marks_job_failed_on_borg_error(db_engine):
         await service.execute_prune(job_id, repo_id, 0, 7, 4, 6, 0, 1, dry_run=True)
 
     verification = testing_session_local()
-    refreshed_job = verification.query(PruneJob).filter(PruneJob.id == job_id).first()
+    refreshed_job = resolve_maintenance_job(verification, job_id, "prune")
 
     assert refreshed_job.status == "failed"
     assert refreshed_job.error_message == "boom"
@@ -157,7 +164,9 @@ async def test_borg2_prune_command_omits_stats_flag():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_borg2_prune_command_includes_keep_within():
+async def test_borg2_prune_command_sends_keep_within_as_keep():
+    """Borg 2.0.0b22 removed --keep-within; --keep takes the same interval. The
+    field is still called keep_within everywhere above the command builder."""
     with patch(
         "app.core.borg2.borg2._run",
         new=AsyncMock(return_value={"success": True, "stdout": "", "stderr": ""}),
@@ -169,5 +178,6 @@ async def test_borg2_prune_command_includes_keep_within():
             dry_run=True,
         )
 
-    cmd = mock_run.await_args.args[0]
-    assert "--keep-within=1d" in cmd
+    cmd = list(mock_run.await_args.args[0])
+    assert cmd[cmd.index("--keep") + 1] == "1d"
+    assert not [arg for arg in cmd if str(arg).startswith("--keep-within")]

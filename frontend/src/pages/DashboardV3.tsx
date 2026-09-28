@@ -14,7 +14,7 @@ import { useNavigate } from 'react-router-dom'
 import { Alert, Box, Button, Stack, Typography } from '@mui/material'
 import { alpha } from '@mui/material/styles'
 import { Activity, ArrowRight, Cpu, HardDrive } from 'lucide-react'
-import { differenceInDays, formatDistanceToNow } from 'date-fns'
+import { differenceInDays, format, formatDistanceToNow } from 'date-fns'
 import { useTheme } from '../context/ThemeContext'
 import { useAnalytics } from '../hooks/useAnalytics'
 import { dashboardAPI, rcloneAPI } from '../services/api'
@@ -24,28 +24,62 @@ import { ArcGauge, StorageDonut, SuccessDonut } from './dashboard-v3/charts'
 import { DashboardSkeleton } from './dashboard-v3/DashboardSkeleton'
 import { PulseDot } from './dashboard-v3/health'
 import { UpcomingBackupsPanel } from './dashboard-v3/UpcomingBackupsPanel'
+import { SpaceSavingsPanel } from './dashboard-v3/SpaceSavingsPanel'
+import { SuccessDonutLegend } from './dashboard-v3/SuccessDonutLegend'
 import { CapabilityLaunchpad } from './dashboard-v3/CapabilityLaunchpad'
 import { RepositoryHealthPanel } from './dashboard-v3/RepositoryHealthPanel'
 import { ResourceGaugeGrid } from './dashboard-v3/ResourceGaugeGrid'
-import { makeT, STATUS, TokenContext } from './dashboard-v3/tokens'
-import type { DashboardOverview } from './dashboard-v3/types'
+import { makeT, statusColor, TokenContext } from './dashboard-v3/tokens'
+import type { ActivityEntry, DashboardOverview } from './dashboard-v3/types'
 import { gaugeColor, toCompactGB } from './dashboard-v3/utils'
+import { parseBackendDate } from '../utils/dateUtils'
 
+// A backend one release older sends the feed (every run of the window)
+// instead of the timeline counts and the failures; both derive from it here
+// the way this page used to.
 const RESOLVING_ACTIVITY_STATUSES = new Set(['completed', 'completed_with_warnings'])
 
-function getCurrentFailures(activityFeed: DashboardOverview['activity_feed']) {
-  return activityFeed.filter((activity) => {
+function failuresFromFeed(feed: ActivityEntry[]): ActivityEntry[] {
+  return feed.filter((activity) => {
     if (activity.status !== 'failed') return false
-
     const failedAt = new Date(activity.timestamp).getTime()
-    return !activityFeed.some(
+    return !feed.some(
       (candidate) =>
         candidate.type === activity.type &&
         candidate.repository === activity.repository &&
         RESOLVING_ACTIVITY_STATUSES.has(candidate.status) &&
-        new Date(candidate.timestamp).getTime() > failedAt
+        // a tie resolves, as on the server
+        new Date(candidate.timestamp).getTime() >= failedAt
     )
   })
+}
+
+function timelineFromFeed(
+  feed: ActivityEntry[]
+): NonNullable<DashboardOverview['activity_timeline']> {
+  const cells = new Map<string, { date: string; type: string; total: number; failed: number }>()
+  for (const activity of feed) {
+    const started = parseBackendDate(activity.timestamp)
+    // an entry the older backend could not date is skipped, not rendered
+    if (Number.isNaN(started.getTime())) continue
+    const date = format(started, 'yyyy-MM-dd')
+    const key = `${date}:${activity.type}`
+    const cell = cells.get(key) ?? { date, type: activity.type, total: 0, failed: 0 }
+    cell.total += 1
+    if (activity.status === 'failed') cell.failed += 1
+    cells.set(key, cell)
+  }
+  return Array.from(cells.values())
+}
+
+// The zone the timeline's days are bucketed in: the viewer's, so a run
+// just before local midnight lands on the day the viewer saw it start.
+function viewerTimeZone(): string | undefined {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined
+  } catch {
+    return undefined
+  }
 }
 
 export default function DashboardV3() {
@@ -55,6 +89,7 @@ export default function DashboardV3() {
   const { trackNavigation, EventAction } = useAnalytics()
   const T = makeT(effectiveMode === 'dark')
   const [nowMs] = React.useState(() => Date.now())
+  const [timeZone] = React.useState(viewerTimeZone)
 
   const surface = {
     bgcolor: T.bgCard,
@@ -70,8 +105,8 @@ export default function DashboardV3() {
     error,
     refetch,
   } = useQuery<DashboardOverview>({
-    queryKey: ['dashboard-v3'],
-    queryFn: () => dashboardAPI.getOverview().then((response) => response.data),
+    queryKey: ['dashboard-v3', timeZone],
+    queryFn: () => dashboardAPI.getOverview(timeZone).then((response) => response.data),
     refetchInterval: 30_000,
   })
 
@@ -120,7 +155,7 @@ export default function DashboardV3() {
   const warningCount = repos.filter((r) => r.health_status === 'warning').length
   const healthyCount = repos.filter((r) => r.health_status === 'healthy').length
   const sysStatus = criticalCount > 0 ? 'critical' : warningCount > 0 ? 'warning' : 'healthy'
-  const sc = STATUS[sysStatus]
+  const sc = { color: statusColor(sysStatus, T) }
   const activeAutomationCount =
     summary.active_automations ?? summary.active_schedules + (summary.active_backup_plans ?? 0)
   const totalAutomationCount =
@@ -128,10 +163,12 @@ export default function DashboardV3() {
 
   // Most recent backup across all repos
   const lastBackupDate = repos
-    .map((r) => (r.last_backup ? new Date(r.last_backup) : null))
+    .map((r) => (r.last_backup ? parseBackendDate(r.last_backup) : null))
     .filter(Boolean)
     .sort((a, b) => b!.getTime() - a!.getTime())[0]
-  const currentFailures = getCurrentFailures(ov.activity_feed)
+  const legacyFeed = ov.activity_feed ?? []
+  const currentFailures = ov.current_failures ?? failuresFromFeed(legacyFeed)
+  const activityTimeline = ov.activity_timeline ?? timelineFromFeed(legacyFeed)
 
   return (
     <TokenContext.Provider value={T}>
@@ -159,7 +196,13 @@ export default function DashboardV3() {
             borderColor: alpha(sc.color, 0.33),
           }}
         >
-          <Stack direction="row" spacing={2} alignItems="center">
+          <Stack
+            direction="row"
+            spacing={2}
+            sx={{
+              alignItems: 'center',
+            }}
+          >
             <PulseDot color={sc.color} />
             <Box>
               <Typography
@@ -364,9 +407,11 @@ export default function DashboardV3() {
                   The donut below is a glanceable shape, not the focal point. */}
               <Stack
                 direction="row"
-                alignItems="baseline"
-                justifyContent="space-between"
-                sx={{ mb: 1.75 }}
+                sx={{
+                  alignItems: 'baseline',
+                  justifyContent: 'space-between',
+                  mb: 1.75,
+                }}
               >
                 <Typography sx={{ fontSize: '0.8125rem', fontWeight: 600, color: T.textPrimary }}>
                   {t('dashboard.successDonut.label')}
@@ -393,44 +438,23 @@ export default function DashboardV3() {
                 good={summary.successful_jobs_30d}
                 total={summary.total_jobs_30d}
               />
-              <Stack direction="row" justifyContent="space-between" sx={{ mt: 1.75, px: 0.5 }}>
-                <Stack direction="row" alignItems="baseline" spacing={0.75}>
-                  <Typography
-                    sx={{
-                      fontFamily: T.mono,
-                      fontWeight: 700,
-                      color: T.green,
-                      fontSize: '0.875rem',
-                      lineHeight: 1,
-                    }}
-                  >
-                    {summary.successful_jobs_30d}
-                  </Typography>
-                  <Typography sx={{ fontSize: '0.75rem', color: T.textMuted }}>
-                    {t('dashboard.successDonut.passed')}
-                  </Typography>
-                </Stack>
-                <Stack direction="row" alignItems="baseline" spacing={0.75}>
-                  <Typography
-                    sx={{
-                      fontFamily: T.mono,
-                      fontWeight: 700,
-                      color: summary.failed_jobs_30d > 0 ? T.red : T.textMuted,
-                      fontSize: '0.875rem',
-                      lineHeight: 1,
-                    }}
-                  >
-                    {summary.failed_jobs_30d}
-                  </Typography>
-                  <Typography sx={{ fontSize: '0.75rem', color: T.textMuted }}>
-                    {t('dashboard.successDonut.failed')}
-                  </Typography>
-                </Stack>
-              </Stack>
+              <Box sx={{ mt: 1.75, px: 0.5 }}>
+                <SuccessDonutLegend
+                  passed={summary.successful_jobs_30d}
+                  failed={summary.failed_jobs_30d}
+                />
+              </Box>
             </Box>
 
             <Box sx={{ ...surface, p: 2 }}>
-              <Stack direction="row" spacing={0.75} alignItems="center" sx={{ mb: 2 }}>
+              <Stack
+                direction="row"
+                spacing={0.75}
+                sx={{
+                  alignItems: 'center',
+                  mb: 2,
+                }}
+              >
                 <Cpu size={14} color={T.textMuted} />
                 <Typography
                   sx={{
@@ -481,17 +505,37 @@ export default function DashboardV3() {
 
             <UpcomingBackupsPanel tasks={ov.upcoming_tasks} />
 
+            <SpaceSavingsPanel
+              rows={ov.space_savings ?? []}
+              onNavigate={(route) => {
+                trackNavigation(EventAction.VIEW, {
+                  section: 'dashboard',
+                  destination: route.substring(1),
+                  source: 'space_savings',
+                })
+                navigate(route)
+              }}
+            />
+
             {/* Storage donut */}
             <Box sx={{ ...surface, p: 2 }}>
               {/* Total size moves into the header so it reads as data, not a
                   centered hero number. */}
               <Stack
                 direction="row"
-                alignItems="baseline"
-                justifyContent="space-between"
-                sx={{ mb: 1.75 }}
+                sx={{
+                  alignItems: 'baseline',
+                  justifyContent: 'space-between',
+                  mb: 1.75,
+                }}
               >
-                <Stack direction="row" spacing={0.75} alignItems="center">
+                <Stack
+                  direction="row"
+                  spacing={0.75}
+                  sx={{
+                    alignItems: 'center',
+                  }}
+                >
                   <HardDrive size={14} color={T.textMuted} />
                   <Typography sx={{ fontSize: '0.8125rem', fontWeight: 600, color: T.textPrimary }}>
                     {t('dashboard.banner.stats.storage')}
@@ -570,11 +614,19 @@ export default function DashboardV3() {
             <Box sx={{ ...surface, p: 2.5 }}>
               <Stack
                 direction="row"
-                alignItems="center"
-                justifyContent="space-between"
-                sx={{ mb: 1.75 }}
+                sx={{
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  mb: 1.75,
+                }}
               >
-                <Stack direction="row" spacing={1} alignItems="center">
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{
+                    alignItems: 'center',
+                  }}
+                >
                   <Activity size={14} color={T.textMuted} />
                   <Typography
                     sx={{
@@ -586,12 +638,24 @@ export default function DashboardV3() {
                     {t('dashboard.recentActivity.last14Days')}
                   </Typography>
                 </Stack>
-                <Stack direction="row" spacing={1.5} alignItems="center">
+                <Stack
+                  direction="row"
+                  spacing={1.5}
+                  sx={{
+                    alignItems: 'center',
+                  }}
+                >
                   {/* Failed-marker legend lives in the header next to the
                       Full Log button so it does not claim its own row under
                       the chart. The ringed circle here visually matches the
                       ring drawn around failed dots in the SVG. */}
-                  <Stack direction="row" spacing={0.65} alignItems="center">
+                  <Stack
+                    direction="row"
+                    spacing={0.65}
+                    sx={{
+                      alignItems: 'center',
+                    }}
+                  >
                     <Box
                       sx={{
                         width: 8,
@@ -630,14 +694,14 @@ export default function DashboardV3() {
                 </Stack>
               </Stack>
 
-              {ov.activity_feed.length === 0 ? (
+              {activityTimeline.length === 0 && currentFailures.length === 0 ? (
                 <Typography
                   sx={{ color: T.textMuted, textAlign: 'center', py: 3, fontSize: '0.875rem' }}
                 >
                   {t('dashboard.recentActivity.emptyRecorded')}
                 </Typography>
               ) : (
-                <ActivityTimeline activities={ov.activity_feed} />
+                <ActivityTimeline timeline={activityTimeline} />
               )}
             </Box>
           </Box>

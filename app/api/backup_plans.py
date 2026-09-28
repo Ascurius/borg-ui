@@ -13,12 +13,12 @@ from app.core.security import (
     check_repo_access,
     encrypt_secret,
     get_current_user,
+    repository_role_allows,
     require_any_role,
 )
 from app.database.database import get_db
 from app.database.models import (
     AgentJobLog,
-    BackupJob,
     BackupPlan,
     BackupPlanRepository,
     BackupPlanRun,
@@ -30,6 +30,7 @@ from app.database.models import (
     Script,
     ScriptExecution,
     User,
+    UserRepositoryPermission,
 )
 from app.services.backup_plan_policy import (
     evaluate_backup_plan_access,
@@ -49,12 +50,17 @@ from app.services.log_policy import (
     get_log_save_policy,
     job_has_logs_by_policy,
 )
+from app.services.operations.backup_facade import BackupJobFacade
 from app.services.repository_executor import repository_executor_type
 from app.utils.datetime_utils import serialize_datetime
 from app.utils.schedule_time import (
     InvalidScheduleTimezone,
     calculate_next_cron_run,
     normalize_schedule_timezone,
+)
+from app.services.schedule_availability import (
+    DEFAULT_AVAILABILITY_CHECK_INTERVAL_MINUTES,
+    validate_availability_intervals,
 )
 from app.utils.source_locations import (
     decode_source_locations,
@@ -140,6 +146,11 @@ class BackupPlanPayload(BaseModel):
     max_parallel_repositories: int = 1
     failure_behavior: str = "continue"
     schedule_enabled: bool = False
+    schedule_mode: str = "cron"
+    availability_check_interval_minutes: int = (
+        DEFAULT_AVAILABILITY_CHECK_INTERVAL_MINUTES
+    )
+    min_success_interval_minutes: int = 0
     cron_expression: Optional[str] = None
     timezone: str = "UTC"
     pre_backup_script_id: Optional[int] = None
@@ -195,7 +206,7 @@ def _unique_backup_plan_name(db: Session, base_name: str) -> str:
     existing_names = {
         name
         for (name,) in db.query(BackupPlan.name)
-        .filter(BackupPlan.name.like(f"{candidate}%"))
+        .filter(BackupPlan.name.ilike(f"{candidate}%"))
         .all()
     }
     if candidate not in existing_names:
@@ -622,11 +633,18 @@ def _serialize_plan(plan: BackupPlan, *, detail: bool = False) -> dict[str, Any]
         "max_parallel_repositories": plan.max_parallel_repositories,
         "failure_behavior": plan.failure_behavior,
         "schedule_enabled": bool(plan.schedule_enabled),
+        "schedule_mode": plan.schedule_mode,
+        "availability_check_interval_minutes": plan.availability_check_interval_minutes,
+        "min_success_interval_minutes": plan.min_success_interval_minutes,
         "cron_expression": plan.cron_expression,
         "timezone": plan.timezone,
         "last_run": serialize_datetime(plan.last_run),
         "next_run": serialize_datetime(plan.next_run),
         "repository_count": len(enabled_links),
+        "repositories": [
+            _serialize_repository_link(link)
+            for link in sorted(plan.repositories, key=lambda item: item.execution_order)
+        ],
         "created_at": serialize_datetime(plan.created_at),
         "updated_at": serialize_datetime(plan.updated_at),
     }
@@ -650,16 +668,13 @@ def _serialize_plan(plan: BackupPlan, *, detail: bool = False) -> dict[str, Any]
                 "prune_keep_quarterly": plan.prune_keep_quarterly,
                 "prune_keep_yearly": plan.prune_keep_yearly,
                 "prune_keep_within": plan.prune_keep_within,
-                "repositories": [
-                    _serialize_repository_link(link) for link in plan.repositories
-                ],
             }
         )
     return payload
 
 
 def _serialize_backup_job(
-    job: Optional[BackupJob],
+    job,
     repo: Optional[Repository],
     *,
     log_save_policy: str = DEFAULT_LOG_SAVE_POLICY,
@@ -683,6 +698,7 @@ def _serialize_backup_job(
         ),
         "maintenance_status": job.maintenance_status,
         "archive_name": job.archive_name,
+        "archive_pruned_at": serialize_datetime(job.archive_pruned_at),
         "execution_mode": job.execution_mode or "local",
         "route_strategy": job.route_strategy,
         "retry_attempt": job.retry_attempt or 1,
@@ -692,6 +708,18 @@ def _serialize_backup_job(
         "retry_requested_at": serialize_datetime(job.retry_requested_at),
         "progress_details": serialize_backup_progress_details(job, repo),
     }
+
+
+def _plan_run_backup_job(link: BackupPlanRunRepository) -> Optional[Any]:
+    """The backup this plan-run row points at, as the facade the serializer
+    reads. The session comes off the loaded row, as
+    `_latest_agent_script_line` does."""
+    if link.backup_operation is None:
+        return None
+    session = object_session(link.backup_operation)
+    if session is None:
+        return None
+    return BackupJobFacade(session, link.backup_operation)
 
 
 def _serialize_plan_run_repository(
@@ -720,7 +748,7 @@ def _serialize_plan_run_repository(
         if repo
         else None,
         "backup_job": _serialize_backup_job(
-            link.backup_job,
+            _plan_run_backup_job(link),
             repo,
             log_save_policy=log_save_policy,
         ),
@@ -790,6 +818,7 @@ def _serialize_plan_run(
         "started_at": serialize_datetime(run.started_at),
         "completed_at": serialize_datetime(run.completed_at),
         "error_message": run.error_message,
+        "skip_reason": run.skip_reason,
         "created_at": serialize_datetime(run.created_at),
         "retry_attempt": run.retry_attempt or 1,
         "retry_original_run_id": run.retry_original_run_id,
@@ -816,18 +845,34 @@ def _serialize_plan_run(
 
 
 def _can_view_plan(db: Session, user: User, plan: BackupPlan) -> bool:
+    return bool(_plans_viewable(db, user, [plan]))
+
+
+def _plans_viewable(db: Session, user: User, plans) -> list:
+    """The plans among `plans` the user may view: every repository a plan
+    links must be one they may view, and a plan linking none is nobody's
+    but an admin's. The user's permission rows are read once for the list,
+    not once per link, and the rule is `check_repo_access`'s."""
+    plans = list(plans)
     if user.role == "admin":
-        return True
-    if not plan.repositories:
-        return False
-    for link in plan.repositories:
-        if not link.repository:
-            continue
-        try:
-            check_repo_access(db, user, link.repository, "viewer")
-        except HTTPException:
-            return False
-    return True
+        return plans
+    roles = {}
+    if plans:
+        roles = dict(
+            db.query(
+                UserRepositoryPermission.repository_id, UserRepositoryPermission.role
+            ).filter(UserRepositoryPermission.user_id == user.id)
+        )
+    return [
+        plan
+        for plan in plans
+        if plan.repositories
+        and all(
+            repository_role_allows(user, roles.get(link.repository_id), "viewer")
+            for link in plan.repositories
+            if link.repository
+        )
+    ]
 
 
 def _require_plan_operator_access(db: Session, user: User, plan: BackupPlan) -> None:
@@ -882,7 +927,7 @@ def _load_run_or_404(db: Session, run_id: int) -> BackupPlanRun:
                 BackupPlanRunRepository.repository
             ),
             joinedload(BackupPlanRun.repositories).joinedload(
-                BackupPlanRunRepository.backup_job
+                BackupPlanRunRepository.backup_operation
             ),
             joinedload(BackupPlanRun.script_executions).joinedload(
                 ScriptExecution.script
@@ -1100,7 +1145,7 @@ def _validate_payload(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"key": "backend.errors.backupPlans.sourceRequired"},
         )
-    if not payload.repositories:
+    if not any(link.enabled for link in payload.repositories):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"key": "backend.errors.backupPlans.repositoriesRequired"},
@@ -1149,7 +1194,22 @@ def _validate_payload(
 
     normalized_tz = normalize_schedule_timezone(payload.timezone)
     payload.timezone = normalized_tz
-    if payload.schedule_enabled:
+    if payload.schedule_mode not in {"cron", "availability"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"key": "backend.errors.schedule.invalidMode"},
+        )
+    try:
+        validate_availability_intervals(
+            payload.availability_check_interval_minutes,
+            payload.min_success_interval_minutes,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"key": "backend.errors.schedule.invalidAvailabilityInterval"},
+        ) from exc
+    if payload.schedule_enabled and payload.schedule_mode == "cron":
         if not payload.cron_expression:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1297,15 +1357,27 @@ def _apply_payload(plan: BackupPlan, payload: BackupPlanPayload) -> None:
     plan.max_parallel_repositories = payload.max_parallel_repositories
     plan.failure_behavior = payload.failure_behavior
     plan.schedule_enabled = payload.schedule_enabled
-    plan.cron_expression = payload.cron_expression if payload.schedule_enabled else None
-    plan.timezone = payload.timezone
-    plan.next_run = (
-        calculate_next_cron_run(
-            payload.cron_expression, schedule_timezone=payload.timezone
-        )
-        if payload.schedule_enabled and payload.cron_expression
+    plan.schedule_mode = payload.schedule_mode
+    plan.availability_check_interval_minutes = (
+        payload.availability_check_interval_minutes
+    )
+    plan.min_success_interval_minutes = payload.min_success_interval_minutes
+    plan.cron_expression = (
+        payload.cron_expression
+        if payload.schedule_enabled and payload.schedule_mode == "cron"
         else None
     )
+    plan.timezone = payload.timezone
+    if not payload.schedule_enabled:
+        plan.next_run = None
+    elif payload.schedule_mode == "availability":
+        plan.next_run = datetime.utcnow()
+    elif plan.cron_expression:
+        plan.next_run = calculate_next_cron_run(
+            plan.cron_expression, schedule_timezone=payload.timezone
+        )
+    else:
+        plan.next_run = None
     plan.pre_backup_script_id = payload.pre_backup_script_id
     plan.post_backup_script_id = payload.post_backup_script_id
     plan.pre_backup_script_parameters = payload.pre_backup_script_parameters
@@ -1405,7 +1477,7 @@ async def list_backup_plan_runs(
                 BackupPlanRunRepository.repository
             ),
             joinedload(BackupPlanRun.repositories).joinedload(
-                BackupPlanRunRepository.backup_job
+                BackupPlanRunRepository.backup_operation
             ),
             joinedload(BackupPlanRun.script_executions).joinedload(
                 ScriptExecution.script
@@ -1695,7 +1767,7 @@ async def list_backup_plan_runs_for_plan(
                 BackupPlanRunRepository.repository
             ),
             joinedload(BackupPlanRun.repositories).joinedload(
-                BackupPlanRunRepository.backup_job
+                BackupPlanRunRepository.backup_operation
             ),
             joinedload(BackupPlanRun.script_executions).joinedload(
                 ScriptExecution.script
@@ -1758,6 +1830,82 @@ async def toggle_backup_plan(
         "Backup plan toggled",
         backup_plan_id=plan.id,
         enabled=plan.enabled,
+        user=current_user.username,
+    )
+    return _serialize_plan(plan, detail=True)
+
+
+@router.post("/{plan_id}/repositories/{repository_id}/toggle")
+async def toggle_backup_plan_repository(
+    plan_id: int,
+    repository_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Skip or resume one repository inside a plan without touching its config."""
+    plan = _load_plan_or_404(db, plan_id)
+    _require_plan_operator_access(db, current_user, plan)
+
+    link = next(
+        (item for item in plan.repositories if item.repository_id == repository_id),
+        None,
+    )
+    if link is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"key": "backend.errors.backupPlans.repositoryNotFound"},
+        )
+    if link.enabled and not any(
+        item.enabled for item in plan.repositories if item.id != link.id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"key": "backend.errors.backupPlans.repositoriesRequired"},
+        )
+    if not link.enabled:
+        # Resuming must pass the same checks as attaching an enabled link on save.
+        repo = link.repository
+        if repo is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"key": "backend.errors.backupPlans.repositoryNotFound"},
+            )
+        if repo.mode == "observe":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"key": "backend.errors.backupPlans.observeRepositorySelected"},
+            )
+        source_locations = decode_source_locations(
+            plan.source_locations,
+            source_type=plan.source_type,
+            source_ssh_connection_id=plan.source_ssh_connection_id,
+            source_directories=_decode_json_list(plan.source_directories),
+        )
+        route = plan_repository_route(repo, source_locations)
+        if not route.supported:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"key": route.reason_key, "params": route.display_params},
+            )
+        require_backup_plan_feature_access(
+            db,
+            enabled_repository_count=sum(
+                1 for item in plan.repositories if item.enabled
+            )
+            + 1,
+            repository_run_mode=plan.repository_run_mode,
+            source_locations=source_locations,
+        )
+
+    link.enabled = not link.enabled
+    plan.updated_at = datetime.utcnow()
+    db.commit()
+    plan = _load_plan_or_404(db, plan_id)
+    logger.info(
+        "Backup plan repository toggled",
+        backup_plan_id=plan.id,
+        repository_id=repository_id,
+        enabled=link.enabled,
         user=current_user.username,
     )
     return _serialize_plan(plan, detail=True)

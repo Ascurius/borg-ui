@@ -25,9 +25,18 @@
       "clear": "Clear",
       "reset": "Reset",
       "deploy": "Deploy",
-      "view": "View"
+      "view": "View",
+      "collapse": "Collapse",
+      "expand": "Expand"
     },
     "status": "Status",
+    "loading": "Loading...",
+    "search": "Search",
+    "noResults": "No results found",
+    "password": {
+      "show": "Show password",
+      "hide": "Hide password"
+    },
     "never": "Never",
     "na": "N/A",
     "unknown": "Unknown",
@@ -60,7 +69,7 @@
     }
   },
   "login": {
-    "title": "Borg Web UI",
+    "title": "Borg UI",
     "subtitle": "Enter your credentials to continue",
     "username": "Username",
     "password": "Password",
@@ -124,6 +133,7 @@
     "badges": {
       "new": "New"
     },
+    "comingSoon": "Coming soon",
     "settings": {
       "personal": "Personal",
       "system": "System",
@@ -145,9 +155,13 @@
       "scripts": "Scripts",
       "users": "Users",
       "exportImport": "Export/Import",
-      "beta": "Beta"
+      "beta": "Beta",
+      "backgroundWork": "Background work"
     },
     "menu": {
+      "openDrawer": "Open navigation",
+      "userMenu": "User menu",
+      "enterpriseDeployment": "Enterprise deployment",
       "accountAndSecurityDesc": "Profile, password, 2FA, passkeys",
       "appearanceDesc": "Theme",
       "notificationsDesc": "Alerts & preferences",
@@ -257,7 +271,376 @@
   "managedAgents": {
     "planGate": {
       "message": "Managed Agents need Pro or Enterprise. Upgrade to enroll remote machines and run agent-backed jobs."
+    },
+    "agent": "Agent",
+    "page": {
+      "title": "Managed Agents",
+      "subtitle": "Lightweight machines connected to this Borg UI server",
+      "refresh": "Refresh",
+      "refreshing": "Refreshing agents",
+      "addAgent": "Add Agent",
+      "unknownAgent": "Unknown agent",
+      "never": "Never",
+      "none": "None",
+      "noneReported": "None reported",
+      "notReported": "Not reported",
+      "os": "OS",
+      "lastSeen": "Last seen",
+      "agentVersion": "Agent version",
+      "borg": "Borg",
+      "capabilities": "Capabilities",
+      "emptyAgents": "No agents enrolled.",
+      "emptyJobs": "No agent jobs yet.",
+      "emptyTokens": "No enrollment tokens created.",
+      "tabs": {
+        "agents": "Agents",
+        "jobs": "Jobs",
+        "tokens": "Enrollment Tokens"
+      },
+      "toasts": {
+        "tokenCreated": "Enrollment token created",
+        "tokenRevoked": "Enrollment token revoked",
+        "agentRevoked": "Agent revoked",
+        "agentDeleted": "Agent deleted",
+        "cancellationRequested": "Cancellation requested",
+        "copied": "Copied",
+        "agentVersionPinned": "Version pin saved",
+        "agentUpgradeRequested_one": "Upgrade requested",
+        "agentUpgradeRequested_other": "Upgrade requested for {{count}} endpoints"
+      },
+      "errors": {
+        "revokeToken": "Failed to revoke enrollment token",
+        "revokeAgent": "Failed to revoke agent",
+        "deleteAgent": "Failed to delete agent",
+        "cancelJob": "Failed to cancel job",
+        "runDiagnostics": "Failed to run diagnostics",
+        "upgradeAgent": "Could not request the upgrade",
+        "pinAgentVersion": "Could not save the version pin"
+      },
+      "table": {
+        "job": "Job",
+        "status": "Status",
+        "progress": "Progress",
+        "updated": "Updated",
+        "actions": "Actions",
+        "name": "Name",
+        "prefix": "Prefix",
+        "expires": "Expires"
+      },
+      "actions": {
+        "runDiagnostics": "Run diagnostics",
+        "viewAgentLogs": "View agent logs",
+        "reinstallAgent": "Reinstall agent",
+        "revokeAccess": "Revoke access",
+        "revokeAgent": "Revoke agent",
+        "deleteAgent": "Delete agent",
+        "viewLogs": "View logs",
+        "cancelJob": "Cancel job",
+        "revokeToken": "Revoke token",
+        "upgradeAgent": "Upgrade this endpoint",
+        "pinAgentVersion": "Pin this endpoint's version",
+        "changeServerUrl": "Change server URL",
+        "uninstallAgent": "Uninstall the agent"
+      },
+      "noBorg": {
+        "title": "No usable Borg binary reported",
+        "description": "Install Borg on this agent or regenerate the setup command with Borg installation enabled."
+      },
+      "deleteDialog": {
+        "title": "Delete agent",
+        "confirm": "Delete agent",
+        "description": "Deleting removes it from the fleet list. The local service may still run until removed on the client."
+      },
+      "reinstallDialog": {
+        "title": "Reinstall agent",
+        "copyCommand": "Copy reinstall command",
+        "description": "Run this on the enrolled machine to update the Borg UI agent package and restart the systemd service. No enrollment token or registration step is required.",
+        "configPreserved": "The script preserves the existing agent config at",
+        "serviceUserPreserved": "The service also keeps running as the user recorded in its systemd unit — run the command from any account that can sudo.",
+        "borgInstallation": "Borg installation",
+        "borgSelectionHint": "Selecting Borg versions upgrades those binaries on the agent to the versions this server provides. Leave this on Skip unless a Borg upgrade is intended.",
+        "borgOptions": {
+          "borg1": {
+            "label": "Borg 1.x",
+            "description": "Verifies or updates Borg 1 as 'borg' to this server's version."
+          },
+          "borg2": {
+            "label": "Borg 2.x beta only",
+            "description": "Verifies or updates Borg 2 as 'borg2' to this server's version."
+          },
+          "both": {
+            "label": "Borg 1.x and Borg 2.x beta",
+            "description": "Verifies or updates Borg 1 as 'borg' and Borg 2 as 'borg2' to this server's versions."
+          },
+          "skip": {
+            "label": "Skip Borg install",
+            "description": "Default. Only updates the agent package; Borg binaries are left untouched."
+          }
+        }
+      },
+      "logs": {
+        "agent": "Agent Logs",
+        "agentTitle": "Agent Logs - {{name}}",
+        "job": "Agent Job",
+        "jobTitle": "Agent Job Logs - Job #{{id}}"
+      },
+      "diagnostics": {
+        "title": "Agent diagnostics",
+        "running": "Running diagnostics",
+        "runCheck": "Run check",
+        "description": "Verify the outbound agent session and optionally test a TCP target from the agent host.",
+        "invalidPort": "Enter a TCP port between 1 and 65535.",
+        "invalidTimeout": "Enter a timeout between 0.5 and 10 seconds.",
+        "advancedSummary": "Advanced: test another service",
+        "advancedDescription": "Checks whether this agent can reach a separate service. Leave blank for normal diagnostics.",
+        "serviceHost": "Service host",
+        "serviceHostHelper": "Optional service to test from this agent",
+        "servicePort": "Service port",
+        "timeout": "Timeout",
+        "seconds": "Seconds",
+        "timeoutRange": "0.5-10 seconds",
+        "sessionHealthy": "Session healthy",
+        "agentOffline": "Agent offline",
+        "timedOut": "Timed out",
+        "sessionFailed": "Session failed",
+        "tcpReachable": "TCP reachable",
+        "tcpFailed": "TCP failed",
+        "emptyResult": "Run a check to verify the active agent session. Add a host and port to test TCP reachability from the agent host.",
+        "unavailable": "Diagnostics are unavailable in this story or test surface."
+      },
+      "upgrade": {
+        "upToDate": "Current",
+        "outdated": "Update available",
+        "ahead": "Ahead of server",
+        "pinned": "Pinned",
+        "unknown": "Version unknown",
+        "targetTooltip": "This server serves agent version {{version}}",
+        "pinnedTooltip": "Pinned to version {{version}} and will not track the server",
+        "unknownTooltip": "This endpoint has not reported a version we can compare",
+        "outdatedCount_one": "{{count}} endpoint is running an older agent",
+        "outdatedCount_other": "{{count}} endpoints are running an older agent",
+        "bannerBody": "The current agent version is {{version}}.",
+        "bannerMixedTargets": "Each one targets its own configured version.",
+        "manualOnly": "Manual upgrades only",
+        "manualOnlyTooltip": "This endpoint has no self-upgrade helper, so it is updated by running the reinstall command on the machine. One reinstall prepares it for server-driven upgrades.",
+        "selectedCount_one": "{{count}} endpoint selected",
+        "selectedCount_other": "{{count}} endpoints selected",
+        "upgradeSelected_one": "Upgrade {{count}} endpoint",
+        "upgradeSelected_other": "Upgrade {{count}} endpoints",
+        "selectAgent": "Select {{name}}",
+        "clearSelection": "Clear",
+        "bannerManualOnly_one": "{{count}} endpoint needs a manual reinstall from its card before it can be upgraded from here.",
+        "bannerManualOnly_other": "{{count}} endpoints need a manual reinstall from their cards before they can be upgraded from here.",
+        "upgradeAll": "Upgrade all ({{count}})"
+      },
+      "upgradeDialog": {
+        "title_one": "Upgrade this endpoint",
+        "title_other": "Upgrade {{count}} endpoints",
+        "description": "The endpoint reinstalls itself from this server.",
+        "descriptionWithVersion_one": "The endpoint reinstalls itself from this server and comes back on version {{version}}.",
+        "descriptionWithVersion_other": "Each endpoint reinstalls itself from this server and comes back on version {{version}}.",
+        "mixedTargets": "Each endpoint reinstalls itself from this server and comes back on its own configured version.",
+        "disconnectWarning_one": "It disconnects for a short period while it does.",
+        "disconnectWarning_other": "Each one disconnects for a short period while it does, and they are upgraded a few at a time, so some wait before they start.",
+        "busyWarning": "An endpoint that is running a backup refuses the upgrade, so try again once it is idle.",
+        "confirm": "Upgrade"
+      },
+      "upgradeState": {
+        "upgrading": "Upgrading",
+        "upgradingTo": "Upgrading to {{version}}",
+        "upgradingTooltip": "The endpoint is reinstalling itself and will reconnect on its own.",
+        "failed": "Upgrade failed",
+        "failedHint": "The endpoint did not come back in time. Reinstall it manually.",
+        "queued": "Waiting to upgrade",
+        "queuedTooltip": "Queued behind other endpoints. It starts on its own when a slot frees."
+      },
+      "pinControl": {
+        "title": "Version pin",
+        "hint": "By default an endpoint tracks the version this server serves. Pin it to hold it on a specific version instead.",
+        "agentVersionLabel": "Agent version",
+        "trackServer": "Track server",
+        "borgVersionLabel": "Borg version",
+        "leaveAsInstalled": "Leave as installed",
+        "borgHint": "The Borg choice applies at the next upgrade of this endpoint.",
+        "save": "Save",
+        "unavailableVersion": "{{version}} (no longer served)"
+      },
+      "borgPin": {
+        "active": "Borg {{version}}",
+        "activeTooltip": "Pinned to Borg {{version}}, which this endpoint reports.",
+        "pending": "Borg {{version}} pending",
+        "pendingTooltip": "Pinned to Borg {{version}}, which this endpoint does not report yet. The next upgrade installs it."
+      },
+      "setServerDialog": {
+        "title": "Change server URL",
+        "description": "Point this endpoint at a different Borg UI address. It keeps its identity, its credential and its history, so no new enrollment token is needed.",
+        "fieldLabel": "New server URL",
+        "fieldHelper": "Prefilled with this server's own address. Edit it if the endpoint should reach Borg UI somewhere else, for example through a reverse proxy.",
+        "invalidUrl": "Enter a full URL starting with http:// or https://, with no quote, pipe or backslash character.",
+        "copyCommand": "Copy command",
+        "runHint": "Run this on the endpoint, as a user who can sudo.",
+        "statusHint": "Not sure what address the endpoint holds right now? Run borg-ui-agent status on it."
+      },
+      "offlineStatusHint": "Run borg-ui-agent status on the endpoint to see the server address it currently holds.",
+      "uninstallDialog": {
+        "title": "Uninstall the agent",
+        "description": "Run this on the endpoint to remove Borg UI from it completely. It unregisters itself first, so this card updates on its own.",
+        "removesTitle": "What this removes",
+        "removesService": "The borg-ui-agent service and its upgrade helper",
+        "removesVenv": "The virtualenv at /opt/borg-ui-agent",
+        "removesConfig": "The configuration at /etc/borg-ui-agent, including the credential",
+        "removesUser": "The dedicated borg-ui-agent service user, if the install created one",
+        "keepsBorg": "Your own Borg installation is not touched. Only binaries this installer placed are removed.",
+        "keepsRepositories": "Your backup repositories are not touched.",
+        "copyCommand": "Copy command"
+      },
+      "insecureCommandWarning": "This server is reachable over plain HTTP, so this command downloads a script unencrypted and runs it as root. Anyone on the network path can replace what it downloads. Put the server behind HTTPS before running this outside a network you trust."
+    },
+    "installCommand": {
+      "title": "Install command",
+      "copy": "Copy install command",
+      "description": "Run the command on the Linux machine. The installer registers the agent and enables the systemd service by default.",
+      "connected": "{{name}} connected",
+      "waiting": "Waiting for agent to connect…",
+      "connectedDescription": "You can close this dialog; the agent will keep running.",
+      "waitingDescription": "This page will update automatically once the install completes."
+    },
+    "setupGuide": {
+      "summary": "Run this on a remote machine to register it with this Borg UI server.",
+      "help": "Setup Help",
+      "title": "Agent Setup Help",
+      "copySetupCommand": "Copy setup command",
+      "copyInstallCommands": "Copy install commands",
+      "copyStatusCommand": "Copy status command",
+      "copySystemdCommands": "Copy systemd commands",
+      "steps": {
+        "install": {
+          "title": "1. Run the Linux installer",
+          "description": "Run this on the Linux machine that owns the files Borg should back up. The installer installs dependencies, registers the agent, and enables the systemd service. By default, the service runs as the user who invoked sudo, so repository and source paths must be accessible to that user."
+        },
+        "server": {
+          "title": "2. Server URL and token",
+          "description": "The server URL must be reachable from the client machine. localhost only works when the agent and Borg UI are on the same machine; remote clients should use the Borg UI host name, IP address, or HTTPS URL they can reach. Enrollment tokens are temporary setup credentials; the enrolled agent keeps its own credential until revoked or deleted."
+        },
+        "troubleshooting": {
+          "title": "3. Manual troubleshooting",
+          "descriptionPrefix": "Manual installation remains useful for troubleshooting. The agent source is in the",
+          "link": "Borg UI agent directory"
+        },
+        "service": {
+          "title": "4. Service checks",
+          "description": "The installer enables systemd by default so the agent survives reboot. Use these commands only when inspecting or repairing a manual installation."
+        }
+      }
+    },
+    "add": {
+      "title": "Add Agent",
+      "steps": {
+        "target": "Target",
+        "details": "Details",
+        "install": "Install"
+      },
+      "errors": {
+        "createToken": "Failed to create enrollment token"
+      },
+      "platform": "Platform",
+      "platforms": {
+        "linux": "Linux",
+        "macos": "macOS",
+        "windows": "Windows"
+      },
+      "selected": "Selected",
+      "comingLater": "Coming later",
+      "serverUrl": "Server URL",
+      "localhostWarning": "localhost only works when the agent runs on the same machine as Borg UI. Remote machines need a reachable host name, IP, or HTTPS URL.",
+      "serverUrlHelper": "This URL must be reachable from the agent machine.",
+      "agentName": "Agent name",
+      "defaultPath": "Default path",
+      "defaultPathHelper": "Starting directory for browsing this agent's files.",
+      "tokenExpiry": "Token expiry",
+      "expiry": {
+        "1h": "1 hour",
+        "24h": "24 hours",
+        "7d": "7 days",
+        "30d": "30 days",
+        "never": "Never"
+      },
+      "serviceUser": "Service user",
+      "serviceUsers": {
+        "current": {
+          "label": "Installing user",
+          "description": "The agent can access the same files as the user running the installer."
+        },
+        "dedicated": {
+          "label": "Dedicated borg-ui-agent user",
+          "description": "Use a separate low-privilege service account for stricter isolation."
+        },
+        "root": {
+          "label": "Root",
+          "description": "Use only when the agent must back up root-owned paths."
+        }
+      },
+      "rootWarning": "Root mode lets this agent run root-level Borg operations. Use it only for root-owned paths.",
+      "borgInstallation": "Borg installation",
+      "borgOptions": {
+        "borg1": {
+          "label": "Borg 1.x",
+          "description": "Default. Installs or verifies Borg 1 as 'borg'."
+        },
+        "borg2": {
+          "label": "Borg 2.x beta only",
+          "description": "Advanced experimental option. Installs or verifies Borg 2 as 'borg2'."
+        },
+        "both": {
+          "label": "Borg 1.x and Borg 2.x beta",
+          "description": "Advanced experimental option. Keeps Borg 1 as 'borg' and Borg 2 as 'borg2'."
+        },
+        "skip": {
+          "label": "Skip Borg install",
+          "description": "Use this when Borg is managed separately on the agent machine."
+        }
+      },
+      "generateInstallCommand": "Generate install command"
     }
+  },
+  "apiTokens": {
+    "title": "API Tokens",
+    "description": "Programmatic access, shown only once when generated",
+    "empty": "No tokens yet",
+    "prefix": "Prefix",
+    "created": "Created",
+    "lastUsed": "Last used",
+    "revoke": "Revoke token",
+    "revoked": "Token revoked",
+    "name": "Token name",
+    "namePlaceholder": "e.g. CI deploy, Home automation",
+    "generateTitle": "Generate API Token",
+    "newTokenTitle": "Your new API token",
+    "copyWarning": "Copy this token now. You won't be able to see it again.",
+    "copied": "Copied!",
+    "copyToClipboard": "Copy to clipboard",
+    "closeWithoutCopyingTitle": "Close without copying?",
+    "closeWithoutCopyingDescription": "You haven't copied the token. Once you close this dialog, the token cannot be retrieved.",
+    "closeAnyway": "Close anyway",
+    "errors": {
+      "generate": "Failed to generate token",
+      "revoke": "Failed to revoke token"
+    }
+  },
+  "accountPassword": {
+    "title": "Change password",
+    "current": "Current password",
+    "new": "New password",
+    "confirm": "Confirm password",
+    "mismatch": "Passwords do not match",
+    "saving": "Saving",
+    "update": "Update password"
+  },
+  "mountSuccess": {
+    "title": "Archive Mounted",
+    "accessViaDocker": "Access via Docker:",
+    "copied": "Copied!",
+    "copyCommand": "Copy command"
   },
   "cloudStorage": {
     "title": "Cloud Storage",
@@ -286,6 +669,9 @@
     "storagePercentUsed": "{{value}}% used",
     "noStorageInfo": "No storage info",
     "configSourceLabel": "Config",
+    "configSource": {
+      "managed": "Managed"
+    },
     "managedConfig": "Server-managed rclone.conf",
     "editRemote": "Edit remote",
     "deleteRemote": "Delete remote",
@@ -361,11 +747,20 @@
     "failed": "Failed",
     "running": "Running",
     "pending": "Pending",
-    "cancelled": "Cancelled"
+    "cancelled": "Cancelled",
+    "skipped": "Skipped",
+    "queued": "Queued",
+    "warnings": "Warnings"
   },
   "dashboard": {
     "title": "Dashboard",
     "subtitle": "Comprehensive overview of your backup infrastructure",
+    "spaceSavings": {
+      "title": "Space you could free",
+      "line": "at least {{size}} with {{retention}}",
+      "hint": "Frees the most of the compared policies. Open to preview it.",
+      "stale": "may have changed"
+    },
     "stats": {
       "repositories": "Repositories",
       "sshRemote": "SSH remote",
@@ -486,6 +881,8 @@
       "ariaLabel": "Backup activity over last 14 days",
       "today": "today",
       "legendFailed": "failed",
+      "cellTitle_one": "{{type}}: {{count}} run, {{failed}} failed",
+      "cellTitle_other": "{{type}}: {{count}} runs, {{failed}} failed",
       "jobType": {
         "backup": "backup",
         "check": "check",
@@ -555,7 +952,7 @@
     "tabs": {
       "ariaLabel": "Backup operation type",
       "backupPlans": "Backup Plans",
-      "legacyBackup": "Legacy Backup"
+      "legacyBackup": "Backup automations"
     },
     "planRun": {
       "title": "Run a Backup Plan",
@@ -635,14 +1032,200 @@
     "noRepositories": "No repositories found. Create a repository first.",
     "selectRepository": "Select a repository to view its archives",
     "deletionStarted": "Archive deletion started in background (Job ID: {{id}})",
+    "openFullPage": "Open full page",
     "mountTimeout": "Mount timeout: Large repositories may need more time to mount.",
     "mountFailed": "Failed to mount archive: {{error}}",
     "restoreStarted": "Restore job started! Check the Activity tab to monitor progress.",
+    "restorePanel": {
+      "label": "Restore progress",
+      "pending": "Restore queued",
+      "running": "Restoring…",
+      "completed": "Restore complete",
+      "completed_with_warnings": "Restore completed with warnings",
+      "failed": "Restore failed",
+      "cancelled": "Restore cancelled",
+      "unavailable": "Restore status unavailable",
+      "unavailableHint": "Could not read the job status. The restore may still be running. Check the Activity page.",
+      "waiting": "Waiting for the job to start…",
+      "restoringTo_one": "{{count}} file so far to {{path}}",
+      "restoringTo_other": "{{count}} files so far to {{path}}",
+      "restoredTo_one": "{{count}} file restored to {{path}}",
+      "restoredTo_other": "{{count}} files restored to {{path}}",
+      "noDetails": "No details were reported.",
+      "viewActivity": "View in Activity",
+      "dismiss": "Dismiss"
+    },
     "mountSuccess": "Archive mounted successfully!\n\nMount is inside the container. To access files, run:\n\n{{command}}",
     "toasts": {
       "deleteFailed": "Failed to delete archive",
       "restoreFailed": "Failed to start restore",
-      "notSelected": "Repository or archive not selected"
+      "notSelected": "Repository or archive not selected",
+      "archiveUnavailable": "That archive is not in the list yet. Refresh and try again."
+    },
+    "sync": {
+      "fresh": "Synced {{ago}}",
+      "syncing": "Syncing",
+      "stale": "Sync is out of date",
+      "never": "Not indexed yet"
+    },
+    "view": {
+      "heatmap": "Heatmap",
+      "list": "List",
+      "growth": "Growth",
+      "scaleDays": "Days",
+      "scaleHours": "Hours",
+      "scaleLabel": "Scale"
+    },
+    "heatmap": {
+      "title": "Backup calendar",
+      "summary": "{{count}} archives on {{days}} days, {{first}} to {{last}}",
+      "none": "No archives",
+      "archives_one": "{{count}} archive",
+      "archives_other": "{{count}} archives",
+      "missed": "Expected run, no archive and no run on record",
+      "sizeOutlier": "Unusually small",
+      "durationOutlier": "Unusually slow",
+      "unusualRun": "Unusual size or duration",
+      "legendLess": "Less",
+      "legendMore": "More",
+      "tooltip": "{{count}} on {{date}} · {{size}} · {{duration}}",
+      "missedTotal_one": "{{count}} day",
+      "missedTotal_other": "{{count}} days",
+      "pickArchive": "{{count}} archives on {{date}}",
+      "legendMissed": "Nothing on record",
+      "cadenceUnknown": "no schedule known, so no day is judged"
+    },
+    "growth": {
+      "title": "Repository growth",
+      "legendRepository": "Repository size after this backup",
+      "legendSource": "Source size (before deduplication)",
+      "staleNote_one": "{{count}} archive is being re-measured after archives were removed. Its figures show the last measurement.",
+      "staleNote_other": "{{count}} archives are being re-measured after archives were removed. Their figures show the last measurement.",
+      "unmeasuredNote_one": "{{count}} archive is not measured yet and is not drawn.",
+      "unmeasuredNote_other": "{{count}} archives are not measured yet and are not drawn.",
+      "empty": "The growth graph needs at least two measured archives.",
+      "tooltipAdded": "Unique data",
+      "tooltipRepository": "Repository size after",
+      "tooltipSource": "Source size",
+      "tooltipStale": "Stale measurement",
+      "openArchive": "Open archive"
+    },
+    "search": {
+      "placeholder": "Search files in this repository",
+      "title": "Search results",
+      "present": "In latest",
+      "absent": "Not in latest",
+      "empty": "No matching files",
+      "truncated": "Showing the first {{count}} matches",
+      "locked": "{{count}} files match. Pro lists them all; these are the first {{shown}}.",
+      "lockedCapped": "More than {{count}} files match. Pro lists them all; these are the first {{shown}}.",
+      "lastSeen": "Last seen {{date}}",
+      "inArchives_one": "in {{count}} archive",
+      "inArchives_other": "in {{count}} archives",
+      "selectPrompt": "Pick a file to see the archives it was backed up in.",
+      "typeToSearch": "Type a file name to search this repository."
+    },
+    "detail": {
+      "tabChanges": "Changes",
+      "tabChangesWithCounts": "Changes (+{{added}} −{{removed}} ~{{modified}})",
+      "tabFiles": "Files",
+      "loadFailed": "This archive could not be loaded.",
+      "restore": "Restore",
+      "mount": "Mount",
+      "delete": "Delete",
+      "tabChangesLabel": "Changes",
+      "stats": {
+        "addedToRepository": "Added to the repository",
+        "addedHint": "Data unique to this archive. Deleting it frees at least this much.",
+        "filesChanged": "Files changed",
+        "filesChangedNotIndexed": "Not indexed yet",
+        "filesChangedUnavailable": "Not available for this repository",
+        "dataBackedUp": "Data backed up",
+        "files": "Files",
+        "duration": "Duration",
+        "compression": "Compression",
+        "compressionNotReported": "Not reported by this Borg version",
+        "remeasuring": "Re-measuring after archives were removed",
+        "notMeasured": "Not measured yet",
+        "vsPrevious": "vs previous"
+      }
+    },
+    "changes": {
+      "search": "Filter by path",
+      "noMatch": "No change matches that path",
+      "compareWith": "Compare with",
+      "net": "Net",
+      "added": "Added",
+      "removed": "Removed",
+      "modified": "Modified",
+      "summaryRow": "{{count}} more in {{path}}",
+      "truncated": "This archive's index was truncated at the row cap, so some paths are summarised.",
+      "pending": "This archive has not been indexed yet.",
+      "locked": "Pro lists the files behind these counts, with filters and a path search.",
+      "skipped": "History indexing was skipped for this archive.",
+      "failed": "This archive could not be indexed. Rebuilding the history index tries it again.",
+      "rebuildLink": "Rebuild the history index",
+      "rebuildFailed": "The history rebuild could not be started.",
+      "rebuildStarted": "The history rebuild has been queued.",
+      "empty": "No changes between these archives.",
+      "loadFailed": "The changes for this archive could not be loaded.",
+      "showMore": "Show more",
+      "filterLabel": "Change type",
+      "delta": "{{sign}}{{size}}",
+      "summaryFolder": "Folder",
+      "agentUnsupported": "Change history needs an agent that can build it: this repository has no usable agent assigned, or its agent predates change history. Assign or enable an agent, or update it."
+    },
+    "files": {
+      "size": "Size",
+      "modified": "Modified",
+      "owner": "Owner",
+      "permissions": "Permissions",
+      "restore": "Restore",
+      "download": "Download",
+      "downloadFolder": "Download folder",
+      "history": "History",
+      "firstSeen": "First seen",
+      "unchanged": "Unchanged",
+      "changed": "Changed",
+      "restoreThis": "Restore this",
+      "notPresent_one": "Not present in {{count}} older archive",
+      "notPresent_other": "Not present in {{count}} older archives",
+      "selected": "{{count}} selected ({{size}})",
+      "selectedCount": "{{count}} selected",
+      "restoreSelection": "Restore selection",
+      "selectionBar": "Selection",
+      "clearSelection": "Clear selection",
+      "showSelected": "Show selected",
+      "hideSelected": "Hide selected",
+      "removeFromSelection": "Remove {{name}}",
+      "searchInArchive": "Search in this archive",
+      "folderMetadata": "Folder",
+      "noSelection": "Select a file or folder to see details.",
+      "path": "Path",
+      "historyEmpty": "No earlier archive contains this path.",
+      "historyLocked": "Pro shows every version with its size, and restores the file from any of them.",
+      "historyLockedSummary": "{{count}} versions, from {{first}} to {{last}}.",
+      "type": "Type",
+      "typeFile": "File",
+      "typeDirectory": "Folder",
+      "historyUnavailableAgent": "Change history needs an agent that can build it: this repository has no usable agent assigned, or its agent predates change history. Assign or enable an agent, or update it.",
+      "historyNotIndexed": "This repository has not been indexed yet.",
+      "historyCoverage_one": "{{indexed}} of {{count}} archive indexed",
+      "historyCoverage_other": "{{indexed}} of {{count}} archives indexed",
+      "historyEmptyIndexed": "None of the indexed archives contains this path.",
+      "historyFailed": "This repository could not be indexed."
+    },
+    "toolbarOperations": "Operations",
+    "hourly": {
+      "window": "Last {{count}} weeks, one row per hour",
+      "tooltip": "{{count}} at {{time}} on {{date}}",
+      "none": "No archives in the last {{count}} weeks."
+    },
+    "indexMode": {
+      "archivesTitle": "Archives only for this repository",
+      "offTitle": "Background work is off for this repository",
+      "description": "File history is not being built here, so nothing new is indexed. Anything already stored is kept and simply not updated.",
+      "changeSetting": "Change this in repository settings"
     }
   },
   "restore": {
@@ -691,7 +1274,7 @@
     "createBackup": "Create Backup Schedule",
     "createBackupPlan": "Create Backup Plan",
     "createSchedule": "Create Schedule",
-    "createLegacySchedule": "Create legacy schedule",
+    "createLegacySchedule": "Create backup automation",
     "addCheck": "Add Check Schedule",
     "addRestoreCheck": "Add Restore Check",
     "tabs": {
@@ -723,11 +1306,25 @@
       "runCompact": "Compact",
       "runCompactTip": "Repository is compacted after each backup",
       "runCheck": "Check",
-      "runCheckTip": "Integrity check runs after each backup (in addition to any scheduled check below)"
+      "runCheckTip": "Integrity check runs after each backup (in addition to any scheduled check below)",
+      "collapse": "Collapse",
+      "expand": "Expand",
+      "togglePlan": "{{action}} {{name}}"
     },
     "noRepositories": "You need to create at least one repository before scheduling backups.",
-    "legacyBackupSchedulesTitle": "Legacy Backup Schedules",
-    "legacyBackupSchedulesDescription": "Existing repository-based schedules continue to run here. New scheduled backups should be created as Backup Plans.",
+    "legacyBackupSchedulesTitle": "Backup automations",
+    "legacyBackupSchedulesDescription": "Custom repository-based backup automations, including fixed-time and availability-triggered runs.",
+    "trigger": {
+      "catchUp": "Run missed backups when the source becomes available",
+      "label": "Run trigger",
+      "fixedTime": "At a fixed time",
+      "whenAvailable": "When source is available",
+      "availabilityDescription": "Borg UI checks for a reachable source and runs after the minimum interval has elapsed.",
+      "checkInterval": "Check every (minutes)",
+      "checkIntervalHelper": "How often Borg UI checks whether the source is available.",
+      "minimumInterval": "Minimum interval after a successful run (hours)",
+      "minimumIntervalHelper": "Borg UI will not start another backup before this interval has elapsed."
+    },
     "confirmRunNow": "Run \"{{name}}\" now?",
     "maintenance": {
       "pruning": "Pruning archives...",
@@ -753,6 +1350,18 @@
       "never": "Never"
     },
     "card": {
+      "serviceTypes": {
+        "webhook": "Webhook",
+        "slack": "Slack",
+        "discord": "Discord",
+        "telegram": "Telegram",
+        "email": "Email",
+        "teams": "Teams",
+        "pushover": "Pushover",
+        "ntfy": "Ntfy",
+        "gotify": "Gotify",
+        "matrix": "Matrix"
+      },
       "stats": {
         "schedule": "Schedule",
         "repository": "Repository",
@@ -821,6 +1430,18 @@
     "title": "Backup Plans",
     "subtitle": "Define sources, settings, schedules, and the repositories each backup writes to.",
     "loading": "Loading backup plans...",
+    "select": {
+      "source": {
+        "local": "Local source",
+        "remote": "Remote source",
+        "agent": "Managed agent",
+        "mixed": "Multiple sources"
+      },
+      "repositories_one": "{{count}} repository",
+      "repositories_other": "{{count}} repositories",
+      "scheduled": "Scheduled",
+      "manual": "Manual"
+    },
     "runTooltipPro": "This plan uses multiple repositories or parallel execution. Edit it or upgrade to Pro to run it.",
     "runTooltipProFeature": "This plan uses {{feature}}, which requires Pro. Edit it or upgrade to Pro to run it.",
     "runTooltipProFeatures": "This plan uses Pro-only features: {{features}}. Edit it or upgrade to Pro to run it.",
@@ -905,7 +1526,11 @@
       "nextRun": "Next run: {{date}}",
       "repositoryFallback": "Repository",
       "moreRepositories": "+{{count}} more",
-      "runningNow": "Running"
+      "runningNow": "Running",
+      "repositoryCountPartial": "{{enabled}} of {{total}} repositories",
+      "skippedRepositoriesTooltip": "Skipped during runs: {{names}}",
+      "skippedLabel": "Skipped",
+      "clickToResumeRepository": "Resume backups to {{name}}"
     },
     "statuses": {
       "unknown": "Unknown",
@@ -937,7 +1562,9 @@
       "repositoryCreateFailed": "Failed to create repository",
       "multiRepositoryRequiresPro": "Multiple repositories in one backup plan require Pro",
       "selectSourceConnection": "Select a remote client before browsing source paths",
-      "scriptCreateFailed": "Failed to create generated script"
+      "scriptCreateFailed": "Failed to create generated script",
+      "repositoryToggled": "Repository updated",
+      "repositoryToggleFailed": "Failed to update repository"
     },
     "sourceChooser": {
       "summaryTitle": "Backup source",
@@ -1135,6 +1762,8 @@
       "runsOnServer": "Runs on Borg UI server",
       "runsOnSshHost": "Runs on SSH host",
       "runsOnManagedAgent": "Runs on managed agent",
+      "directOnSourceTitle": "Backs up directly on the source machine",
+      "directOnSourceDescription": "Borg UI runs Borg over SSH and streams progress here.",
       "sourceMustMatchAgent": "This repository is controlled by {{agent}}, so sources must also be on {{agent}}.",
       "agentRepoSshUnsupported": "Agent-owned repositories cannot use SSH repository targets.",
       "serverToAgentRepo": "Borg UI cannot push server-local paths into an agent-owned repository.",
@@ -1448,6 +2077,7 @@
       "encryption": "Encryption"
     },
     "observeOnly": "Observe Only",
+    "deleteConfirmation": "Are you sure you want to delete repository \"{{name}}\"?",
     "buttons": {
       "info": "Info",
       "check": "Check",
@@ -1488,7 +2118,6 @@
       "checkFailed": "Failed to start check",
       "compactStarted": "Compact operation started",
       "compactFailed": "Failed to start compact",
-      "dryRunCompleted": "Dry run completed - review results below",
       "pruneStarted": "Prune job started",
       "pruned": "Repository pruned successfully!",
       "pruneFailed": "Failed to prune repository",
@@ -1517,9 +2146,11 @@
   },
   "activity": {
     "title": "Activity",
-    "subtitle": "View all operations and their logs",
+    "subtitle": "Every run on every repository, newest first",
     "actions": {
-      "refresh": "Refresh activity"
+      "refresh": "Refresh activity",
+      "loadMore": "Load more",
+      "loadingMore": "Loading..."
     },
     "filters": {
       "type": "Type",
@@ -1536,7 +2167,8 @@
         "package": "Package",
         "rcloneSync": "Cloud Sync",
         "rcloneHydrate": "Cloud Hydrate",
-        "scriptExecution": "Script"
+        "scriptExecution": "Script",
+        "availabilityCheck": "Availability check"
       },
       "statuses": {
         "completed": "Completed",
@@ -1544,12 +2176,117 @@
         "needsBackup": "Needs backup",
         "failed": "Failed",
         "running": "Running",
-        "pending": "Pending"
+        "pending": "Pending",
+        "skipped": "Skipped"
       }
     },
     "empty": {
       "title": "No activity found",
       "message": "There are no operations matching your filters"
+    },
+    "filterCategory": "Category",
+    "filterTrigger": "Trigger",
+    "allTriggers": "All triggers",
+    "triggers": {
+      "manual": "Manual",
+      "schedule": "Schedule",
+      "plan": "Plan",
+      "import": "Import",
+      "followup": "Follow-up",
+      "reconcile": "Reconcile",
+      "retry": "Retry",
+      "preview": "Prune preview",
+      "previewAuto": "Automatic · Prune preview"
+    },
+    "runTitle": {
+      "reconcile": "Reconcile run",
+      "manual": "Rebuild",
+      "retry": "Retry",
+      "import": "Import"
+    },
+    "followupsCollapsed": "{{count}} steps",
+    "operations": "Operations",
+    "runChain": {
+      "allSucceeded": "All succeeded",
+      "failed": "{{count}} failed",
+      "failed_one": "{{count}} failed",
+      "active": "{{count}} in progress",
+      "cancelled": "{{count}} cancelled",
+      "cancelled_one": "{{count}} cancelled"
+    },
+    "followupsCollapsed_one": "{{count}} step",
+    "repositoryView": {
+      "back": "All activity",
+      "subtitle": "Runs on this repository, newest first",
+      "today": "Today",
+      "yesterday": "Yesterday",
+      "empty": "No runs on this repository match these filters.",
+      "loadFailed": "The runs could not be loaded.",
+      "logs": "Logs",
+      "errorDetails": "Error details",
+      "triggerSource": {
+        "plan": "Plan: {{name}}",
+        "schedule": "Schedule: {{name}}"
+      }
+    },
+    "repositoryScope": {
+      "label": "Repository",
+      "all": "All repositories"
+    },
+    "indexHiddenTooltip": "Index runs are hidden until you select this",
+    "umbrella": {
+      "plan": "Plan · {{name}}",
+      "schedule": "Schedule · {{name}}"
+    },
+    "day": {
+      "today": "Today",
+      "yesterday": "Yesterday",
+      "unknown": "Undated"
+    },
+    "summary": {
+      "runs": "{{count}} runs",
+      "runs_one": "{{count}} run",
+      "repositories": "across {{count}} repositories",
+      "repositories_one": "across {{count}} repository",
+      "indexHidden": "index runs hidden"
+    },
+    "runningNow": {
+      "title": "Running now"
+    },
+    "health": {
+      "backup": "Backup",
+      "check": "Check",
+      "prune": "Prune",
+      "compact": "Compact",
+      "index": "Index",
+      "mirror": "Mirror",
+      "running": "Running",
+      "overdue": "overdue"
+    },
+    "hook": {
+      "pre": "Pre-backup script",
+      "post": "Post-backup script",
+      "sourcePre": "Source pre-backup script",
+      "sourcePost": "Source post-backup script",
+      "other": "Script"
+    },
+    "planRun": {
+      "repositories": "{{count}} repositories",
+      "repositories_one": "{{count}} repository",
+      "members": "{{count}} runs",
+      "members_one": "{{count}} run",
+      "trigger": {
+        "manual": "Manual",
+        "schedule": "Scheduled",
+        "retry": "Retry",
+        "availability": "Availability"
+      }
+    }
+  },
+  "availabilitySchedule": {
+    "skipReasons": {
+      "minimumIntervalNotElapsed": "Minimum interval not elapsed",
+      "sourceUnavailable": "Source unavailable"
     }
   },
   "cloudStorageJobs": {
@@ -1923,6 +2660,7 @@
     },
     "systemKey": {
       "title": "System SSH Key",
+      "defaultDescription": "System SSH key for all remote connections",
       "noKey": "No system SSH key found. Generate a new one or import an existing one.",
       "generate": "Generate System SSH Key",
       "import": "Import Existing Key",
@@ -1988,6 +2726,9 @@
       "presetHetzner": "Hetzner Storage Box",
       "presetHetznerDescription": "Storage Box repository over Hetzner's extended SSH service.",
       "presetHetznerDefaults": "Port 23, SFTP deployment on, default path /home",
+      "presetRsyncNet": "rsync.net",
+      "presetRsyncNetDescription": "Plain SSH account with Borg preinstalled and a restricted shell.",
+      "presetRsyncNetDefaults": "Port 22, SFTP deployment on, default path /",
       "presetNas": "NAS",
       "presetNasDescription": "Synology, Unraid, or similar NAS with SSH path mapping.",
       "presetNasDefaults": "Port 22, default path /backups, SSH path prefix /volume1",
@@ -2131,7 +2872,26 @@
       "keyDeleteFailed": "Failed to delete SSH key",
       "publicKeyCopied": "Public key copied to clipboard!",
       "diagnosticsComplete": "Diagnostics complete",
-      "diagnosticsFailed": "Failed to run diagnostics"
+      "diagnosticsFailed": "Failed to run diagnostics",
+      "hostKeyTrusted": "Host key trusted",
+      "hostKeyTrustFailed": "Failed to trust the host key",
+      "hostKeyForgotten": "Host key forgotten. The next connection has to verify it again.",
+      "hostKeyForgetFailed": "Failed to forget the host key",
+      "hostKeyReadFailed": "Failed to read the host key"
+    },
+    "hostKeyDialog": {
+      "title": "Host key",
+      "subtitle": "The key {{host}}:{{port}} presents when Borg UI connects.",
+      "trusted": "This host key is trusted. Connections to this machine are verified against it.",
+      "unknown": "No host key is trusted for this connection yet, so the machine answering on this address is not authenticated.",
+      "changed": "The key this host presents is not the one Borg UI trusts. That is either a key rotation on the host or someone answering in its place. Verify it on the host before trusting it.",
+      "unreachable": "The host key could not be read. The machine may be offline or unreachable.",
+      "trustedFingerprint": "Trusted fingerprint",
+      "observedFingerprint": "Fingerprint the host presents now",
+      "compareHint": "Compare this with the output of ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub on the host itself.",
+      "trust": "Trust this key",
+      "trustNewKey": "Trust the new key",
+      "forget": "Forget this key"
     }
   },
   "scripts": {
@@ -2234,8 +2994,8 @@
       "rcloneHydrate": "Hydrate local cache",
       "enableCloudMirror": "Enable cloud mirror",
       "backupNow": "Backup Now",
-      "legacyBackup": "Legacy Backup",
-      "legacyBackupTooltip": "Run the old repository-based backup using this repository's legacy source paths",
+      "legacyBackup": "Run backup automation",
+      "legacyBackupTooltip": "Run the repository-based backup automation using this repository's configured source paths",
       "backupPlanRequired": "Create a Backup Plan to define sources",
       "viewArchives": "View Archives",
       "viewBackupPlans": "View linked backup plans",
@@ -2244,7 +3004,9 @@
       "delete": "Delete",
       "permanentDelete": "Permanently delete files",
       "createBackupPlan": "Create Backup Plan",
-      "createBackupPlanSourceRequired": "Add source paths before creating a Backup Plan"
+      "createBackupPlanSourceRequired": "Add source paths before creating a Backup Plan",
+      "operations": "Operations",
+      "prunePreview": "Prune preview"
     },
     "legacySources": {
       "title": "Legacy source settings",
@@ -2253,6 +3015,10 @@
     "edit": "Edit",
     "lastCheck": "Last Check",
     "lastCompact": "Last Compact",
+    "lastPrune": "Last Prune",
+    "lastIndex": "Last Index",
+    "backgroundWorkOff": "Background work is off",
+    "backgroundWorkOffHint": "Background indexing is off for this repository. Change it in repository settings, under Advanced.",
     "tomorrow": "Tomorrow",
     "schedulePaused": "Schedule paused",
     "schedulePausedWithName": "{{name}} paused",
@@ -2399,19 +3165,6 @@
       "encryption": "Encryption",
       "lastModified": "Last Modified",
       "repositoryLocation": "Repository Location",
-      "storageStatistics": "Storage Statistics",
-      "totalSize": "Total Size",
-      "usedOnDisk": "Used on Disk",
-      "uniqueData": "Unique Data",
-      "totalChunks": "Total Chunks",
-      "uniqueChunks": "Unique Chunks",
-      "files": "Files",
-      "archiveCount": "Archives",
-      "latestBackupSize": "Latest Backup Size",
-      "firstBackup": "First Backup",
-      "latestBackup": "Latest Backup",
-      "noBackupsYet": "No backups yet",
-      "noBackupsDesc": "This repository has been initialized but contains no archives. Storage statistics will appear here after you create your first backup.",
       "loadFailed": "Failed to load repository information. Make sure the repository is accessible and properly initialized.",
       "v2PlanRequired": "This repository uses Borg 2. Your data is safe. Upgrade to Pro to view its details.",
       "exportKeyfileTooltip": "Export keyfile. Keep this safe!"
@@ -2422,7 +3175,8 @@
       "warningPanel": "This is not repository deletion. Borg UI will keep the repository record, schedules, scripts, connection settings, and future backup capability. The archive data selected in this preview cannot be restored through Borg UI after the wipe completes.",
       "previewButton": "Generate wipe preview",
       "previewReady": "Preview ready",
-      "previewScope": "{{count}} archives selected for deletion",
+      "previewScope_one": "{{count}} archive selected for deletion",
+      "previewScope_other": "{{count}} archives selected for deletion",
       "dryRunOutput": "Dry-run output",
       "emptyState": "No archives were found in this repository. There is nothing to wipe.",
       "staleState": "The archive list changed after this preview was generated. Generate a new preview before wiping contents.",
@@ -2478,7 +3232,7 @@
     "prune": {
       "whatDoesPruningDo": "What does pruning do?",
       "explanation": "Pruning automatically deletes old archives based on retention rules. This helps manage repository size by keeping only the backups you need.",
-      "dryRunTip": "Tip: Always run \"Dry Run\" first to preview what will be deleted!",
+      "dryRunTip": "Tip: preview first to see which archives would be deleted and what that frees.",
       "retentionPolicy": "Retention Policy",
       "retentionDescription": "Specify how many backups to keep for each time period",
       "keepWithin": "Keep Within",
@@ -2517,7 +3271,7 @@
       "dryRunSuccess": "Dry run completed successfully. Review the output above to see which archives would be deleted. If everything looks correct, click \"Prune Archives\" to execute.",
       "warningTitle": "Warning: Deleted archives cannot be recovered!",
       "warningCompact": "After pruning, run \"Compact\" to actually free up disk space.",
-      "dryRunButton": "Dry Run (Preview)",
+      "dryRunButton": "Preview",
       "resultsTitle": "Results",
       "dryRunPreviewBadge": "PREVIEW",
       "pruneCompleteBadge": "COMPLETE",
@@ -2554,8 +3308,11 @@
       "edit": "Edit",
       "duplicate": "Duplicate",
       "delete": "Delete",
+      "deleting": "Deleting...",
       "viewLogs": "View Logs",
       "viewArchive": "View Archive",
+      "viewArchivePruned": "Archive pruned",
+      "viewArchiveUnindexed": "Archive not indexed yet, retry after the next sync",
       "downloadLogs": "Download Logs",
       "errorDetails": "Error Details",
       "cancel": "Cancel",
@@ -2586,10 +3343,14 @@
       "check": "Repository Check",
       "compact": "Compact",
       "prune": "Prune",
+      "pruneDryRun": "Prune (dry run)",
+      "pruneDryRunPolicy": "Prune dry run · {{retention}}",
       "package": "Package Install",
       "rcloneSync": "Cloud Sync",
       "rcloneHydrate": "Cloud Hydrate",
-      "scriptExecution": "Script"
+      "scriptExecution": "Script",
+      "availabilityCheck": "Availability check",
+      "backupPlanRun": "Plan run"
     },
     "scheduledById": "Scheduled (ID: {{id}})",
     "backupPlanByName": "Backup Plan: {{name}}",
@@ -2660,15 +3421,6 @@
     "columnType": "Type",
     "columnDate": "Date",
     "columnActions": "Actions"
-  },
-  "repositoryInfo": {
-    "title": "Repository Information",
-    "encryption": "Encryption",
-    "location": "Location",
-    "totalSize": "Total Size",
-    "archives": "Archives",
-    "lastModified": "Last Modified",
-    "na": "N/A"
   },
   "systemSettings": {
     "title": "System Settings",
@@ -2863,7 +3615,9 @@
     "failedToSaveTimeoutSettings": "Failed to save timeout settings",
     "statsRefreshStarted": "Stats refresh started",
     "statsRefreshCompleted": "Stats refresh completed",
-    "failedToStartStatsRefresh": "Failed to start stats refresh"
+    "failedToStartStatsRefresh": "Failed to start stats refresh",
+    "autoPrunePreviewLabel": "Automatic prune previews",
+    "autoPrunePreviewHelper": "Compare retention policies on their own after the archive list changes, and when the Prune Preview page opens. When off, a comparison runs only when you press Compare now."
   },
   "monitoringReports": {
     "title": "Monitoring & Reports",
@@ -2909,6 +3663,191 @@
     "reportSent": "Backup report sent for {{count}} repositories",
     "failedToSend": "Failed to send backup report",
     "lastReport": "Last report:"
+  },
+  "operations": {
+    "category": {
+      "import": "Import",
+      "backup": "Backup",
+      "restore": "Restore",
+      "maintenance": "Maintenance",
+      "index": "Index",
+      "mirror": "Mirror",
+      "system": "System"
+    },
+    "background": {
+      "retry": "Retry",
+      "plan": "plan",
+      "stage": {
+        "connect": "Connect",
+        "stats": "Stats",
+        "archives": "Archive list",
+        "history": "File history",
+        "retention": "Retention preview"
+      },
+      "workers_one": "{{count}} worker",
+      "workers_other": "{{count}} workers",
+      "title": "Background work",
+      "pauseFailed": "Could not change the background queue state.",
+      "rebuildFailed": "The rebuild could not be started.",
+      "queueFailed": "The background queue could not be loaded.",
+      "pauseAdminOnly": "Only administrators can pause background work.",
+      "reason": {
+        "paused": "Paused",
+        "lane_busy": "{{kind}} still running",
+        "index_busy": "Waiting for this repository's other index work to finish",
+        "workers": "Waiting for an index worker",
+        "queued": "Next in line",
+        "upstream_paused": "Waiting on a paused stage"
+      },
+      "foregroundRunning": "{{kind}} running for {{elapsed}}",
+      "viewRuns": "View runs",
+      "stageFailed": "Failed",
+      "repositoryColumn": "Repository",
+      "workersDecrease": "Fewer index workers",
+      "workersIncrease": "More index workers",
+      "workersFailed": "The worker count could not be changed.",
+      "pausedBanner": "Background work is paused. Queued stages will not start until you resume.",
+      "subtitle": "What Borg UI is doing to your repositories, and what it keeps for each of them.",
+      "rebuildRow": "Rebuild {{repository}}",
+      "rebuildSummaryAll": "Rebuild everything for {{repository}}. Browsing and backups keep working while it runs; the new data replaces the old when each stage finishes.",
+      "hub": {
+        "repositories_one": "{{count}} repository",
+        "repositories_other": "{{count}} repositories",
+        "archives_one": "{{count, number}} archive indexed",
+        "archives_other": "{{count, number}} archives indexed",
+        "rows_one": "{{count, number}} history row",
+        "rows_other": "{{count, number}} history rows",
+        "bytes": "about {{size}} on disk",
+        "reconcileEvery": "Reconcile runs every {{minutes}} minutes. The last one ran {{ago}}.",
+        "reconcileNever": "No reconcile has run yet. It runs every {{minutes}} minutes.",
+        "reconcileOff": "Automatic reconcile is turned off because the stats refresh interval is 0.",
+        "reconcileHelp": "A reconcile looks at every repository for archives created or pruned outside Borg UI and brings the derived data up to date.",
+        "reconcileNow": "Reconcile now",
+        "reconcileStarted_one": "Reconcile queued for {{count}} repository.",
+        "reconcileStarted_other": "Reconcile queued for {{count}} repositories.",
+        "reconcileNone": "Every repository already has index work queued.",
+        "reconcileFailed": "The reconcile could not be started.",
+        "reconcileAdminOnly": "Only administrators can start a reconcile.",
+        "attention_zero": "Nothing needs attention",
+        "attention_one": "{{count}} needs attention",
+        "attention_other": "{{count}} need attention",
+        "attentionStale_one": "{{count}} stale",
+        "attentionStale_other": "{{count}} stale",
+        "attentionNever_one": "{{count}} never indexed",
+        "attentionNever_other": "{{count}} never indexed",
+        "attentionHistory_one": "{{count}} with failed or truncated history",
+        "attentionHistory_other": "{{count}} with failed or truncated history",
+        "attentionRunning_one": "{{count}} running",
+        "attentionRunning_other": "{{count}} running",
+        "filterName": "Filter by name",
+        "filterShow": "Show",
+        "filterAll": "All repositories",
+        "filterAttention": "Needs attention",
+        "filterStale": "Stale",
+        "filterNever": "Never indexed",
+        "filterHistory": "Failed or truncated history",
+        "filterRunning": "Running",
+        "sortBy": "Sort by",
+        "sortName": "Name",
+        "sortRows": "History rows",
+        "sortSynced": "Last updated",
+        "showMore_one": "Show {{count}} more",
+        "showMore_other": "Show {{count}} more",
+        "shownOf": "Showing {{shown}} of {{total}}",
+        "noMatchTitle": "No repositories match",
+        "noMatchDescription": "Change the filter or clear it to see every repository.",
+        "rowArchives_one": "{{count, number}} archive",
+        "rowArchives_other": "{{count, number}} archives",
+        "historyCoverage": "{{indexed}} of {{total}} indexed",
+        "historyRows_one": "{{count, number}} row",
+        "historyRows_other": "{{count, number}} rows",
+        "historyFailed_one": "{{count}} failed",
+        "historyFailed_other": "{{count}} failed",
+        "historyTruncated_one": "{{count}} truncated",
+        "historyTruncated_other": "{{count}} truncated",
+        "historyPending_one": "{{count}} waiting",
+        "historyPending_other": "{{count}} waiting",
+        "historyNone": "No file history yet",
+        "historyShare": "{{percent}}% of all history rows",
+        "syncOff": "Not refreshed",
+        "modeArchives": "Archives only",
+        "modeOff": "Not indexed",
+        "trackOff": "Background work is off for this repository",
+        "statsNever": "Not refreshed yet",
+        "openDetails": "Open the details for {{repository}}",
+        "noRepositoriesTitle": "No repositories yet",
+        "noRepositoriesDescription": "Add or import a repository and its derived data will show up here.",
+        "loadFailed": "The repository summary could not be loaded.",
+        "detailFailedTitle": "Archives whose file history failed",
+        "detailTruncatedTitle": "Archives with truncated file history",
+        "detailAttempts_one": "{{count}} attempt",
+        "detailAttempts_other": "{{count}} attempts",
+        "detailPartial": "File history covers {{indexed}} of {{total}} archives.",
+        "detailAllIndexed": "Every archive has its file history.",
+        "detailHint": "Rebuild to index these archives again.",
+        "viewIndexRuns": "View index runs",
+        "openRepository": "Open repository",
+        "historyAgentUnsupported": "Needs a capable agent",
+        "updatedAgo": "Updated {{ago}}",
+        "updatedNever": "Not updated yet",
+        "statsLastRefreshed": "Last refreshed"
+      },
+      "rebuildTitle": "Rebuild derived data",
+      "rebuildAction": "Rebuild",
+      "currentRun": "Current run",
+      "strip": {
+        "idle": "Idle",
+        "running_one": "{{count}} running",
+        "running_other": "{{count}} running",
+        "waiting_one": "{{count}} waiting",
+        "waiting_other": "{{count}} waiting",
+        "failed_one": "{{count}} failed",
+        "failed_other": "{{count}} failed",
+        "paused": "Paused",
+        "pauseStage": "Pause {{stage}}",
+        "resumeStage": "Resume {{stage}}",
+        "label": "Background stages",
+        "off": "Off"
+      },
+      "pauseAll": "Pause all",
+      "resumeAll": "Resume all",
+      "currentStageColumn": "Current stage",
+      "lastUpdatedColumn": "Last updated"
+    },
+    "status": {
+      "queued": "Queued",
+      "running": "Running",
+      "completed": "Completed",
+      "completed_with_warnings": "Completed with warnings",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "skipped": "Skipped"
+    },
+    "kind": {
+      "import_connect": "Connect repository",
+      "backup": "backup",
+      "restore": "restore",
+      "restore_check": "restore check",
+      "check": "check",
+      "prune": "prune",
+      "compact": "compact",
+      "delete_archive": "delete archive",
+      "wipe": "wipe",
+      "rclone_sync": "mirror sync",
+      "package_install": "package install",
+      "stats": "Refresh stats",
+      "archive_sync": "Sync archive list",
+      "history_index": "Index file history",
+      "history_merge": "Fold removed history",
+      "prune_compare": "Compare retention",
+      "prune_dry_run": "prune (dry run)",
+      "prune_dry_run_policy": "dry run · {{retention}}",
+      "prune_dry_run_auto": "automatic prune (dry run) · {{retention}}",
+      "script_execution": "script",
+      "availability_check": "availability check",
+      "rclone_hydrate": "mirror hydrate",
+      "package": "package install"
+    }
   },
   "notifications": {
     "title": "Notification Services",
@@ -3186,6 +4125,7 @@
     "subtitle": "Configure log storage, retention, and cleanup policies for job logs",
     "storageUsage": "Storage Usage",
     "storageUsageDesc": "Current log storage utilization and statistics",
+    "storageUnavailable": "Log storage figures are unavailable right now; the store may still be full.",
     "totalSize": "Total Size",
     "fileCount": "File Count",
     "oldestLog": "Oldest Log",
@@ -3358,7 +4298,7 @@
   },
   "archiveNameTemplate": {
     "label": "Archive Name Template",
-    "hint": "Customize archive naming. Available placeholders: {job_name}, {now}, {date}, {time}, {timestamp}",
+    "hint": "Customize archive naming. Available placeholders: {job_name}, {now}, {utcnow}, {date}, {time}, {timestamp}. {now}, {date} and {time} use the creating machine's local time, {utcnow} uses UTC, and {timestamp} is Unix time. The preview uses your browser's clock.",
     "preview": "Preview:"
   },
   "remoteMachineCard": {
@@ -3368,12 +4308,22 @@
       "testing": "Testing",
       "unknown": "Unknown"
     },
+    "restricted": {
+      "label": "Borg only",
+      "tooltip": "The remote shell is restricted to Borg. Browsing and storage information are unavailable on this connection.",
+      "storage": "Storage unavailable (Borg only)"
+    },
     "storage": "Storage",
     "mountPoint": "Mount Point",
     "actions": {
       "edit": "Edit",
       "delete": "Delete",
       "deploy": "Deploy Key"
+    },
+    "hostKey": {
+      "verified": "Host key verified",
+      "unverified": "Host key not verified",
+      "action": "Host key"
     }
   },
   "restoreJobCard": {
@@ -3476,6 +4426,11 @@
     "noScheduledChecks": "No scheduled checks",
     "noScheduledChecksDesc": "Configure automatic repository checks to ensure data integrity",
     "needRepository": "You need to create at least one repository before scheduling checks.",
+    "repositoryNotFound": "Repository not found",
+    "status": {
+      "cancelled": "Cancelled",
+      "running": "Running"
+    },
     "historyTitle": "Scheduled Check History",
     "historyShowing": "Showing {{filtered}} of {{total}} scheduled check jobs",
     "historyShowingFiltered": "Showing {{filtered}} of {{total}} scheduled check jobs (filtered)",
@@ -3573,6 +4528,10 @@
     "canaryModeHint": "Canary mode adds a tiny Borg UI canary file to future backups while enabled, then verifies it from the latest archive. It works after the next backup.",
     "canaryUnavailableObserveOnly": "Canary mode is unavailable for observe-only repositories because Borg UI does not create their backups. Use selected probe paths or a full archive drill.",
     "noBackupYet": "No backup yet",
+    "timeLabels": {
+      "storedUtc": "Stored UTC",
+      "localTimezone": "Your local timezone"
+    },
     "probeModeHint": "Probe-path mode restores real files you choose. Use it for higher-confidence checks on critical paths without extracting the full archive.",
     "fullArchiveWarning": "Full archive drills can be expensive on large repositories. Use this sparingly, and only when you have enough temporary storage and maintenance window budget."
   },
@@ -3630,7 +4589,11 @@
     "moveUp": "Move up",
     "moveDown": "Move down",
     "remove": "Remove",
-    "searchOrAddMore": "Search or add more..."
+    "searchOrAddMore": "Search or add more...",
+    "skipped": "Skipped",
+    "skip": "Skip during runs",
+    "resume": "Resume backups",
+    "lastEnabled": "At least one repository must stay enabled"
   },
   "wizard": {
     "steps": {
@@ -3666,6 +4629,7 @@
       "remoteSshfsNote": "Remote directories are mounted via SSHFS preserving their original paths. Exclude patterns work the same as local sources (e.g., */var/cache/*)."
     },
     "dataSource": {
+      "note": "Note:",
       "title": "Where is the data you want to back up?",
       "localDescription": "Back up data from this server (local or mounted filesystems)",
       "agentLocalDescription": "Back up paths from the selected managed agent filesystem",
@@ -3684,6 +4648,9 @@
       "remoteSshNote": "The Borg UI server will SSH into the remote machine to browse and back up the selected directories. Ensure the SSH connection is properly configured with the necessary permissions."
     },
     "location": {
+      "borgVersion": "Borg Version",
+      "beta": "Beta",
+      "borg2": "Borg 2",
       "repositoryNameLabel": "Repository Name",
       "repositoryNameHelper": "A friendly name to identify this repository",
       "repositoryModeLabel": "Repository Mode",
@@ -3729,6 +4696,14 @@
       "rcloneOAuthBorgUiHelper": "Borg UI receives the provider callback server-side. After the provider says authorization is complete, return here; this dialog checks automatically.",
       "rcloneOAuthLoopbackHelper": "rclone will use its local loopback callback. Use this only when your browser can reach the same host as the rclone process.",
       "rcloneOAuthSetupMissing": "Borg UI-owned OAuth is not configured for this provider.",
+      "rcloneProviderSearchPlaceholder": "Search providers",
+      "rcloneProviderSearchNoResults": "No providers found",
+      "rcloneDefaultProviders": {
+        "localLabel": "Local filesystem",
+        "localDescription": "Local path remote.",
+        "customLabel": "Custom rclone backend",
+        "customDescription": "Manual setup for any rclone backend."
+      },
       "rcloneOAuthCallbackUrl": "Borg UI callback: {{url}}",
       "rcloneOAuthModeBorgUi": "Borg UI callback",
       "rcloneOAuthModeLoopback": "rclone loopback",
@@ -3846,6 +4821,8 @@
       "useFolder": "Use folder"
     },
     "restoreDestination": {
+      "port": "Port {{port}}",
+      "connected": "Connected",
       "title": "Where should files be restored?",
       "subtitle": "Select the destination and location for your restored files",
       "borgUiServerDesc": "Restore to this server's local storage",
@@ -3888,7 +4865,9 @@
       "selectDirTooltip": "Select directory and all contents",
       "helpText": "Click files to select them, or click folders to navigate. Use the checkbox next to folders to select entire directories.",
       "failedToLoadContents": "Failed to load archive contents",
-      "loadContentsTimeout": "Still loading — this archive is taking longer than expected. Try again in a moment."
+      "loadContentsTimeout": "Still loading — this archive is taking longer than expected. Try again in a moment.",
+      "filterPlaceholder": "Filter this folder",
+      "filterLabel": "Filter files in this folder"
     },
     "restorePath": {
       "title": "Choose restore location",
@@ -3981,6 +4960,9 @@
       "compression": "Compression",
       "customFlags": "Custom Flags",
       "repositoryInitialized": "Repository will be initialized",
+      "readyToInitialize": "Ready to Initialize",
+      "hidePassphrase": "Hide passphrase",
+      "showPassphrase": "Show passphrase",
       "repositoryImportNote": "Repository will be verified before import. Ensure the passphrase is correct.",
       "repositoryEditNote": "Changes will be saved to the repository configuration."
     },
@@ -4001,6 +4983,44 @@
       "passphrasePlaceholderCreate": "Enter passphrase",
       "passphraseHelperEdit": "Optional - leave blank to keep last saved passphrase",
       "passphraseHelperCreate": "Keep this safe - you cannot access backups without it!",
+      "options": {
+        "repokey": {
+          "label": "Repository Key",
+          "description": "Key stored in repository (recommended)"
+        },
+        "repokey-blake2": {
+          "label": "Repository Key (BLAKE2)",
+          "description": "Faster hashing variant"
+        },
+        "keyfile": {
+          "label": "Key File",
+          "description": "Key stored in a separate file"
+        },
+        "keyfile-blake2": {
+          "label": "Key File (BLAKE2)",
+          "description": "Key file with faster hashing"
+        },
+        "repokey-aes-ocb": {
+          "label": "Repository Key (AES-OCB)",
+          "description": "Default for Borg 2 · recommended"
+        },
+        "repokey-chacha20-poly1305": {
+          "label": "Repository Key (ChaCha20)",
+          "description": "Alternative AEAD cipher"
+        },
+        "keyfile-aes-ocb": {
+          "label": "Key File (AES-OCB)",
+          "description": "Key stored in a separate file"
+        },
+        "keyfile-chacha20-poly1305": {
+          "label": "Key File (ChaCha20)",
+          "description": "Key file with ChaCha20"
+        },
+        "none": {
+          "label": "None",
+          "description": "No encryption (not recommended)"
+        }
+      },
       "borgKeyfileTitle": "Borg Keyfile (Optional)",
       "borgKeyfileDesc": "Borg keyfiles are typically stored without a file extension in ~/.config/borg/keys/",
       "uploadFile": "Upload File",
@@ -4024,6 +5044,7 @@
         "selectAtLeastOne": "Select at least one repository to continue."
       },
       "maintenance": {
+        "caution": "Caution:",
         "title": "Maintenance Options",
         "subtitle": "Run prune and compact after backups to manage disk space.",
         "info": "Prune removes old archives. Compact reclaims disk space.",
@@ -4034,6 +5055,10 @@
         "compactAfterPruneDesc": "Reclaim disk space by freeing segments",
         "compactInfo": "Compact reclaims disk space after prune. May take time on large repositories."
       },
+      "stepIndicator": {
+        "progress": "Step {{current}} / {{total}}",
+        "goToStep": "Go to step {{step}}: {{label}}"
+      },
       "config": {
         "scheduleLabel": "Schedule (Cron Expression)",
         "scheduleHelper": "Click the clock icon to use the visual builder.",
@@ -4042,6 +5067,8 @@
       },
       "review": {
         "readyToCreate": "Ready to create schedule!",
+        "ready": "Ready",
+        "keep": "Keep:",
         "reviewAndConfirm": "Review and confirm below.",
         "jobSummary": "Job Summary",
         "name": "Name",
@@ -4067,16 +5094,50 @@
       }
     }
   },
-  "repositoryStatsGrid": {
-    "totalArchives": "Total Archives",
-    "originalSize": "Total Archive Size",
-    "originalSizeTooltip": "Total logical size of all backed up data across all archives before compression and deduplication",
-    "compressedSize": "Compressed Archive Size",
-    "compressedSizeTooltip": "Total size of all archive data after compression, before deduplication across all archives",
-    "numberOfFiles": "Number of Files",
-    "numberOfFilesTooltip": "Total number of files across all archives",
-    "repositorySize": "Repository Size",
-    "repositorySizeTooltip": "Actual storage used by the repository on disk after compression and deduplication across all archives"
+  "repositoryStats": {
+    "freeSpace": "Free space",
+    "heading": "Storage Statistics",
+    "archives": "Archives",
+    "originalSize": "Original Size",
+    "usedOnDisk": "Used on Disk",
+    "spaceSaved": "Space Saved",
+    "backupSpan": "Backup Span",
+    "backupSpanValue": "{{first}} to {{last}}",
+    "latestArchiveFiles": "Files in Latest",
+    "unknown": "Unknown",
+    "unknownHint": "Not measured yet",
+    "pending": "Pending",
+    "pendingHint": "The archive index is catching up with the repository",
+    "indexing": "Indexing…",
+    "indexingArchivesHint": "The archive list is being read",
+    "indexingSizeHint": "The repository size is being measured",
+    "updated": "Updated {{ago}}",
+    "updating": "Updating",
+    "notIndexed": "Not indexed yet",
+    "source": {
+      "borg1_cache_stats": "borg info",
+      "borg2_index": "Borg 2 index",
+      "storage_used": "storage",
+      "compact_stats": "last compact"
+    },
+    "sourceHint": {
+      "borg1_cache_stats": "Deduplicated size from Borg's cache statistics",
+      "borg2_index": "Sum of every object in the repository's chunk index",
+      "storage_used": "Bytes the repository occupies on its storage",
+      "compact_stats": "Repository size reported by the last compact"
+    },
+    "originalSizeHint": {
+      "borg1_cache_stats": "Source data size of every archive, from Borg's cache statistics",
+      "compact_stats": "Source data size of every archive, reported by the last compact",
+      "archives": "Sum of the original size of every archive the newest listing saw"
+    },
+    "spaceSavedHint": "Original size divided by the space used on disk: deduplication and compression together",
+    "spaceSavedUnknownHint": "Nothing to divide by",
+    "spaceSavedMixedHint": "The source data size and the space used on disk were measured at different times",
+    "backupSpanHint": "The oldest and the newest archive",
+    "latestArchiveFilesHint": "Number of files in the newest archive, not a total",
+    "refresh": "Refresh from Borg",
+    "refreshed": "Repository information refreshed"
   },
   "upcomingJobs": {
     "title": "Upcoming Jobs (Next 24 Hours)",
@@ -4130,21 +5191,28 @@
     "title": "Archive Contents",
     "loading": "Loading archive contents...",
     "slowLoadingHint": "This archive is large, so listing its files takes a little longer. Hang tight — this only happens the first time; afterwards it's cached.",
+    "loadFailed": "Could not load the archive contents.",
+    "retry": "Retry",
     "emptyDirectory": "This directory is empty",
     "emptyArchive": "This archive is empty",
     "emptyArchiveDesc": "No files were backed up in this archive. This may happen if the source directory was empty or inaccessible during the backup.",
     "noInfo": "No archive information available",
     "root": "Root",
     "downloadFile": "Download file",
+    "downloadFolder": "Download folder",
     "managedCanaryLabel": "Borg UI canary",
     "managedCanaryDescription": "Managed restore-check canary files. Borg UI adds these to backups while canary mode is enabled.",
     "managedCanaryBanner": "This folder is managed by Borg UI for canary restore checks. It is safe to leave untouched.",
     "managedCanaryProbeDisabled": "Canary paths are verified automatically by canary mode.",
+    "includedByParent": "Included with {{parent}}. Unselect {{parent}} to choose items inside it.",
     "failedToDownloadFile": "Failed to download file",
+    "failedToDownloadFolder": "Failed to download folder",
     "downloadPreparing": "Preparing download of {{name}}…",
+    "downloadFolderPreparing": "Preparing folder download of {{name}}…",
     "downloadingBytes": "Downloading… {{size}}",
     "downloadingPercent": "Downloading… {{percent}}% ({{size}})",
-    "downloadComplete": "Downloaded {{name}}"
+    "downloadComplete": "Downloaded {{name}}",
+    "downloadFolderComplete": "Downloaded {{name}}"
   },
   "codeEditor": {
     "loading": "Loading editor..."
@@ -4172,7 +5240,9 @@
     "copyToClipboard": "Copy to clipboard",
     "copied": "Copied!",
     "commandCopied": "Command copied to clipboard",
-    "copyFailed": "Failed to copy to clipboard"
+    "copyFailed": "Failed to copy to clipboard",
+    "remoteServeCommand": "Remote command (for restricted keys)",
+    "remoteServeCommandDesc": "Borg runs this on the repository host. A forced-command wrapper in authorized_keys must accept it."
   },
   "cronBuilderComponent": {
     "runEvery": "Run every",
@@ -4415,11 +5485,18 @@
     "creating": "Creating...",
     "create": "Create",
     "failedToLoad": "Failed to load directory",
+    "selectAgentFirst": "Select an agent before browsing.",
+    "selectRemoteFirst": "Select a rclone remote first.",
+    "createFailed": "Failed to create folder",
     "chips": {
       "remote": "Remote",
       "host": "Host",
       "borg": "Borg"
     }
+  },
+  "repoSelect": {
+    "label": "Repository",
+    "placeholder": "Select a repository"
   },
   "cronExpressionInput": {
     "label": "Schedule"
@@ -4431,6 +5508,17 @@
     "selectPath": "Select Path"
   },
   "cache": {
+    "redis": "Redis",
+    "inMemory": "In-Memory",
+    "connection": "Connection",
+    "externalRedis": "External Redis",
+    "localDocker": "Local Docker",
+    "durationDays_one": "{{count}} day",
+    "durationDays_other": "{{count}} days",
+    "durationHours_one": "{{count}} hour",
+    "durationHours_other": "{{count}} hours",
+    "durationMinutes_one": "{{count}} minute",
+    "durationMinutes_other": "{{count}} minutes",
     "subtitle": "Monitor and configure the Redis-based archive caching system for faster browsing",
     "cacheStatus": "Cache Status",
     "cachedArchives": "Cached Entities",
@@ -4517,7 +5605,6 @@
   },
   "repositoryInfoDialog": {
     "failedToDownloadKeyfile": "Failed to download keyfile",
-    "noArchivesDescription": "This repository has been initialized but contains no archives. Storage statistics will appear here after you create your first backup.",
     "failedToLoad": "Failed to load repository information. Make sure the repository is accessible and properly initialized.",
     "recovery": {
       "title": "Recovery commands",
@@ -4549,6 +5636,8 @@
     },
     "confirmRemove": "Remove this script from the repository?",
     "parametersConfigured": "{{count}} parameter(s) configured",
+    "parameterCount_one": "{{count}} parameter",
+    "parameterCount_other": "{{count}} parameters",
     "tooltips": {
       "testScript": "Test run this script",
       "parametersOutOfSync": "Parameters need attention - script definition has changed",
@@ -4567,7 +5656,13 @@
       "continueOnErrorHelperText": "Override default: If checked, the backup will proceed even if this script fails.",
       "onFailureLabel": "If this script fails:",
       "cancel": "Cancel",
-      "assignScript": "Assign Script"
+      "assignScript": "Assign Script",
+      "inlineScriptReplacementWarning": "Adding a library script will replace the current inline script for this hook."
+    },
+    "testDialog": {
+      "title": "Test: {{scriptName}}",
+      "exitCode": "Exit: {{code}}",
+      "duration": "{{seconds}}s"
     },
     "parametersDialog": {
       "title": "Configure Script Parameters: {{scriptName}}",
@@ -4699,8 +5794,12 @@
         "jobNotFound": "Agent job not found",
         "jobNotStartable": "This agent job cannot be started",
         "repositoryOperationFailed": "The agent repository operation failed",
+        "repositoryOperationFailedWithReason": "The agent repository operation failed: {{reason}}",
         "repositoryOperationTimeout": "The agent repository operation timed out",
-        "unsupportedJobKind": "Unsupported agent job type"
+        "unsupportedJobKind": "Unsupported agent job type",
+        "desiredVersionUnavailable": "That agent version is not available on this server.",
+        "upgradeUnsupported": "This endpoint cannot upgrade itself yet. Reinstall it once from the command in the reinstall dialog.",
+        "upgradeTargetUnavailable": "This server does not ship an agent version to upgrade to."
       },
       "repo": {
         "repositoryNotFound": "Repository not found",
@@ -4714,6 +5813,8 @@
         "permissionDeniedCreateDirectory": "Permission denied: cannot create directory at '{{path}}'. To store repositories on your host machine, use paths starting with '/local/'.",
         "permissionDeniedCreateParentDirectory": "Permission denied: cannot create parent directory '{{path}}'. Please ensure the directory exists on your host machine with proper permissions.",
         "encryptedPassphraseRequired": "Passphrase is required for encryption mode '{{mode}}'",
+        "agentBorg2Unavailable": "This endpoint doesn't have Borg 2 installed, so a Borg 2 repository can't be created or opened on it. Install Borg 2 on the endpoint, or pick Borg 1.",
+        "agentBorg2TooOld": "This endpoint's Borg 2 is {{version}}; borg-ui needs {{minimum}} or newer for a Borg 2 repository. Upgrade Borg 2 on the endpoint, or pick Borg 1.",
         "agentPassphraseUnavailable": "This managed agent didn't report a BORG_PASSPHRASE, so an encrypted repository can't be opened by it. Set BORG_PASSPHRASE in the agent's environment, or enter a passphrase here.",
         "encryptedPassphraseIncorrect": "Repository is encrypted but the passphrase is incorrect or missing. Please provide the correct passphrase.",
         "encryptionKeyfileNotRequired": "Repository uses '{{mode}}' encryption, which does not require a keyfile. Keyfile upload is only needed for 'keyfile' or 'keyfile-blake2' encryption modes.",
@@ -4846,6 +5947,7 @@
       },
       "backupPlans": {
         "nameRequired": "Backup plan name is required.",
+        "nameExists": "A backup plan with this name already exists.",
         "clearLegacyRepositoryNotSelected": "Cannot clear legacy source settings for a repository that is not selected in this backup plan.",
         "retryUnsupported": "This backup plan run cannot be retried."
       },
@@ -4890,7 +5992,7 @@
         "adminAccessRequired": "Admin access required",
         "cannotEnableAsBackupSource": "Cannot enable as backup source: {{error}}",
         "connectionTestFailed": "SSH connection test failed: {{error}}",
-        "failedCollectStorage": "Failed to collect storage information",
+        "failedCollectStorage": "Storage information is unavailable for this connection.",
         "failedGenerateKey": "Failed to generate SSH key: {{error}}",
         "invalidKeyType": "Invalid key type. Must be one of: {{types}}",
         "invalidPrivateKeyFormat": "Invalid private key format",
@@ -4926,7 +6028,10 @@
         "failedDeleteSshKey": "Failed to delete SSH key: {{error}}",
         "failedToggleBackupSource": "Failed to toggle backup source: {{error}}",
         "failedListBackupSources": "Failed to list backup sources: {{error}}",
-        "failedVerifyBorgInstallation": "Failed to verify Borg installation: {{error}}"
+        "failedVerifyBorgInstallation": "Failed to verify Borg installation: {{error}}",
+        "failedReadHostKey": "Failed to read the host key: {{error}}",
+        "hostKeyChangedWhileConfirming": "The host key changed while you were confirming it. Check it again before trusting it.",
+        "failedStoreHostKey": "Failed to store the host key: {{error}}"
       },
       "settings": {
         "adminAccessRequired": "Admin access required",
@@ -4972,6 +6077,8 @@
       "activity": {
         "adminOnlyDelete": "Only administrators can delete job entries",
         "cannotDeleteRunningJob": "Cannot delete running job. Cancel it first or wait for completion.",
+        "planRunHasFailedOperation": "This plan run has a failed operation. Delete that operation instead.",
+        "cannotCancelWhileRunning": "{{jobType}} jobs cannot be cancelled while they run",
         "invalidJobType": "Invalid job type: {{jobType}}",
         "jobNotFound": "{{jobType}} job not found",
         "cannotDownloadLogsForRunningJob": "Cannot download logs for running job",
@@ -4982,11 +6089,14 @@
         "deleteAlreadyRunning": "Delete operation is already running for this archive (Job ID: {{jobId}})",
         "deleteJobNotFound": "Delete job not found",
         "failedGetArchiveContents": "Failed to get archive contents",
+        "unsupportedRepositoryVersion": "This repository uses format version {{version}}, which the Borg 2 build on this server cannot read. Borg 2 is still in beta and its repository format has changed between betas. Recreate the repository with the current build, or install the Borg 2 build that created it.",
         "failedGetArchiveInfo": "Failed to get archive info",
         "failedListArchives": "Failed to list archives",
         "repositoryNotFound": "Repository not found",
         "fileNotFoundAfterExtraction": "File not found after extraction",
-        "failedExtractFile": "Failed to extract file: {{error}}"
+        "failedExtractFile": "Failed to extract file: {{error}}",
+        "historyUnavailableForAgent": "Change history is not available for repositories whose agent cannot build it, so there is nothing to rebuild. Assign or enable an agent, or update one that predates change history.",
+        "historyRunning": "Change history is still being built for this repository, and that run did not stop when asked (operation {{operationId}}). Rebuilding now would delete rows it writes back, so wait for it to finish and try again."
       },
       "borg": {
         "repositoryDoesNotExist": "Repository does not exist at the specified path",
@@ -5090,6 +6200,16 @@
       },
       "jobs": {
         "repositoryOperationActive": "Another operation is already running on this repository. Please wait for it to finish and try again."
+      },
+      "prune": {
+        "noKeepRule": "Set at least one keep rule before previewing or running a prune.",
+        "dryRunFailed": "Borg's dry run failed.",
+        "comparisonRunning": "A retention comparison is already running for this repository.",
+        "candidateNotStored": "This policy has not been compared yet. Run a comparison to see it.",
+        "autoPreviewOff": "Automatic prune previews are turned off."
+      },
+      "operations": {
+        "unknownStage": "Unknown background stage."
       }
     },
     "success": {
@@ -5150,6 +6270,7 @@
         "connectionDeleted": "SSH connection deleted successfully",
         "connectionTestFailed": "SSH connection test failed",
         "connectionTestSuccess": "SSH connection test successful",
+        "connectionTestSuccessRestricted": "SSH connection works. The remote shell is restricted to Borg, so browsing and storage information are unavailable.",
         "connectionUpdated": "SSH connection updated successfully",
         "sshKeyCreated": "SSH key created successfully",
         "sshKeyDeleted": "SSH key deleted successfully",
@@ -5161,7 +6282,9 @@
         "sshKeyUpdated": "SSH key updated successfully",
         "storageRefreshed": "Storage information refreshed successfully",
         "systemKeyGenerated": "System SSH key generated successfully",
-        "systemKeyImported": "System SSH key imported successfully"
+        "systemKeyImported": "System SSH key imported successfully",
+        "hostKeyTrusted": "Host key trusted",
+        "hostKeyForgotten": "Host key forgotten"
       },
       "packages": {
         "installationInProgress": "Package '{{name}}' installation already in progress",
@@ -5201,6 +6324,7 @@
     },
     "currentPlan": "Your Plan",
     "fullAccessLabel": "Full Access",
+    "featureTrialLabel": "Pro preview",
     "planSuffix": "Plan",
     "activeStatus": "Active",
     "descriptionCommunity": "Core backup features included",
@@ -5248,7 +6372,16 @@
     "upgradeNudgeAfterTitle": "Unlock more on Pro or Enterprise",
     "upgradeNudgePro": "Pro",
     "upgradeNudgeEnterprise": "Enterprise",
-    "viewUpgradeOptions": "View upgrade options"
+    "viewUpgradeOptions": "View upgrade options",
+    "expiredUpgradeCta": "Restore Pro features",
+    "daysShort_one": "{{count}} day left",
+    "daysShort_other": "{{count}} days left",
+    "liteLabel": "Pro Lite",
+    "liteDescription": "Every Pro feature on one installation",
+    "featureTrialCountdown_one": "{{count}} day of Pro preview left",
+    "featureTrialCountdown_other": "{{count}} days of Pro preview left",
+    "featureTrialEndsNotice": "On {{date}} these lock again. Upgrade to Pro to keep them.",
+    "featureTrialOpens": "Open during the preview"
   },
   "licensing": {
     "title": "Licensing",
@@ -5258,16 +6391,51 @@
     "instanceIdValue": "Instance ID: {{instanceId}}",
     "licenseIdValue": "Active licence: {{licenseId}}",
     "expiresAtValue": "Expires on: {{date}}",
-    "viewPlanDetails": "View plan details →"
+    "viewPlanDetails": "View plan details →",
+    "statusActive": "Active",
+    "statusFullAccess": "Full access",
+    "statusExpired": "Expired",
+    "statusCommunity": "Community",
+    "validUntil": "Valid until {{date}}",
+    "validIndefinitely": "No expiry date on this entitlement.",
+    "noPaidLicence": "No paid entitlement on this instance.",
+    "instanceIdLabel": "Instance ID",
+    "licenseIdLabel": "Licence ID",
+    "expiresLabel": "Expires on",
+    "copyValue": "Copy",
+    "copied": "Copied",
+    "seats": {
+      "title": "Installations on this licence",
+      "subtitle": "Every installation currently using a seat on this licence.",
+      "usage": "{{used}} of {{total}} seats in use",
+      "empty": "No installation holds a seat on this licence right now.",
+      "thisInstance": "This instance",
+      "currentHint": "Use Deactivate above to release this seat.",
+      "unknownHost": "Unknown host",
+      "meta": "Version {{version}} · activated {{activated}} · last seen {{lastSeen}}",
+      "releaseButton": "Release seat",
+      "confirmTitle": "Release this seat?",
+      "confirmBody": "{{instance}} drops to Community on its next check-in. Release its seat so another installation can use it?",
+      "releaseSuccess": "Seat released.",
+      "releaseFailed": "Could not release that seat.",
+      "loadFailed": "Could not load the seats for this licence."
+    }
   },
   "upgradePrompt": {
     "featureLabel": "{{plan}} feature",
     "defaultMessage": "This feature requires the {{plan}} plan.",
     "requiresPlan": "Requires {{plan}} plan",
     "buyLink": "Upgrade at borgui.com",
-    "learnMore": "See what's included →"
+    "learnMore": "See what's included →",
+    "trialFailed": "The trial could not be started. Try again later.",
+    "trialNeedsAdmin": "Ask an administrator to start the trial.",
+    "trialUnavailable": "A free trial is not available right now.",
+    "trialEnded": "Your Pro preview has ended.",
+    "tryFree": "Try it free"
   },
   "announcements": {
+    "latestRelease": "Latest release",
+    "close": "Close announcement",
     "highlights": "What's new",
     "viewDetails": "View details",
     "remindLater": "Remind me later",
@@ -5279,6 +6447,114 @@
       "maintenance_notice": "Maintenance notice",
       "migration_notice": "Migration notice",
       "custom_announcement": "Announcement"
+    }
+  },
+  "repositoryIndexMode": {
+    "label": "Background indexing",
+    "mode": {
+      "full": {
+        "title": "Everything",
+        "cost": "Keeps the archive list, file history, health and sizes current."
+      },
+      "archives": {
+        "title": "Archives only",
+        "cost": "Keeps the archive list, heatmap, health and last backup age current, and stops diffing files. Best for repositories too large to diff."
+      },
+      "off": {
+        "title": "Off",
+        "cost": "Refreshes nothing. The archive list will no longer refresh. Best for slow or rarely reachable remotes."
+      }
+    },
+    "excludes": "Paths to skip",
+    "excludesHelp": "One glob pattern per line. File history ignores paths that match.",
+    "excludesInactive": "These patterns apply to file history, which this mode does not build."
+  },
+  "prunePreview": {
+    "title": "Prune preview",
+    "crumbRepositories": "Repositories",
+    "retention": "Retention",
+    "prefilledPlan": "Prefilled from the plan {{name}}. Changes here are a preview until you run the prune.",
+    "prefilledLastPrune": "Prefilled from the last manual prune.",
+    "prefilledDefault": "Default retention.",
+    "reset": "Reset",
+    "refresh": "Refresh preview",
+    "refreshedAt": "Preview refreshed {{when}}",
+    "deleted": "Archives deleted",
+    "ofTotal": "of {{total}}",
+    "kept": "{{count}} kept",
+    "freed": "Space freed",
+    "atLeast": "at least {{size}}",
+    "freedSub": "exact figure after the prune and compact",
+    "deletedCount": "{{count}} deleted",
+    "lostShort": "{{count}} files lost forever",
+    "before": "Footprint before",
+    "after": "Footprint after",
+    "atMost": "at most",
+    "notMeasured": "not measured",
+    "heatmapTitle": "What stays, what goes",
+    "legendKept": "Kept",
+    "legendDeleted": "Deleted",
+    "legendMixed": "Mixed day",
+    "cellKept": "{{name}}: kept, rule {{rule}}",
+    "cellDeleted": "{{name}}: would be deleted",
+    "rankedTitle": "Deleted archives ranked by what they free",
+    "remeasured": "Re-measured just now for {{count}} candidates",
+    "remeasuredPartial": "Re-measured the oldest {{cap}} of {{count}}; the rest use their stored value",
+    "remeasuring": "re-measuring",
+    "showAll": "Show all {{count}}",
+    "lostTitle": "Files lost forever",
+    "lostSummary": "{{count}} files, {{size}}, no surviving archive holds them",
+    "lostLocked": "Pro lists these files, their size and the archive that last held each one.",
+    "lostNone": "No file is lost: every path a deleted archive holds survives in a kept archive.",
+    "lostUnknown": "No lost file found, but the index is incomplete, so this answer is not final.",
+    "lostPath": "Path",
+    "lostSize": "Size",
+    "lostHeldBy": "Last held by",
+    "lostSearch": "Filter by path",
+    "lostNoMatch": "No listed file matches",
+    "lostMore": "{{count}} more, largest first",
+    "lostAgent": "Agent-executed repositories have no history index, so lost files cannot be computed.",
+    "lostUnavailable": "The history index is not available for this repository.",
+    "warnIncomplete": "Index incomplete for {{count}} archives. Files that only those archives held may be missing from the list.",
+    "warnIndexNow": "Open the archives",
+    "warnLowerBound": "Space freed is a lower bound. Borg reports no per-set statistics before a prune; chunks shared only among deleted archives are freed too and are not counted here.",
+    "showLog": "Show Borg output ({{deleted}} would prune, {{kept}} keeping)",
+    "cancel": "Cancel",
+    "runNow": "Run prune now, delete {{count}} archives",
+    "confirmTitle": "Delete {{count}} archives?",
+    "confirmBody": "This runs the prune with the retention shown. Deleted archives cannot be recovered.",
+    "confirm": "Confirm",
+    "dryRunFailed": "Borg's dry run failed. The output is below.",
+    "previewFailed": "The preview could not be built (HTTP {{status}}). Try again once the repository is idle.",
+    "defaultsFailed": "The retention defaults could not be loaded.",
+    "retry": "Retry",
+    "noKeepRule": "Set at least one keep rule.",
+    "compare": {
+      "title": "Compared policies",
+      "intro": "The same archives under other retention rules. Pick a row to preview it in full.",
+      "computedOn": "Compared on {{date}}",
+      "stale": "Numbers may have changed since the last comparison.",
+      "notYet": "Not compared yet.",
+      "compareNow": "Compare now",
+      "comparing": "Comparing, this runs one dry run per policy.",
+      "colPolicy": "Policy",
+      "colRetention": "Retention",
+      "colKept": "Kept",
+      "colDeleted": "Deleted",
+      "colFree": "Would free",
+      "colLost": "File data lost",
+      "current": "Current",
+      "currentNoPolicy": "No policy",
+      "editing": "Editing",
+      "presets": {
+        "standard": "Standard",
+        "longer": "Longer",
+        "wide": "Wide"
+      },
+      "partial": "Some sizes are stored values, not re-measured.",
+      "refreshFailed": "Could not start the comparison.",
+      "autoOff": "Automatic prune previews are off, so this comparison is out of date and is not shown. Press Compare now to run it.",
+      "autoOffAction": "Turn on in Settings"
     }
   }
 }

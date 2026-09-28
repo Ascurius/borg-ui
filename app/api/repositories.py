@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import Response
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
-from typing import List, Optional, Dict, Any, Union
+from dataclasses import dataclass, field
+from typing import List, Literal, Optional, Dict, Any, Union
 from datetime import datetime, timezone
-from functools import partial
 from pathlib import Path as FilesystemPath
 from types import SimpleNamespace
 import structlog
@@ -17,52 +18,73 @@ import uuid
 
 from app.database.database import get_db, SessionLocal
 from app.database.models import (
-    User,
+    AgentMachine,
+    Archive,
+    DEFAULT_HISTORY_INDEX_EXCLUDES,
+    Operation,
+    OperationRcloneDetails,
+    RcloneRemote,
     Repository,
     RepositoryStorage,
-    RcloneRemote,
-    RcloneSyncJob,
-    AgentMachine,
-    CheckJob,
-    CompactJob,
-    PruneJob,
-    RestoreCheckJob,
     ScheduledJob,
     ScheduledJobRepository,
     SystemSettings,
+    User,
     UserRepositoryPermission,
-    RepositoryWipeJob,
 )
 from app.api.maintenance_jobs import (
-    create_maintenance_job,
-    start_background_maintenance_job,
-    get_job_with_repository,
-    get_repository_jobs,
+    get_maintenance_job_with_repository,
+    get_repository_maintenance_jobs,
     get_repository_with_access,
-    read_job_logs,
     serialize_job_status,
     serialize_job_summary,
 )
+from app.services.operations.maintenance_start import (
+    active_maintenance_operation,
+    start_maintenance,
+)
+from app.services.operations.job_facade import MaintenanceJobFacade
+from app.services.operations.enqueue import enqueue, wake_runner
+from app.services.operations.rclone_facade import RcloneSyncFacade
+from app.services.operations.index_mode import MODE_KINDS, indexes_history
+from app.services.operations.index_mode import mode_of as index_mode_of
+from app.services.operations.reconcile import enqueue_reconcile_run
+from app.services.operations.runner import operation_runner
+from app.services.operations.repository_status import (
+    LastRuns,
+    StorageSummary,
+    last_runs,
+    storage_summaries,
+)
 from app.core.authorization import authorize_request
-from app.core.security import get_current_user, check_repo_access, decrypt_secret
+from app.core.security import get_current_user, check_repo_access
 from app.core.borg import BorgInterface
 from app.core.borg_router import BorgRouter
-from app.core.borg_errors import is_lock_error
+from app.core.borg_errors import is_lock_error, is_repository_exists_failure
+from app.core.borg2 import (
+    ENCRYPTION_FLAGS_SINCE_BETA,
+    borg2_speaks_encryption_flags,
+    normalize_repo_info_encryption,
+)
 from app.core.features import (
     FEATURES,
     get_current_plan,
-    plan_includes,
+    has_feature,
     require_feature_access,
 )
 from app.config import settings
 from app.services.mqtt_service import mqtt_service
-from app.services.restore_check_service import restore_check_service
+from app.services.operations.wipe_facade import (
+    WipeJobFacade,
+    active_wipe_operation,
+)
 from app.services.repository_wipe_service import (
     WipeArchiveSetChanged,
     WipeValidationError,
     repository_wipe_service,
 )
 from app.services.repository_executor import (
+    agent_timezone_for_repository,
     is_agent_executor,
     legacy_execution_target,
     normalize_executor_type,
@@ -74,7 +96,9 @@ from app.services.check_flag_validation import (
     CheckFlagConflictError,
     validate_check_flags_for_max_duration,
 )
-from app.services.agent_job_dispatcher import dispatch_agent_job_best_effort
+from app.services.agent_job_dispatcher import (
+    dispatch_agent_job_best_effort,
+)
 from app.services.agent_connection_manager import (
     agent_connection_manager,
     AgentConnectionUnavailable,
@@ -82,13 +106,16 @@ from app.services.agent_connection_manager import (
     AgentCommandError,
 )
 from app.core.agent_constants import AGENT_FILESYSTEM_BROWSE_TIMEOUT_SECONDS
-from app.services.job_admission import (
-    OPERATION_CHECK,
-    OPERATION_COMPACT,
-    OPERATION_PRUNE,
-    ensure_repository_admission,
-)
+from app.core.agent_versions import agent_borg_version_for_major
 from app.services.log_policy import get_log_save_policy, job_has_logs_by_policy
+from app.services.repository_info_sync import sync_archive_stats_from_info
+from app.services.storage_usage import (
+    SOURCE_BORG1_CACHE_STATS,
+    SOURCE_STORAGE_USED,
+    borg1_original_size,
+    format_bytes,
+    set_repository_size,
+)
 from app.services.repository_command_lock import run_serialized_repository_command
 from app.services.rclone_repository_service import (
     SYNC_DIRECTION_AGENT_TO_REMOTE,
@@ -99,7 +126,11 @@ from app.services.rclone_repository_service import (
     normalize_rclone_relative_path,
     rclone_repository_service,
 )
-from app.utils.datetime_utils import serialize_datetime
+from app.utils.datetime_utils import (
+    parse_borg_archive_time,
+    serialize_borg_archive_time,
+    serialize_datetime,
+)
 from app.utils.schedule_time import (
     DEFAULT_SCHEDULE_TIMEZONE,
     InvalidScheduleTimezone,
@@ -115,13 +146,16 @@ from app.utils.source_locations import (
     normalize_source_locations,
 )
 from app.utils.borg_env import (
+    build_repository_borg_env,
+    effective_repository_remote_path,
     get_standard_ssh_opts as shared_get_standard_ssh_opts,
     setup_borg_env as shared_setup_borg_env,
     cleanup_temp_key_file,
+    REQUEST_LOCK_WAIT,
+    with_lock_wait,
 )
 from app.utils.ssh_utils import (
-    resolve_repo_ssh_key_file,
-    ssh_key_auth_args,
+    resolve_repo_ssh_key_file,  # noqa: F401
 )  # Backward-compatible patch target for tests
 
 logger = structlog.get_logger()
@@ -136,40 +170,15 @@ V2_ONLY_ENCRYPTION_MODES = {
 
 
 def _router_repo_snapshot(repository: Repository) -> SimpleNamespace:
-    return SimpleNamespace(id=repository.id, borg_version=repository.borg_version)
-
-
-def _dispatch_router_check(router_repo: SimpleNamespace, job: CheckJob):
-    return BorgRouter(router_repo).check(job.id)
-
-
-def _dispatch_router_compact(router_repo: SimpleNamespace, job: CompactJob):
-    return BorgRouter(router_repo).compact(job.id)
-
-
-def _dispatch_router_prune(
-    router_repo: SimpleNamespace,
-    keep_hourly: int,
-    keep_daily: int,
-    keep_weekly: int,
-    keep_monthly: int,
-    keep_quarterly: int,
-    keep_yearly: int,
-    keep_within: str | None,
-    job: PruneJob,
-):
-    args = (
-        job.id,
-        keep_hourly,
-        keep_daily,
-        keep_weekly,
-        keep_monthly,
-        keep_quarterly,
-        keep_yearly,
-        False,
+    # BorgRouter routes on executor_type (with the legacy execution_target
+    # fallback). Keep those in the snapshot so the router's agent gate stays
+    # functional even though these endpoints branch on the executor earlier.
+    return SimpleNamespace(
+        id=repository.id,
+        borg_version=repository.borg_version,
+        executor_type=repository.executor_type,
+        execution_target=repository.execution_target,
     )
-    kwargs = {"keep_within": keep_within} if keep_within is not None else {}
-    return BorgRouter(router_repo).prune(*args, **kwargs)
 
 
 AGENT_RCLONE_SYNC_CAPABILITY = "repository.rclone_sync"
@@ -403,10 +412,17 @@ def _permanent_delete_target(repository: Repository) -> FilesystemPath:
             detail={"key": "backend.errors.repo.permanentDeleteUnsafePath"},
         )
 
-    if (
-        not (resolved_target / "config").is_file()
-        or not (resolved_target / "data").is_dir()
-    ):
+    borg1_layout = (resolved_target / "config").is_file() and (
+        resolved_target / "data"
+    ).is_dir()
+    borg2_config = resolved_target / "config"
+    borg2_layout = (
+        borg2_config.is_dir()
+        and (borg2_config / "version").is_file()
+        and (borg2_config / "id").is_file()
+        and (borg2_config / "readme").is_file()
+    )
+    if not (borg1_layout or borg2_layout):
         raise HTTPException(
             status_code=400,
             detail={"key": "backend.errors.repo.permanentDeleteNotBorgRepository"},
@@ -458,49 +474,70 @@ def setup_borg_env(base_env=None, passphrase=None, ssh_opts=None):
     )
 
 
-def _prepare_repository_borg_env(repository: Repository, db: Session):
+def _prepare_repository_borg_env(
+    repository: Repository, db: Session, *, lock_wait: str = "180"
+):
     """Build Borg execution environment for a stored repository.
 
     Returns the environment plus any temporary SSH key file that must be
-    cleaned up by the caller.
+    cleaned up by the caller. Request handlers pass REQUEST_LOCK_WAIT.
     """
-    temp_key_file = resolve_repo_ssh_key_file(repository, db)
-    ssh_opts = get_standard_ssh_opts(include_key_path=temp_key_file)
-    env = setup_borg_env(
-        passphrase=repository.passphrase,
-        ssh_opts=ssh_opts,
-    )
-    return env, temp_key_file
+    return build_repository_borg_env(repository, db, lock_wait=lock_wait)
 
 
 def _repository_stats_borg_env(env: Dict[str, str]) -> Dict[str, str]:
-    """Return a Borg environment that renders archive timestamps in UTC."""
+    """Return a Borg environment that renders archive timestamps in UTC.
+
+    The machine-parsed wrapper invocations pin TZ=UTC themselves now, so this
+    is redundant for them - kept because the operations runner (#888) builds
+    explicit stats envs through it, and double-pinning is harmless.
+    """
     stats_env = env.copy()
     stats_env["TZ"] = "UTC"
     return stats_env
 
 
-def _parse_borg_archive_time(value: Any) -> Optional[datetime]:
-    """Parse a Borg archive timestamp as a naive UTC database value."""
-    if value is None:
-        return None
+def _normalize_archive_listing_times(
+    archives: List[Any], *, timezone_name: Optional[str]
+) -> List[Any]:
+    """Re-render borg archive timestamps with an explicit UTC offset.
 
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, tz=timezone.utc).replace(tzinfo=None)
+    Borg's own rendering may be naive, which the frontend's Date parsing
+    reads as browser-local time. ``timezone_name`` names the zone borg
+    rendered the listing in ("UTC" for TZ=UTC-forced server listings, the
+    agent-reported zone for agent listings).
+    """
+    normalized = []
+    for archive in archives:
+        if not isinstance(archive, dict):
+            normalized.append(archive)
+            continue
+        updated = dict(archive)
+        for field in ("time", "start", "end"):
+            value = updated.get(field)
+            if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                continue
+            serialized = serialize_borg_archive_time(value, timezone_name=timezone_name)
+            # Unparseable values keep their raw form rather than dropping
+            # to None - the response never loses information.
+            if isinstance(serialized, str):
+                updated[field] = serialized
+        normalized.append(updated)
+    return normalized
 
-    if not isinstance(value, str):
-        return None
 
-    normalized = value.strip()
-    if not normalized:
-        return None
+def _parse_borg_archive_time(
+    value: Any, *, timezone_name: Optional[str] = None
+) -> Optional[datetime]:
+    """Parse a Borg archive timestamp as a naive UTC database value.
 
-    dt = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt.replace(tzinfo=None)
+    Naive values are wall clock in the zone borg rendered the listing in -
+    pass the agent's reported zone for agent listings and "UTC" for listings
+    forced to TZ=UTC; the server's local zone is the fallback. Assuming UTC
+    unconditionally shifted last_backup by the UTC offset on every non-UTC
+    deployment.
+    """
+    return parse_borg_archive_time(value, timezone_name=timezone_name)
 
 
 def _load_repository_with_access(
@@ -533,29 +570,52 @@ def _resolve_bypass_lock(
     return use_bypass_lock, _lock_source(repository.bypass_lock, system_enabled)
 
 
-def _get_repository_schedule_summary(repo_id: int, db: Session) -> Dict[str, Any]:
-    """Return one preferred schedule summary for a repository.
+def _repository_schedule_summaries(
+    db: Session, repository_ids
+) -> Dict[int, Dict[str, Any]]:
+    """One preferred schedule summary per repository, in three queries for
+    the whole list rather than three per repository.
 
-    Enabled schedules win over disabled ones. We support both legacy single-repo
-    schedules and multi-repo schedules through the junction table.
+    Enabled schedules win over disabled ones, and among them the one whose
+    next run comes first. We support both legacy single-repo schedules and
+    multi-repo schedules through the junction table.
     """
-
-    direct_matches = (
-        db.query(ScheduledJob).filter(ScheduledJob.repository_id == repo_id).all()
-    )
-    linked_schedule_ids = [
-        row.scheduled_job_id
-        for row in db.query(ScheduledJobRepository.scheduled_job_id)
-        .filter(ScheduledJobRepository.repository_id == repo_id)
+    ids = list(repository_ids)
+    if not ids:
+        return {}
+    matched: Dict[int, List[ScheduledJob]] = {repo_id: [] for repo_id in ids}
+    for job in (
+        db.query(ScheduledJob)
+        .filter(ScheduledJob.repository_id.in_(ids))
+        .order_by(ScheduledJob.id)
         .all()
-    ]
-    linked_matches = (
-        db.query(ScheduledJob).filter(ScheduledJob.id.in_(linked_schedule_ids)).all()
-        if linked_schedule_ids
-        else []
+    ):
+        matched[job.repository_id].append(job)
+    links = (
+        db.query(
+            ScheduledJobRepository.repository_id,
+            ScheduledJobRepository.scheduled_job_id,
+        )
+        .filter(ScheduledJobRepository.repository_id.in_(ids))
+        .all()
     )
+    linked_jobs = (
+        {
+            job.id: job
+            for job in db.query(ScheduledJob)
+            .filter(ScheduledJob.id.in_(sorted({job_id for _, job_id in links})))
+            .all()
+        }
+        if links
+        else {}
+    )
+    for repo_id, job_id in sorted(links, key=lambda link: link[1]):
+        if job_id in linked_jobs:
+            matched[repo_id].append(linked_jobs[job_id])
+    return {repo_id: _schedule_summary(jobs) for repo_id, jobs in matched.items()}
 
-    matched = direct_matches + linked_matches
+
+def _schedule_summary(matched: List[ScheduledJob]) -> Dict[str, Any]:
     if not matched:
         return {
             "has_schedule": False,
@@ -565,7 +625,15 @@ def _get_repository_schedule_summary(repo_id: int, db: Session) -> Dict[str, Any
             "next_run": None,
         }
 
-    preferred = next((job for job in matched if job.enabled), matched[0])
+    # The card shows `next_run` as the next backup: of the enabled
+    # schedules, the one that runs soonest.
+    enabled = [job for job in matched if job.enabled]
+    timed = [job for job in enabled if job.next_run]
+    preferred = (
+        min(timed, key=lambda job: (job.next_run, job.id))
+        if timed
+        else next(iter(enabled), matched[0])
+    )
     return {
         "has_schedule": True,
         "schedule_enabled": bool(preferred.enabled),
@@ -587,13 +655,18 @@ async def _run_repository_command(
     log_fields: Optional[Dict[str, Any]] = None,
 ):
     """Execute a repository-scoped Borg command with common SSH/env handling."""
-    env, temp_key_file = _prepare_repository_borg_env(repository, db)
+    env, temp_key_file = _prepare_repository_borg_env(
+        repository, db, lock_wait=REQUEST_LOCK_WAIT
+    )
+    # Both callers machine-parse the JSON output; pin the render zone so borg1
+    # timestamps come out UTC instead of server-local.
+    env["TZ"] = "UTC"
     try:
         if temp_key_file and log_message:
             logger.info(log_message, **(log_fields or {}))
 
         process = await asyncio.create_subprocess_exec(
-            *cmd,
+            *with_lock_wait(cmd, env),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
@@ -718,20 +791,6 @@ def _parse_agent_json_result(result: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _agent_prune_operation_payload(request: dict) -> dict[str, Any]:
-    keep_within = _normalize_prune_keep_within(request.get("keep_within"))
-    return {
-        "keep_hourly": request.get("keep_hourly", 0),
-        "keep_daily": request.get("keep_daily", 7),
-        "keep_weekly": request.get("keep_weekly", 4),
-        "keep_monthly": request.get("keep_monthly", 6),
-        "keep_quarterly": request.get("keep_quarterly", 0),
-        "keep_yearly": request.get("keep_yearly", 1),
-        "keep_within": keep_within,
-        "dry_run": request.get("dry_run", False),
-    }
-
-
 def _normalize_prune_keep_within(value: Any) -> str | None:
     if value is None:
         return None
@@ -801,19 +860,91 @@ def _agent_result_archives(result) -> list:
     return archives if isinstance(archives, list) else []
 
 
-async def _update_agent_repository_stats(repository: Repository, db: Session) -> bool:
+def _agent_supports(db: Session, repository: Repository, capability: str) -> bool:
+    if not repository.agent_machine_id:
+        return False
+    agent = (
+        db.query(AgentMachine)
+        .filter(AgentMachine.id == repository.agent_machine_id)
+        .first()
+    )
+    return bool(agent and capability in (agent.capabilities or []))
+
+
+def _agent_storage_usage_data(result: Optional[dict]) -> dict:
+    """The JSON object a `repository.storage_usage` job prints."""
+    meta = result or {}
+    if meta.get("return_code", 0) != 0 or meta.get("success", True) is False:
+        return {}
+    data = meta.get("data")
+    if isinstance(data, dict):
+        return data
+    try:
+        parsed = json.loads(meta.get("stdout") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+@dataclass
+class AgentStatsRefresh:
+    """What a refresh produced: whether it ran, and the repository-level
+    source data size Borg 1 reports in the same `repo-info` call (None for
+    Borg 2, which reports it through compact instead). Truthiness is the
+    success every caller read before."""
+
+    ok: bool
+    original_size: Optional[int] = None
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+async def _update_agent_repository_stats(
+    repository: Repository, db: Session, *, raise_busy: bool = False
+) -> AgentStatsRefresh:
     """Refresh stats for an agent repo by running list + repo-info on the node.
 
     Sets archive_count, last_backup and encryption from the live agent results.
     A remote Borg 2 repository has no client-computable on-disk size (borg2
     repo-info exposes no size, and du is server/local-only), so total_size is
     left unchanged rather than reset.
+
+    With `raise_busy` the admission's refusal of the list job (another job
+    holds the repository, nothing gathered yet) is raised instead of logged,
+    so the operations runner can defer the `stats` operation and retry it
+    later. Only the list, because a deferral repeats the whole refresh,
+    listing included: raising for a later job would make every retry pay
+    for the listing again and could fail an operation that used to complete
+    with the listing. Those jobs keep the swallow and only cost what they
+    would have added. A route caller keeps the swallow throughout and
+    reports "not refreshed" for a refused list.
     """
     from app.services.agent_job_dispatcher import dispatch_agent_job_best_effort
+    from app.services.operations.runner import repository_busy
     from app.services.repository_executor import (
+        cancel_unclaimed_agent_repository_job,
         queue_agent_repository_operation_job,
         wait_for_agent_repository_operation_job,
     )
+
+    def busy(exc: BaseException) -> bool:
+        return raise_busy and repository_busy(exc)
+
+    async def wait(job, timeout_seconds):
+        # A job the server stops waiting for that no agent took (still
+        # queued) is taken out of the admission's way, or every later refresh
+        # would be refused as its duplicate with no bound: the reaper never
+        # reaps a queued job. A job the agent claimed or runs stays: its
+        # result warms the next attempt, and a dead agent's job is reaped.
+        try:
+            return await wait_for_agent_repository_operation_job(
+                db, job.id, timeout_seconds=timeout_seconds
+            )
+        except HTTPException as exc:
+            if exc.status_code == 504:
+                cancel_unclaimed_agent_repository_job(db, job.id)
+            raise
 
     try:
         timeouts = get_operation_timeouts(db)
@@ -822,9 +953,7 @@ async def _update_agent_repository_stats(repository: Repository, db: Session) ->
             db, repository, job_kind="repository.list_archives"
         )
         await dispatch_agent_job_best_effort(db, list_job, repository_id=repository.id)
-        list_result = await wait_for_agent_repository_operation_job(
-            db, list_job.id, timeout_seconds=timeouts["list_timeout"]
-        )
+        list_result = await wait(list_job, timeouts["list_timeout"])
         archives = _agent_result_archives(list_result)
         # A completed job can still carry a non-zero borg exit with no stdout,
         # which parses to [] -- don't let that wipe the stored count to 0. Trust
@@ -837,13 +966,18 @@ async def _update_agent_repository_stats(repository: Repository, db: Session) ->
         )
         archive_count = len(archives)
 
+        agent_zone = agent_timezone_for_repository(db, repository)
         archive_times = []
         for archive in archives:
-            archive_time = archive.get("time") or archive.get("start")
-            if not archive_time:
+            archive_time = archive.get("time")
+            if archive_time is None:
+                archive_time = archive.get("start")
+            if archive_time is None:
                 continue
             try:
-                parsed_time = _parse_borg_archive_time(archive_time)
+                parsed_time = _parse_borg_archive_time(
+                    archive_time, timezone_name=agent_zone
+                )
             except ValueError:
                 continue
             if parsed_time:
@@ -852,6 +986,10 @@ async def _update_agent_repository_stats(repository: Repository, db: Session) ->
 
         encryption_mode = None
         total_size = None
+        total_size_bytes = None
+        total_size_source = None
+        borg_last_modified = None
+        original_size = None
         try:
             rinfo_job = queue_agent_repository_operation_job(
                 db, repository, job_kind="repository.rinfo"
@@ -859,17 +997,34 @@ async def _update_agent_repository_stats(repository: Repository, db: Session) ->
             await dispatch_agent_job_best_effort(
                 db, rinfo_job, repository_id=repository.id
             )
-            rinfo_result = await wait_for_agent_repository_operation_job(
-                db, rinfo_job.id, timeout_seconds=timeouts["info_timeout"]
-            )
+            rinfo_result = await wait(rinfo_job, timeouts["info_timeout"])
             rinfo = json.loads((rinfo_result or {}).get("stdout") or "{}")
+            # Deliberately NOT normalize_repo_info_encryption() here. That fills
+            # `mode` with the bare cipher for Borg 2.0.0b22, which is right for
+            # display but wrong for this column: the stored value is the combined
+            # name the repository was created with (repokey-aes-ocb), and b22's
+            # repo-info does not report the key location, so writing its cipher
+            # back would drop that half for good. No mode, no write — the stored
+            # name stands.
             encryption_mode = (rinfo.get("encryption") or {}).get("mode")
             # Borg 1 `info --json` exposes repo-level dedup size in cache.stats;
-            # Borg 2 `repo-info --json` does not (remote size is unknowable).
+            # Borg 2 `repo-info --json` does not. For Borg 2 the size comes
+            # from the agent instead, below.
             stats = (rinfo.get("cache") or {}).get("stats") or {}
             size_bytes = stats.get("unique_csize") or stats.get("unique_size")
             if isinstance(size_bytes, (int, float)) and size_bytes > 0:
                 total_size = format_bytes(int(size_bytes))
+                total_size_bytes = int(size_bytes)
+                total_size_source = SOURCE_BORG1_CACHE_STATS
+            # The same payload carries the repository's source data size,
+            # which the caller files with the operation for the stats strip.
+            original_size = borg1_original_size(rinfo)
+            # Both versions report the last manifest write; the agent renders
+            # it in its reported zone (UTC since #889).
+            borg_last_modified = _parse_borg_archive_time(
+                (rinfo.get("repository") or {}).get("last_modified"),
+                timezone_name=agent_zone,
+            )
         except Exception as e:
             logger.warning(
                 "agent repo-info for stats refresh failed",
@@ -877,14 +1032,84 @@ async def _update_agent_repository_stats(repository: Repository, db: Session) ->
                 error=str(e),
             )
 
+        # Borg 2 reports no size through repo-info. Agents from 0.1.4 measure
+        # it read-only (chunk index, else a store tool) and say when they
+        # cannot; older agents only know du, which fails on store URLs.
+        # Guarded on total_size so Borg 1 keeps using cache.stats above.
+        storage_usage_tried = False
+        if total_size is None and _agent_supports(
+            db, repository, "repository.storage_usage"
+        ):
+            storage_usage_tried = True
+            try:
+                usage_job = queue_agent_repository_operation_job(
+                    db,
+                    repository,
+                    job_kind="repository.storage_usage",
+                    operation={"timeout_seconds": timeouts["info_timeout"]},
+                )
+                await dispatch_agent_job_best_effort(
+                    db, usage_job, repository_id=repository.id
+                )
+                usage_result = await wait(usage_job, timeouts["info_timeout"])
+                usage = _agent_storage_usage_data(usage_result)
+                size_bytes = usage.get("bytes")
+                if (
+                    isinstance(size_bytes, int)
+                    and size_bytes > 0
+                    and usage.get("source")
+                ):
+                    total_size = format_bytes(size_bytes)
+                    total_size_bytes = size_bytes
+                    total_size_source = str(usage["source"])
+            except Exception as e:
+                logger.warning(
+                    "agent storage-usage for stats refresh failed",
+                    repository=repository.name,
+                    error=str(e),
+                )
+        # du is the older agents' only tool and the Borg 1 fallback when
+        # rinfo carried no cache stats (storage_usage answers Borg 1 with
+        # borg1_uses_rinfo). For Borg 2 it adds nothing: storage_usage runs
+        # du itself for local paths and du fails on store URLs.
+        if total_size is None and (
+            not storage_usage_tried or (repository.borg_version or 1) != 2
+        ):
+            try:
+                du_job = queue_agent_repository_operation_job(
+                    db, repository, job_kind="repository.disk_usage"
+                )
+                await dispatch_agent_job_best_effort(
+                    db, du_job, repository_id=repository.id
+                )
+                du_result = await wait(du_job, timeouts["info_timeout"])
+                du_meta = du_result or {}
+                if du_meta.get("return_code", 0) == 0:
+                    # `du -sb` prints "<bytes>\t<path>".
+                    stdout = (du_meta.get("stdout") or "").strip()
+                    first = stdout.split("\n")[0] if stdout else ""
+                    fields = first.split()
+                    if fields and fields[0].isdigit() and int(fields[0]) > 0:
+                        total_size = format_bytes(int(fields[0]))
+                        total_size_bytes = int(fields[0])
+                        total_size_source = SOURCE_STORAGE_USED
+            except Exception as e:
+                logger.warning(
+                    "agent disk-usage for stats refresh failed",
+                    repository=repository.name,
+                    error=str(e),
+                )
+
         if list_ok:
             repository.archive_count = archive_count
             if last_backup_time:
                 repository.last_backup = last_backup_time
         if encryption_mode:
             repository.encryption = encryption_mode
-        if total_size:
-            repository.total_size = total_size
+        if total_size and total_size_bytes is not None:
+            set_repository_size(repository, total_size_bytes, total_size_source)
+        if borg_last_modified:
+            repository.borg_last_modified = borg_last_modified
         db.commit()
         logger.info(
             "Updated agent repository stats",
@@ -892,152 +1117,16 @@ async def _update_agent_repository_stats(repository: Repository, db: Session) ->
             archive_count=archive_count,
             encryption=encryption_mode,
         )
-        return True
+        return AgentStatsRefresh(True, original_size=original_size)
     except Exception as e:
+        if busy(e):
+            raise
         logger.error(
             "Failed to update agent repository stats",
             repository=repository.name,
             error=str(e),
         )
-        return False
-
-
-async def update_repository_stats(repository: Repository, db: Session) -> bool:
-    """
-    Update the archive count and repository size stats by querying Borg.
-    Returns True if successful, False otherwise.
-    """
-    if is_agent_executor(repository):
-        return await _update_agent_repository_stats(repository, db)
-
-    temp_key_file = None
-    try:
-        # Check system-wide bypass_lock_on_list setting
-        from app.database.models import SystemSettings
-
-        system_settings = db.query(SystemSettings).first()
-        use_bypass_lock = repository.bypass_lock or (
-            system_settings and system_settings.bypass_lock_on_list
-        )
-        env, temp_key_file = _prepare_repository_borg_env(repository, db)
-        stats_env = _repository_stats_borg_env(env)
-
-        router = BorgRouter(repository)
-
-        # Get archive list and count
-        archives = await router.list_archives(env=stats_env)
-
-        archive_count = 0
-        total_size = None
-        last_backup_time = None
-
-        try:
-            if isinstance(archives, str):
-                archives_data = json.loads(archives)
-                archives = (
-                    archives_data.get("archives", [])
-                    if isinstance(archives_data, dict)
-                    else archives_data
-                )
-
-            if isinstance(archives, list):
-                archive_count = len(archives)
-
-                archive_times = []
-                for archive in archives:
-                    archive_time = archive.get("time") or archive.get("start")
-                    if not archive_time:
-                        continue
-
-                    try:
-                        parsed_time = _parse_borg_archive_time(archive_time)
-                    except ValueError as te:
-                        logger.warning(
-                            "Failed to parse archive timestamp",
-                            repository=repository.name,
-                            timestamp=archive_time,
-                            error=str(te),
-                        )
-                        continue
-
-                    if parsed_time:
-                        archive_times.append(parsed_time)
-
-                if archive_times:
-                    last_backup_time = max(archive_times)
-        except json.JSONDecodeError as e:
-            logger.error(
-                "Failed to parse archive list JSON",
-                repository=repository.name,
-                error=str(e),
-                stdout=str(archives)[:200],
-            )
-
-        # Get timeouts from DB settings (with fallback to config)
-        timeouts = get_operation_timeouts(db)
-
-        try:
-            total_size_bytes = await router.calculate_total_size_bytes(
-                env=env,
-                info_timeout=timeouts["info_timeout"],
-                use_bypass_lock=use_bypass_lock,
-                temp_key_file=temp_key_file,
-            )
-            if total_size_bytes > 0:
-                total_size = format_bytes(total_size_bytes)
-        except Exception as e:
-            logger.warning(
-                "Failed to get repository size",
-                repository=repository.name,
-                error=str(e),
-            )
-
-        # Update repository
-        old_count = repository.archive_count
-        old_size = repository.total_size
-        old_last_backup = repository.last_backup
-        repository.archive_count = archive_count
-        if total_size:
-            repository.total_size = total_size
-        if last_backup_time:
-            repository.last_backup = last_backup_time
-
-        db.commit()
-        logger.info(
-            "Updated repository stats",
-            repository=repository.name,
-            archive_count_old=old_count,
-            archive_count_new=archive_count,
-            size_old=old_size,
-            size_new=total_size,
-            last_backup_old=old_last_backup,
-            last_backup_new=last_backup_time,
-        )
-        return True
-
-    except Exception as e:
-        logger.error(
-            "Exception while updating repository stats",
-            repository=repository.name,
-            error=str(e),
-        )
-        return False
-    finally:
-        if temp_key_file and os.path.exists(temp_key_file):
-            try:
-                os.unlink(temp_key_file)
-            except Exception:
-                pass
-
-
-# Helper function to format bytes to human readable format
-def format_bytes(bytes_size: int) -> str:
-    """Format bytes to human readable string (e.g., '1.23 GB')"""
-    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
-        if bytes_size < 1024.0:
-            return f"{bytes_size:.2f} {unit}"
-        bytes_size /= 1024.0
-    return f"{bytes_size:.2f} EB"
+        return AgentStatsRefresh(False)
 
 
 def _decode_json_list_field(value):
@@ -1093,6 +1182,125 @@ def format_datetime(dt):
     return serialize_datetime(dt)
 
 
+def _storage_summary_or_none(
+    db: Session, repository: Repository
+) -> Optional[StorageSummary]:
+    """The repository's storage summary, or None when it cannot be computed:
+    a decorative object must not take the repository detail down. The
+    detail carries the archive sums and the compact statistics; the list,
+    polled by every tab, carries the stored size columns only."""
+    repository_id = repository.id  # before a rollback could expire the row
+    try:
+        return storage_summaries(db, [repository], archives=True).get(repository_id)
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "Failed to compute storage summary",
+            repository_id=repository_id,
+            error=str(exc),
+            exc_info=True,
+        )
+        return None
+
+
+def index_pending_kinds(db: Session, repository_ids) -> dict[int, list[str]]:
+    """The index kinds (`stats`, `archive_sync`, `history_index`) queued
+    or running per repository (#1063), for the card to say "indexing"
+    while a chain a user's action started (an import, a backup, a manual
+    refresh) has not produced a count or a size yet, instead of showing 0 archives and no size as if the
+    repository were empty. Every trigger counts, the periodic reconcile
+    and a manual resync included: the reader replaces only a placeholder
+    (a count of 0, no size, no last backup) with "indexing", so a settled
+    repository keeps showing its figures while a routine listing waits.
+    Sorted, so the payload is the same text for the same state."""
+    ids = list(repository_ids)
+    if not ids:
+        return {}
+    pending: dict[int, set[str]] = {}
+    for repository_id, kind in (
+        db.query(Operation.repository_id, Operation.kind)
+        .filter(
+            Operation.repository_id.in_(ids),
+            Operation.category == "index",
+            Operation.status.in_(("queued", "running")),
+        )
+        .distinct()
+        .all()
+    ):
+        pending.setdefault(repository_id, set()).add(kind)
+    return {repository_id: sorted(kinds) for repository_id, kinds in pending.items()}
+
+
+def _index_pending_kinds_or_empty(db: Session, repository: Repository) -> list[str]:
+    """The pending index kinds of one repository, or an empty list when the
+    query fails: a decorative field must not take the detail or the
+    storage route down, the same rule `_storage_summary_or_none` applies."""
+    repository_id = repository.id  # before a rollback could expire the row
+    try:
+        return index_pending_kinds(db, [repository_id]).get(repository_id, [])
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "Failed to compute pending index kinds",
+            repository_id=repository_id,
+            error=str(exc),
+            exc_info=True,
+        )
+        return []
+
+
+def storage_payload(summary: Optional[StorageSummary]) -> Optional[dict]:
+    """The `storage` object of a repository response (#981): the stored
+    size with its provenance and time, Borg's last manifest write, the
+    archive sums and the newest compact statistics. A None field is "not
+    measured yet" or "not reported by this Borg version"; a size of 0 is a
+    measurement (an emptied repository), so the two are distinct states. A
+    size with `measured_at` None comes from the formatted string (the
+    upgrade's backfill, or a row it did not reach), so its time is unknown;
+    `archives_consistent` False says the archive figures are withheld
+    because the rows and the count disagree, or because no listing has run
+    for the repository yet; `archives_listed` tells the two apart (a
+    reader shows "pending" only for a repository a listing has reached)
+    and is computed on every route, so the card can tell a settled, empty
+    repository from one nothing has listed; `archives_consistent` None
+    says the route did not compute the archive figures (the list; the
+    detail and the storage route do). The source data size is never
+    withheld: `original_size_source` says whether it is the sum over the
+    archive rows (`archives`), which answers while every row carries its
+    info, or the figure Borg reports for the whole repository
+    (`borg1_cache_stats` from `info`, `compact_stats` from a compact),
+    which answers while a row is still waiting for one. That figure
+    carries `original_size_at`, the time of the run that reported it: it
+    is not necessarily as new as `measured_at` beside it, and a reader
+    that says how fresh the figures are must take it into account. `first_backup_at` and `last_backup_at`
+    span the current archives. `latest_archive_files` is the newest
+    archive's file count, not a sum. `compact` is the statistics of that
+    run as `parse_compact_stats` read them, including its
+    `size_precision`: `rounded` says its figures come from Borg's
+    formatted output, so they can differ from `size_bytes` by the rounding
+    of that text rather than by a change in the repository."""
+    if summary is None:
+        return None
+    return {
+        "size_bytes": summary.size_bytes,
+        "size_source": summary.size_source,
+        "measured_at": format_datetime(summary.measured_at),
+        "last_modified": format_datetime(summary.last_modified),
+        "archives_consistent": summary.archives_consistent,
+        "archives_listed": summary.archives_listed,
+        "original_size": summary.original_size,
+        "original_size_source": summary.original_size_source,
+        "original_size_at": format_datetime(summary.original_size_at),
+        "compressed_size": summary.compressed_size,
+        "deduplicated_size": summary.deduplicated_size,
+        "latest_archive_files": summary.latest_archive_files,
+        "first_backup_at": format_datetime(summary.first_backup_at),
+        "last_backup_at": format_datetime(summary.last_backup_at),
+        "compact": summary.compact,
+        "compact_at": format_datetime(summary.compact_at),
+    }
+
+
 def _borg_result_error(result: Dict[str, Any]) -> Optional[str]:
     for key in ("error", "stderr", "stdout"):
         value = result.get(key)
@@ -1115,7 +1323,19 @@ def _repository_init_failure_detail(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # Pydantic models
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+
+def _single_line_passphrase(value: Optional[str]) -> Optional[str]:
+    """A passphrase must be a single line.
+
+    The remote-backup path shlex-quotes it into a shell command, and every
+    redaction of echoed output there works line-by-line — a value spanning
+    lines would be read back as fragments that defeat the masking pattern.
+    """
+    if value and ("\n" in value or "\r" in value):
+        raise ValueError("passphrase must not contain line breaks")
+    return value
 
 
 class RepositoryCreate(BaseModel):
@@ -1172,6 +1392,11 @@ class RepositoryCreate(BaseModel):
     rclone_extra_flags: Optional[List[str]] = None
     rclone_cache_path: Optional[str] = None
 
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase_single_line(cls, value: Optional[str]) -> Optional[str]:
+        return _single_line_passphrase(value)
+
 
 class RepositoryImport(BaseModel):
     name: str
@@ -1226,6 +1451,11 @@ class RepositoryImport(BaseModel):
     rclone_extra_flags: Optional[List[str]] = None
     rclone_cache_path: Optional[str] = None
 
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase_single_line(cls, value: Optional[str]) -> Optional[str]:
+        return _single_line_passphrase(value)
+
 
 class RepositoryUpdate(BaseModel):
     name: Optional[str] = None
@@ -1251,6 +1481,8 @@ class RepositoryUpdate(BaseModel):
         None  # full: backups + observability, observe: observability-only
     )
     bypass_lock: Optional[bool] = None  # Use --bypass-lock for read-only storage access
+    history_index_excludes: Optional[List[str]] = None
+    index_mode: Optional[Literal["full", "archives", "off"]] = None
     custom_flags: Optional[str] = None  # Custom command-line flags for borg create
     upload_ratelimit_kib: Optional[int] = None
     source_connection_id: Optional[int] = (
@@ -1859,28 +2091,132 @@ def _discard_rclone_repository_record(
         shutil.rmtree(cache_path, ignore_errors=True)
 
 
-def _serialize_rclone_storage(
-    repository: Repository, db: Session, *, log_save_policy: str | None = None
-) -> Optional[Dict[str, Any]]:
-    storage = (
-        db.query(RepositoryStorage)
-        .filter(RepositoryStorage.repository_id == repository.id)
-        .first()
+@dataclass
+class _ListPageRows:
+    """What the repository list reads per card, loaded once for the page
+    (#1091): the storage rows by repository, the agent machines by id, the
+    rclone remotes by id, and the newest rclone sync by repository. The
+    rclone details rows are only held here, so the facade's `db.get` finds
+    them in the identity map."""
+
+    storages: Dict[int, RepositoryStorage]
+    agents: Dict[int, AgentMachine]
+    remotes: Dict[int, RcloneRemote] = field(default_factory=dict)
+    latest_syncs: Dict[int, Operation] = field(default_factory=dict)
+    rclone_details: List[OperationRcloneDetails] = field(default_factory=list)
+
+
+def _load_list_page_rows(
+    db: Session, repositories: List[Repository], repository_ids: List[int]
+) -> _ListPageRows:
+    agent_ids = {r.agent_machine_id for r in repositories if r.agent_machine_id}
+    agents = (
+        {
+            agent.id: agent
+            for agent in db.query(AgentMachine)
+            .filter(AgentMachine.id.in_(sorted(agent_ids)))
+            .all()
+        }
+        if agent_ids
+        else {}
     )
+    storages = {
+        storage.repository_id: storage
+        for storage in db.query(RepositoryStorage)
+        .filter(RepositoryStorage.repository_id.in_(repository_ids))
+        .all()
+    }
+    page = _ListPageRows(storages=storages, agents=agents)
+    rclone = [s for s in storages.values() if s.backend == "rclone"]
+    if not rclone:
+        return page
+    remote_ids = sorted({s.rclone_remote_id for s in rclone if s.rclone_remote_id})
+    if remote_ids:
+        page.remotes = {
+            remote.id: remote
+            for remote in db.query(RcloneRemote)
+            .filter(RcloneRemote.id.in_(remote_ids))
+            .all()
+        }
+    ranked = (
+        db.query(
+            Operation.id.label("id"),
+            func.row_number()
+            .over(
+                partition_by=Operation.repository_id,
+                order_by=(Operation.created_at.desc(), Operation.id.desc()),
+            )
+            .label("rank"),
+        )
+        .filter(
+            Operation.repository_id.in_(sorted(s.repository_id for s in rclone)),
+            Operation.kind == "rclone_sync",
+        )
+        .subquery()
+    )
+    latest = (
+        db.query(Operation)
+        .join(ranked, ranked.c.id == Operation.id)
+        .filter(ranked.c.rank == 1)
+        .all()
+    )
+    page.latest_syncs = {op.repository_id: op for op in latest}
+    if latest:
+        page.rclone_details = (
+            db.query(OperationRcloneDetails)
+            .filter(OperationRcloneDetails.operation_id.in_([op.id for op in latest]))
+            .all()
+        )
+    return page
+
+
+def _serialize_rclone_storage(
+    repository: Repository,
+    db: Session,
+    *,
+    log_save_policy: str | None = None,
+    page: Optional[_ListPageRows] = None,
+) -> Optional[Dict[str, Any]]:
+    """`page` is the list route's rows, loaded once for the page;
+    single-repository callers leave it out and query."""
+    if page is not None:
+        storage = page.storages.get(repository.id)
+    else:
+        storage = (
+            db.query(RepositoryStorage)
+            .filter(RepositoryStorage.repository_id == repository.id)
+            .first()
+        )
     if not storage or storage.backend != "rclone":
         return None
-    remote = (
-        db.query(RcloneRemote)
-        .filter(RcloneRemote.id == storage.rclone_remote_id)
-        .first()
-    )
+    if page is not None:
+        remote = page.remotes.get(storage.rclone_remote_id)
+    else:
+        remote = (
+            db.query(RcloneRemote)
+            .filter(RcloneRemote.id == storage.rclone_remote_id)
+            .first()
+        )
     status = rclone_repository_service.serialize_status(repository, storage, remote)
-    status.update(_agent_machine_summary(repository, db))
+    status.update(
+        _agent_machine_summary(
+            repository, db, agents=page.agents if page is not None else None
+        )
+    )
+    if page is not None:
+        latest_operation = page.latest_syncs.get(repository.id)
+    else:
+        latest_operation = (
+            db.query(Operation)
+            .filter(
+                Operation.repository_id == repository.id,
+                Operation.kind == "rclone_sync",
+            )
+            .order_by(Operation.created_at.desc(), Operation.id.desc())
+            .first()
+        )
     latest_job = (
-        db.query(RcloneSyncJob)
-        .filter(RcloneSyncJob.repository_id == repository.id)
-        .order_by(RcloneSyncJob.created_at.desc(), RcloneSyncJob.id.desc())
-        .first()
+        RcloneSyncFacade(db, latest_operation) if latest_operation is not None else None
     )
     if log_save_policy is None:
         log_save_policy = get_log_save_policy(db)
@@ -1907,83 +2243,9 @@ def _serialize_rclone_storage(
     return status
 
 
-def _mark_background_rclone_sync_failed(job_id: int, message: str) -> None:
-    db = SessionLocal()
-    try:
-        job = db.query(RcloneSyncJob).filter(RcloneSyncJob.id == job_id).first()
-        if not job:
-            return
-        storage = (
-            db.query(RepositoryStorage)
-            .filter(RepositoryStorage.repository_id == job.repository_id)
-            .first()
-        )
-        if storage:
-            storage.sync_status = "failed"
-            storage.last_sync_error = message
-        job.status = "failed"
-        job.completed_at = datetime.now(timezone.utc)
-        job.error_text = message
-        job.log_text = (
-            f"{job.log_text.rstrip()}\n{message}" if job.log_text else message
-        )
-        db.commit()
-    finally:
-        db.close()
-
-
-async def _run_background_rclone_sync_job(job_id: int) -> None:
-    db = SessionLocal()
-    try:
-        job = db.query(RcloneSyncJob).filter(RcloneSyncJob.id == job_id).first()
-        if job is None:
-            logger.warning("Skipping missing background rclone sync job", job_id=job_id)
-            return
-        repository = (
-            db.query(Repository).filter(Repository.id == job.repository_id).first()
-        )
-        if repository is None:
-            raise ValueError(f"repository {job.repository_id} was not found")
-
-        async def run_sync():
-            return await rclone_repository_service.sync_repository(
-                db,
-                repository,
-                triggered_by=job.triggered_by,
-                scheduled_for=job.scheduled_for,
-                job_id=job.id,
-            )
-
-        await run_serialized_repository_command(repository.id, run_sync, scope="rclone")
-    except asyncio.CancelledError:
-        message = "Background rclone sync job was cancelled"
-        logger.info(message, job_id=job_id)
-        db.rollback()
-        _mark_background_rclone_sync_failed(job_id, message)
-        raise
-    except Exception as exc:
-        message = str(exc) or exc.__class__.__name__
-        logger.error(
-            "Background rclone sync job failed",
-            job_id=job_id,
-            error=message,
-        )
-        db.rollback()
-        _mark_background_rclone_sync_failed(job_id, message)
-    finally:
-        db.close()
-
-
-def _log_background_rclone_sync_task_result(task: asyncio.Task) -> None:
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        logger.info("Background rclone sync job was cancelled")
-    except Exception as exc:
-        logger.error("Background rclone sync task raised", error=str(exc))
-
-
 def _queue_initial_cloud_mirror_sync(db: Session, repository: Repository) -> None:
+    """Queue the first mirror sync for a newly created cloud repository. The
+    runner dispatches it (spec 7.1); nothing is spawned here."""
     storage = (
         db.query(RepositoryStorage)
         .filter(RepositoryStorage.repository_id == repository.id)
@@ -1991,68 +2253,88 @@ def _queue_initial_cloud_mirror_sync(db: Session, repository: Repository) -> Non
     )
     if not storage or storage.backend != "rclone":
         return
-    sync_job = RcloneSyncJob(
+    operation = enqueue(
+        db,
+        "rclone_sync",
         repository_id=repository.id,
-        direction=storage.sync_direction,
-        operation="sync",
-        status="pending",
-        triggered_by="initial",
+        trigger="import",
+        commit=False,
     )
-    db.add(sync_job)
+    job = RcloneSyncFacade(db, operation)
+    job.direction = storage.sync_direction
+    job.operation = "sync"
     storage.sync_status = "pending"
     storage.last_sync_error = None
     db.commit()
-    db.refresh(sync_job)
-    task = asyncio.create_task(_run_background_rclone_sync_job(sync_job.id))
-    task.add_done_callback(_log_background_rclone_sync_task_result)
+    wake_runner()
 
 
-def resume_pending_initial_cloud_mirror_sync_jobs() -> int:
+def resume_pending_initial_cloud_mirror_sync_operations() -> int:
+    """Requeue an initial mirror sync a restart interrupted.
+
+    Spec 7.6 would mark a `running` non-index operation failed, which is right
+    for a Borg command holding a lock and wrong for a mirror sync: `rclone
+    sync` is itself a reconciliation, so re-running it is safe and is what the
+    pre-phase-6 code did. Runs before `OperationRunner.recover_on_startup`, so
+    recovery sees a `queued` row and leaves it alone.
+    """
     db = SessionLocal()
     try:
-        jobs = (
-            db.query(RcloneSyncJob)
+        operations = (
+            db.query(Operation)
             .filter(
-                RcloneSyncJob.operation == "sync",
-                RcloneSyncJob.triggered_by == "initial",
-                RcloneSyncJob.status.in_(("pending", "running")),
+                Operation.kind == "rclone_sync",
+                Operation.trigger == "import",
+                Operation.status.in_(("queued", "running")),
             )
-            .order_by(RcloneSyncJob.id.asc())
+            .order_by(Operation.id.asc())
             .all()
         )
-        dispatched = 0
-        for job in jobs:
+        resumed = 0
+        for operation in operations:
             storage = (
                 db.query(RepositoryStorage)
-                .filter(RepositoryStorage.repository_id == job.repository_id)
+                .filter(RepositoryStorage.repository_id == operation.repository_id)
                 .first()
             )
             if storage:
                 storage.sync_status = "pending"
                 storage.last_sync_error = None
+            job = RcloneSyncFacade(db, operation)
             job.status = "pending"
+            job.started_at = None
             job.completed_at = None
             job.error_text = None
-            db.commit()
-            task = asyncio.create_task(_run_background_rclone_sync_job(job.id))
-            task.add_done_callback(_log_background_rclone_sync_task_result)
-            dispatched += 1
-        return dispatched
+            resumed += 1
+        db.commit()
+        if resumed:
+            wake_runner()
+        return resumed
     finally:
         db.close()
 
 
-def _agent_machine_summary(repository: Repository, db: Session) -> Dict[str, Any]:
+def _agent_machine_summary(
+    repository: Repository,
+    db: Session,
+    *,
+    agents: Optional[Dict[int, AgentMachine]] = None,
+) -> Dict[str, Any]:
+    """`agents` is the list route's machines by id, loaded once for the
+    page; single-repository callers leave it out and query."""
     if not repository.agent_machine_id:
         return {
             "agent_machine_name": None,
             "agent_machine_status": None,
         }
-    agent = (
-        db.query(AgentMachine)
-        .filter(AgentMachine.id == repository.agent_machine_id)
-        .first()
-    )
+    if agents is not None:
+        agent = agents.get(repository.agent_machine_id)
+    else:
+        agent = (
+            db.query(AgentMachine)
+            .filter(AgentMachine.id == repository.agent_machine_id)
+            .first()
+        )
     return {
         "agent_machine_name": agent.name if agent else None,
         "agent_machine_status": agent.status if agent else None,
@@ -2062,7 +2344,7 @@ def _agent_machine_summary(repository: Repository, db: Session) -> Dict[str, Any
 def _require_borg2_feature(db: Session) -> None:
     current_plan = get_current_plan(db)
     required = FEATURES["borg_v2"]
-    if not plan_includes(current_plan, required):
+    if not has_feature(db, "borg_v2"):
         raise HTTPException(
             status_code=403,
             detail={
@@ -2149,6 +2431,34 @@ def _reject_agent_repository_ssh_target(
         )
 
 
+def _require_agent_borg2(agent: AgentMachine) -> None:
+    """Refuse a Borg 2 repository on an endpoint that cannot run one.
+
+    Both failures are otherwise invisible until the init job reaches the
+    endpoint and dies there: no `borg2` on PATH is "No such file or directory",
+    and a pre-b22 one rejects every encryption mode the server emits. Neither
+    exit code names the real problem, so decide it here, where the answer is
+    already known.
+    """
+    version = agent_borg_version_for_major(agent.borg_versions, 2)
+    if version is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"key": "backend.errors.repo.agentBorg2Unavailable"},
+        )
+    if not borg2_speaks_encryption_flags(version):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "key": "backend.errors.repo.agentBorg2TooOld",
+                "params": {
+                    "version": version,
+                    "minimum": f"2.0.0b{ENCRYPTION_FLAGS_SINCE_BETA}",
+                },
+            },
+        )
+
+
 async def _validate_agent_repository_payload(
     repo_data: Union[RepositoryCreate, RepositoryImport], db: Session
 ) -> AgentMachine:
@@ -2158,6 +2468,9 @@ async def _validate_agent_repository_payload(
         execution_target=repo_data.execution_target,
     )
     agent = _require_queueable_agent(repo_data.agent_machine_id, db)
+
+    if _uses_borg2_payload(repo_data):
+        _require_agent_borg2(agent)
 
     encrypted = repo_data.encryption in [
         "repokey",
@@ -2349,6 +2662,26 @@ async def _create_agent_repository_record(
         imported=imported,
         user=current_user.username,
     )
+
+    if imported:
+        # Record the verified connect step and hand stats and archive listing
+        # to the operations runner (spec section 7.4), same as the
+        # server-managed Borg 1 import path.
+        try:
+            from app.services.operations.enqueue import record_import_connect
+
+            record_import_connect(db, repository, user_id=current_user.id)
+        except Exception as e:
+            # A failed flush/chain build leaves the session unusable and may
+            # leave a half-flushed import_connect row that a later commit on
+            # this same session would persist without its follow-ups. Roll the
+            # session back before continuing best-effort.
+            db.rollback()
+            logger.warning(
+                "Failed to enqueue post-import operations",
+                repository=repository.name,
+                error=str(e),
+            )
 
     try:
         mqtt_service.sync_state_with_db(db, reason="agent repository creation")
@@ -2910,7 +3243,7 @@ async def _import_direct_rclone_repository_record(
 
 
 @router.get("/")
-async def get_repositories(
+def get_repositories(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     """Get all repositories"""
@@ -2932,31 +3265,77 @@ async def get_repositories(
         # Check for running maintenance jobs for each repository
         repo_list = []
         log_save_policy = get_log_save_policy(db)
+        # Last prune and last index for the card's metadata row, computed
+        # once for the whole page (spec 10.2) rather than polled per card.
+        # Two decorative fields must not take the whole list down; when they
+        # cannot be computed they are left out, and the card shows no
+        # entry rather than "Never".
+        runs: Optional[dict[int, LastRuns]]
+        repository_ids = [repo.id for repo in repositories]
+        try:
+            runs = last_runs(db, repositories)
+        except Exception as exc:
+            logger.warning("Failed to compute last runs", error=str(exc), exc_info=True)
+            # PostgreSQL aborts the transaction on a failed statement; the
+            # rest of the list must still be able to query. The rollback
+            # expires the loaded rows, so reload them in one query (by the
+            # ids captured above, which touches no expired attribute).
+            db.rollback()
+            runs = None
+            repositories = (
+                db.query(Repository).filter(Repository.id.in_(repository_ids)).all()
+            )
+
+        # The stored size columns (plus whether a listing has run, one query
+        # on the operations table) and the pending index kinds (another):
+        # both decorative, each behind its own guard, so the second failing
+        # leaves the sizes the first already read. A failure leaves the
+        # cards without that field rather than taking the list down; the
+        # rollback expires the loaded rows, so they are reloaded after every
+        # rollback, not only the first.
+
+        def reload_rows():
+            nonlocal repositories
+            db.rollback()
+            repositories = (
+                db.query(Repository).filter(Repository.id.in_(repository_ids)).all()
+            )
+
+        try:
+            storage = storage_summaries(db, repositories, archives=False)
+        except Exception as exc:
+            logger.warning(
+                "Failed to compute storage columns", error=str(exc), exc_info=True
+            )
+            storage = {}
+            reload_rows()
+        try:
+            index_pending = index_pending_kinds(db, repository_ids)
+        except Exception as exc:
+            logger.warning(
+                "Failed to compute pending index kinds", error=str(exc), exc_info=True
+            )
+            index_pending = {}
+            reload_rows()
+
+        # What each card reads per repository, loaded once for the page:
+        # a query per repository here made the list cost five statements
+        # per repository on every poll (#1091).
+        # Running check, compact, or prune.
+        maintenance_running = {
+            repository_id
+            for (repository_id,) in db.query(Operation.repository_id)
+            .filter(
+                Operation.repository_id.in_(repository_ids),
+                Operation.status == "running",
+                Operation.kind.in_(("check", "compact", "prune")),
+            )
+            .distinct()
+        }
+        schedule_summaries = _repository_schedule_summaries(db, repository_ids)
+        page = _load_list_page_rows(db, repositories, repository_ids)
         for repo in repositories:
-            # Check if this repository has running check, compact, or prune jobs
-            has_check = (
-                db.query(CheckJob)
-                .filter(CheckJob.repository_id == repo.id, CheckJob.status == "running")
-                .first()
-                is not None
-            )
-
-            has_compact = (
-                db.query(CompactJob)
-                .filter(
-                    CompactJob.repository_id == repo.id, CompactJob.status == "running"
-                )
-                .first()
-                is not None
-            )
-
-            has_prune = (
-                db.query(PruneJob)
-                .filter(PruneJob.repository_id == repo.id, PruneJob.status == "running")
-                .first()
-                is not None
-            )
-            schedule_summary = _get_repository_schedule_summary(repo.id, db)
+            schedule_summary = schedule_summaries[repo.id]
             source_directories = _decode_json_list_field(repo.source_directories)
 
             repo_payload = {
@@ -2974,10 +3353,11 @@ async def get_repositories(
                 ),
                 "exclude_patterns": _decode_json_list_field(repo.exclude_patterns),
                 "repository_type": repo.repository_type,
+                "connection_id": repo.connection_id,
                 "execution_target": repo.execution_target or "local",
                 "executor_type": repository_executor_type(repo),
                 "agent_machine_id": repo.agent_machine_id,
-                **_agent_machine_summary(repo, db),
+                **_agent_machine_summary(repo, db, agents=page.agents),
                 "host": repo.host,
                 "port": repo.port,
                 "username": repo.username,
@@ -2986,7 +3366,17 @@ async def get_repositories(
                 "last_backup": format_datetime(repo.last_backup),
                 "last_check": format_datetime(repo.last_check),
                 "last_compact": format_datetime(repo.last_compact),
+                **(
+                    {
+                        "last_prune": format_datetime(runs[repo.id].last_prune),
+                        "last_index": format_datetime(runs[repo.id].last_index),
+                    }
+                    if runs is not None
+                    else {}
+                ),
                 "total_size": repo.total_size,
+                "storage": storage_payload(storage.get(repo.id)),
+                "index_pending_kinds": index_pending.get(repo.id, []),
                 "archive_count": repo.archive_count,
                 "created_at": format_datetime(repo.created_at),
                 "updated_at": format_datetime(repo.updated_at),
@@ -3002,9 +3392,18 @@ async def get_repositories(
                 "mode": repo.mode
                 or "full",  # Default to "full" for backward compatibility
                 "bypass_lock": repo.bypass_lock or False,
+                # `is None` rather than falsy: an operator who cleared every
+                # pattern stored [], and the defaults are only the fallback for
+                # a row that predates the column.
+                "history_index_excludes": (
+                    list(DEFAULT_HISTORY_INDEX_EXCLUDES)
+                    if repo.history_index_excludes is None
+                    else repo.history_index_excludes
+                ),
+                "index_mode": index_mode_of(repo),
                 "custom_flags": repo.custom_flags,
                 "upload_ratelimit_kib": repo.upload_ratelimit_kib,
-                "has_running_maintenance": has_check or has_compact or has_prune,
+                "has_running_maintenance": repo.id in maintenance_running,
                 "has_schedule": schedule_summary["has_schedule"],
                 "schedule_enabled": schedule_summary["schedule_enabled"],
                 "schedule_name": schedule_summary["schedule_name"],
@@ -3015,7 +3414,10 @@ async def get_repositories(
                 "borg_version": repo.borg_version or 1,
             }
             rclone_storage = _serialize_rclone_storage(
-                repo, db, log_save_policy=log_save_policy
+                repo,
+                db,
+                log_save_policy=log_save_policy,
+                page=page,
             )
             if rclone_storage:
                 repo_payload["storage_backend"] = _primary_storage_backend(repo)
@@ -3721,15 +4123,21 @@ async def import_repository(
             repository.has_keyfile = True
             db.commit()
 
-        # Update archive count by listing archives (non-blocking - don't fail import)
+        # Record the verified connect step and hand stats and archive listing
+        # to the operations runner (spec section 7.4). The request no longer
+        # waits on Borg for derived data.
         try:
-            from app.core.borg_router import BorgRouter
+            from app.services.operations.enqueue import record_import_connect
 
-            await BorgRouter(repository).update_stats(db)
+            record_import_connect(db, repository, user_id=current_user.id)
         except Exception as e:
-            # Log but don't fail the import - stats can be updated later
+            # A failed flush/chain build leaves the session unusable and may
+            # leave a half-flushed import_connect row that a later commit on
+            # this same session would persist without its follow-ups. Roll the
+            # session back before continuing best-effort.
+            db.rollback()
             logger.warning(
-                "Failed to update repository stats after import",
+                "Failed to enqueue post-import operations",
                 repository=repository.name,
                 error=str(e),
             )
@@ -4008,6 +4416,40 @@ async def download_keyfile(repo_id: int, db: Session = Depends(get_db)):
         )
 
 
+@router.get("/{repo_id}/storage")
+async def get_repository_storage(
+    repo_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The stored size figures of one repository (#981) and the index work
+    still pending for it (#1063), from the database alone. The archive
+    header and the info dialog read this instead of the repository detail:
+    the detail runs a live `borg info` for a server-executed repository,
+    which would hold Borg's cache lock against the dialog's own `/info`
+    call and make one of the two fail on a slow remote."""
+    repository = db.query(Repository).filter(Repository.id == repo_id).first()
+    if not repository:
+        raise HTTPException(
+            status_code=404,
+            detail={"key": "backend.errors.repo.repositoryNotFound"},
+        )
+    _require_repository_access(db, current_user, repository, "viewer")
+    # Local import: archive_index imports from this module.
+    from app.api.archive_index import sync_state_for
+
+    sync_state, last_synced_at = sync_state_for(db, repository)
+    return {
+        "repository_id": repository.id,
+        "storage": storage_payload(_storage_summary_or_none(db, repository)),
+        "index_pending_kinds": _index_pending_kinds_or_empty(db, repository),
+        # The archive listing's freshness, so the dialog's "Updated" caption
+        # covers the archive figures as well as the size.
+        "sync_state": sync_state,
+        "last_synced_at": last_synced_at,
+    }
+
+
 @router.get("/{repo_id}")
 async def get_repository(
     repo_id: int,
@@ -4035,6 +4477,11 @@ async def get_repository(
         # Get repository statistics
         stats = await get_repository_stats(repository, db, bypass_lock=use_bypass_lock)
 
+        # computed before the payload is built: on a failure this rolls the
+        # session back, which would expire every row the payload still reads
+        storage = storage_payload(_storage_summary_or_none(db, repository))
+        pending_kinds = _index_pending_kinds_or_empty(db, repository)
+
         repository_payload = {
             "id": repository.id,
             "name": repository.name,
@@ -4047,6 +4494,8 @@ async def get_repository(
             **_agent_machine_summary(repository, db),
             "last_backup": format_datetime(repository.last_backup),
             "total_size": repository.total_size,
+            "storage": storage,
+            "index_pending_kinds": pending_kinds,
             "archive_count": repository.archive_count,
             "created_at": format_datetime(repository.created_at),
             "updated_at": format_datetime(repository.updated_at),
@@ -4057,6 +4506,12 @@ async def get_repository(
             ),
             "source_locations": _repository_source_locations(repository),
             "upload_ratelimit_kib": repository.upload_ratelimit_kib,
+            "history_index_excludes": (
+                list(DEFAULT_HISTORY_INDEX_EXCLUDES)
+                if repository.history_index_excludes is None
+                else repository.history_index_excludes
+            ),
+            "index_mode": index_mode_of(repository),
             "stats": stats,
         }
         rclone_storage = _serialize_rclone_storage(repository, db)
@@ -4081,6 +4536,100 @@ async def get_repository(
             status_code=500,
             detail={"key": "backend.errors.repo.failedToRetrieveRepository"},
         )
+
+
+async def _apply_index_mode_change(
+    db: Session, repository: Repository, *, changed: bool
+) -> None:
+    """Spec 6.8. Leaving `full` cancels the repository's queued index work,
+    so a mode set to stop the diffs does not leave hours of them waiting in
+    the queue. A running index is left to finish: the lane time is already
+    spent, and the rows it writes are kept either way (the mode makes
+    history stale, never deleted). Returning to `full` enqueues one
+    reconcile run so the repository catches up without waiting for the tick.
+
+    The mode is already committed when this runs, so the cancelling half is
+    driven by the mode the repository now has rather than by `changed`: if a
+    cancel fails partway, the same PUT sent again finishes the job, where a
+    change-only guard would see no change and leave the rest queued. It is
+    naturally idempotent, since it only ever looks at work still queued. The
+    catch-up run is the half that must not repeat, so that one stays behind
+    `changed` and does not fire on every edit of a `full` repository.
+    """
+    mode = index_mode_of(repository)
+    if mode == "full":
+        if not changed:
+            return
+        try:
+            enqueue_reconcile_run(db, repository.id, force=True)
+        except Exception as exc:
+            # A catch-up run is a convenience; the tick will pick the
+            # repository up within the hour. The mode change itself is
+            # already stored and must not be undone by this.
+            db.rollback()
+            logger.warning(
+                "Index mode catch-up run failed",
+                repo_id=repository.id,
+                error=str(exc),
+            )
+        return
+    queued = (
+        db.query(Operation)
+        .filter(
+            Operation.repository_id == repository.id,
+            Operation.category == "index",
+            Operation.status == "queued",
+            Operation.kind.notin_(sorted(MODE_KINDS[mode])),
+        )
+        .all()
+    )
+    if not queued:
+        return
+    _relink_over_cancelled(db, repository.id, {op.id: op for op in queued})
+    for operation in queued:
+        # The rows were read before the relink commit, and the runner can
+        # claim one in between. Only what is still waiting is cancelled;
+        # anything that started is left to finish, as the mode promises.
+        db.refresh(operation)
+        if operation.status == "queued":
+            await operation_runner.request_cancel(operation.id)
+
+
+def _relink_over_cancelled(
+    db: Session, repository_id: int, doomed: dict[int, Operation]
+) -> None:
+    """Point the queued work that survives a mode change at the nearest
+    dependency that survives with it.
+
+    A follow-up chain is linear and `stats` sits last, behind the history
+    stages (`followups.FOLLOWUPS`), so cancelling the history of a queued
+    chain would leave `stats` depending on a `cancelled` row. The runner
+    reads that as a failed dependency and skips it, which loses the size
+    refresh `archives` mode exists to keep and paints a failed stage on a
+    repository the user just told us not to worry about. Rewritten and
+    committed before the cancels, so the runner never sees the dangling
+    state.
+    """
+    survivors = (
+        db.query(Operation)
+        .filter(
+            Operation.repository_id == repository_id,
+            Operation.status == "queued",
+            Operation.depends_on_id.in_(sorted(doomed)),
+            Operation.id.notin_(sorted(doomed)),
+        )
+        .all()
+    )
+    if not survivors:
+        return
+    for operation in survivors:
+        dependency = operation.depends_on_id
+        seen: set[int] = set()
+        while dependency in doomed and dependency not in seen:
+            seen.add(dependency)
+            dependency = doomed[dependency].depends_on_id
+        operation.depends_on_id = None if dependency in doomed else dependency
+    db.commit()
 
 
 @router.put("/{repo_id}")
@@ -4196,6 +4745,7 @@ async def update_repository(
         if target_executor_type == "agent":
             _require_managed_agents_feature(db)
         sync_cloud_mirror_after_update = False
+        index_mode_changed = False
         if requested_rclone_updates:
             storage = existing_rclone_storage
             is_direct_rclone_repository = repository.repository_type == "rclone"
@@ -4832,6 +5382,15 @@ async def update_repository(
         if repo_data.bypass_lock is not None:
             repository.bypass_lock = repo_data.bypass_lock
 
+        if repo_data.history_index_excludes is not None:
+            repository.history_index_excludes = [
+                p.strip() for p in repo_data.history_index_excludes if p and p.strip()
+            ]
+
+        if repo_data.index_mode is not None:
+            index_mode_changed = repo_data.index_mode != index_mode_of(repository)
+            repository.index_mode = repo_data.index_mode
+
         if repo_data.custom_flags is not None:
             repository.custom_flags = repo_data.custom_flags
 
@@ -4841,6 +5400,8 @@ async def update_repository(
         executor_changed = (
             "executor_type" in update_data or repo_data.execution_target is not None
         )
+        previous_executor_type = repository_executor_type(repository)
+        reopen_history = False
         if executor_changed:
             if target_executor_type == "agent":
                 requested_agent_id = (
@@ -4864,6 +5425,7 @@ async def update_repository(
                     repository_location="ssh" if repository.connection_id else "local",
                 )
                 repository.agent_machine_id = None
+                reopen_history = previous_executor_type == "agent"
 
         elif (
             "connection_id" in update_data
@@ -4895,9 +5457,52 @@ async def update_repository(
         ):
             _apply_mirror_source_strategy(existing_rclone_storage, repository)
 
+        if reopen_history:
+            # On the server the history stage exists again: the archives an
+            # agent left `skipped` go back to `pending` with a fresh retry
+            # budget, and so does a `failed` one the agent's listing had not
+            # marked yet (the same rule either way, not one that depends on
+            # whether a listing ran in between), in the same transaction as
+            # the executor change, so neither is stored without the other. A
+            # mode that excludes the
+            # history stage keeps them `pending`, which is what every archive
+            # of such a repository reads as; a later return to `full` catches
+            # them up (spec 6.8).
+            db.query(Archive).filter(
+                Archive.repository_id == repository.id,
+                Archive.history_state.in_(("skipped", "failed")),
+            ).update(
+                {Archive.history_state: "pending", Archive.history_attempts: 0},
+                synchronize_session=False,
+            )
+
         repository.updated_at = datetime.utcnow()
         db.commit()
 
+        if repo_data.index_mode is not None:
+            await _apply_index_mode_change(db, repository, changed=index_mode_changed)
+
+        if (
+            reopen_history
+            and indexes_history(index_mode_of(repository))
+            # a mode change to `full` in the same update queued its own
+            # forced catch-up run just above; a second one would only
+            # re-diff every archive
+            and not (repo_data.index_mode is not None and index_mode_changed)
+        ):
+            # An index run for the reopened archives now rather than at the
+            # hourly tick. Forced past the in-flight check: a listing the
+            # agent's chain still has queued carries no history stage and
+            # would not reach them. Best effort, like the mode catch-up.
+            try:
+                enqueue_reconcile_run(db, repository.id, force=True)
+            except Exception as e:
+                db.rollback()
+                logger.error(
+                    "Failed to queue the history index after the executor change",
+                    repo_id=repository.id,
+                    error=str(e),
+                )
         if sync_cloud_mirror_after_update:
             try:
                 _queue_initial_cloud_mirror_sync(db, repository)
@@ -4956,74 +5561,10 @@ async def delete_repository(
 
         from app.database.models import (
             RepositoryScript,
-            RestoreJob,
-            CheckJob,
-            RestoreCheckJob,
-            PruneJob,
-            CompactJob,
             ScheduledJob,
             ScheduledJobRepository,
-            BackupJob,
             ScriptExecution,
         )
-
-        # 1. Delete job records (these don't have CASCADE)
-        # Note: RestoreJob stores repository path (string), not repository_id (int)
-        restore_jobs = (
-            db.query(RestoreJob).filter(RestoreJob.repository == repository.path).all()
-        )
-        for job in restore_jobs:
-            db.delete(job)
-        if restore_jobs:
-            logger.info(
-                "Deleted restore jobs", repo_id=repo_id, count=len(restore_jobs)
-            )
-
-        check_jobs = db.query(CheckJob).filter(CheckJob.repository_id == repo_id).all()
-        for job in check_jobs:
-            db.delete(job)
-        if check_jobs:
-            logger.info("Deleted check jobs", repo_id=repo_id, count=len(check_jobs))
-
-        restore_check_jobs = (
-            db.query(RestoreCheckJob)
-            .filter(RestoreCheckJob.repository_id == repo_id)
-            .all()
-        )
-        for job in restore_check_jobs:
-            db.delete(job)
-        if restore_check_jobs:
-            logger.info(
-                "Deleted restore check jobs",
-                repo_id=repo_id,
-                count=len(restore_check_jobs),
-            )
-
-        prune_jobs = db.query(PruneJob).filter(PruneJob.repository_id == repo_id).all()
-        for job in prune_jobs:
-            db.delete(job)
-        if prune_jobs:
-            logger.info("Deleted prune jobs", repo_id=repo_id, count=len(prune_jobs))
-
-        compact_jobs = (
-            db.query(CompactJob).filter(CompactJob.repository_id == repo_id).all()
-        )
-        for job in compact_jobs:
-            db.delete(job)
-        if compact_jobs:
-            logger.info(
-                "Deleted compact jobs", repo_id=repo_id, count=len(compact_jobs)
-            )
-
-        # 2. Set repository path to NULL (preserve historical backup jobs)
-        # Note: BackupJob stores repository path (string), not repository_id (int)
-        backup_jobs = (
-            db.query(BackupJob).filter(BackupJob.repository == repository.path).all()
-        )
-        for job in backup_jobs:
-            job.repository = None
-        if backup_jobs:
-            logger.info("Unlinked backup jobs", repo_id=repo_id, count=len(backup_jobs))
 
         # 3. Handle scheduled jobs
         # Set ScheduledJob.repository_id to NULL (for single-repo schedules)
@@ -5199,65 +5740,26 @@ async def check_repository(
         except CheckFlagConflictError as exc:
             _raise_check_flag_conflict(exc)
 
-        if is_agent_executor(repository):
-            ensure_repository_admission(
-                db,
-                repository,
-                OPERATION_CHECK,
-                duplicate_error_key="backend.errors.repo.checkAlreadyRunning",
-            )
-            check_job = create_maintenance_job(
-                db,
-                CheckJob,
-                repository,
-                extra_fields={
-                    "max_duration": max_duration,
-                    "extra_flags": check_extra_flags,
-                },
-            )
-            agent_job = queue_agent_repository_operation_job(
-                db,
-                repository,
-                job_kind="repository.check",
-                operation={
-                    "max_duration": max_duration,
-                    "check_extra_flags": check_extra_flags,
-                },
-                maintenance_job_kind="check",
-                maintenance_job_id=check_job.id,
-            )
-            await dispatch_agent_job_best_effort(db, agent_job, repository_id=repo_id)
-            logger.info(
-                "Agent repository check job queued",
-                job_id=check_job.id,
-                agent_job_id=agent_job.id,
-                repository_id=repo_id,
-                user=current_user.username,
-            )
-            return {
-                "job_id": check_job.id,
-                "status": "pending",
-                "message": "backend.success.repo.checkJobStarted",
-            }
-
-        check_job = start_background_maintenance_job(
+        # The agent branch is gone: BorgRouter.check() already routes an agent
+        # repository to its node and waits, so the executor covers all three
+        # worlds (spec section 13 phase 5).
+        check_job = start_maintenance(
             db,
             repository,
-            CheckJob,
-            error_key="backend.errors.repo.checkAlreadyRunning",
-            dispatcher=partial(
-                _dispatch_router_check,
-                _router_repo_snapshot(repository),
-            ),
-            extra_fields={
+            "check",
+            trigger="manual",
+            params={
                 "max_duration": max_duration,
                 "extra_flags": check_extra_flags,
+                "scheduled_check": False,
             },
+            user_id=current_user.id,
+            duplicate_error_key="backend.errors.repo.checkAlreadyRunning",
         )
 
         logger.info(
-            "Check job created",
-            job_id=check_job.id,
+            "Check operation queued",
+            operation_id=check_job.id,
             repository_id=repo_id,
             user=current_user.username,
         )
@@ -5305,24 +5807,23 @@ async def restore_check_repository(
             repository.restore_check_paths = json.dumps([])
             repository.restore_check_full_archive = False
 
-        restore_check_job = start_background_maintenance_job(
+        restore_check_job = start_maintenance(
             db,
             repository,
-            RestoreCheckJob,
-            error_key="backend.errors.repo.restoreCheckAlreadyRunning",
-            dispatcher=lambda job: restore_check_service.execute_restore_check(
-                job.id, repository.id
-            ),
-            extra_fields={
+            "restore_check",
+            trigger="manual",
+            params={
                 "probe_paths": json.dumps(probe_paths),
                 "full_archive": full_archive,
                 "scheduled_restore_check": False,
             },
+            user_id=current_user.id,
+            duplicate_error_key="backend.errors.repo.restoreCheckAlreadyRunning",
         )
 
         logger.info(
-            "Restore check job created",
-            job_id=restore_check_job.id,
+            "Restore check operation queued",
+            operation_id=restore_check_job.id,
             repository_id=repo_id,
             user=current_user.username,
         )
@@ -5358,55 +5859,20 @@ async def compact_repository(
         repository = get_repository_with_access(
             db, current_user, repo_id, required_role="operator"
         )
-        if is_agent_executor(repository):
-            ensure_repository_admission(
-                db,
-                repository,
-                OPERATION_COMPACT,
-                duplicate_error_key="backend.errors.repo.compactAlreadyRunning",
-            )
-            compact_job = create_maintenance_job(
-                db,
-                CompactJob,
-                repository,
-                extra_fields={"scheduled_compact": False},
-            )
-            agent_job = queue_agent_repository_operation_job(
-                db,
-                repository,
-                job_kind="repository.compact",
-                maintenance_job_kind="compact",
-                maintenance_job_id=compact_job.id,
-            )
-            await dispatch_agent_job_best_effort(db, agent_job, repository_id=repo_id)
-            logger.info(
-                "Agent repository compact job queued",
-                job_id=compact_job.id,
-                agent_job_id=agent_job.id,
-                repository_id=repo_id,
-                user=current_user.username,
-            )
-            return {
-                "job_id": compact_job.id,
-                "status": "pending",
-                "message": "backend.success.repo.compactJobStarted",
-            }
 
-        compact_job = start_background_maintenance_job(
+        compact_job = start_maintenance(
             db,
             repository,
-            CompactJob,
-            error_key="backend.errors.repo.compactAlreadyRunning",
-            dispatcher=partial(
-                _dispatch_router_compact,
-                _router_repo_snapshot(repository),
-            ),
-            extra_fields={"scheduled_compact": False},
+            "compact",
+            trigger="manual",
+            params={"scheduled_compact": False},
+            user_id=current_user.id,
+            duplicate_error_key="backend.errors.repo.compactAlreadyRunning",
         )
 
         logger.info(
-            "Compact job created",
-            job_id=compact_job.id,
+            "Compact operation queued",
+            operation_id=compact_job.id,
             repository_id=repo_id,
             user=current_user.username,
         )
@@ -5437,12 +5903,6 @@ async def prune_repository(
         repository = get_repository_with_access(
             db, current_user, repo_id, required_role="operator"
         )
-        ensure_repository_admission(
-            db,
-            repository,
-            OPERATION_PRUNE,
-            duplicate_error_key="backend.errors.repo.pruneAlreadyRunning",
-        )
 
         # Extract retention policy from request
         keep_hourly = request.get("keep_hourly", 0)
@@ -5454,147 +5914,67 @@ async def prune_repository(
         keep_within = _normalize_prune_keep_within(request.get("keep_within"))
         dry_run = request.get("dry_run", False)
 
-        if is_agent_executor(repository):
-            prune_job = create_maintenance_job(
+        if not dry_run:
+            prune_job = start_maintenance(
                 db,
-                PruneJob,
                 repository,
-                extra_fields={
+                "prune",
+                trigger="manual",
+                params={
+                    "keep_hourly": keep_hourly,
+                    "keep_daily": keep_daily,
+                    "keep_weekly": keep_weekly,
+                    "keep_monthly": keep_monthly,
+                    "keep_quarterly": keep_quarterly,
+                    "keep_yearly": keep_yearly,
+                    "keep_within": keep_within,
                     "scheduled_prune": False,
                 },
+                user_id=current_user.id,
+                duplicate_error_key="backend.errors.repo.pruneAlreadyRunning",
             )
-            agent_job = queue_agent_repository_operation_job(
-                db,
-                repository,
-                job_kind="repository.prune",
-                operation=_agent_prune_operation_payload(request),
-                maintenance_job_kind="prune",
-                maintenance_job_id=prune_job.id,
-            )
-            await dispatch_agent_job_best_effort(db, agent_job, repository_id=repo_id)
             logger.info(
-                "Agent repository prune job queued",
-                job_id=prune_job.id,
-                agent_job_id=agent_job.id,
-                repository_id=repo_id,
-                dry_run=dry_run,
-                user=current_user.username,
-            )
-            if not dry_run:
-                return {
-                    "job_id": prune_job.id,
-                    "status": "pending",
-                    "message": "backend.success.repo.pruneJobStarted",
-                }
-
-            result = await wait_for_agent_repository_operation_job(db, agent_job.id)
-            db.refresh(prune_job)
-            if prune_job.status == "pending":
-                prune_job.status = "completed"
-                prune_job.completed_at = datetime.utcnow()
-                db.commit()
-                db.refresh(prune_job)
-            stdout_output = read_job_logs(
-                prune_job, fallback_to_logs=True, log_save_policy="all_jobs"
-            )
-            if not stdout_output:
-                stdout_output = str(result.get("stdout") or "")
-            return {
-                "job_id": prune_job.id,
-                "status": prune_job.status,
-                "dry_run": dry_run,
-                "prune_result": {
-                    "success": prune_job.status == "completed",
-                    "stdout": stdout_output,
-                    "stderr": prune_job.error_message
-                    or str(result.get("stderr") or ""),
-                },
-            }
-
-        if not dry_run:
-            prune_job = start_background_maintenance_job(
-                db,
-                repository,
-                PruneJob,
-                error_key="backend.errors.repo.pruneAlreadyRunning",
-                dispatcher=partial(
-                    _dispatch_router_prune,
-                    _router_repo_snapshot(repository),
-                    keep_hourly,
-                    keep_daily,
-                    keep_weekly,
-                    keep_monthly,
-                    keep_quarterly,
-                    keep_yearly,
-                    keep_within,
-                ),
-                extra_fields={"scheduled_prune": False},
-            )
-
-            logger.info(
-                "Prune job created",
-                job_id=prune_job.id,
+                "Prune operation queued",
+                operation_id=prune_job.id,
                 repository_id=repo_id,
                 user=current_user.username,
             )
-
             return {
                 "job_id": prune_job.id,
                 "status": "pending",
                 "message": "backend.success.repo.pruneJobStarted",
             }
 
-        prune_job = create_maintenance_job(
-            db,
-            PruneJob,
-            repository,
-            extra_fields={
-                "scheduled_prune": False,
-            },
-        )
+        from app.services.prune_preview import Retention, run_prune_dry_run
 
+        prune_job, stdout_output = await run_prune_dry_run(
+            db,
+            repository,
+            Retention(
+                keep_hourly=keep_hourly,
+                keep_daily=keep_daily,
+                keep_weekly=keep_weekly,
+                keep_monthly=keep_monthly,
+                keep_quarterly=keep_quarterly,
+                keep_yearly=keep_yearly,
+                keep_within=keep_within,
+            ),
+            user_id=current_user.id,
+        )
         logger.info(
-            "Starting prune job",
+            "Prune dry run finished",
             job_id=prune_job.id,
             repository_id=repo_id,
-            dry_run=dry_run,
             user=current_user.username,
         )
-
-        # Wait for prune to complete and get logs
-        prune_kwargs = {"keep_within": keep_within} if keep_within is not None else {}
-        await BorgRouter(repository).prune(
-            prune_job.id,
-            keep_hourly,
-            keep_daily,
-            keep_weekly,
-            keep_monthly,
-            keep_quarterly,
-            keep_yearly,
-            dry_run,
-            **prune_kwargs,
-        )
-
-        # Refresh job to get updated status and logs
-        db.refresh(prune_job)
-
-        # Read log file if it exists
-        stdout_output = read_job_logs(
-            prune_job, fallback_to_logs=True, log_save_policy="all_jobs"
-        )
-        stderr_output = ""
-
-        # Return results in format expected by frontend
         return {
             "job_id": prune_job.id,
             "status": prune_job.status,
-            "dry_run": dry_run,
+            "dry_run": True,
             "prune_result": {
                 "success": prune_job.status == "completed",
                 "stdout": stdout_output,
-                "stderr": stderr_output
-                if stderr_output or prune_job.error_message
-                else (prune_job.error_message or ""),
+                "stderr": prune_job.error_message or "",
             },
         }
     except HTTPException:
@@ -5656,7 +6036,7 @@ async def execute_repository_wipe(
             understood=request.understood,
             run_compact=request.run_compact,
         )
-        asyncio.create_task(repository_wipe_service.execute_wipe(job.id, repo_id))
+        # The runner dispatches it (spec 7.1); nothing is spawned here.
         return repository_wipe_service.serialize_job(job)
     except WipeArchiveSetChanged:
         raise HTTPException(
@@ -5686,15 +6066,8 @@ async def get_repository_wipe_job(
         repository = get_repository_with_access(
             db, current_user, repo_id, required_role="operator"
         )
-        job = (
-            db.query(RepositoryWipeJob)
-            .filter(
-                RepositoryWipeJob.id == job_id,
-                RepositoryWipeJob.repository_id == repository.id,
-            )
-            .first()
-        )
-        if not job:
+        job = repository_wipe_service.resolve_job_or_preview(db, repository, job_id)
+        if not job or job.repository_id != repository.id:
             raise HTTPException(
                 status_code=404,
                 detail={"key": "backend.errors.repo.wipeJobNotFound"},
@@ -5781,90 +6154,6 @@ async def get_repository_statistics(
         )
 
 
-async def check_remote_borg_installation(
-    host: str, username: str, port: int, ssh_key_id: int
-) -> Dict[str, Any]:
-    """Check if borg is installed on remote machine"""
-    temp_key_file = None
-    try:
-        logger.info(
-            "Checking remote borg installation", host=host, username=username, port=port
-        )
-
-        # Get SSH key from database
-        from app.database.models import SSHKey
-        from app.database.database import get_db
-        import tempfile
-
-        db = next(get_db())
-        ssh_key = db.query(SSHKey).filter(SSHKey.id == ssh_key_id).first()
-        if not ssh_key:
-            return {"success": False, "error": "SSH key not found", "has_borg": False}
-
-        # Decrypt private key
-        private_key = decrypt_secret(ssh_key.private_key)
-
-        # Ensure private key ends with newline
-        if not private_key.endswith("\n"):
-            private_key += "\n"
-
-        # Create temporary key file
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-            f.write(private_key)
-            temp_key_file = f.name
-
-        os.chmod(temp_key_file, 0o600)
-
-        # Check for borg
-        borg_cmd = [
-            "ssh",
-            *ssh_key_auth_args(temp_key_file),
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "ConnectTimeout=10",
-            "-p",
-            str(port),
-            f"{username}@{host}",
-            "which borg",
-        ]
-
-        borg_process = await asyncio.create_subprocess_exec(
-            *borg_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        borg_stdout, borg_stderr = await asyncio.wait_for(
-            borg_process.communicate(), timeout=15
-        )
-        has_borg = borg_process.returncode == 0
-
-        logger.info("Remote borg check completed", host=host, has_borg=has_borg)
-
-        return {
-            "success": True,
-            "has_borg": has_borg,
-            "borg_path": borg_stdout.decode().strip() if has_borg else None,
-        }
-
-    except asyncio.TimeoutError:
-        logger.error("Remote borg check timed out", host=host)
-        return {
-            "success": False,
-            "error": "Connection timeout while checking remote borg installation",
-            "has_borg": False,
-        }
-    except Exception as e:
-        logger.error(
-            "Failed to check remote borg installation", host=host, error=str(e)
-        )
-        return {"success": False, "error": str(e), "has_borg": False}
-    finally:
-        if temp_key_file and os.path.exists(temp_key_file):
-            try:
-                os.unlink(temp_key_file)
-            except Exception as e:
-                logger.warning("Failed to clean up temp SSH key", error=str(e))
-
-
 async def verify_existing_repository(
     path: str,
     passphrase: str = None,
@@ -5929,10 +6218,7 @@ async def initialize_borg_repository(
     if result.get("success"):
         result.setdefault("message", "backend.success.repo.repositoryInitialized")
         result.setdefault("already_existed", False)
-    elif (
-        result.get("return_code") == 2
-        and "repository already exists" in (result.get("stderr") or "").lower()
-    ):
+    elif is_repository_exists_failure(result):
         return {
             "success": True,
             "message": "backend.success.repo.repositoryAlreadyExists",
@@ -5941,13 +6227,15 @@ async def initialize_borg_repository(
     return result
 
 
-@router.get("/{repo_id}/archives")
+@router.get("/{repo_id}/archives/live")
 async def list_repository_archives(
     repo_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """List all archives in a repository using borg list"""
+    """List archives straight from borg. The database-backed list is
+    `GET /{repo_id}/archives` in `app/api/archive_index.py`; this route
+    stays for the Archives page until phase 4."""
 
     async def _operation():
         repository = _load_repository_with_access(repo_id, current_user, db, "viewer")
@@ -5965,6 +6253,9 @@ async def list_repository_archives(
             )
             archives_data = _parse_agent_json_result(result)
             archives = archives_data.get("archives", [])
+            archives = _normalize_archive_listing_times(
+                archives, timezone_name=agent_timezone_for_repository(db, repository)
+            )
             archives = enrich_archives_with_backup_metadata(archives, repository, db)
             logger.info(
                 "Agent repository archives listed successfully",
@@ -5987,9 +6278,12 @@ async def list_repository_archives(
         )
         router = BorgRouter(repository)
         cmd = router.build_repo_list_command(repository.path)
-        if repository.remote_path:
-            cmd.extend(["--remote-path", repository.remote_path])
-        if use_bypass_lock:
+        if remote_path := effective_repository_remote_path(repository):
+            cmd.extend(["--remote-path", remote_path])
+        # BorgRouter returns a Borg 2 command for a Borg 2 repository, and Borg 2
+        # has no --bypass-lock (see app/core/borg2.py), so the flag goes on only
+        # where it exists.
+        if use_bypass_lock and not router.is_v2:
             cmd.append("--bypass-lock")
 
         stdout = await _run_repository_command_with_retries(
@@ -6008,6 +6302,8 @@ async def list_repository_archives(
         try:
             archives_data = json.loads(stdout.decode())
             archives = archives_data.get("archives", [])
+            # The listing ran under TZ=UTC (_run_repository_command).
+            archives = _normalize_archive_listing_times(archives, timezone_name="UTC")
             archives = enrich_archives_with_backup_metadata(archives, repository, db)
 
             logger.info(
@@ -6055,7 +6351,7 @@ async def get_repository_info(
                 agent_job.id,
                 timeout_seconds=get_operation_timeouts(db)["info_timeout"],
             )
-            info_data = _parse_agent_json_result(result)
+            info_data = normalize_repo_info_encryption(_parse_agent_json_result(result))
 
             # The dialog's stats panel (the Borg 2 view in particular) is driven
             # by `archives`. Borg 2 `info --json` already carries the archive list
@@ -6071,6 +6367,10 @@ async def get_repository_info(
                 agent_job_id=agent_job.id,
                 archive_count=len(archives),
             )
+            # The card renders the stored columns; sync them from the list just
+            # fetched (Borg 2 only — the helper guards), or the dialog shows a
+            # count the card contradicts.
+            sync_archive_stats_from_info(repository, info_data, db)
             return {
                 "success": True,
                 "info": {
@@ -6087,9 +6387,12 @@ async def get_repository_info(
         )
         router = BorgRouter(repository)
         cmd = router.build_repo_info_command(repository.path)
-        if repository.remote_path:
-            cmd.extend(["--remote-path", repository.remote_path])
-        if use_bypass_lock:
+        if remote_path := effective_repository_remote_path(repository):
+            cmd.extend(["--remote-path", remote_path])
+        # BorgRouter returns a Borg 2 command for a Borg 2 repository, and Borg 2
+        # has no --bypass-lock (see app/core/borg2.py), so the flag goes on only
+        # where it exists.
+        if use_bypass_lock and not router.is_v2:
             cmd.append("--bypass-lock")
 
         stdout = await _run_repository_command_with_retries(
@@ -6106,7 +6409,7 @@ async def get_repository_info(
         )
         # Parse JSON output
         try:
-            info_data = json.loads(stdout.decode())
+            info_data = normalize_repo_info_encryption(json.loads(stdout.decode()))
 
             # Extract relevant information
             repository_info = info_data.get("repository", {})
@@ -6114,6 +6417,10 @@ async def get_repository_info(
             encryption_info = info_data.get("encryption", {})
 
             logger.info("Repository info retrieved successfully", repo_id=repo_id)
+
+            # Same sync as the agent branch above: the card renders the stored
+            # columns (Borg 2 only — the helper guards).
+            sync_archive_stats_from_info(repository, info_data, db)
 
             return {
                 "success": True,
@@ -6202,28 +6509,49 @@ async def get_repository_stats(
             "compressed_size": "Unknown",
             "deduplicated_size": "Unknown",
             "archive_count": repository.archive_count or 0,
-            "last_modified": format_datetime(repository.updated_at),
+            "last_modified": format_datetime(repository.borg_last_modified),
+            "total_size_source": repository.total_size_source,
             "encryption": repository.encryption or "Unknown",
             "executor": "agent",
         }
 
     temp_key_file = None
     try:
-        env, temp_key_file = _prepare_repository_borg_env(repository, db)
+        env, temp_key_file = _prepare_repository_borg_env(
+            repository, db, lock_wait=REQUEST_LOCK_WAIT
+        )
 
         router = BorgRouter(repository)
         cmd = router.build_repo_info_command(repository.path)
         if bypass_lock:
             cmd.append("--bypass-lock")
-        if repository.remote_path:
-            cmd.extend(["--remote-path", repository.remote_path])
-        info_result = await borg._execute_command(cmd, env=env)
+        if remote_path := effective_repository_remote_path(repository):
+            cmd.extend(["--remote-path", remote_path])
+        # machine-parsed: render timestamps in UTC (Borg 1 prints them naive)
+        info_env = dict(env or {})
+        info_env["TZ"] = "UTC"
+        info_result = await borg._execute_command(cmd, env=info_env)
 
         if not info_result["success"]:
             return {
                 "error": "Failed to get repository info",
                 "details": info_result["stderr"],
             }
+
+        # The info call just made carries Borg's own last_modified; the stored
+        # column is the fallback for a payload without one.
+        last_modified = repository.borg_last_modified
+        try:
+            payload = json.loads(info_result.get("stdout") or "{}")
+            last_modified = (
+                _parse_borg_archive_time(
+                    (payload.get("repository") or {}).get("last_modified"),
+                    timezone_name="UTC",
+                )
+                or last_modified
+            )
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            pass
 
         # Parse repository info (basic implementation)
         # In a real implementation, you would parse the borg info output
@@ -6232,7 +6560,8 @@ async def get_repository_stats(
             "compressed_size": "Unknown",
             "deduplicated_size": "Unknown",
             "archive_count": 0,
-            "last_modified": None,
+            "last_modified": format_datetime(last_modified),
+            "total_size_source": repository.total_size_source,
             "encryption": "Unknown",
         }
 
@@ -6266,10 +6595,10 @@ async def get_check_job_status(
 ):
     """Get status of a check job"""
     try:
-        job, _ = get_job_with_repository(
+        job, _ = get_maintenance_job_with_repository(
             db,
             current_user,
-            CheckJob,
+            "check",
             job_id,
             not_found_key="backend.errors.repo.checkJobNotFound",
         )
@@ -6298,7 +6627,9 @@ async def get_repository_check_jobs(
 ):
     """Get recent check jobs for a repository"""
     try:
-        jobs = get_repository_jobs(db, current_user, repo_id, CheckJob, limit=limit)
+        jobs = get_repository_maintenance_jobs(
+            db, current_user, repo_id, "check", limit=limit
+        )
         if scheduled_only:
             jobs = [job for job in jobs if bool(getattr(job, "scheduled_check", False))]
         log_save_policy = get_log_save_policy(db)
@@ -6333,10 +6664,10 @@ async def get_restore_check_job_status(
 ):
     """Get status of a restore verification job."""
     try:
-        job, _ = get_job_with_repository(
+        job, _ = get_maintenance_job_with_repository(
             db,
             current_user,
-            RestoreCheckJob,
+            "restore_check",
             job_id,
             not_found_key="backend.errors.repo.restoreCheckJobNotFound",
         )
@@ -6376,8 +6707,8 @@ async def get_repository_restore_check_jobs(
 ):
     """Get recent restore verification jobs for a repository."""
     try:
-        jobs = get_repository_jobs(
-            db, current_user, repo_id, RestoreCheckJob, limit=limit
+        jobs = get_repository_maintenance_jobs(
+            db, current_user, repo_id, "restore_check", limit=limit
         )
         log_save_policy = get_log_save_policy(db)
         return {
@@ -6423,10 +6754,10 @@ async def get_compact_job_status(
 ):
     """Get status of a compact job"""
     try:
-        job, _ = get_job_with_repository(
+        job, _ = get_maintenance_job_with_repository(
             db,
             current_user,
-            CompactJob,
+            "compact",
             job_id,
             not_found_key="backend.errors.repo.compactJobNotFound",
         )
@@ -6454,7 +6785,9 @@ async def get_repository_compact_jobs(
 ):
     """Get recent compact jobs for a repository"""
     try:
-        jobs = get_repository_jobs(db, current_user, repo_id, CompactJob, limit=limit)
+        jobs = get_repository_maintenance_jobs(
+            db, current_user, repo_id, "compact", limit=limit
+        )
         log_save_policy = get_log_save_policy(db)
         return {
             "jobs": [
@@ -6484,10 +6817,10 @@ async def get_prune_job_status(
 ):
     """Get status of a prune job"""
     try:
-        job, _ = get_job_with_repository(
+        job, _ = get_maintenance_job_with_repository(
             db,
             current_user,
-            PruneJob,
+            "prune",
             job_id,
             not_found_key="backend.errors.repo.pruneJobNotFound",
         )
@@ -6514,7 +6847,9 @@ async def get_repository_prune_jobs(
 ):
     """Get recent prune jobs for a repository"""
     try:
-        jobs = get_repository_jobs(db, current_user, repo_id, PruneJob, limit=limit)
+        jobs = get_repository_maintenance_jobs(
+            db, current_user, repo_id, "prune", limit=limit
+        )
         log_save_policy = get_log_save_policy(db)
         return {
             "jobs": [
@@ -6551,49 +6886,29 @@ async def get_running_jobs(
         # Force refresh from database to get latest values
         db.expire_all()
 
-        check_job = (
-            db.query(CheckJob)
-            .filter(
-                CheckJob.repository_id == repo_id,
-                CheckJob.status.in_(ACTIVE_MAINTENANCE_JOB_STATUSES),
-            )
-            .first()
-        )
+        # Phase 5 moved these four kinds to `operations`; nothing writes new
+        # rows to their legacy tables any more. `active_maintenance_operation`
+        # checks operations first and falls back to a legacy row a
+        # pre-phase-5 install left active, so this stays accurate either way.
+        def _job_or_legacy(kind: str):
+            job = active_maintenance_operation(db, repo_id, kind)
+            if isinstance(job, Operation):
+                return MaintenanceJobFacade(db, job)
+            return job
 
-        compact_job = (
-            db.query(CompactJob)
-            .filter(
-                CompactJob.repository_id == repo_id,
-                CompactJob.status.in_(ACTIVE_MAINTENANCE_JOB_STATUSES),
-            )
-            .first()
-        )
+        check_job = _job_or_legacy("check")
+        compact_job = _job_or_legacy("compact")
+        prune_job = _job_or_legacy("prune")
+        restore_check_job = _job_or_legacy("restore_check")
 
-        prune_job = (
-            db.query(PruneJob)
-            .filter(
-                PruneJob.repository_id == repo_id,
-                PruneJob.status.in_(ACTIVE_MAINTENANCE_JOB_STATUSES),
-            )
-            .first()
-        )
-
-        restore_check_job = (
-            db.query(RestoreCheckJob)
-            .filter(
-                RestoreCheckJob.repository_id == repo_id,
-                RestoreCheckJob.status.in_(ACTIVE_MAINTENANCE_JOB_STATUSES),
-            )
-            .first()
-        )
-
+        # Phase 6 moved wipe to `operations` too; `active_wipe_operation`
+        # checks that table first and falls back to a legacy row a pre-phase-6
+        # install left active.
+        wipe_operation = active_wipe_operation(db, repo_id)
         wipe_job = (
-            db.query(RepositoryWipeJob)
-            .filter(
-                RepositoryWipeJob.repository_id == repo_id,
-                RepositoryWipeJob.status.in_(("pending", "running")),
-            )
-            .first()
+            WipeJobFacade(db, wipe_operation)
+            if isinstance(wipe_operation, Operation)
+            else wipe_operation
         )
 
         result = {

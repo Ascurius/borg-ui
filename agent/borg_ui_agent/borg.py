@@ -30,6 +30,11 @@ def detect_platform() -> dict:
         "hostname": platform.node(),
         "os": platform.system().lower() or "unknown",
         "arch": platform.machine() or "unknown",
+        # The zone borg renders machine-parsed output in, which this agent
+        # pins to TZ=UTC (repository_ops.MACHINE_PARSED_JOB_KINDS). The server
+        # interprets naive listing timestamps with this value; agents that
+        # predate the pin report their detected machine zone instead.
+        "timezone": "UTC",
     }
 
 

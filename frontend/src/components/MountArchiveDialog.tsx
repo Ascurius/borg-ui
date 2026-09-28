@@ -13,6 +13,7 @@ import ResponsiveDialog from './shared/ResponsiveDialog'
 import { useTranslation } from 'react-i18next'
 import { HardDrive, Info } from 'lucide-react'
 import { Archive } from '../types'
+import { formatDate } from '../utils/dateUtils'
 
 interface MountArchiveDialogProps {
   open: boolean
@@ -37,11 +38,28 @@ export default function MountArchiveDialog({
   return (
     <ResponsiveDialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
       <DialogTitle>
-        <Stack direction="row" spacing={2} alignItems="center">
+        <Stack
+          direction="row"
+          spacing={2}
+          sx={{
+            alignItems: 'center',
+          }}
+        >
           <HardDrive size={24} />
           <Box>
-            <Stack direction="row" spacing={0.75} alignItems="center">
-              <Typography variant="h6" fontWeight={600}>
+            <Stack
+              direction="row"
+              spacing={0.75}
+              sx={{
+                alignItems: 'center',
+              }}
+            >
+              <Typography
+                variant="h6"
+                sx={{
+                  fontWeight: 600,
+                }}
+              >
                 {t('dialogs.mountArchive.title')}
               </Typography>
               <Tooltip title={t('dialogs.mount.readOnlyInfo')} arrow placement="top">
@@ -50,9 +68,21 @@ export default function MountArchiveDialog({
                 </Box>
               </Tooltip>
             </Stack>
-            <Typography variant="body2" color="text.secondary">
+            <Typography
+              variant="body2"
+              sx={{
+                color: 'text.secondary',
+              }}
+            >
               {archive?.name}
             </Typography>
+            {archive && (
+              // Borg 2 series archives share one name; name plus timestamp is
+              // what identifies the selected archive for the user.
+              <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                {formatDate(archive.start || archive.time)}
+              </Typography>
+            )}
           </Box>
         </Stack>
       </DialogTitle>

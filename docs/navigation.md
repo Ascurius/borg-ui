@@ -27,7 +27,7 @@ For a new setup, follow the sidebar in this order:
 | Sidebar area | Tab | Use it for |
 | --- | --- | --- |
 | Main | Dashboard | Check repository health, recent activity, backup freshness, restore-check status, and setup-gap actions for backup plans, cloud storage, remote clients, and verification. |
-| Main | Activity | Review job history, live or recent logs, failures, and completed backup, restore, check, prune, compact, script, or package work. |
+| Main | Activity | Review job history as operations: queued, running, and finished work with follow-up index steps nested under their parent, live or recent logs, and failures. |
 | Infrastructure | Remote Machines | Add SSH-connected machines for remote repositories, remote backup sources, and SSH restore destinations. |
 | Infrastructure | Remote Clients | Register other Borg UI client servers, check health and version compatibility from this server, and route selected requests to a remote client. Visible to admins; management requires Pro or Enterprise. |
 | Infrastructure | Managed Agents | Enroll and manage Borg UI agents on remote machines. |
@@ -37,6 +37,7 @@ For a new setup, follow the sidebar in this order:
 | Backups | Backup | Run older repository-based backups or legacy backup jobs. New workflows should usually start from Backup Plans. |
 | Backups | Schedule | Review scheduled repository work, scheduled restore checks, and plan schedules from one operational view. |
 | Backups | Archives | Browse archives, select files or folders, restore data, and run archive-level actions. |
+| Backups | Archive detail (`/archives/:repositoryId/:archiveId`) | Changes, Files, and Info tabs for one archive, reached from the Archives heatmap or list. |
 
 ## Settings
 
@@ -58,8 +59,10 @@ administration.
 | Tab | Use it for |
 | --- | --- |
 | Licensing | Manage license status and plan-gated capabilities. |
-| System | Configure runtime settings, backup health thresholds, timeouts, and maintenance controls. |
+| System | Configure runtime settings, backup health thresholds, timeouts, and maintenance controls. Repository Monitoring holds the Automatic prune previews switch: turn it off and Borg UI stops comparing retention policies on its own, and the Prune Preview page runs one only when you press Compare now. |
 | Monitoring & Reports | Configure backup reports, monitoring behavior, and recent activity included in reports. |
+| Background work | See how many repositories are in each background stage (connect, archive list, retention preview, file history, stats), click a stage to filter the table to its repositories, pause or resume a single stage or all of them, adjust index workers, and rebuild derived data. Retention preview reads Off while automatic prune previews are turned off. Visible to admins and operators. |
+| Repository settings, Advanced step | How much a repository indexes in the background (everything, archives only, or off) and the paths file history skips. Reached by editing a repository. |
 | MQTT | Configure MQTT and Home Assistant integration. This appears when MQTT is enabled. |
 | Cache | Configure Redis/cache behavior and clear cache entries when needed. |
 | Logs | Review log storage and cleanup controls. |

@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import datetime
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
+import structlog
 from fastapi import HTTPException, status
+from sqlalchemy import update
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import SingletonThreadPool, StaticPool
 
-from app.database.models import AgentJob, AgentMachine, BackupJob, Repository
+from app.core.borg_errors import (
+    LOCK_CONTENTION_DETAIL_KEY,
+    is_lock_contention_exit_code,
+)
+from app.database.models import AgentJob, AgentJobLog, AgentMachine, Repository
 from app.services.agent_job_dispatcher import dispatch_agent_cancel_if_connected
 from app.services.job_admission import (
     OPERATION_BACKUP,
@@ -17,10 +25,21 @@ from app.services.job_admission import (
     ignore_active_job,
     operation_for_agent_job_kind,
 )
+from app.services.operations.backup_facade import (
+    admission_ignore_for,
+    backup_job_link_columns,
+    resolve_backup_job,
+)
+from app.utils.redaction import redact_secrets
+
+logger = structlog.get_logger()
 
 EXECUTOR_SERVER = "server"
 EXECUTOR_AGENT = "agent"
-TERMINAL_AGENT_STATUSES = {"completed", "failed", "canceled"}
+# `completed_with_warnings`: the agent ran the command through and the
+# server classified its Borg warning exit code (`_complete_agent_job`).
+TERMINAL_AGENT_STATUSES = {"completed", "completed_with_warnings", "failed", "canceled"}
+SUCCESSFUL_AGENT_STATUSES = {"completed", "completed_with_warnings"}
 REPOSITORY_OPERATION_CAPABILITIES = {
     "repository.init",
     "repository.info",
@@ -31,12 +50,30 @@ REPOSITORY_OPERATION_CAPABILITIES = {
     "repository.break_lock",
     "repository.list_archive_contents",
     "repository.extract_archive_file",
+    "repository.export_archive_tar",
     "repository.restore",
     "repository.check",
     "repository.prune",
     "repository.compact",
     "repository.rclone_sync",
+    "repository.disk_usage",
+    "repository.storage_usage",
+    "repository.diff",
 }
+# Kinds whose output the server parses. The agent reports the raw JSON as
+# `stdout` and its own parse of it as `data` (its MACHINE_PARSED_JOB_KINDS;
+# the two packages share no imports, so the set is stated twice). The reader
+# takes the result once, from the wait below, and nothing reads the stored
+# copy back, so the row keeps only what still describes the run.
+MACHINE_PARSED_JOB_KINDS = frozenset(
+    {
+        "repository.info",
+        "repository.rinfo",
+        "repository.archive_info",
+        "repository.list_archives",
+    }
+)
+CONSUMED_RESULT_KEYS = ("return_code", "command", "stderr")
 
 
 def normalize_executor_type(
@@ -63,6 +100,75 @@ def repository_executor_type(repository: Repository) -> str:
 
 def is_agent_executor(repository: Repository) -> bool:
     return repository_executor_type(repository) == EXECUTOR_AGENT
+
+
+# The agent job that produces an archive's change listing for the history
+# index (agents from 0.1.6).
+AGENT_DIFF_JOB_KIND = "repository.diff"
+
+
+def agent_advertises_job(agent: Any, job_kind: str) -> bool:
+    """`agent_supports_job` on an agent row already loaded (a page's
+    machines, or the columns the query below selects)."""
+    if agent is None or agent.deleted_at is not None:
+        return False
+    if agent.status in ("disabled", "revoked", "deleted"):
+        return False
+    return isinstance(agent.capabilities, list) and job_kind in agent.capabilities
+
+
+def agent_supports_job(
+    db: Session,
+    repository: Repository,
+    job_kind: str,
+    *,
+    agents: Optional[Mapping[int, AgentMachine]] = None,
+) -> bool:
+    """True when the repository's agent advertises `job_kind`.
+
+    `agents` is a page's machines by id, loaded once (the repositories hub
+    asks per repository on every poll): rows with `capabilities`,
+    `deleted_at` and `status`; single-repository callers leave it out and
+    query.
+
+    Agents report their capabilities on hello and heartbeat, so an agent
+    from before a job kind existed answers False until it is updated; so
+    does a repository with no agent assigned, and one whose agent is
+    disabled, revoked or deleted, which the admission refuses every job
+    (`validate_agent_repository_operation`): the job it once advertised is
+    not on offer. Whether the agent is online is a question for the moment
+    the job is queued, not for this one.
+    """
+    if not repository.agent_machine_id:
+        return False
+    if agents is not None:
+        return agent_advertises_job(agents.get(repository.agent_machine_id), job_kind)
+    row = (
+        db.query(
+            AgentMachine.capabilities, AgentMachine.deleted_at, AgentMachine.status
+        )
+        .filter(AgentMachine.id == repository.agent_machine_id)
+        .one_or_none()
+    )
+    return agent_advertises_job(row, job_kind)
+
+
+def agent_timezone_for_repository(db: Session, repository: Repository) -> Optional[str]:
+    """The IANA zone the repository's agent reported, if any.
+
+    Borg renders archive times in the local zone of the process that produced
+    the listing; for an agent-executed repository that is the agent, so its
+    reported (current) zone is the one to interpret those times with. None for
+    non-agent repositories and for agents that never reported a zone.
+    """
+    if not is_agent_executor(repository) or not repository.agent_machine_id:
+        return None
+    agent = (
+        db.query(AgentMachine)
+        .filter(AgentMachine.id == repository.agent_machine_id)
+        .first()
+    )
+    return agent.timezone if agent else None
 
 
 def legacy_execution_target(
@@ -193,9 +299,14 @@ def build_agent_repository_operation_payload(
 
     operation_payload = dict(operation or {})
     if maintenance_job_kind and maintenance_job_id:
+        # Since phase 5 every maintenance job is an `operations` row. The
+        # legacy `*_jobs` ids are an independent sequence, so the table is
+        # named: a payload without it was written before the upgrade and
+        # names a legacy row.
         operation_payload["maintenance_job"] = {
             "kind": maintenance_job_kind,
             "id": maintenance_job_id,
+            "table": "operations",
         }
 
     secrets = {}
@@ -235,7 +346,11 @@ def validate_agent_backup_repository(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"key": "backend.errors.agents.agentNotFound"},
         )
-    if agent.status in ("disabled", "revoked"):
+    if agent.deleted_at is not None or agent.status in (
+        "disabled",
+        "revoked",
+        "deleted",
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"key": "backend.errors.agents.agentNotQueueable"},
@@ -285,7 +400,11 @@ def validate_agent_repository_operation(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"key": "backend.errors.agents.agentNotFound"},
         )
-    if agent.status in ("disabled", "revoked"):
+    if agent.deleted_at is not None or agent.status in (
+        "disabled",
+        "revoked",
+        "deleted",
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"key": "backend.errors.agents.agentNotQueueable"},
@@ -302,6 +421,32 @@ def validate_agent_repository_operation(
     return agent
 
 
+def _require_repository_lane(
+    db: Session, repository: Repository, maintenance_job_id: Optional[int]
+) -> None:
+    """Refuse to leave queued operations out of admission unless the caller's
+    maintenance row holds the repository lane: a running operation of an
+    exclusive kind on this repository. While it runs, no queued exclusive
+    operation of the repository can start (`lanes.lane_free`), and any other
+    queued operation that starts goes through admission itself. From
+    anywhere else a queued prune would simply stop being counted, so this
+    is a programming error and fails loudly."""
+    from app.database.models import Operation
+    from app.services.operations.vocab import is_exclusive
+
+    row = db.get(Operation, maintenance_job_id) if maintenance_job_id else None
+    if (
+        row is None
+        or row.repository_id != repository.id
+        or row.status != "running"
+        or not is_exclusive(row.kind)
+    ):
+        raise RuntimeError(
+            "ignore_queued_operations is only valid for a running exclusive "
+            "operation of the repository (the runner's repository lane)"
+        )
+
+
 def queue_agent_repository_operation_job(
     db: Session,
     repository: Repository,
@@ -310,38 +455,47 @@ def queue_agent_repository_operation_job(
     operation: Optional[dict[str, Any]] = None,
     maintenance_job_kind: Optional[str] = None,
     maintenance_job_id: Optional[int] = None,
+    ignore_queued_operations: bool = False,
 ) -> AgentJob:
+    """`ignore_queued_operations` (see `list_active_repository_work`) is only
+    valid from the runner's repository lane, and is refused anywhere else:
+    see `_require_repository_lane`."""
+    if ignore_queued_operations:
+        _require_repository_lane(db, repository, maintenance_job_id)
     agent = validate_agent_repository_operation(db, repository, job_kind=job_kind)
     operation_payload = operation
     admission_operation = operation_for_agent_job_kind(job_kind)
-    maintenance_table_by_kind = {
-        "check": "check_jobs",
-        "restore_check": "restore_check_jobs",
-        "compact": "compact_jobs",
-        "prune": "prune_jobs",
-        "delete_archive": "delete_archive_jobs",
-    }
+    # Phase 5 moved every maintenance kind to `operations`. The value is the
+    # table admission should ignore, so the row this caller just created
+    # cannot block its own admission.
     ensure_repository_admission(
         db,
         repository,
         admission_operation,
         ignore=ignore_active_job(
-            maintenance_table_by_kind.get(maintenance_job_kind or ""),
+            "operations" if maintenance_job_kind else None,
             maintenance_job_id,
         ),
+        ignore_queued_operations=ignore_queued_operations,
     )
     now = datetime.utcnow()
+    payload = build_agent_repository_operation_payload(
+        repository,
+        job_kind,
+        operation=operation_payload,
+        maintenance_job_kind=maintenance_job_kind,
+        maintenance_job_id=maintenance_job_id,
+    )
+    if ignore_queued_operations:
+        # The same caller defers a run that Borg gave up on a foreign lock:
+        # the failure report leaves its maintenance row open for that (see
+        # `lock_contention_defers`).
+        payload[LOCK_CONTENTION_DEFERS_KEY] = True
     agent_job = AgentJob(
         agent_machine_id=agent.id,
         job_type="repository",
         status="queued",
-        payload=build_agent_repository_operation_payload(
-            repository,
-            job_kind,
-            operation=operation_payload,
-            maintenance_job_kind=maintenance_job_kind,
-            maintenance_job_id=maintenance_job_id,
-        ),
+        payload=payload,
         created_at=now,
         updated_at=now,
     )
@@ -377,6 +531,307 @@ def get_agent_archive_browse_job(
     )
 
 
+# How many of a failed job's last log rows to read for its reason. Borg prints
+# a usage block before the line that says what was actually wrong, and each
+# line arrives as its own row.
+FAILURE_LOG_TAIL = 40
+
+# The agent's failure report (agent 0.1.10): the last lines Borg wrote and
+# whether a lock another process holds ended the run. Kept in the job's
+# `result` next to the return code; an older agent sends neither.
+FAILURE_KIND_LOCK_CONTENTION = "lock_contention"
+FAILURE_KIND_OTHER = "other"
+FAILURE_TAIL_MAX_CHARS = 4096
+# Payload key of an agent job whose caller defers a lock another process
+# holds (the operations runner, through the repository lane).
+LOCK_CONTENTION_DEFERS_KEY = "lock_contention_defers"
+# Result key the failure report sets when it left the linked row for the
+# next attempt. Recorded once, at failure time: the row's deferral count
+# moves on afterwards, so it cannot be asked again later.
+LOCK_FAILURE_DEFERRED_KEY = "deferred"
+# What a Borg 1 on legacy exit codes says instead of exit code 73.
+_LOCK_CONTENTION_LINE = re.compile(
+    r"Failed to create/acquire the lock .*\(timeout\)\.?\s*$"
+)
+# Borg 2 also exits 73 for a lock of its own that another borg killed:
+# not contention, and nothing a wait changes. The agent's report says
+# `other` for it; the old-agent fallback looks for the line in the log rows.
+LOCK_LOST_LINE = "Our lock was killed by another borg"
+# `--show-rc` ends Borg's output with its exit code, which is not a reason.
+_SHOW_RC_LINE = re.compile(
+    r"^terminating with (success|warning|error) status, rc -?\d+"
+)
+# Borg prints its reason first and, for some errors, a traceback after it.
+_TRACEBACK_HEADER = "Traceback (most recent call last):"
+
+
+def agent_failure_result(
+    return_code: Optional[int],
+    *,
+    stderr_tail: Optional[str] = None,
+    failure_kind: Optional[str] = None,
+) -> dict[str, Any]:
+    """The `result` a failed agent job keeps: the return code as before,
+    and the report's fields when the agent sent them. The tail is bounded
+    here too, and a kind this server does not know reads as `other`. Borg
+    names the repository in its messages, so a location with credentials
+    is redacted before the tail is kept: it reaches the operation's
+    message and the failure notifications from here."""
+    result: dict[str, Any] = {}
+    if return_code is not None:
+        result["return_code"] = return_code
+    if stderr_tail is not None:
+        # redacted first: a cut through a location could take the scheme
+        # the redaction recognises a credential by
+        result["stderr_tail"] = (redact_secrets(stderr_tail) or "")[
+            -FAILURE_TAIL_MAX_CHARS:
+        ]
+    if failure_kind is not None:
+        result["failure_kind"] = (
+            FAILURE_KIND_LOCK_CONTENTION
+            if failure_kind == FAILURE_KIND_LOCK_CONTENTION
+            else FAILURE_KIND_OTHER
+        )
+    return result
+
+
+def _failure_result(agent_job: Any) -> dict[str, Any]:
+    result = getattr(agent_job, "result", None)
+    return result if isinstance(result, dict) else {}
+
+
+def agent_failure_is_lock_contention(
+    agent_job: Any, db: Optional[Session] = None
+) -> bool:
+    """Whether the agent's Borg run ended on a lock another process holds:
+    the report's classification, or, from an agent that sent none, Borg's
+    modern exit code (the agent has asked Borg for them since #1100). The
+    log rows are not the source (they may not have arrived); with `db` they
+    only rule out a Borg 2 run that lost its own lock, which exits 73 too."""
+    result = _failure_result(agent_job)
+    failure_kind = result.get("failure_kind")
+    if failure_kind is not None:
+        return failure_kind == FAILURE_KIND_LOCK_CONTENTION
+    if not is_lock_contention_exit_code(result.get("return_code")):
+        return False
+    if db is None or getattr(agent_job, "id", None) is None:
+        return True
+    lost = (
+        db.query(AgentJobLog.id)
+        .filter(
+            AgentJobLog.agent_job_id == agent_job.id,
+            AgentJobLog.message.contains(LOCK_LOST_LINE),
+        )
+        .first()
+    )
+    return lost is None
+
+
+def lock_contention_defers(agent_job: Any, db: Optional[Session] = None) -> bool:
+    """Whether this failure is one the caller defers instead of recording:
+    a lock another process holds, on a job queued by a caller that asked
+    for it (`LOCK_CONTENTION_DEFERS_KEY`). The failure report then leaves
+    the linked maintenance row as it is; the caller's wait raises the
+    marked error and the operations runner runs the row again later -
+    unless the row's deferral budget is spent (`_fail_agent_job`)."""
+    payload = getattr(agent_job, "payload", None)
+    if (
+        not isinstance(payload, dict)
+        or payload.get(LOCK_CONTENTION_DEFERS_KEY) is not True
+    ):
+        return False
+    return agent_failure_is_lock_contention(agent_job, db)
+
+
+def lock_failure_was_deferred(agent_job: Any) -> bool:
+    """Whether this job's failure report left the linked row for another
+    attempt (see `lock_contention_defers`): its late log lines belong to no
+    operation log."""
+    return _failure_result(agent_job).get(LOCK_FAILURE_DEFERRED_KEY) is True
+
+
+def lock_contention_for_waiter(agent_job: Any, db: Session) -> bool:
+    """The mark on the waiter's error. For a job whose caller defers
+    (`LOCK_CONTENTION_DEFERS_KEY`) it is the decision the failure report
+    recorded, never taken again: the log rows may have changed since, and
+    the caller must see what the report did with the row. Any other job is
+    classified as it stands."""
+    payload = getattr(agent_job, "payload", None)
+    if isinstance(payload, dict) and payload.get(LOCK_CONTENTION_DEFERS_KEY) is True:
+        return lock_failure_was_deferred(agent_job)
+    return agent_failure_is_lock_contention(agent_job, db)
+
+
+def _tail_reason_line(tail: str, *, lock_contention: bool) -> Optional[str]:
+    """The reason line from the report's tail: the lock line when the run
+    ended on a lock (Borg may go on after it), else the last non-empty
+    line - Borg ends with the sentence that says what was wrong, after any
+    usage block - skipping the `--show-rc` status line, which only repeats
+    the exit code. An error Borg follows with a traceback (and its platform
+    block) is the line before the traceback."""
+    lines = [
+        line.strip()
+        for line in tail.splitlines()
+        if line.strip() and not _SHOW_RC_LINE.match(line.strip())
+    ]
+    if not lines:
+        return None
+    if lock_contention:
+        for line in reversed(lines):
+            if _LOCK_CONTENTION_LINE.search(line):
+                return line
+    if _TRACEBACK_HEADER in lines:
+        before = lines[: lines.index(_TRACEBACK_HEADER)]
+        if before:
+            return before[-1]
+    return lines[-1]
+
+
+def _log_reason_line(rows: list, *, stream: Optional[str]) -> Optional[str]:
+    """The reason line from the job's newest log row on `stream` (any stream
+    when it is None), given `rows` ordered newest first.
+
+    A row's first non-empty line is the reason: borg leads with the human
+    sentence and follows it with a traceback.
+
+    Sequence 0 is the agent's own "Starting <kind>: <command>" preamble, never
+    a reason - it is what the job was about to run, not why it stopped.
+    """
+    for sequence, row_stream, message in rows:
+        if sequence == 0 or (stream is not None and row_stream != stream):
+            continue
+        lines = [line.strip() for line in (message or "").splitlines() if line.strip()]
+        if lines:
+            return lines[0]
+    return None
+
+
+def _agent_job_failure_message(db: Session, agent_job: AgentJob) -> Optional[str]:
+    """The agent reports "exited with code N" and, since 0.1.10, the tail of
+    what borg wrote; borg's actual reason is taken from that tail.
+
+    An older agent sends no tail, and its reason is in the job log - read
+    back here, though the log line may not have arrived yet (the report and
+    the log travel separately). Prefer stderr, but fall back to stdout: borg
+    prints an argument error ("invalid choice: ...") on stdout, and reporting
+    only the exit code there leaves the operator with nothing to act on.
+    """
+    tail = _failure_result(agent_job).get("stderr_tail")
+    if isinstance(tail, str) and tail.strip():
+        reason = _tail_reason_line(
+            tail, lock_contention=agent_failure_is_lock_contention(agent_job, db)
+        )
+    else:
+        rows = (
+            db.query(AgentJobLog.sequence, AgentJobLog.stream, AgentJobLog.message)
+            .filter(AgentJobLog.agent_job_id == agent_job.id)
+            .order_by(AgentJobLog.sequence.desc())
+            .limit(FAILURE_LOG_TAIL)
+            .all()
+        )
+        reason = _log_reason_line(rows, stream="stderr") or _log_reason_line(
+            rows, stream=None
+        )
+    # Redacted as a whole: the log rows of an older agent are raw, and the
+    # message reaches the operation row and the notifications.
+    if not reason:
+        return redact_secrets(agent_job.error_message)
+    if not agent_job.error_message:
+        return redact_secrets(reason)
+    return redact_secrets(f"{agent_job.error_message}: {reason}")
+
+
+def agent_operation_failed_detail(
+    reason: Optional[str], *, lock_contention: bool = False
+) -> dict[str, Any]:
+    """The error detail for a failed agent repository operation.
+
+    The reason belongs in `params`, not in a `message` key: the frontend renders
+    a detail by translating its key with its params and drops every other field,
+    so a `message` never reaches the operator - which is how borg's actual
+    complaint used to surface as a bare "The agent repository operation failed".
+
+    `lock_contention` marks the detail for the operations runner, which
+    defers the operation on it (`repository_busy`); a route's answer keeps
+    its status and key, the frontend does not read the mark.
+    """
+    reason = (reason or "").strip()
+    if not reason:
+        detail: dict[str, Any] = {
+            "key": "backend.errors.agents.repositoryOperationFailed"
+        }
+    else:
+        detail = {
+            "key": "backend.errors.agents.repositoryOperationFailedWithReason",
+            "params": {"reason": reason},
+        }
+    if lock_contention:
+        detail[LOCK_CONTENTION_DETAIL_KEY] = True
+    return detail
+
+
+def lock_contention_error(reason: Optional[str]) -> HTTPException:
+    """The waiter's error for an agent run that ended on a lock another
+    process holds, for a reader that learns of the failure another way."""
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=agent_operation_failed_detail(reason, lock_contention=True),
+    )
+
+
+def is_machine_parsed_job(agent_job: AgentJob) -> bool:
+    payload = agent_job.payload if isinstance(agent_job.payload, dict) else {}
+    return payload.get("job_kind") in MACHINE_PARSED_JOB_KINDS
+
+
+def consumed_result(result: Any) -> dict[str, Any]:
+    """A machine-parsed result as the row keeps it once its reader has it:
+    `stdout` and `data` (the same output twice) are gone, the rest stays."""
+    if not isinstance(result, dict):
+        return {}
+    return {key: result[key] for key in CONSUMED_RESULT_KEYS if key in result}
+
+
+def drop_consumed_agent_job_output(db: Session, agent_job: AgentJob) -> None:
+    """Reduce a machine-parsed job's stored result once the wait handed it over.
+
+    A listing is the largest thing a repository job row holds and every reader
+    keeps its own copy, yet the row kept the full one until the job fell out
+    of retention. The write goes through a session of its own on the caller's
+    engine: the caller's transaction is neither committed nor rolled back by
+    it, and the caller's copy of the result is untouched. A pool that hands
+    every session the same connection (in-memory SQLite) cannot give the
+    write a transaction of its own, so the row is left to the retention pass
+    there. Best effort, like the browse route's drop of a consumed contents
+    listing: a failed write is logged, and the retention pass reduces what is
+    left behind.
+    """
+    result = agent_job.result
+    if not is_machine_parsed_job(agent_job) or not isinstance(result, dict):
+        return
+    if "stdout" not in result and "data" not in result:
+        return
+    engine = db.get_bind()
+    if isinstance(engine.pool, (SingletonThreadPool, StaticPool)):
+        return
+    agent_job_id = agent_job.id
+    try:
+        with Session(bind=engine) as own:
+            own.execute(
+                update(AgentJob)
+                .where(AgentJob.id == agent_job_id)
+                .values(result=consumed_result(result))
+            )
+            own.commit()
+    except Exception as exc:
+        # the exception text can carry the bound parameters, stderr included
+        logger.warning(
+            "consumed agent job result could not be reduced",
+            agent_job_id=agent_job_id,
+            error_type=type(exc).__name__,
+        )
+
+
 async def wait_for_agent_repository_operation_job(
     db: Session,
     agent_job_id: int,
@@ -393,15 +848,18 @@ async def wait_for_agent_repository_operation_job(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"key": "backend.errors.agents.jobNotFound"},
             )
-        if agent_job.status == "completed":
-            return agent_job.result or {}
+        if agent_job.status in SUCCESSFUL_AGENT_STATUSES:
+            # The caller gets the full result; the row keeps the small part.
+            result = agent_job.result or {}
+            drop_consumed_agent_job_output(db, agent_job)
+            return result
         if agent_job.status in TERMINAL_AGENT_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail={
-                    "key": "backend.errors.agents.repositoryOperationFailed",
-                    "message": agent_job.error_message,
-                },
+                detail=agent_operation_failed_detail(
+                    _agent_job_failure_message(db, agent_job),
+                    lock_contention=lock_contention_for_waiter(agent_job, db),
+                ),
             )
         await asyncio.sleep(poll_interval_seconds)
 
@@ -411,9 +869,16 @@ async def wait_for_agent_repository_operation_job(
     )
 
 
+# `agent_jobs.job_type` of the row that carries a backup to its agent. Named
+# once: the writers set it and `get_agent_job_for_backup` reads it, and a
+# mismatch between them fails silently — the cancel route would find no job
+# and refuse, the log endpoints would serve nothing.
+BACKUP_AGENT_JOB_TYPE = "backup"
+
+
 def queue_agent_backup_job(
     db: Session,
-    backup_job: BackupJob,
+    backup_job,
     repository: Repository,
     *,
     archive_name: Optional[str] = None,
@@ -434,7 +899,7 @@ def queue_agent_backup_job(
         db,
         repository,
         OPERATION_BACKUP,
-        ignore=ignore_active_job(BackupJob.__tablename__, backup_job.id),
+        ignore=admission_ignore_for(backup_job),
     )
 
     archive_name = archive_name or (
@@ -446,8 +911,7 @@ def queue_agent_backup_job(
     now = datetime.utcnow()
     agent_job = AgentJob(
         agent_machine_id=agent.id,
-        backup_job_id=backup_job.id,
-        job_type="backup",
+        job_type=BACKUP_AGENT_JOB_TYPE,
         status="queued",
         payload=build_agent_backup_payload(
             repository,
@@ -460,6 +924,7 @@ def queue_agent_backup_job(
         ),
         created_at=now,
         updated_at=now,
+        **backup_job_link_columns(db, backup_job.id),
     )
     db.add(agent_job)
     db.commit()
@@ -490,7 +955,11 @@ def build_agent_script_payload(
 
 def validate_agent_script(agent: AgentMachine) -> None:
     """Ensure the agent is queueable and advertises the ``script.run`` capability."""
-    if agent.status in ("disabled", "revoked"):
+    if agent.deleted_at is not None or agent.status in (
+        "disabled",
+        "revoked",
+        "deleted",
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"key": "backend.errors.agents.agentNotQueueable"},
@@ -511,15 +980,23 @@ def queue_agent_script_job(
     *,
     script_name: str,
     env: Optional[dict[str, str]] = None,
-    backup_job_id: Optional[int] = None,
 ) -> AgentJob:
     """Enqueue a ``script.run`` job for a resolved agent. Not a borg operation, so
-    it carries no repository admission — it wraps a plan run, not the borg call."""
+    it carries no repository admission — it wraps a plan run, not the borg call.
+
+    It carries no backup link either. `agent_jobs` has one link column,
+    `operation_id`, and every reader of it — the agent's own reports, the
+    reaper, the cancel path — takes the row it points at to *be* that
+    operation's transport job: a script row wearing the same link would
+    fail a finished backup, overwrite its log and be cancelled in its
+    place. What ties a hook to the run it belongs to is its
+    `script_executions` row, through the plan run and the `agent_job_id`
+    the caller writes back onto it.
+    """
     validate_agent_script(agent)
     now = datetime.utcnow()
     agent_job = AgentJob(
         agent_machine_id=agent.id,
-        backup_job_id=backup_job_id,
         job_type="script",
         status="queued",
         payload=build_agent_script_payload(script_name, env),
@@ -601,19 +1078,121 @@ async def wait_for_agent_script_job(
         await asyncio.sleep(poll_interval_seconds)
 
 
-def get_agent_job_for_backup(db: Session, backup_job_id: int) -> Optional[AgentJob]:
+def get_agent_job_for_backup(db: Session, backup_job: Any) -> Optional[AgentJob]:
+    """The transport job that carries a backup to its agent.
+
+    `agent_jobs` has one link column, so the lookup names the kind it wants
+    rather than trusting the link alone: the caller cancels this job, reads
+    its logs and decides the backup's fate from its status, none of which
+    may land on a row that merely belongs to the same run.
+    """
     return (
         db.query(AgentJob)
-        .filter(AgentJob.backup_job_id == backup_job_id)
+        .filter(
+            AgentJob.operation_id == backup_job.id,
+            AgentJob.job_type == BACKUP_AGENT_JOB_TYPE,
+        )
         .order_by(AgentJob.id.desc())
         .first()
     )
 
 
+# A job moves queued -> claimed -> running -> terminal, so two lost races are
+# the most a live job can cost; the bound only guards against a pathological
+# writer flipping the row back and forth.
+ABANDON_ATTEMPTS = 4
+
+
+def abandon_agent_repository_operation_job(
+    db: Session, agent_job_id: int, *, now: Optional[datetime] = None
+) -> Optional[AgentJob]:
+    """Take a repository job the caller stopped waiting for out of the
+    admission's way.
+
+    A job nobody claimed is cancelled outright: the reaper only reaps
+    in-flight jobs, so a queued job of an unresponsive agent would count as
+    active work for every later request on the repository until the agent
+    reconnects and runs the stale job. A claimed or running job gets
+    cancel_requested and the agent ends it. Terminal jobs are left alone.
+    Returns the job, or None when it no longer exists.
+    """
+    agent_job = db.query(AgentJob).filter(AgentJob.id == agent_job_id).first()
+    if agent_job is None:
+        return None
+    now = now or datetime.utcnow()
+    # Conditional on the status just read, and retried while the job is
+    # still live: the agent's reports land concurrently. A completion must
+    # not turn back into cancel_requested (admission counts that as
+    # active); a claim or start between read and write must still get the
+    # cancel, so a lost race re-reads and writes for the new state.
+    for _ in range(ABANDON_ATTEMPTS):
+        observed = agent_job.status
+        if observed == "queued":
+            values = {
+                "status": "canceled",
+                "completed_at": now,
+                "error_message": (
+                    "Abandoned by server: the agent did not pick the job up in time"
+                ),
+                "updated_at": now,
+            }
+        elif observed in ("claimed", "running"):
+            values = {"status": "cancel_requested", "updated_at": now}
+        else:
+            return agent_job
+        changed = (
+            db.query(AgentJob)
+            .filter(AgentJob.id == agent_job.id, AgentJob.status == observed)
+            .update(values, synchronize_session=False)
+        )
+        db.commit()
+        db.refresh(agent_job)
+        if changed:
+            return agent_job
+    return agent_job
+
+
+def cancel_unclaimed_agent_repository_job(db: Session, agent_job_id: int) -> None:
+    """Cancel a repository job the caller stopped waiting for (a 504 from the
+    wait) if no agent has taken it yet.
+
+    Left queued, the job is the duplicate every later request on the
+    repository is refused for, with no bound: the reaper never reaps a
+    queued job. A job the agent claimed or runs is left alone: the work is
+    the agent's (a long `borg info` cache build outlives the server's
+    patience and warms the next attempt), and if the agent is gone the
+    reaper reaps the job after its window. Never raises: the callers hold no
+    pending session state at this point, so a failed commit is rolled back
+    and logged, and the caller leaves with the timeout it came with."""
+    now = datetime.utcnow()
+    try:
+        db.query(AgentJob).filter(
+            AgentJob.id == agent_job_id, AgentJob.status == "queued"
+        ).update(
+            {
+                "status": "canceled",
+                "completed_at": now,
+                "error_message": (
+                    "Abandoned by server: the agent did not pick the job up in time"
+                ),
+                "updated_at": now,
+            },
+            synchronize_session=False,
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "agent job could not be cancelled",
+            agent_job_id=agent_job_id,
+            error=str(exc),
+        )
+
+
 def cancel_agent_backup_job(
-    db: Session, backup_job: BackupJob, *, now: Optional[datetime] = None
+    db: Session, backup_job, *, now: Optional[datetime] = None
 ) -> tuple[AgentJob, bool]:
-    agent_job = get_agent_job_for_backup(db, backup_job.id)
+    agent_job = get_agent_job_for_backup(db, backup_job)
     if not agent_job:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -649,7 +1228,7 @@ async def wait_for_agent_backup_job(
     while True:
         db.expire_all()
         agent_job = db.query(AgentJob).filter(AgentJob.id == agent_job_id).first()
-        backup_job = db.query(BackupJob).filter(BackupJob.id == backup_job_id).first()
+        backup_job = resolve_backup_job(db, backup_job_id)
         if not agent_job or not backup_job:
             return "failed"
 

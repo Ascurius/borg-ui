@@ -7,13 +7,14 @@ Provides unified mount management for:
 """
 
 import asyncio
+import functools
 import os
 import subprocess
 import tempfile
-import shutil
 import uuid
 import platform
 import json
+import shlex
 from datetime import datetime, timezone
 from enum import Enum
 from dataclasses import dataclass, asdict
@@ -26,13 +27,66 @@ from cryptography.fernet import Fernet
 
 from app.config import settings
 from app.core.borg_router import BorgRouter
+from app.utils.borg_env import (
+    effective_repository_remote_path,
+    get_standard_ssh_opts,
+    REQUEST_LOCK_WAIT,
+    with_lock_wait,
+)
+from app.utils.fs import active_mount_points, remove_tree_without_crossing_mounts
 from app.core.security import decrypt_secret
 from app.database.database import SessionLocal
 from app.database.models import SSHConnection, SSHKey, Repository, SystemSettings
-from app.utils.borg_env import get_standard_ssh_opts
+from app.utils.ssh_host_keys import host_key_ssh_opts
+from app.utils.ssh_utils import (
+    resolve_repo_ssh_key_file,
+    resolve_repository_ssh_connection,
+)
 from app.utils.ssh_utils import ssh_key_auth_args, sshfs_key_auth_options
 
 logger = structlog.get_logger()
+
+# Ubuntu 25.04+ ships an enforced AppArmor profile on the setuid fusermount3
+# binary that only permits FUSE mount targets under a handful of roots (/tmp/**/
+# among them). Mounting under DATA_DIR is denied there with "failed mntpnt match",
+# so the SSHFS cache lives under /tmp. The path stays stable per repository, which
+# is what the borg files cache needs (see #681).
+SSHFS_CACHE_BASE = "/tmp/borg-ui/sshfs-cache"
+
+
+def stable_sshfs_temp_root(repository_id: int | None) -> str | None:
+    """Per-repository SSHFS mount root, stable across runs."""
+    if repository_id is None:
+        return None
+    return os.path.join(SSHFS_CACHE_BASE, f"repository-{repository_id}")
+
+
+def _ensure_sshfs_cache_root(temp_root: str) -> None:
+    """Create the SSHFS cache root, rejecting hijacked path components.
+
+    /tmp is world-writable, so a local user could otherwise pre-create
+    /tmp/borg-ui as a symlink and redirect the mount elsewhere (CWE-59).
+    A residual TOCTOU race remains for an attacker already running inside
+    the container; closing it needs an O_NOFOLLOW dirfd walk.
+    """
+    path = Path(temp_root)
+    base = Path(SSHFS_CACHE_BASE)
+    if base not in path.parents:
+        os.makedirs(temp_root, exist_ok=True)
+        return
+
+    for component in (base.parent, base, path):
+        if component.is_symlink():
+            raise Exception(
+                f"Refusing to use SSHFS cache path reached via symlink: {component}"
+            )
+        component.mkdir(mode=0o700, exist_ok=True)
+        component.chmod(0o700)
+        if component.stat().st_uid != os.geteuid():
+            raise Exception(
+                f"Refusing to use SSHFS cache path owned by another user: {component}"
+            )
+
 
 NO_FUSE_SUPPORT_MARKERS = (
     "no fuse support",
@@ -84,8 +138,21 @@ def _sshfs_symlink_options(preserve_symlinks: bool) -> list[str]:
     choice for interactive browsing, not a fidelity path — via ``preserve_symlinks=False``.
     """
     if preserve_symlinks:
-        return ["-o", "no_contain_symlinks"]
+        # sshfs builds without the contain_symlinks patch (Ubuntu 24.04's 3.7.3)
+        # have no sandbox to disable and reject the unknown option outright.
+        return ["-o", "no_contain_symlinks"] if _sshfs_has_contain_symlinks() else []
     return ["-o", "follow_symlinks"]
+
+
+@functools.lru_cache(maxsize=1)
+def _sshfs_has_contain_symlinks() -> bool:
+    try:
+        result = subprocess.run(
+            ["sshfs", "-h"], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return "no_contain_symlinks" in result.stdout + result.stderr
 
 
 def _sshfs_missing_remote_path(error_message: str) -> bool:
@@ -109,6 +176,43 @@ def _sshfs_login_relative_candidate(
 
     relative_path = normalized.lstrip("/")
     return relative_path or None
+
+
+async def _communicate_or_kill(
+    process: asyncio.subprocess.Process,
+    *,
+    timeout: float,
+    input: Optional[bytes] = None,
+) -> Tuple[bytes, bytes]:
+    """`communicate` with a deadline that also ends the child.
+
+    `wait_for` only cancels the wait: a hung ssh or sftp would otherwise
+    outlive the check that started it, on a timeout as on a cancellation.
+    """
+    try:
+        return await asyncio.wait_for(process.communicate(input=input), timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await asyncio.shield(process.wait())
+        raise
+
+
+def _sftp_quote(path: str) -> str:
+    """Escape a path for an sftp batch command.
+
+    sftp splits its command line itself and `ls` globs. Inside double quotes
+    it keeps a backslash in front of a glob character, so the only literal
+    form is unquoted with every space, quote, backslash and glob character
+    backslash-escaped (checked against OpenSSH's sftp).
+    """
+    return "".join(f"\\{ch}" if ch in _SFTP_SPECIAL else ch for ch in path)
+
+
+_SFTP_SPECIAL = frozenset(" \t\"'\\*?[]")
 
 
 class MountType(Enum):
@@ -209,16 +313,21 @@ class MountService:
         try:
             import glob
 
-            # Find all legacy /tmp roots and repository-stable cache roots.
+            # Legacy /tmp roots, the current cache root, and the DATA_DIR root
+            # used before the move to /tmp (kept so upgrades leave nothing behind).
+            stable_cache_parents = [
+                Path(SSHFS_CACHE_BASE),
+                Path(settings.data_dir) / "sshfs-cache",
+            ]
             temp_dirs = list(
                 dict.fromkeys(
                     [
                         *glob.glob("/tmp/sshfs_mount_*"),
-                        *glob.glob(
-                            str(
-                                Path(settings.data_dir) / "sshfs-cache" / "repository-*"
-                            )
-                        ),
+                        *[
+                            path
+                            for parent in stable_cache_parents
+                            for path in glob.glob(str(parent / "repository-*"))
+                        ],
                     ]
                 )
             )
@@ -229,60 +338,23 @@ class MountService:
                 if mount_info.temp_root:
                     tracked_temp_roots.add(mount_info.temp_root)
 
-            active_mount_points = self._get_active_mount_points()
-            stable_cache_parent = Path(settings.data_dir) / "sshfs-cache"
-
-            def is_stable_cache_root(temp_dir: str) -> bool:
-                temp_path = Path(temp_dir)
-                return (
-                    temp_path.parent == stable_cache_parent
-                    and temp_path.name.startswith("repository-")
-                )
-
-            def has_active_mount_inside(temp_dir: str) -> bool:
-                if active_mount_points is None:
-                    return False
-                temp_path = Path(temp_dir).resolve()
-                for mount_point in active_mount_points:
-                    try:
-                        mount_path = Path(mount_point).resolve()
-                    except OSError:
-                        mount_path = Path(mount_point)
-                    if mount_path == temp_path or mount_path.is_relative_to(temp_path):
-                        return True
-                return False
-
-            # Remove orphaned directories
+            # Remove orphaned directories. The guard refuses any root that still
+            # has something mounted inside it.
             orphaned_count = 0
             for temp_dir in temp_dirs:
-                if temp_dir not in tracked_temp_roots:
-                    if is_stable_cache_root(temp_dir) and active_mount_points is None:
-                        logger.debug(
-                            "Skipping stable SSHFS cache root cleanup without mount table",
-                            temp_dir=temp_dir,
-                        )
+                if temp_dir in tracked_temp_roots:
+                    continue
+                # /tmp is shared: never sweep a matching path another user made.
+                try:
+                    if os.lstat(temp_dir).st_uid != os.geteuid():
                         continue
-                    if is_stable_cache_root(temp_dir) and has_active_mount_inside(
-                        temp_dir
-                    ):
-                        logger.debug(
-                            "Skipping mounted stable SSHFS cache root cleanup",
-                            temp_dir=temp_dir,
-                        )
-                        continue
-                    try:
-                        # Check if directory is empty or can be safely removed
-                        shutil.rmtree(temp_dir, ignore_errors=True)
-                        orphaned_count += 1
-                        logger.debug(
-                            "Cleaned up orphaned temp directory", temp_dir=temp_dir
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to cleanup orphaned temp directory",
-                            temp_dir=temp_dir,
-                            error=str(e),
-                        )
+                except OSError:
+                    continue
+                if remove_tree_without_crossing_mounts(temp_dir):
+                    orphaned_count += 1
+                    logger.debug(
+                        "Cleaned up orphaned temp directory", temp_dir=temp_dir
+                    )
 
             if orphaned_count > 0:
                 logger.info(
@@ -333,24 +405,25 @@ class MountService:
 
     def _get_active_mount_points(self) -> Optional[set[str]]:
         """Return active system mount points, or None if they cannot be listed."""
-        result = subprocess.run(["mount"], capture_output=True, text=True, timeout=5)
+        return active_mount_points()
 
-        if result.returncode != 0:
-            logger.warning("Failed to list system mounts for cleanup")
-            return None
+    def _is_mount_point_occupied(self, mount_point: str) -> bool:
+        """Return whether a mount target is active in the system or service state."""
+        normalized_mount_point = os.path.normpath(mount_point)
+        active_mount_points = self._get_active_mount_points()
+        if active_mount_points is not None and normalized_mount_point in {
+            os.path.normpath(active_mount_point)
+            for active_mount_point in active_mount_points
+        }:
+            return True
 
-        active_mount_points = set()
-        for line in result.stdout.split("\n"):
-            parts = line.split()
-            if len(parts) >= 3 and "on" in parts:
-                try:
-                    on_index = parts.index("on")
-                    if on_index + 1 < len(parts):
-                        active_mount_points.add(parts[on_index + 1])
-                except Exception:
-                    continue
+        if os.path.ismount(normalized_mount_point):
+            return True
 
-        return active_mount_points
+        return any(
+            os.path.normpath(mount_info.mount_point) == normalized_mount_point
+            for mount_info in self.active_mounts.values()
+        )
 
     def _cleanup_managed_mount_dir(self, mount_point: Optional[str]):
         """Remove an empty directory only when it lives under the managed mount base."""
@@ -621,7 +694,7 @@ class MountService:
             if temp_root is None:
                 temp_root = tempfile.mkdtemp(prefix=f"sshfs_mount_{job_id or 'user'}_")
             else:
-                os.makedirs(temp_root, exist_ok=True)
+                _ensure_sshfs_cache_root(temp_root)
 
             logger.info(
                 "Mounting multiple SSH paths under shared temp root",
@@ -911,6 +984,7 @@ class MountService:
         repository_id: int,
         archive_name: Optional[str] = None,
         mount_point: Optional[str] = None,
+        archive_id: Optional[str] = None,
     ) -> Tuple[str, str]:
         """
         Mount a Borg repository or specific archive for browsing
@@ -919,6 +993,9 @@ class MountService:
             repository_id: Repository ID to mount
             archive_name: Optional specific archive name (None = mount entire repo)
             mount_point: Optional custom mount point (must be validated)
+            archive_id: Borg 2 archive id for series disambiguation - archives
+                in a series share one name and only the id addresses exactly
+                one of them
 
         Returns:
             Tuple of (mount_point, mount_id)
@@ -950,24 +1027,24 @@ class MountService:
                 if not mount_point.startswith("/"):
                     mount_point = str(self.mount_base_dir / mount_point)
                 else:
+                    mount_point = os.path.normpath(mount_point)
                     # Absolute path provided - validate it
                     self._validate_mount_point(mount_point)
 
-                # If directory exists and is not empty, it's likely stale - clean it first
+                # Reuse empty directories, but never displace an existing mount (or
+                # obscure user data) at an explicit target. Match the auto-path
+                # behavior by allocating a unique sibling directory instead.
                 if os.path.exists(mount_point):
-                    if os.path.isdir(mount_point) and not os.listdir(mount_point):
+                    if (
+                        os.path.isdir(mount_point)
+                        and not os.listdir(mount_point)
+                        and not self._is_mount_point_occupied(mount_point)
+                    ):
                         # Empty directory, reuse it
                         pass
-                    elif os.path.isdir(mount_point):
-                        # Directory exists with content - might be old mount, try to unmount
-                        try:
-                            subprocess.run(
-                                ["fusermount", "-uz", mount_point],
-                                capture_output=True,
-                                timeout=5,
-                            )
-                        except:
-                            pass
+                    else:
+                        mount_point = f"{mount_point}_{uuid.uuid4().hex[:8]}"
+                        os.makedirs(mount_point, exist_ok=True)
                 else:
                     os.makedirs(mount_point, exist_ok=True)
             else:
@@ -998,6 +1075,7 @@ class MountService:
             try:
                 # Build borg mount command
                 env = os.environ.copy()
+                env["BORG_LOCK_WAIT"] = REQUEST_LOCK_WAIT
 
                 logger.info(
                     "Repository details",
@@ -1007,70 +1085,22 @@ class MountService:
                 )
 
                 # Handle SSH repositories
-                if repository.connection_id:
-                    # Always disable strict host key checking for SSH repos
-                    ssh_opts = get_standard_ssh_opts()
-
-                    if repository.connection_id:
-                        # Repository linked to SSH connection
-                        connection = (
-                            db.query(SSHConnection)
-                            .filter(SSHConnection.id == repository.connection_id)
-                            .first()
-                        )
-
-                        logger.info(
-                            "SSH connection details",
-                            mount_id=mount_id,
-                            connection_found=bool(connection),
-                            connection_id=repository.connection_id,
-                            ssh_key_id=connection.ssh_key_id if connection else None,
-                        )
-
-                        if connection and connection.ssh_key_id:
-                            ssh_key = (
-                                db.query(SSHKey)
-                                .filter(SSHKey.id == connection.ssh_key_id)
-                                .first()
-                            )
-
-                            if ssh_key:
-                                # Decrypt SSH key
-                                temp_key_file = self._decrypt_and_write_key(ssh_key)
-                                # Set BORG_RSH with key and SSH options
-                                key_ssh_opts = get_standard_ssh_opts(
-                                    include_key_path=temp_key_file
-                                )
-                                env["BORG_RSH"] = f"ssh {' '.join(key_ssh_opts)}"
-                                logger.info(
-                                    "Set BORG_RSH with key",
-                                    mount_id=mount_id,
-                                    borg_rsh=env["BORG_RSH"],
-                                )
-                            else:
-                                # No key found, use SSH options only
-                                env["BORG_RSH"] = f"ssh {' '.join(ssh_opts)}"
-                                logger.info(
-                                    "Set BORG_RSH without key (key not found)",
-                                    mount_id=mount_id,
-                                    borg_rsh=env["BORG_RSH"],
-                                )
-                        else:
-                            # No key configured or connection not found
-                            env["BORG_RSH"] = f"ssh {' '.join(ssh_opts)}"
-                            logger.info(
-                                "Set BORG_RSH without key (no connection or key)",
-                                mount_id=mount_id,
-                                borg_rsh=env["BORG_RSH"],
-                            )
-                    else:
-                        # SSH repository without connection_id (embedded SSH URL)
-                        env["BORG_RSH"] = f"ssh {' '.join(ssh_opts)}"
-                        logger.info(
-                            "Set BORG_RSH for SSH repo without connection",
-                            mount_id=mount_id,
-                            borg_rsh=env["BORG_RSH"],
-                        )
+                connection = resolve_repository_ssh_connection(repository, db)
+                if connection:
+                    temp_key_file = resolve_repo_ssh_key_file(repository, db)
+                    ssh_opts = get_standard_ssh_opts(
+                        include_key_path=temp_key_file,
+                        connection=connection,
+                        db=db,
+                    )
+                    env["BORG_RSH"] = f"ssh {' '.join(ssh_opts)}"
+                    logger.info(
+                        "Set BORG_RSH for repository connection",
+                        mount_id=mount_id,
+                        connection_id=connection.id,
+                        has_ssh_key=bool(temp_key_file),
+                        borg_rsh=env["BORG_RSH"],
+                    )
                 else:
                     logger.info("Not an SSH repository", mount_id=mount_id)
 
@@ -1078,11 +1108,23 @@ class MountService:
                 if repository.passphrase:
                     env["BORG_PASSPHRASE"] = repository.passphrase
 
+                # Borg 2 archives in a series share one name; `-a <name>`
+                # matches and mounts every archive of the series as its own
+                # subdirectory. Address by aid: whenever a Borg 2 id is
+                # present - the selector pattern extract and restore checks
+                # use - including an id-only request, which must still mount
+                # exactly that archive rather than falling back to the whole
+                # repository. The human-readable name stays on mount point,
+                # source label and logs.
+                archive_selector = archive_name
+                if archive_id and (repository.borg_version or 1) == 2:
+                    archive_selector = f"aid:{archive_id}"
+
                 cmd = BorgRouter(repository).build_mount_command(
                     repository_path=repository.path,
-                    archive_name=archive_name,
+                    archive_name=archive_selector,
                     mount_point=mount_point,
-                    remote_path=repository.remote_path,
+                    remote_path=effective_repository_remote_path(repository, db),
                     bypass_lock=repository.bypass_lock,
                 )
 
@@ -1100,7 +1142,7 @@ class MountService:
                 # Execute mount in foreground mode
                 # We'll start it and let it run in the background
                 process = await asyncio.create_subprocess_exec(
-                    *cmd,
+                    *with_lock_wait(cmd, env),
                     env=env,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
@@ -1416,6 +1458,24 @@ class MountService:
         except Exception:
             return False
 
+    def _remote_path_candidates(
+        self, connection: SSHConnection, remote_path: str
+    ) -> list[str]:
+        """The paths the SSHFS mount tries for `remote_path`, in order.
+
+        A missing absolute path is retried relative to the login directory
+        (see `_mount_sshfs`), so anything that inspects the path first has to
+        resolve it the same way or it judges a different path than the one
+        that gets mounted.
+        """
+        default_path = getattr(connection, "default_path", None)
+        login_relative_path = _sshfs_login_relative_candidate(
+            remote_path, default_path if isinstance(default_path, str) else None
+        )
+        if login_relative_path and login_relative_path != remote_path:
+            return [remote_path, login_relative_path]
+        return [remote_path]
+
     async def _check_remote_is_file(
         self, connection: SSHConnection, remote_path: str, temp_key_file: str
     ) -> bool:
@@ -1425,6 +1485,9 @@ class MountService:
         Uses SSH shell commands first (fast), falls back to SFTP if shell access denied.
         This ensures compatibility with SFTP-only servers (like Hetzner Storage Boxes).
 
+        The first candidate path that exists decides, exactly as the mount
+        picks the path it mounts.
+
         Args:
             connection: SSH connection
             remote_path: Remote path to check
@@ -1433,32 +1496,36 @@ class MountService:
         Returns:
             True if path is a file, False if directory or doesn't exist
         """
+        candidates = self._remote_path_candidates(connection, remote_path)
+        check = f"test -f {shlex.quote(candidates[-1])}"
+        for candidate in reversed(candidates[:-1]):
+            quoted = shlex.quote(candidate)
+            check = f"if test -e {quoted}; then test -f {quoted}; else {check}; fi"
         try:
             # Method 1: Try SSH shell command first (fast, but requires shell access)
             cmd = [
                 "ssh",
                 *ssh_key_auth_args(temp_key_file),
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
+                *host_key_ssh_opts(connection),
                 "-o",
                 "ConnectTimeout=10",
                 "-p",
                 str(connection.port),
                 f"{connection.username}@{connection.host}",
-                f"test -f '{remote_path}' && echo 'FILE' || echo 'DIR'",
+                f"{check} && echo 'FILE' || echo 'DIR'",
             ]
 
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
 
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+            stdout, stderr = await _communicate_or_kill(process, timeout=10)
 
-            # Check if SSH command succeeded
-            if process.returncode == 0:
-                result = stdout.decode().strip()
+            # A shell that ran the check prints exactly one of the two words.
+            # Anything else is an SFTP-only account (or a login banner / forced
+            # command), not an answer.
+            result = stdout.decode(errors="replace").strip()
+            if process.returncode == 0 and result in ("FILE", "DIR"):
                 is_file = result == "FILE"
                 logger.debug(
                     "Checked remote path type via SSH shell",
@@ -1466,15 +1533,12 @@ class MountService:
                     is_file=is_file,
                 )
                 return is_file
-            else:
-                # Shell command failed (possibly SFTP-only server)
-                stderr_msg = stderr.decode() if stderr else ""
-                logger.info(
-                    "SSH shell check failed (possibly SFTP-only), will use SFTP stat",
-                    remote_path=remote_path,
-                    stderr=stderr_msg,
-                )
-                # Fall through to SFTP method
+            logger.info(
+                "SSH shell check gave no answer (possibly SFTP-only), will use SFTP",
+                remote_path=remote_path,
+                returncode=process.returncode,
+                stderr=(stderr.decode(errors="replace") if stderr else ""),
+            )
 
         except asyncio.TimeoutError:
             logger.warning(
@@ -1487,11 +1551,19 @@ class MountService:
                 error=str(e),
             )
 
-        # Method 2: Use SFTP stat (works on SFTP-only servers)
+        # Method 2: SFTP (works on SFTP-only servers)
         try:
-            return await self._check_remote_is_file_via_sftp(
-                connection, remote_path, temp_key_file
-            )
+            for candidate in candidates:
+                kind = await self._sftp_path_kind(connection, candidate, temp_key_file)
+                if kind is not None:
+                    logger.debug(
+                        "Checked remote path type via SFTP",
+                        remote_path=remote_path,
+                        resolved_path=candidate,
+                        kind=kind,
+                    )
+                    return kind == "file"
+            return False
         except Exception as e:
             logger.warning(
                 "SFTP check also failed, assuming directory",
@@ -1500,78 +1572,56 @@ class MountService:
             )
             return False
 
-    async def _check_remote_is_file_via_sftp(
-        self, connection: SSHConnection, remote_path: str, temp_key_file: str
+    async def _sftp_batch_succeeds(
+        self, connection: SSHConnection, command: str, temp_key_file: str
     ) -> bool:
+        """Run one sftp batch command; True when it succeeded.
+
+        Batch mode (`-b -`) makes sftp exit non-zero when the command fails,
+        which is the only signal OpenSSH's sftp gives: it has no `stat`, and
+        its `ls` output looks the same for a file and a directory's contents.
         """
-        Check if remote path is file using SFTP protocol (works on SFTP-only servers)
-
-        Args:
-            connection: SSH connection
-            remote_path: Remote path to check
-            temp_key_file: Path to temporary SSH key file
-
-        Returns:
-            True if file, False if directory
-        """
-
-        # Use SFTP subsystem via SSH
         cmd = [
             "sftp",
+            "-b",
+            "-",
             *ssh_key_auth_args(temp_key_file),
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
+            *host_key_ssh_opts(connection),
             "-o",
             "ConnectTimeout=10",
             "-P",
             str(connection.port),
             f"{connection.username}@{connection.host}",
         ]
-
-        # Send stat command via stdin
-        sftp_commands = f"stat '{remote_path}'\nquit\n"
-
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-
-        stdout, _ = await asyncio.wait_for(
-            process.communicate(input=sftp_commands.encode()), timeout=15
+        _, stderr = await _communicate_or_kill(
+            process, timeout=15, input=f"{command}\n".encode()
         )
+        if process.returncode not in (0, 1):
+            # 255 and friends: the connection itself failed, not the command.
+            raise RuntimeError(
+                f"sftp exited {process.returncode}: "
+                f"{stderr.decode(errors='replace').strip()}"
+            )
+        return process.returncode == 0
 
-        output = stdout.decode()
-
-        # Parse SFTP stat output
-        # Look for "File type:" or mode bits to determine if it's a file
-        # SFTP stat output includes: "Flags: 0x0000000X" where X indicates type
-        # Or "Permissions:" line with mode bits
-
-        # Simple heuristic: if output contains directory indicators
-        is_directory = any(
-            indicator in output.lower()
-            for indicator in [
-                "directory",
-                "type: directory",
-                "d---------",  # Mode bits starting with 'd'
-                "drwx",
-            ]
-        )
-
-        is_file = not is_directory and "cannot" not in output.lower()
-
-        logger.debug(
-            "Checked remote path type via SFTP",
-            remote_path=remote_path,
-            is_file=is_file,
-            is_directory=is_directory,
-        )
-
-        return is_file
+    async def _sftp_path_kind(
+        self, connection: SSHConnection, remote_path: str, temp_key_file: str
+    ) -> Optional[str]:
+        """ "dir", "file", or None when the path does not exist, via SFTP."""
+        quoted = _sftp_quote(remote_path)
+        if await self._sftp_batch_succeeds(connection, f"cd {quoted}", temp_key_file):
+            return "dir"
+        if await self._sftp_batch_succeeds(
+            connection, f"ls -l {quoted}", temp_key_file
+        ):
+            return "file"
+        return None
 
     def _decrypt_and_write_key(self, ssh_key: SSHKey) -> str:
         """
@@ -1633,10 +1683,7 @@ class MountService:
                 diag_ssh = [
                     "ssh",
                     *ssh_key_auth_args(temp_key_file),
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "UserKnownHostsFile=/dev/null",
+                    *host_key_ssh_opts(connection),
                     "-o",
                     "ConnectTimeout=10",
                     "-p",
@@ -1695,10 +1742,7 @@ class MountService:
                 "-p",
                 str(connection.port),
                 *sshfs_key_auth_options(temp_key_file),
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
+                *host_key_ssh_opts(connection),
                 "-o",
                 "ConnectTimeout=30",
                 "-o",
@@ -1733,15 +1777,8 @@ class MountService:
                 sftp_server=sftp_server_path or "/usr/lib/openssh/sftp-server",
             )
 
-        mount_attempts = [remote_path]
-        connection_default_path = getattr(connection, "default_path", None)
-        if not isinstance(connection_default_path, str):
-            connection_default_path = None
-        login_relative_path = _sshfs_login_relative_candidate(
-            remote_path, connection_default_path
-        )
-        if login_relative_path and login_relative_path != remote_path:
-            mount_attempts.append(login_relative_path)
+        mount_attempts = self._remote_path_candidates(connection, remote_path)
+        login_relative_path = mount_attempts[1] if len(mount_attempts) > 1 else None
 
         for attempt_index, path_to_mount in enumerate(mount_attempts):
             cmd = build_sshfs_command(path_to_mount)
@@ -1904,6 +1941,11 @@ class MountService:
                 if attempt < 2:
                     await asyncio.sleep(2)
 
+        if not force:
+            # Busy (a shell or process inside it): detach lazily so nothing is
+            # left mounted under the temp root that cleanup is about to delete.
+            logger.warning("FUSE mount busy, detaching lazily", mount_point=mount_point)
+            return await self._unmount_fuse(mount_point, force=True)
         return False
 
     async def _unmount_borg(
@@ -1970,14 +2012,8 @@ class MountService:
     ):
         """Cleanup temporary directories and key files"""
         # Cleanup temp root directory
-        if temp_root and os.path.exists(temp_root):
-            try:
-                shutil.rmtree(temp_root, ignore_errors=True)
-                logger.debug("Cleaned up temp root", temp_root=temp_root)
-            except Exception as e:
-                logger.warning(
-                    "Failed to cleanup temp root", temp_root=temp_root, error=str(e)
-                )
+        if temp_root and remove_tree_without_crossing_mounts(temp_root):
+            logger.debug("Cleaned up temp root", temp_root=temp_root)
 
         # Cleanup temp key file
         if temp_key_file and os.path.exists(temp_key_file):

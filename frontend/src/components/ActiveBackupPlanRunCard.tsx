@@ -48,8 +48,8 @@ function isActive(status?: string): boolean {
   return status === 'pending' || status === 'running'
 }
 
-function getRepositoryLabel(runRepository: BackupPlanRunRepository): string {
-  return runRepository.repository?.name || runRepository.backup_job?.repository || 'Repository'
+function getRepositoryLabel(runRepository: BackupPlanRunRepository, fallback: string): string {
+  return runRepository.repository?.name || runRepository.backup_job?.repository || fallback
 }
 
 function aggregateStats(run: BackupPlanRun) {
@@ -195,13 +195,13 @@ const ActiveBackupPlanRunCard: React.FC<ActiveBackupPlanRunCardProps> = ({
   visibleStats.push({
     key: 'speed',
     label: t('backup.runningJobs.progress.speed'),
-    value: stats.hasSpeed ? `${stats.speed.toFixed(2)} MB/s` : 'N/A',
+    value: stats.hasSpeed ? `${stats.speed.toFixed(2)} MB/s` : t('common.na'),
     valueColor: undefined,
   })
   visibleStats.push({
     key: 'eta',
     label: t('backup.runningJobs.progress.eta'),
-    value: stats.hasEta ? formatDurationSeconds(stats.eta) : 'N/A',
+    value: stats.hasEta ? formatDurationSeconds(stats.eta) : t('common.na'),
     valueColor: undefined,
   })
 
@@ -242,8 +242,12 @@ const ActiveBackupPlanRunCard: React.FC<ActiveBackupPlanRunCardProps> = ({
             <Stack
               direction="row"
               spacing={0.75}
-              alignItems="center"
-              sx={{ mb: 0.5, flexWrap: 'wrap', gap: 0.5 }}
+              sx={{
+                alignItems: 'center',
+                mb: 0.5,
+                flexWrap: 'wrap',
+                gap: 0.5,
+              }}
             >
               <Box
                 sx={{
@@ -262,7 +266,14 @@ const ActiveBackupPlanRunCard: React.FC<ActiveBackupPlanRunCardProps> = ({
                   },
                 }}
               />
-              <Typography variant="body1" fontWeight={700} noWrap sx={{ lineHeight: 1.3 }}>
+              <Typography
+                variant="body1"
+                noWrap
+                sx={{
+                  fontWeight: 700,
+                  lineHeight: 1.3,
+                }}
+              >
                 {planName}
               </Typography>
               <Typography
@@ -283,7 +294,13 @@ const ActiveBackupPlanRunCard: React.FC<ActiveBackupPlanRunCardProps> = ({
                 #{run.id}
               </Typography>
             </Stack>
-            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+            <Typography
+              variant="caption"
+              sx={{
+                color: 'text.secondary',
+                display: 'block',
+              }}
+            >
               {t('backupPlans.runsPanel.repositoryProgress', {
                 completed: run.repositories.filter((r) => !isActive(r.status)).length,
                 total: run.repositories.length,
@@ -294,11 +311,21 @@ const ActiveBackupPlanRunCard: React.FC<ActiveBackupPlanRunCardProps> = ({
           </Box>
 
           {/* Right: actions */}
-          <Stack direction="row" spacing={0.75} alignItems="center" flexShrink={0}>
+          <Stack
+            direction="row"
+            spacing={0.75}
+            sx={{
+              alignItems: 'center',
+              flexShrink: 0,
+            }}
+          >
             <Typography
               variant="caption"
-              color="text.secondary"
-              sx={{ display: { xs: 'none', sm: 'block' }, mr: 0.5 }}
+              sx={{
+                color: 'text.secondary',
+                display: { xs: 'none', sm: 'block' },
+                mr: 0.5,
+              }}
             >
               {formatTimeRange(run.started_at, run.completed_at, run.status)}
             </Typography>
@@ -336,9 +363,11 @@ const ActiveBackupPlanRunCard: React.FC<ActiveBackupPlanRunCardProps> = ({
           <Box sx={{ mb: 1.5 }}>
             <Stack
               direction="row"
-              justifyContent="space-between"
-              alignItems="center"
-              sx={{ mb: 0.5 }}
+              sx={{
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                mb: 0.5,
+              }}
             >
               <Typography
                 sx={{
@@ -418,9 +447,9 @@ const ActiveBackupPlanRunCard: React.FC<ActiveBackupPlanRunCardProps> = ({
                 </Box>
                 <Typography
                   variant="body2"
-                  fontWeight={600}
                   noWrap
                   sx={{
+                    fontWeight: 600,
                     fontVariantNumeric: 'tabular-nums',
                     fontSize: '0.875rem',
                     color: stat.valueColor || 'text.primary',
@@ -452,11 +481,11 @@ const ActiveBackupPlanRunCard: React.FC<ActiveBackupPlanRunCardProps> = ({
               const repoDoneWithWarnings = repoRun.status === 'completed_with_warnings'
               const repoFailed = repoRun.status === 'failed' || repoRun.status === 'cancelled'
 
-              // Done uses brand emerald LIVE_DOT (a stronger, on-brand green
-              // than MUI's default success teal). Done-with-warnings borrows
-              // amber so the warning hint is unmistakable while the repo still
-              // reads as "this finished, no action needed urgently".
-              const successColor = LIVE_DOT
+              // Done is read as text, so it takes the theme's success green,
+              // which clears 4.5:1 in both modes (LIVE_DOT does not). Done
+              // with warnings borrows amber so the warning hint is
+              // unmistakable while the repo still reads as finished.
+              const successColor = theme.palette.success.main
               const warningColor = theme.palette.warning.main
               const errorColor = theme.palette.error.main
               // Running repo is communicated by a pulsing emerald LIVE_DOT (the
@@ -549,11 +578,14 @@ const ActiveBackupPlanRunCard: React.FC<ActiveBackupPlanRunCardProps> = ({
                   {icon}
                   <Typography
                     variant="caption"
-                    fontWeight={600}
                     noWrap
-                    sx={{ flex: 1, minWidth: 0 }}
+                    sx={{
+                      fontWeight: 600,
+                      flex: 1,
+                      minWidth: 0,
+                    }}
                   >
-                    {getRepositoryLabel(repoRun)}
+                    {getRepositoryLabel(repoRun, t('backupPlans.status.repositoryFallback'))}
                   </Typography>
                   <Typography
                     variant="caption"

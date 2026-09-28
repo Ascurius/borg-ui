@@ -10,7 +10,7 @@ export const formatDate = (dateString: string | null | undefined): string => {
   if (!dateString) return 'Never'
 
   try {
-    const date = new Date(dateString)
+    const date = parseBackendDate(dateString)
     return date.toLocaleString(undefined, {
       day: 'numeric',
       month: 'short',
@@ -33,7 +33,7 @@ export const formatDateShort = (dateString: string | null | undefined): string =
   if (!dateString) return 'Never'
 
   try {
-    const date = new Date(dateString)
+    const date = parseBackendDate(dateString)
     return date.toLocaleDateString(undefined, {
       month: 'short',
       day: 'numeric',
@@ -43,6 +43,29 @@ export const formatDateShort = (dateString: string | null | undefined): string =
     console.error('Error formatting date:', error)
     return dateString
   }
+}
+
+/**
+ * Format a date-only string ("2026-09-01") in the short format, as the
+ * calendar day it names. `new Date()` reads such a string as UTC midnight,
+ * which is the day before for anyone west of Greenwich.
+ * Example: "Sep 1, 2026"
+ */
+export const formatCalendarDay = (dateString: string | null | undefined): string => {
+  if (!dateString) return 'Never'
+  const [y, m, d] = dateString.slice(0, 10).split('-').map(Number)
+  if (!y || !m || !d) return formatDateShort(dateString)
+  const day = new Date(y, m - 1, d)
+  // the constructor rolls a bad day over ("2026-02-30" becomes March 2),
+  // so a date that did not survive the round trip was never a real day
+  if (day.getFullYear() !== y || day.getMonth() !== m - 1 || day.getDate() !== d) {
+    return dateString
+  }
+  return day.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  })
 }
 
 /**
@@ -139,7 +162,7 @@ export const formatRelativeTime = (dateString: string | null | undefined): strin
   if (!dateString) return 'Never'
 
   try {
-    const date = new Date(dateString)
+    const date = parseBackendDate(dateString)
     return formatDistance(date, new Date(), { addSuffix: true })
   } catch (error) {
     console.error('Error formatting relative time:', error)
@@ -188,7 +211,7 @@ export const formatTimeRange = (
   if (!startTime) return 'N/A'
 
   try {
-    const start = new Date(startTime)
+    const start = parseBackendDate(startTime)
 
     if (status === 'running') {
       // Calculate duration from start to now
@@ -199,7 +222,7 @@ export const formatTimeRange = (
 
     if (!endTime) return 'N/A'
 
-    const end = new Date(endTime)
+    const end = parseBackendDate(endTime)
     const durationMs = end.getTime() - start.getTime()
     const durationSec = Math.floor(durationMs / 1000)
 
@@ -210,6 +233,22 @@ export const formatTimeRange = (
   }
 }
 
+// A date and time with no offset. Date-only and zoned values, and anything
+// that is not ISO, go to `new Date()` untouched.
+const NAIVE_ISO_DATETIME = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/
+
+/**
+ * Parse a timestamp coming from the backend.
+ *
+ * Datetimes are stored naive-UTC (SQLite) and some routes emit them without
+ * an offset, which `new Date()` reads as *local* time per the ES spec - a
+ * viewer at UTC+5:30 would see a backup finished a minute ago as "in about 5
+ * hours". Treat an offset-less value as UTC, and leave anything that already
+ * carries an offset alone.
+ */
+export const parseBackendDate = (value: string): Date =>
+  new Date(NAIVE_ISO_DATETIME.test(value) ? `${value.replace(' ', 'T')}Z` : value)
+
 /**
  * Calculate elapsed time from a start date to now
  * Example: "2025-11-09T14:56:53Z" -> "Running for 2 hours"
@@ -218,7 +257,7 @@ export const formatElapsedTime = (startTime: string | null | undefined): string 
   if (!startTime) return ''
 
   try {
-    const start = new Date(startTime)
+    const start = parseBackendDate(startTime)
     const durationMs = Date.now() - start.getTime()
     const durationSec = Math.max(0, Math.floor(durationMs / 1000))
 
@@ -635,7 +674,7 @@ export const formatDateTimeFull = (dateString: string | null | undefined): strin
   if (!dateString) return 'Never'
 
   try {
-    const date = new Date(dateString)
+    const date = parseBackendDate(dateString)
     const datePart = date.toLocaleDateString(undefined, {
       month: 'long',
       day: 'numeric',
@@ -662,7 +701,7 @@ export const formatDateCompact = (dateString: string | null | undefined): string
   if (!dateString) return 'Never'
 
   try {
-    const date = new Date(dateString)
+    const date = parseBackendDate(dateString)
     return date.toLocaleString(undefined, {
       day: 'numeric',
       month: 'short',
@@ -683,7 +722,7 @@ export const formatDateCompactInTimeZone = (
   if (!dateString) return 'Never'
 
   try {
-    const date = new Date(dateString)
+    const date = parseBackendDate(dateString)
     return date.toLocaleString(undefined, {
       day: 'numeric',
       month: 'short',
@@ -705,7 +744,7 @@ export const formatDateTimeFullInTimeZone = (
   if (!dateString) return 'Never'
 
   try {
-    const date = new Date(dateString)
+    const date = parseBackendDate(dateString)
     const datePart = date.toLocaleDateString(undefined, {
       month: 'long',
       day: 'numeric',

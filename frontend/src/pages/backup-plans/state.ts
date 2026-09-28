@@ -21,6 +21,7 @@ export const createInitialState = (): WizardState => ({
   sourceLocations: [],
   excludePatterns: [],
   repositoryIds: [],
+  disabledRepositoryIds: [],
   compression: 'lz4',
   archiveNameTemplate: '{plan_name}-{repo_name}-{now}',
   customFlags: '',
@@ -30,8 +31,11 @@ export const createInitialState = (): WizardState => ({
   maxParallelRepositories: 1,
   failureBehavior: 'continue',
   scheduleEnabled: false,
+  scheduleMode: 'cron',
   cronExpression: '0 21 * * *',
   timezone: getBrowserTimeZone(),
+  availabilityCheckIntervalMinutes: 30,
+  minimumSuccessIntervalHours: 20,
   preBackupScriptId: null,
   postBackupScriptId: null,
   preBackupScriptParameters: {},
@@ -313,9 +317,9 @@ function normalizePlanScriptHooks(plan: BackupPlan): BackupPlanScriptHook[] {
 }
 
 export function planToState(plan: BackupPlan): WizardState {
-  const repositoryLinks = (plan.repositories || [])
-    .filter((link) => link.enabled)
-    .sort((a, b) => a.execution_order - b.execution_order)
+  const repositoryLinks = [...(plan.repositories || [])].sort(
+    (a, b) => a.execution_order - b.execution_order
+  )
   const sourceLocations = normalizePlanSourceLocations(plan)
   const sourceDirectories = sourceLocations.length
     ? sourceLocations.flatMap((location) => location.paths)
@@ -339,6 +343,9 @@ export function planToState(plan: BackupPlan): WizardState {
     sourceLocations,
     excludePatterns: plan.exclude_patterns || [],
     repositoryIds: repositoryLinks.map((link) => link.repository_id),
+    disabledRepositoryIds: repositoryLinks
+      .filter((link) => !link.enabled)
+      .map((link) => link.repository_id),
     compression: plan.compression || 'lz4',
     archiveNameTemplate: plan.archive_name_template || '{plan_name}-{repo_name}-{now}',
     customFlags: plan.custom_flags || '',
@@ -350,8 +357,11 @@ export function planToState(plan: BackupPlan): WizardState {
     maxParallelRepositories: plan.max_parallel_repositories || 1,
     failureBehavior: plan.failure_behavior || 'continue',
     scheduleEnabled: Boolean(plan.schedule_enabled),
+    scheduleMode: plan.schedule_mode || 'cron',
     cronExpression: plan.cron_expression || '0 21 * * *',
     timezone: plan.timezone || getBrowserTimeZone(),
+    availabilityCheckIntervalMinutes: plan.availability_check_interval_minutes ?? 30,
+    minimumSuccessIntervalHours: (plan.min_success_interval_minutes ?? 20 * 60) / 60,
     preBackupScriptId: firstPreHook?.script_id ?? plan.pre_backup_script_id ?? null,
     postBackupScriptId: firstPostHook?.script_id ?? plan.post_backup_script_id ?? null,
     preBackupScriptParameters:

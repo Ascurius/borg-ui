@@ -4,24 +4,24 @@ import { alpha } from '@mui/material/styles'
 import { Server, XCircle } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { formatDistanceToNow } from 'date-fns'
-import { formatDateTimeFull } from '../../utils/dateUtils'
+import { formatDateTimeFull, parseBackendDate } from '../../utils/dateUtils'
 import { translateBackendKey } from '../../utils/translateBackendKey'
 import { DimStatusGrid, PulseDot, ScheduleBadge } from './health'
-import { STATUS, TYPE_COLOR, type Tokens } from './tokens'
+import { statusColor, typeColor, type HealthStatus, type Tokens } from './tokens'
 import type { DashboardOverview } from './types'
 
 type RepositoryHealth = DashboardOverview['repository_health']
 type RepoCardData = RepositoryHealth[number]
-type ActivityFeed = DashboardOverview['activity_feed']
+type CurrentFailures = NonNullable<DashboardOverview['current_failures']>
 
 /**
  * Two small chips rendered identically on both the compact and full repo
- * card variants: the destination-type chip (colored by `TYPE_COLOR`) and an
+ * card variants: the destination-type chip (colored by `typeColor`) and an
  * optional "Observe Only" chip when the repo is in observe mode.
  */
 function RepoTypeChips({ repo, T }: { repo: RepoCardData; T: Tokens }) {
   const { t } = useTranslation()
-  const tColor = TYPE_COLOR[repo.type.toLowerCase()] ?? T.textMuted
+  const tColor = typeColor(repo.type, T)
   return (
     <>
       <Chip
@@ -74,7 +74,7 @@ export function RepositoryHealthPanel({
   warningCount: number
   healthyCount: number
   nowMs: number
-  currentFailures: ActivityFeed
+  currentFailures: CurrentFailures
   onOpenRepositories: () => void
 }) {
   const { t } = useTranslation()
@@ -92,8 +92,21 @@ export function RepositoryHealthPanel({
 
   return (
     <Box sx={{ ...surface, p: 2.5 }}>
-      <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 2 }}>
-        <Stack direction="row" spacing={1} alignItems="center">
+      <Stack
+        direction="row"
+        sx={{
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          mb: 2,
+        }}
+      >
+        <Stack
+          direction="row"
+          spacing={1}
+          sx={{
+            alignItems: 'center',
+          }}
+        >
           <Server size={14} color={T.textMuted} />
           <Typography
             sx={{
@@ -164,7 +177,14 @@ export function RepositoryHealthPanel({
             p: 1.25,
           }}
         >
-          <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.75 }}>
+          <Stack
+            direction="row"
+            spacing={1}
+            sx={{
+              alignItems: 'center',
+              mb: 0.75,
+            }}
+          >
             <XCircle size={14} color={T.red} />
             <Typography
               sx={{
@@ -182,8 +202,10 @@ export function RepositoryHealthPanel({
                 key={`${a.type}-${a.id}`}
                 direction="row"
                 spacing={1}
-                alignItems="baseline"
-                sx={{ minWidth: 0 }}
+                sx={{
+                  alignItems: 'baseline',
+                  minWidth: 0,
+                }}
               >
                 <Typography
                   sx={{
@@ -205,7 +227,7 @@ export function RepositoryHealthPanel({
                       flexShrink: 0,
                     }}
                   >
-                    {formatDistanceToNow(new Date(a.timestamp), { addSuffix: true })}
+                    {formatDistanceToNow(parseBackendDate(a.timestamp), { addSuffix: true })}
                   </Typography>
                 </Tooltip>
                 {a.error && (
@@ -285,13 +307,13 @@ export function RepositoryHealthPanel({
         {repos.map((repo) => {
           // Card color follows the backend's aggregate repository health.
           // Failed restore verification can make the card critical because recovery is at risk.
-          const cardStatus: keyof typeof STATUS =
+          const cardStatus: HealthStatus =
             repo.health_status === 'critical'
               ? 'critical'
               : repo.health_status === 'warning'
                 ? 'warning'
                 : 'healthy'
-          const cs = STATUS[cardStatus]
+          const cs = { color: statusColor(cardStatus, T) }
 
           // Compact one-liner card for healthy repos. The dimension footer on a
           // healthy card is just "everything's fine" four times; collapse to a
@@ -299,7 +321,7 @@ export function RepositoryHealthPanel({
           // weight. Same outer surface, border, hover, and click target.
           if (repo.health_status === 'healthy') {
             const lastBackupLabel = repo.last_backup
-              ? formatDistanceToNow(new Date(repo.last_backup), { addSuffix: false })
+              ? formatDistanceToNow(parseBackendDate(repo.last_backup), { addSuffix: false })
               : t('common.never')
 
             return (
@@ -321,7 +343,13 @@ export function RepositoryHealthPanel({
                   },
                 }}
               >
-                <Stack direction="row" spacing={1} alignItems="center">
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{
+                    alignItems: 'center',
+                  }}
+                >
                   <PulseDot color={cs.color} />
                   <Box sx={{ flexGrow: 1, minWidth: 0 }}>
                     <Typography
@@ -339,8 +367,11 @@ export function RepositoryHealthPanel({
                     <Stack
                       direction="row"
                       spacing={0.75}
-                      alignItems="center"
-                      sx={{ mt: 0.25, minWidth: 0 }}
+                      sx={{
+                        alignItems: 'center',
+                        mt: 0.25,
+                        minWidth: 0,
+                      }}
                     >
                       <RepoTypeChips repo={repo} T={T} />
                       <Typography
@@ -362,7 +393,13 @@ export function RepositoryHealthPanel({
                       </Typography>
                     </Stack>
                   </Box>
-                  <Stack alignItems="flex-end" spacing={0.4} sx={{ flexShrink: 0 }}>
+                  <Stack
+                    spacing={0.4}
+                    sx={{
+                      alignItems: 'flex-end',
+                      flexShrink: 0,
+                    }}
+                  >
                     <Typography
                       sx={{
                         fontFamily: T.mono,
@@ -423,11 +460,19 @@ export function RepositoryHealthPanel({
               {/* Top row: status dot + type chip | next-run pill */}
               <Stack
                 direction="row"
-                alignItems="center"
-                justifyContent="space-between"
-                sx={{ mb: 0.55 }}
+                sx={{
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  mb: 0.55,
+                }}
               >
-                <Stack direction="row" spacing={0.75} alignItems="center">
+                <Stack
+                  direction="row"
+                  spacing={0.75}
+                  sx={{
+                    alignItems: 'center',
+                  }}
+                >
                   <PulseDot color={cs.color} />
                   <RepoTypeChips repo={repo} T={T} />
                 </Stack>
@@ -474,8 +519,11 @@ export function RepositoryHealthPanel({
                 <Stack
                   direction="row"
                   spacing={0.75}
-                  alignItems="center"
-                  sx={{ mb: 0.75, minWidth: 0 }}
+                  sx={{
+                    alignItems: 'center',
+                    mb: 0.75,
+                    minWidth: 0,
+                  }}
                 >
                   <Chip
                     label={t('dashboard.repositoryHealth.planCount', {

@@ -73,11 +73,11 @@ interface RcloneRemoteDialogProps {
   ) => Promise<unknown> | unknown
 }
 
-const DEFAULT_PROVIDERS: RcloneProvider[] = [
+const getDefaultProviders = (t: (key: string) => string): RcloneProvider[] => [
   {
     type: 'local',
-    label: 'Local filesystem',
-    description: 'Local path remote.',
+    label: t('wizard.location.rcloneDefaultProviders.localLabel'),
+    description: t('wizard.location.rcloneDefaultProviders.localDescription'),
     auth_type: 'none',
     type_editable: false,
     docs_url: 'https://rclone.org/local/',
@@ -86,8 +86,8 @@ const DEFAULT_PROVIDERS: RcloneProvider[] = [
   },
   {
     type: 'custom',
-    label: 'Custom rclone backend',
-    description: 'Manual setup for any rclone backend.',
+    label: t('wizard.location.rcloneDefaultProviders.customLabel'),
+    description: t('wizard.location.rcloneDefaultProviders.customDescription'),
     auth_type: 'manual',
     type_editable: true,
     docs_url: 'https://rclone.org/docs/',
@@ -160,7 +160,7 @@ export default function RcloneRemoteDialog({
   isCreating = false,
   error = null,
   disablePortal = false,
-  providers = DEFAULT_PROVIDERS,
+  providers = [],
   onClose,
   onCreate,
   onStartOAuth,
@@ -168,6 +168,7 @@ export default function RcloneRemoteDialog({
   onSaveOAuthCredentials,
 }: RcloneRemoteDialogProps) {
   const { t } = useTranslation()
+  const defaultProviders = useMemo(() => getDefaultProviders(t), [t])
   const [name, setName] = useState('')
   const [providerType, setProviderType] = useState('local')
   const [customProvider, setCustomProvider] = useState('')
@@ -190,7 +191,7 @@ export default function RcloneRemoteDialog({
   const resolvedProviderRef = useRef('local')
   const initializedRemoteKeyRef = useRef<string | null>(null)
 
-  const providerOptions = providers.length ? providers : DEFAULT_PROVIDERS
+  const providerOptions = providers.length ? providers : defaultProviders
   const sortedProviderOptions = useMemo(
     () => sortRcloneProviders(providerOptions),
     [providerOptions]
@@ -716,9 +717,13 @@ export default function RcloneRemoteDialog({
               >
                 <Stack
                   direction="row"
-                  alignItems="center"
                   spacing={1}
-                  sx={{ px: 2, py: 1.25, minHeight: 48 }}
+                  sx={{
+                    alignItems: 'center',
+                    px: 2,
+                    py: 1.25,
+                    minHeight: 48,
+                  }}
                 >
                   {bothOAuthCredsSaved ? (
                     <CheckCircle size={18} color="var(--mui-palette-success-main, #2e7d32)" />
@@ -726,10 +731,21 @@ export default function RcloneRemoteDialog({
                     <KeyRound size={18} />
                   )}
                   <Box sx={{ flex: 1, minWidth: 0 }}>
-                    <Typography variant="subtitle2" fontWeight={600}>
+                    <Typography
+                      variant="subtitle2"
+                      sx={{
+                        fontWeight: 600,
+                      }}
+                    >
                       {t('wizard.location.rcloneOAuthCredentialsTitle')}
                     </Typography>
-                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        color: 'text.secondary',
+                        display: 'block',
+                      }}
+                    >
                       {t('wizard.location.rcloneOAuthCredentialsScopeHint', {
                         provider: selectedProvider.label,
                       })}
@@ -737,8 +753,10 @@ export default function RcloneRemoteDialog({
                     {bothOAuthCredsSaved ? (
                       <Typography
                         variant="caption"
-                        color="text.secondary"
-                        sx={{ display: 'block' }}
+                        sx={{
+                          color: 'text.secondary',
+                          display: 'block',
+                        }}
                       >
                         {t(
                           `wizard.location.rcloneOAuthCredentialSources.${
@@ -804,8 +822,10 @@ export default function RcloneRemoteDialog({
                     <Stack
                       direction={{ xs: 'column', sm: 'row' }}
                       spacing={1}
-                      alignItems={{ xs: 'stretch', sm: 'center' }}
-                      sx={{ mt: 1.5 }}
+                      sx={{
+                        alignItems: { xs: 'stretch', sm: 'center' },
+                        mt: 1.5,
+                      }}
                     >
                       <Button
                         size="small"
@@ -857,19 +877,32 @@ export default function RcloneRemoteDialog({
               >
                 <Stack
                   direction={{ xs: 'column', sm: 'row' }}
-                  alignItems={{ xs: 'flex-start', sm: 'center' }}
-                  justifyContent="space-between"
                   spacing={1}
+                  sx={{
+                    alignItems: { xs: 'flex-start', sm: 'center' },
+                    justifyContent: 'space-between',
+                  }}
                 >
-                  <Stack direction="row" alignItems="center" spacing={0.5}>
-                    <Typography variant="subtitle2" fontWeight={600}>
+                  <Stack
+                    direction="row"
+                    spacing={0.5}
+                    sx={{
+                      alignItems: 'center',
+                    }}
+                  >
+                    <Typography
+                      variant="subtitle2"
+                      sx={{
+                        fontWeight: 600,
+                      }}
+                    >
                       {t('wizard.location.rcloneConnectSectionTitle')}
                     </Typography>
                     <Tooltip
                       title={t('wizard.location.rcloneOAuthHelpTooltip')}
                       arrow
                       placement="top"
-                      componentsProps={{
+                      slotProps={{
                         tooltip: { sx: { maxWidth: 320, whiteSpace: 'pre-line' } },
                       }}
                     >
@@ -888,7 +921,12 @@ export default function RcloneRemoteDialog({
                     />
                   ) : null}
                 </Stack>
-                <Typography variant="body2" color="text.secondary">
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {usesBorgUiOAuth
                     ? borgUiOAuthConfigured
                       ? t('wizard.location.rcloneOAuthBorgUiHelper')
@@ -900,8 +938,10 @@ export default function RcloneRemoteDialog({
                   direction={{ xs: 'column', sm: 'row' }}
                   spacing={1.5}
                   useFlexGap
-                  flexWrap="wrap"
-                  alignItems={{ xs: 'flex-start', sm: 'center' }}
+                  sx={{
+                    flexWrap: 'wrap',
+                    alignItems: { xs: 'flex-start', sm: 'center' },
+                  }}
                 >
                   <Button
                     variant="contained"
@@ -1000,8 +1040,11 @@ export default function RcloneRemoteDialog({
                 {usesBorgUiOAuth && callbackUrl ? (
                   <Typography
                     variant="caption"
-                    color="text.secondary"
-                    sx={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}
+                    sx={{
+                      color: 'text.secondary',
+                      fontFamily: 'monospace',
+                      overflowWrap: 'anywhere',
+                    }}
                   >
                     {t('wizard.location.rcloneOAuthCallbackUrl', { url: callbackUrl })}
                   </Typography>
@@ -1063,10 +1106,20 @@ export default function RcloneRemoteDialog({
                 sx={{ px: 2, '& .MuiAccordionSummary-content': { my: 1.25 } }}
               >
                 <Stack>
-                  <Typography variant="subtitle2" fontWeight={600}>
+                  <Typography
+                    variant="subtitle2"
+                    sx={{
+                      fontWeight: 600,
+                    }}
+                  >
                     {t('wizard.location.rcloneAdvancedTitle')}
                   </Typography>
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      color: 'text.secondary',
+                    }}
+                  >
                     {t('wizard.location.rcloneAdvancedHelper')}
                   </Typography>
                 </Stack>
@@ -1078,8 +1131,11 @@ export default function RcloneRemoteDialog({
                       <Typography
                         key={field.name}
                         variant="caption"
-                        color="text.secondary"
-                        sx={{ display: 'block', overflowWrap: 'anywhere' }}
+                        sx={{
+                          color: 'text.secondary',
+                          display: 'block',
+                          overflowWrap: 'anywhere',
+                        }}
                       >
                         <strong>{field.label}</strong>
                         {field.required ? ` ${t('wizard.location.rcloneRequiredFieldSuffix')}` : ''}

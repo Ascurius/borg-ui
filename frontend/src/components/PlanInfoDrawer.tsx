@@ -13,13 +13,15 @@ import {
 import { useTheme } from '@mui/material/styles'
 import { X, Check, Sparkles, Clock } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import type { Plan } from '../core/features'
+import { nextPlanAbove, type Plan } from '../core/features'
 import { useAnalytics } from '../hooks/useAnalytics'
 import type { EntitlementInfo } from '../hooks/useSystemInfo'
 import { usePlanContent } from '../hooks/usePlanContent'
 import { compareVersions } from '../utils/announcements'
-import { BUY_URL } from '../utils/externalLinks'
+import { buildBuyUrl } from '../utils/externalLinks'
 import { getPlanDrawerColors } from './planDrawerColors'
+import PlanUpcomingFeatures from './PlanUpcomingFeatures'
+import { parseBackendDate } from '../utils/dateUtils'
 
 interface PlanInfoDrawerProps {
   open: boolean
@@ -80,8 +82,9 @@ function getDefaultSelectedPlan(plan: Plan, initialSelectedPlan?: Plan): Plan {
   return UPGRADE_PLANS.includes(plan) ? plan : UPGRADE_PLANS[0]
 }
 
-function getDefaultActiveTab(plan: Plan): ActiveTab {
-  return plan === 'community' ? 'upgrade' : 'your-plan'
+function getDefaultActiveTab(plan: Plan, isFeatureTrial = false): ActiveTab {
+  // A running Pro preview is the reader's plan for now: open on it.
+  return plan === 'community' && !isFeatureTrial ? 'upgrade' : 'your-plan'
 }
 
 function normalizePlan(plan: Plan | string | null | undefined): Plan {
@@ -91,6 +94,8 @@ function normalizePlan(plan: Plan | string | null | undefined): Plan {
 
   return 'community'
 }
+
+const PLAN_RANK: Record<Plan, number> = { community: 0, pro: 1, enterprise: 2 }
 
 export default function PlanInfoDrawer({
   open,
@@ -110,13 +115,37 @@ export default function PlanInfoDrawer({
   const [selectedPlan, setSelectedPlan] = useState<Plan>(
     getDefaultSelectedPlan(normalizedPlan, initialSelectedPlan)
   )
-  const [activeTab, setActiveTab] = useState<ActiveTab>(getDefaultActiveTab(normalizedPlan))
+  // A per-feature trial only exists on Community; a paid plan is never a preview.
+  const isFeatureTrial =
+    normalizedPlan === 'community' &&
+    !(entitlement?.is_full_access && entitlement.status === 'active') &&
+    entitlement?.status === 'active' &&
+    (entitlement.trial_features ?? []).length > 0
+  const [activeTab, setActiveTab] = useState<ActiveTab>(
+    getDefaultActiveTab(normalizedPlan, isFeatureTrial)
+  )
   const [referenceNowMs, setReferenceNowMs] = useState<number | null>(null)
 
   const fullAccessExpiry = entitlement?.expires_at
-    ? new Date(entitlement.expires_at).toLocaleDateString()
+    ? parseBackendDate(entitlement.expires_at).toLocaleDateString()
     : null
   const isFullAccess = entitlement?.is_full_access && entitlement.status === 'active'
+  const isLite = normalizedPlan === 'pro' && entitlement?.license_plan === 'lite'
+  // A per-feature trial runs on the plan the install already has; the drawer
+  // names the preview and lists what it opened (spec 2026-09-21, section 3).
+  const trialFeatures = isFeatureTrial ? (entitlement?.trial_features ?? []) : []
+  // Every manifest row the trial's gate keys unlock, or the bare key when the
+  // manifest has no row for it.
+  const trialFeatureItems = trialFeatures.flatMap<{
+    id: string
+    label: string
+    description?: string
+  }>(({ feature }) => {
+    const rows = planContentFeatures.filter((f) => f.id === feature || f.gate === feature)
+    return rows.length > 0
+      ? rows.map((f) => ({ id: f.id, label: f.label, description: f.description }))
+      : [{ id: feature, label: feature, description: undefined }]
+  })
   const planLabel = (value: Plan) => t(`plan.labels.${value}`)
 
   const daysRemaining =
@@ -124,18 +153,27 @@ export default function PlanInfoDrawer({
       ? Math.max(
           0,
           Math.ceil(
-            (new Date(entitlement.expires_at).getTime() - referenceNowMs) / (1000 * 60 * 60 * 24)
+            (parseBackendDate(entitlement.expires_at).getTime() - referenceNowMs) /
+              (1000 * 60 * 60 * 24)
           )
         )
       : null
 
   const drawerColors = getPlanDrawerColors(muiTheme)
-  const currentPlanColors = drawerColors.plans[isFullAccess ? 'enterprise' : normalizedPlan]
+  const currentPlanColors =
+    drawerColors.plans[isFullAccess ? 'enterprise' : isFeatureTrial ? 'pro' : normalizedPlan]
   const selectedPlanColors = drawerColors.plans[selectedPlan]
   const communityPlanColors = drawerColors.plans.community
   const fullAccessPlanColors = drawerColors.plans.enterprise
+  const countdownColors = isFullAccess ? fullAccessPlanColors : drawerColors.plans.pro
   const color = currentPlanColors.accent
-  const label = isFullAccess ? t('plan.fullAccessLabel') : planLabel(normalizedPlan)
+  const label = isFullAccess
+    ? t('plan.fullAccessLabel')
+    : isFeatureTrial
+      ? t('plan.featureTrialLabel')
+      : isLite
+        ? t('plan.liteLabel')
+        : planLabel(normalizedPlan)
 
   const selectedColor = selectedPlanColors.accent
   const visibleFeatureIds = Object.entries(features ?? {}).filter(
@@ -197,22 +235,77 @@ export default function PlanInfoDrawer({
   const communityFeatures = planContentFeatures.filter(
     (f) => f.plan === 'community' && isFeatureIncluded(f, appVersion)
   )
+  // Community features a newer release brings: an older install learns what
+  // an update gives it, the same way the Upgrade tab does for Pro.
+  const upcomingCommunityFeatures = planContentFeatures.filter(
+    (f) => f.plan === 'community' && isVersionedUpcomingFeature(f, appVersion)
+  )
 
   useEffect(() => {
     if (open) {
       setSelectedPlan(getDefaultSelectedPlan(normalizedPlan, initialSelectedPlan))
-      setActiveTab(getDefaultActiveTab(normalizedPlan))
+      setActiveTab(getDefaultActiveTab(normalizedPlan, isFeatureTrial))
       setReferenceNowMs(Date.now())
     }
-  }, [initialSelectedPlan, normalizedPlan, open])
+  }, [initialSelectedPlan, isFeatureTrial, normalizedPlan, open])
+
+  // The footer sells the tier above the current plan, or the plan being browsed on
+  // the Upgrade tab when that is higher than what the instance already has. On
+  // Enterprise there is nothing to sell, so the footer button is hidden. The same
+  // value drives the href, the label, and the analytics event.
+  const browsedUpgrade =
+    activeTab === 'upgrade' && PLAN_RANK[selectedPlan] > PLAN_RANK[normalizedPlan]
+      ? (selectedPlan as 'pro' | 'enterprise')
+      : null
+  const buyPlan: 'pro' | 'enterprise' | null = browsedUpgrade ?? nextPlanAbove(normalizedPlan)
+  const buySource = isFullAccess
+    ? 'app-trial'
+    : entitlement?.ui_state === 'full_access_expired'
+      ? 'app-expired'
+      : 'app-drawer'
+  const buyOffer = entitlement?.ui_state === 'full_access_expired' ? 'expired' : undefined
 
   const handleBuyClick = () => {
+    if (!buyPlan) return
     trackPlan(EventAction.VIEW, {
       surface: 'plan_drawer',
       operation: 'open_buy_link',
-      selected_plan: selectedPlan,
+      selected_plan: buyPlan,
     })
   }
+
+  // Shown at the top of both tabs once full access has ended. The CTA sits under
+  // the text rather than in the Alert action slot, which squeezed the message to
+  // one word per line inside the narrow drawer.
+  const expiredNotice = (
+    <Alert
+      severity="warning"
+      sx={{ mb: 2, fontSize: '0.75rem', '& .MuiAlert-message': { width: '100%' } }}
+    >
+      {t('plan.fullAccessExpiredNotice')}
+      <Button
+        color="inherit"
+        variant="outlined"
+        size="small"
+        fullWidth
+        component="a"
+        href={buildBuyUrl({ plan: 'pro', src: 'app-expired', offer: 'expired' })}
+        target="_blank"
+        rel="noreferrer"
+        onClick={() =>
+          trackPlan(EventAction.VIEW, {
+            surface: 'plan_drawer',
+            operation: 'open_buy_link',
+            selected_plan: 'pro',
+            context: 'full_access_expired',
+          })
+        }
+        sx={{ mt: 1.25, fontWeight: 700 }}
+      >
+        {t('plan.expiredUpgradeCta')}
+      </Button>
+    </Alert>
+  )
 
   const yourPlanTabColor = color
   const upgradeTabColor = selectedColor
@@ -223,17 +316,19 @@ export default function PlanInfoDrawer({
       open={open}
       onClose={onClose}
       container={container}
-      SlideProps={{
-        onExited: () => {
-          setSelectedPlan(getDefaultSelectedPlan(normalizedPlan, initialSelectedPlan))
-          setActiveTab(getDefaultActiveTab(normalizedPlan))
-        },
-      }}
       sx={{
         '& .MuiDrawer-paper': {
           width: 340,
           boxSizing: 'border-box',
           bgcolor: drawerColors.paper,
+        },
+      }}
+      slotProps={{
+        transition: {
+          onExited: () => {
+            setSelectedPlan(getDefaultSelectedPlan(normalizedPlan, initialSelectedPlan))
+            setActiveTab(getDefaultActiveTab(normalizedPlan, isFeatureTrial))
+          },
         },
       }}
     >
@@ -276,6 +371,13 @@ export default function PlanInfoDrawer({
                 >
                   {label}
                 </Typography>
+                {isLite && (
+                  <Typography
+                    sx={{ fontSize: '0.7rem', color: drawerColors.secondaryText, mt: 0.5 }}
+                  >
+                    {t('plan.liteDescription')}
+                  </Typography>
+                )}
               </Box>
             </Box>
             <IconButton size="small" onClick={onClose} sx={{ mt: -0.5 }}>
@@ -334,49 +436,99 @@ export default function PlanInfoDrawer({
         <Box sx={{ flex: 1, overflowY: 'auto', px: 2.5, py: 2 }}>
           {activeTab === 'your-plan' && (
             <>
-              {entitlement?.ui_state === 'full_access_expired' && (
-                <Alert severity="warning" sx={{ mb: 2, fontSize: '0.75rem' }}>
-                  {t('plan.fullAccessExpiredNotice')}
-                </Alert>
-              )}
+              {entitlement?.ui_state === 'full_access_expired' && expiredNotice}
               {entitlement?.last_refresh_error && (
                 <Alert severity="warning" sx={{ mb: 2, fontSize: '0.75rem' }}>
                   {t('plan.lastRefreshError', { error: entitlement.last_refresh_error })}
                 </Alert>
               )}
 
-              {/* Full access countdown banner */}
-              {isFullAccess && fullAccessExpiry && daysRemaining !== null && (
+              {/* Countdown banner: full access or a Pro preview */}
+              {(isFullAccess || isFeatureTrial) && fullAccessExpiry && daysRemaining !== null && (
                 <Box
                   sx={{
                     mb: 2,
                     p: 1.5,
                     borderRadius: '8px',
-                    bgcolor: fullAccessPlanColors.surface,
+                    bgcolor: countdownColors.surface,
                     border: '1px solid',
-                    borderColor: fullAccessPlanColors.border,
+                    borderColor: countdownColors.border,
                   }}
                 >
                   <Typography
                     sx={{
                       fontSize: '0.78rem',
                       fontWeight: 700,
-                      color: fullAccessPlanColors.accent,
+                      color: countdownColors.accent,
                       lineHeight: 1.3,
                       mb: 0.5,
                     }}
                   >
-                    {t('plan.fullAccessCountdown', { count: daysRemaining })}
+                    {isFullAccess
+                      ? t('plan.fullAccessCountdown', { count: daysRemaining })
+                      : t('plan.featureTrialCountdown', { count: daysRemaining })}
                   </Typography>
                   <Typography
                     sx={{
                       fontSize: '0.7rem',
-                      color: fullAccessPlanColors.description,
+                      color: countdownColors.description,
                       lineHeight: 1.5,
                     }}
                   >
-                    {t('plan.fullAccessEndsNotice', { date: fullAccessExpiry })}
+                    {isFullAccess
+                      ? t('plan.fullAccessEndsNotice', { date: fullAccessExpiry })
+                      : t('plan.featureTrialEndsNotice', { date: fullAccessExpiry })}
                   </Typography>
+                  {isFeatureTrial && (
+                    <Box sx={{ mt: 1 }}>
+                      <Typography
+                        sx={{
+                          fontSize: '0.6rem',
+                          fontWeight: 700,
+                          letterSpacing: '0.08em',
+                          textTransform: 'uppercase',
+                          color: countdownColors.accent,
+                          mb: 0.5,
+                        }}
+                      >
+                        {t('plan.featureTrialOpens')}
+                      </Typography>
+                      {trialFeatureItems.map(({ id, label: name, description }) => (
+                        <Box
+                          key={id}
+                          sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.75, py: 0.25 }}
+                        >
+                          <Check
+                            size={12}
+                            style={{ color: countdownColors.accent, flexShrink: 0, marginTop: 2 }}
+                          />
+                          <Box>
+                            <Typography
+                              sx={{
+                                fontSize: '0.72rem',
+                                fontWeight: 600,
+                                color: countdownColors.accent,
+                                lineHeight: 1.3,
+                              }}
+                            >
+                              {name}
+                            </Typography>
+                            {description && (
+                              <Typography
+                                sx={{
+                                  fontSize: '0.68rem',
+                                  color: countdownColors.description,
+                                  lineHeight: 1.45,
+                                }}
+                              >
+                                {description}
+                              </Typography>
+                            )}
+                          </Box>
+                        </Box>
+                      ))}
+                    </Box>
+                  )}
                 </Box>
               )}
 
@@ -445,17 +597,25 @@ export default function PlanInfoDrawer({
                 </Box>
               ))}
 
+              {upcomingCommunityFeatures.length > 0 && (
+                <>
+                  <Divider sx={{ my: 2 }} />
+                  <PlanUpcomingFeatures
+                    title={t('plan.plannedReleases', { plan: planLabel('community') })}
+                    features={upcomingCommunityFeatures}
+                    colors={communityPlanColors}
+                    sectionColor={drawerColors.sectionText}
+                  />
+                </>
+              )}
+
               {/* Upgrade nudge box */}
             </>
           )}
 
           {activeTab === 'upgrade' && (
             <>
-              {entitlement?.ui_state === 'full_access_expired' && (
-                <Alert severity="warning" sx={{ mb: 2, fontSize: '0.75rem' }}>
-                  {t('plan.fullAccessExpiredNotice')}
-                </Alert>
-              )}
+              {entitlement?.ui_state === 'full_access_expired' && expiredNotice}
               {entitlement?.last_refresh_error && (
                 <Alert severity="warning" sx={{ mb: 2, fontSize: '0.75rem' }}>
                   {t('plan.lastRefreshError', { error: entitlement.last_refresh_error })}
@@ -605,81 +765,12 @@ export default function PlanInfoDrawer({
               {upcomingVersionedFeatures.length > 0 && (
                 <>
                   {currentFeatures.length > 0 && <Divider sx={{ my: 2 }} />}
-                  <Box
-                    sx={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      mb: 1.25,
-                    }}
-                  >
-                    <Typography
-                      variant="caption"
-                      sx={{
-                        fontWeight: 700,
-                        fontSize: '0.6rem',
-                        letterSpacing: '0.08em',
-                        textTransform: 'uppercase',
-                        color: drawerColors.sectionText,
-                      }}
-                    >
-                      {t('plan.plannedReleases', { plan: planLabel(selectedPlan) })}
-                    </Typography>
-                  </Box>
-                  {upcomingVersionedFeatures.map((feature) => (
-                    <Box key={feature.id} sx={{ display: 'flex', gap: 1.25, mb: 1.5 }}>
-                      <Box
-                        sx={{
-                          width: 16,
-                          height: 16,
-                          borderRadius: '4px',
-                          bgcolor: selectedPlanColors.iconSurface,
-                          border: '1px dashed',
-                          borderColor: selectedPlanColors.iconBorder,
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          flexShrink: 0,
-                          mt: 0.125,
-                        }}
-                      >
-                        <Clock size={9} style={{ color: selectedColor }} strokeWidth={2.5} />
-                      </Box>
-                      <Box>
-                        <Typography
-                          sx={{
-                            fontSize: '0.78rem',
-                            fontWeight: 600,
-                            color: 'text.primary',
-                            lineHeight: 1.3,
-                          }}
-                        >
-                          {feature.label}
-                        </Typography>
-                        <Typography
-                          sx={{
-                            fontSize: '0.7rem',
-                            color: selectedPlanColors.description,
-                            lineHeight: 1.4,
-                            mt: 0.25,
-                          }}
-                        >
-                          {feature.description}
-                        </Typography>
-                        <Typography
-                          sx={{
-                            fontSize: '0.68rem',
-                            color: selectedColor,
-                            lineHeight: 1.4,
-                            mt: 0.35,
-                            fontWeight: 700,
-                          }}
-                        >
-                          {t('plan.availableIn', { version: feature.available_in })}
-                        </Typography>
-                      </Box>
-                    </Box>
-                  ))}
+                  <PlanUpcomingFeatures
+                    title={t('plan.plannedReleases', { plan: planLabel(selectedPlan) })}
+                    features={upcomingVersionedFeatures}
+                    colors={selectedPlanColors}
+                    sectionColor={drawerColors.sectionText}
+                  />
                 </>
               )}
 
@@ -801,19 +892,19 @@ export default function PlanInfoDrawer({
               </Typography>
             </Box>
           )}
-          <Button
-            component="a"
-            href={BUY_URL}
-            target="_blank"
-            rel="noreferrer"
-            variant="contained"
-            fullWidth
-            onClick={handleBuyClick}
-          >
-            {t('plan.buyLink', {
-              plan: planLabel(activeTab === 'upgrade' ? selectedPlan : 'pro'),
-            })}
-          </Button>
+          {buyPlan && (
+            <Button
+              component="a"
+              href={buildBuyUrl({ plan: buyPlan, src: buySource, offer: buyOffer })}
+              target="_blank"
+              rel="noreferrer"
+              variant="contained"
+              fullWidth
+              onClick={handleBuyClick}
+            >
+              {t('plan.buyLink', { plan: planLabel(buyPlan) })}
+            </Button>
+          )}
         </Box>
       </Box>
     </Drawer>

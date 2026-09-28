@@ -1,26 +1,86 @@
-from fastapi import APIRouter, Response
+import asyncio
+import hashlib
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+
+from app.api.borg_binaries import binary_table
+from app.core.borg import BorgInterface
+from app.core.borg2 import Borg2Interface
+from app.database.database import get_db
+from app.database.models import AgentMachine
+
+logger = structlog.get_logger()
 
 router = APIRouter(tags=["agent-installer"])
+
+# Where the image keeps the agent wheel built during the Docker build.
+DEFAULT_AGENT_PACKAGE_DIR = "/opt/borg-ui/agent-dist"
+
+# The served script is pinned to the versions this server actually runs. The
+# defaults below keep the raw script valid and runnable on its own (it then
+# falls back to distribution packages), and PINNING_MARKERS delimits the block
+# the server rewrites.
+PINNING_BEGIN = "# BEGIN server-provided pinning"
+PINNING_END = "# END server-provided pinning"
 
 
 INSTALLER_SCRIPT = r"""#!/usr/bin/env bash
 set -euo pipefail
+
+# BEGIN server-provided pinning
+# Replaced when this script is served by a Borg UI instance, which fills in the
+# Borg versions it runs, the checksums of the matching static binaries, and the
+# pins of the endpoint that asked for the script.
+PINNED_BORG1_VERSION=""
+PINNED_BORG2_VERSION=""
+PINNED_BORG_BINARIES=""
+PINNED_AGENT_VERSION=""
+# The Borg major version this endpoint is pinned to in the UI, or empty to
+# leave whatever is installed alone. Read by apply_pinned_borg_version below.
+PINNED_DESIRED_BORG_VERSION=""
+# END server-provided pinning
 
 SERVER=""
 TOKEN=""
 AGENT_NAME=""
 REINSTALL="0"
 AGENT_REF="main"
+AGENT_SOURCE="server"
 BORG_VERSION="1"
 BORG_VERSION_SET="0"
+BORG_SOURCE="server"
 SKIP_BORG_INSTALL="0"
 SERVICE_USER_MODE="current"
 SERVICE_USER_MODE_SET="0"
+REMOTE_UPGRADE="1"
+REMOTE_UPGRADE_SET="0"
+NO_REMOTE_UPGRADE_MARKER="/etc/borg-ui-agent-no-remote-upgrade"
+# Deliberately not under /etc/borg-ui-agent: that directory is owned by the
+# service user, so the agent could replace any file in it, and root sources
+# this one.
+UPGRADE_CONF="/etc/borg-ui-agent-upgrade.conf"
+UPGRADE_UNIT="/etc/systemd/system/borg-ui-agent-upgrade.service"
+UPGRADE_PATH_UNIT="/etc/systemd/system/borg-ui-agent-upgrade.path"
+# The agent asks for an upgrade by creating this. It is in the agent-owned
+# config directory on purpose: creating it is the whole privilege being
+# granted, and nothing ever reads it, only its existence.
+UPGRADE_TRIGGER="/etc/borg-ui-agent/upgrade-requested"
 SERVICE_USER=""
 SERVICE_GROUP=""
 SERVICE_HOME=""
 SERVICE_READ_WRITE_PATHS="/etc/borg-ui-agent /tmp"
-BORG2_VENV="/opt/borg-ui-agent/borg2-venv"
+AGENT_ROOT="/opt/borg-ui-agent"
+BORG_FORWARDER_DIR="${AGENT_ROOT}/bin"
+UPGRADE_HELPER="${AGENT_ROOT}/bin/borg-ui-agent-upgrade"
+BORG1_LINK="/usr/local/bin/borg"
 BORG2_LINK="/usr/local/bin/borg2"
 
 usage() {
@@ -32,6 +92,8 @@ Usage:
     --name AGENT_NAME \
     [--version main] \
     [--borg-version 1|2|both] \
+    [--borg-source server|distro] \
+    [--agent-source server|git] \
     [--service-user current|borg-ui-agent|root|USERNAME] \
     [--skip-borg-install]
 
@@ -46,6 +108,27 @@ Borg install options:
   --borg-version 2      Install/verify Borg 2 as 'borg2' (advanced beta).
   --borg-version both   Install/verify Borg 1 and Borg 2.
   --skip-borg-install   Do not install Borg; register/reinstall with detected binaries only.
+
+Remote upgrade options:
+  --no-remote-upgrade   Do not install the privileged self-upgrade helper. The
+                        endpoint can then only be updated by running this
+                        installer on the machine with --reinstall. A reinstall
+                        remembers this choice; pass --remote-upgrade to undo it.
+
+  --borg-source server  Install the exact Borg versions this Borg UI server runs,
+                        from the static binaries published with those releases
+                        (default). Agent and server then speak the same Borg.
+  --borg-source distro  Use distribution packages instead. The version is then
+                        whatever the distribution ships, which may differ from
+                        the server's. Required on platforms with no published
+                        static binary, such as 32-bit ARM. Borg 1 only: no
+                        distribution ships Borg 2 yet.
+
+Agent install options:
+  --agent-source server Install the agent package the enrolling server offers
+                        (default), so the agent matches the server it talks to.
+  --agent-source git    Install from the upstream Git repository at --version.
+                        Intended for development.
 
 Service user options:
   --service-user current        Run as the user who invoked sudo (default).
@@ -99,6 +182,40 @@ while [[ $# -gt 0 ]]; do
       SKIP_BORG_INSTALL="1"
       shift
       ;;
+    --no-remote-upgrade)
+      REMOTE_UPGRADE="0"
+      REMOTE_UPGRADE_SET="1"
+      shift
+      ;;
+    --remote-upgrade)
+      REMOTE_UPGRADE="1"
+      REMOTE_UPGRADE_SET="1"
+      shift
+      ;;
+    --borg-source)
+      BORG_SOURCE="${2:-server}"
+      case "${BORG_SOURCE}" in
+        server|distro)
+          ;;
+        *)
+          echo "--borg-source must be one of: server, distro." >&2
+          exit 2
+          ;;
+      esac
+      shift 2
+      ;;
+    --agent-source)
+      AGENT_SOURCE="${2:-server}"
+      case "${AGENT_SOURCE}" in
+        server|git)
+          ;;
+        *)
+          echo "--agent-source must be one of: server, git." >&2
+          exit 2
+          ;;
+      esac
+      shift 2
+      ;;
     --service-user)
       if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
         echo "--service-user requires one of: current, borg-ui-agent, root, or an existing username." >&2
@@ -135,11 +252,69 @@ if [[ "${REINSTALL}" == "1" ]]; then
     SKIP_BORG_INSTALL="1"
     echo "Skipping Borg installation by default for reinstall mode."
   fi
+  # Reinstall takes no --server, but the agent package still comes from the
+  # server this machine is enrolled against. Prefer the root-owned upgrade
+  # record: config.toml belongs to the service user, so an agent that rewrote
+  # its own server_url would otherwise have this reinstall fetch and run code
+  # from wherever it named, and record that server for every later upgrade.
+  if [[ -z "${SERVER}" && -r "${UPGRADE_CONF}" ]]; then
+    SERVER="$(sed -nE 's/^SERVER="(.*)"$/\1/p' "${UPGRADE_CONF}" | head -n 1)"
+  fi
+  if [[ -z "${SERVER}" ]]; then
+    SERVER="$(sed -nE 's/^server_url[[:space:]]*=[[:space:]]*"(.*)"[[:space:]]*$/\1/p' \
+      /etc/borg-ui-agent/config.toml | head -n 1)"
+  fi
 elif [[ -z "${SERVER}" || -z "${TOKEN}" || -z "${AGENT_NAME}" ]]; then
   echo "--server, --token, and --name are required." >&2
   usage >&2
   exit 2
 fi
+
+# A server that knows which endpoint is asking resolves that endpoint's pins
+# into the block at the top of this script (installer_pins_for_agent in
+# app/api/agent_installer.py). The pinned Borg version has to beat two things
+# that describe how this endpoint was installed rather than what it should
+# run: the --borg-version the upgrade helper passes from upgrade.conf, and
+# reinstall mode's skip-by-default above. Without that precedence a Borg
+# choice made in the UI could never reach an endpoint.
+#
+# Setting BORG_VERSION_SET and clearing SKIP_BORG_INSTALL is also what makes
+# the choice stick: write_upgrade_conf then records BORG_INSTALL_MODE from
+# BORG_VERSION, so this endpoint's own record follows the pin.
+apply_pinned_borg_version() {
+  if [[ -z "${PINNED_DESIRED_BORG_VERSION}" ]]; then
+    return 0
+  fi
+
+  # The server drops anything but 1 or 2 before serving it. Repeated here
+  # because this script is also runnable straight from the repository, and a
+  # value that reaches the case below unmatched would skip Borg silently.
+  case "${PINNED_DESIRED_BORG_VERSION}" in
+    1 | 2) ;;
+    *)
+      echo "Ignoring unusable pinned Borg version" \
+        "'${PINNED_DESIRED_BORG_VERSION}'." >&2
+      return 0
+      ;;
+  esac
+
+  BORG_VERSION="${PINNED_DESIRED_BORG_VERSION}"
+  BORG_VERSION_SET="1"
+  SKIP_BORG_INSTALL="0"
+
+  if [[ "${BORG_VERSION}" == "2" && "${BORG_SOURCE}" == "distro" ]]; then
+    # install_borg2 exits when the source is distro, which would fail this
+    # whole reinstall and lose the agent upgrade with it. The pin is explicit,
+    # so prefer the server's static binaries over refusing.
+    BORG_SOURCE="server"
+    echo "No distribution ships Borg 2, so the pinned Borg 2 comes from the" \
+      "server's binaries."
+  fi
+
+  echo "This endpoint is pinned to Borg ${BORG_VERSION}."
+}
+
+apply_pinned_borg_version
 
 resolve_user_group_home() {
   local username="$1"
@@ -205,6 +380,15 @@ if [[ "${REINSTALL}" == "1" && "${SERVICE_USER_MODE_SET}" == "0" ]]; then
   fi
 fi
 
+# A reinstall keeps the operator's earlier answer about remote upgrade unless
+# this run gives one explicitly. The marker records a decline; its absence
+# means "never asked", which is also what an endpoint installed before remote
+# upgrade existed looks like, and that endpoint should gain the helper here.
+if [[ "${REMOTE_UPGRADE_SET}" == "0" && -e "${NO_REMOTE_UPGRADE_MARKER}" ]]; then
+  REMOTE_UPGRADE="0"
+  echo "Reinstall: remote upgrade stays declined (${NO_REMOTE_UPGRADE_MARKER} exists)."
+fi
+
 if [[ ! -r /etc/os-release ]]; then
   echo "Cannot detect Linux distribution: /etc/os-release is missing." >&2
   exit 1
@@ -223,7 +407,12 @@ export DEBIAN_FRONTEND=noninteractive
 resolve_service_identity
 
 apt-get update
-apt-get install -y python3 python3-venv python3-pip git curl ca-certificates
+apt-get install -y python3 python3-venv python3-pip curl ca-certificates
+# Only the development install path needs git; the default installs a package
+# built by the enrolling server.
+if [[ "${AGENT_SOURCE}" == "git" ]]; then
+  apt-get install -y git
+fi
 
 install -d -m 0755 /opt/borg-ui-agent
 install -d -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0750 /etc/borg-ui-agent
@@ -284,57 +473,256 @@ verify_borg_path() {
   echo "Verified ${binary_name}: ${output} (${binary_path})"
 }
 
+# Which published static binary this machine can run. Borg builds against a
+# minimum glibc, so the newest build the machine satisfies is the right one.
+detect_machine() {
+  MACHINE_ARCH="$(uname -m)"
+  case "${MACHINE_ARCH}" in
+    amd64) MACHINE_ARCH="x86_64" ;;
+    arm64) MACHINE_ARCH="aarch64" ;;
+  esac
+
+  MACHINE_GLIBC="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
+  if [[ -z "${MACHINE_GLIBC}" ]]; then
+    MACHINE_GLIBC="$(ldd --version 2>/dev/null | head -n 1 |
+      grep -oE '[0-9]+\.[0-9]+$' || true)"
+  fi
+}
+
+# True when the machine's glibc is at least $1. sort -V orders versions, and -C
+# reports whether the input was already ordered.
+glibc_at_least() {
+  [[ -n "${MACHINE_GLIBC}" ]] || return 1
+  printf '%s\n%s\n' "$1" "${MACHINE_GLIBC}" | sort -V -C
+}
+
+select_borg_binary() {
+  local major="$1"
+  local row_major row_arch row_glibc row_sha row_url best_glibc=""
+
+  BINARY_URL=""
+  BINARY_SHA=""
+
+  while read -r row_major row_arch row_glibc row_sha row_url; do
+    [[ -n "${row_major:-}" ]] || continue
+    [[ "${row_major}" == "${major}" ]] || continue
+    [[ "${row_arch}" == "${MACHINE_ARCH}" ]] || continue
+    glibc_at_least "${row_glibc}" || continue
+
+    if [[ -z "${best_glibc}" ]] ||
+      printf '%s\n%s\n' "${best_glibc}" "${row_glibc}" | sort -V -C; then
+      best_glibc="${row_glibc}"
+      BINARY_URL="${row_url}"
+      BINARY_SHA="${row_sha}"
+    fi
+  done <<<"${PINNED_BORG_BINARIES}"
+
+  [[ -n "${BINARY_URL}" ]]
+}
+
+# The lowest glibc the pinned Borg $1 asks of this architecture — the floor a
+# machine has to clear — or nothing when no binary exists for the architecture
+# at all. Borg raises the floor whenever it moves its build runner, so the
+# number comes from the manifest, never from this script.
+lowest_glibc_offered() {
+  local major="$1"
+  local row_major row_arch row_glibc row_sha row_url lowest=""
+
+  while read -r row_major row_arch row_glibc row_sha row_url; do
+    [[ -n "${row_major:-}" ]] || continue
+    [[ "${row_major}" == "${major}" ]] || continue
+    [[ "${row_arch}" == "${MACHINE_ARCH}" ]] || continue
+    if [[ -z "${lowest}" ]] ||
+      printf '%s\n%s\n' "${row_glibc}" "${lowest}" | sort -V -C; then
+      lowest="${row_glibc}"
+    fi
+  done <<<"${PINNED_BORG_BINARIES}"
+
+  printf '%s' "${lowest}"
+}
+
+# What to do when the pinned Borg $1 (version $2) cannot come from the server.
+# Borg 1 has distribution packages; Borg 2 has none, so the only way past is a
+# self-managed install exposed under the name the agent resolves: 'borg2' at
+# the link $3, the same contract the forwarder written by
+# install_borg_from_server fulfils. A pip install alone provides only 'borg'.
+# The suggested commands are pinned to the server's version, so agent and
+# server keep speaking the same Borg; without a reported version there is
+# nothing to pin and no command is printed.
+borg_fallback_advice() {
+  local major="$1" version="$2" link="$3"
+
+  if [[ "${major}" == "1" ]]; then
+    echo "Re-run with --borg-source distro to use the distribution package," >&2
+    echo "or with --skip-borg-install to manage Borg yourself." >&2
+    return
+  fi
+
+  echo "No distribution ships Borg 2 yet. Install the version this server runs" >&2
+  echo "yourself and expose it as 'borg2' on PATH, then re-run with --skip-borg-install." >&2
+  if [[ -n "${version}" ]]; then
+    echo "For example (needs a C toolchain, Borg's build dependencies and OpenSSL 3.2 or newer):" >&2
+    echo "  python3 -m venv /opt/borg2" >&2
+    printf '  /opt/borg2/bin/pip install --pre "borgbackup==%s" "borgstore[rclone,sftp,rest,s3,blake3]"\n' "${version}" >&2
+    echo "  ln -sfn /opt/borg2/bin/borg ${link}" >&2
+  fi
+}
+
+install_borg_binary() {
+  local major="$1" version="$2" dest_dir dest tmp
+
+  dest_dir="${AGENT_ROOT}/borg${major}/${version}"
+  dest="${dest_dir}/borg"
+
+  if [[ -x "${dest}" ]]; then
+    echo "Borg ${version} already present at ${dest}."
+  else
+    install -d -o root -g root -m 0755 "${AGENT_ROOT}" \
+      "${AGENT_ROOT}/borg${major}" "${dest_dir}"
+    tmp="$(mktemp)"
+    echo "Downloading Borg ${version} for ${MACHINE_ARCH} (glibc ${MACHINE_GLIBC})."
+    curl -fsSL --proto '=https' --tlsv1.2 -o "${tmp}" "${BINARY_URL}"
+    if ! printf '%s  %s\n' "${BINARY_SHA}" "${tmp}" | sha256sum -c - >/dev/null; then
+      rm -f "${tmp}"
+      echo "Checksum mismatch for Borg ${version}; refusing to install it." >&2
+      exit 1
+    fi
+    install -o root -g root -m 0755 "${tmp}" "${dest}"
+    rm -f "${tmp}"
+  fi
+
+  verify_borg_path "${dest}" "borg${major}" "${major}"
+  BORG_BINARY_PATH="${dest}"
+}
+
+# A forwarder rather than a symlink to the binary: it is the one place that can
+# later carry policy (exit-code handling, elevation) without touching callers.
+# It lives under AGENT_ROOT so the agent keeps reporting an installer-managed
+# binary; /usr/local/bin holds only a symlink to it.
+#
+# STREAM INVARIANT: never merge stdout into stderr here. Borg UI parses Borg's
+# stdout (--json) and reads stderr for warnings, so the two must stay separate.
+write_forwarder() {
+  local name="$1" target="$2" link="$3" forwarder
+
+  forwarder="${BORG_FORWARDER_DIR}/${name}"
+  install -d -o root -g root -m 0755 "${BORG_FORWARDER_DIR}"
+  cat >"${forwarder}" <<FORWARDER
+#!/usr/bin/env bash
+# Installed by the Borg UI agent installer. Runs the Borg version this machine's
+# Borg UI server runs, ahead of any distribution package on PATH.
+exec ${target} "\$@"
+FORWARDER
+  chown root:root "${forwarder}"
+  chmod 0755 "${forwarder}"
+
+  # The agent finds Borg through PATH, and /usr/local/bin precedes /usr/bin, so
+  # this symlink is what makes it use the pinned binary rather than the
+  # distribution's. Anything else already sitting there is left alone.
+  if [[ -L "${link}" ]] || [[ ! -e "${link}" ]]; then
+    ln -sfn "${forwarder}" "${link}"
+  else
+    echo "${link} exists and is not a symlink; leaving it untouched." >&2
+    echo "The agent will use whichever ${name} PATH resolves to." >&2
+  fi
+}
+
+install_borg_from_server() {
+  local major="$1" version="$2" link="$3"
+
+  if [[ -z "${version}" ]]; then
+    echo "This Borg UI server did not report a Borg ${major} version." >&2
+    borg_fallback_advice "${major}" "" "${link}"
+    exit 1
+  fi
+
+  if ! select_borg_binary "${major}"; then
+    local floor
+    floor="$(lowest_glibc_offered "${major}")"
+    if [[ -n "${floor}" ]]; then
+      echo "Borg ${version} for ${MACHINE_ARCH} needs glibc ${floor} or newer; this machine has glibc ${MACHINE_GLIBC:-unknown}." >&2
+    else
+      echo "No published Borg ${version} binary for ${MACHINE_ARCH}." >&2
+      echo "Borg publishes no static binary for 32-bit ARM or musl systems." >&2
+    fi
+    borg_fallback_advice "${major}" "${version}" "${link}"
+    exit 1
+  fi
+
+  install_borg_binary "${major}" "${version}"
+  write_forwarder "borg${major}" "${BORG_BINARY_PATH}" "${link}"
+
+  # The agent resolves Borg through PATH, so confirm the name really reaches
+  # what was just installed and not a distribution package that shadows it.
+  local path_name="${link##*/}"
+  verify_borg_major "${path_name}" "${major}"
+  if ! "${path_name}" --version 2>&1 | grep -qF "${version}"; then
+    echo "Warning: '${path_name}' on PATH is not the ${version} just installed." >&2
+    echo "The agent would then run a different Borg than this server." >&2
+  fi
+}
+
 install_borg1() {
-  if command -v borg >/dev/null 2>&1; then
-    echo "Existing borg detected; verifying without replacing it."
+  if [[ "${BORG_SOURCE}" == "distro" ]]; then
+    if command -v borg >/dev/null 2>&1; then
+      echo "Existing borg detected; verifying without replacing it."
+      verify_borg_major "borg" "1"
+      return
+    fi
+    apt-get install -y borgbackup
     verify_borg_major "borg" "1"
     return
   fi
 
-  apt-get install -y borgbackup
-  verify_borg_major "borg" "1"
+  install_borg_from_server "1" "${PINNED_BORG1_VERSION}" "${BORG1_LINK}"
+}
+
+# Borg 2 reaches rclone remotes by driving an rclone process, which borgstore
+# expects on PATH. It is a separate Go program that no Borg release bundles, so
+# rclone repositories fail at use time unless it is installed here. Installed
+# alongside Borg 2 rather than as an opt-in: a node that cannot reach a whole
+# class of repositories is a worse default than one extra package.
+install_rclone() {
+  local version
+
+  if ! command -v rclone >/dev/null 2>&1; then
+    # Non-fatal under `set -e`: a failed install must fall through to the warning
+    # below, not abort the whole installer and leave Borg 2 without an agent.
+    apt-get install -y rclone || true
+  fi
+
+  if ! command -v rclone >/dev/null 2>&1; then
+    echo "Warning: rclone could not be installed; rclone: repositories will not work." >&2
+    return
+  fi
+
+  # borgstore requires 1.57.0 or newer. Older distributions ship less than that
+  # (Debian 11 has 1.53), which is worth saying now rather than at backup time.
+  version="$(rclone version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+  if [[ -n "${version}" ]] &&
+    ! printf '%s\n%s\n' "1.57.0" "${version}" | sort -V -C; then
+    echo "Warning: rclone ${version} is older than the 1.57.0 borgstore requires." >&2
+    echo "rclone: repositories will not work until it is updated, see rclone.org." >&2
+    return
+  fi
+
+  echo "Verified rclone: ${version:-unknown version}"
 }
 
 install_borg2() {
-  if command -v borg2 >/dev/null 2>&1; then
-    echo "Existing borg2 detected; verifying without replacing it."
-    verify_borg_major "borg2" "2"
-    return
-  fi
-
-  if [[ -e "${BORG2_LINK}" || -L "${BORG2_LINK}" ]]; then
-    echo "${BORG2_LINK} exists but is not available as borg2 on PATH; refusing to replace it." >&2
+  if [[ "${BORG_SOURCE}" == "distro" ]]; then
+    echo "No distribution ships Borg 2 yet; --borg-source distro cannot install it." >&2
     exit 1
   fi
 
-  if [[ -x "${BORG2_VENV}/bin/borg" ]]; then
-    echo "Existing Borg 2 virtualenv detected; linking without reinstalling."
-    verify_borg_path "${BORG2_VENV}/bin/borg" "borg2" "2"
-    ln -s "${BORG2_VENV}/bin/borg" "${BORG2_LINK}"
-    verify_borg_major "borg2" "2"
-    return
-  fi
-
-  apt-get install -y \
-    build-essential \
-    libacl1-dev \
-    liblz4-dev \
-    libssl-dev \
-    libxxhash-dev \
-    libzstd-dev \
-    pkg-config \
-    python3-dev
-
-  python3 -m venv "${BORG2_VENV}"
-  "${BORG2_VENV}/bin/python" -m pip install --upgrade pip wheel
-  "${BORG2_VENV}/bin/pip" install --pre "borgbackup>=2.0.0b1,<3"
-  ln -s "${BORG2_VENV}/bin/borg" "${BORG2_LINK}"
-  verify_borg_major "borg2" "2"
+  install_borg_from_server "2" "${PINNED_BORG2_VERSION}" "${BORG2_LINK}"
+  install_rclone
 }
 
 if [[ "${SKIP_BORG_INSTALL}" == "1" ]]; then
   echo "Skipping Borg installation by request."
 else
+  detect_machine
   case "${BORG_VERSION}" in
     1)
       install_borg1
@@ -349,10 +737,59 @@ else
   esac
 fi
 
-python3 -m venv /opt/borg-ui-agent/.venv
-/opt/borg-ui-agent/.venv/bin/python -m pip install --upgrade pip wheel
-/opt/borg-ui-agent/.venv/bin/pip install --upgrade --force-reinstall \
-  "git+https://github.com/karanhudia/borg-ui.git@${AGENT_REF}"
+# The agent package comes from the enrolling server by default, so a node runs
+# the agent belonging to the server it talks to rather than whatever the
+# upstream default branch holds today. --agent-source git keeps the old
+# behaviour for development.
+#
+# Resolved into a variable rather than returned from a command substitution:
+# an `exit` inside `$(...)` only leaves the subshell, so a failure there would
+# hand pip an empty argument instead of stopping the install.
+resolve_agent_package_source() {
+  if [[ "${AGENT_SOURCE}" == "git" ]]; then
+    AGENT_PIP_ARGS=("git+https://github.com/karanhudia/borg-ui.git@${AGENT_REF}")
+    return
+  fi
+
+  if [[ -z "${SERVER}" ]]; then
+    echo "No server URL is known, so the agent package cannot be located." >&2
+    echo "Pass --server, or use --agent-source git." >&2
+    exit 1
+  fi
+
+  if [[ -z "${PINNED_AGENT_VERSION}" ]]; then
+    echo "This Borg UI server offers no agent package to install." >&2
+    echo "Its image predates server-provided agent packages, or was built" >&2
+    echo "without one. Re-run with --agent-source git to install from the" >&2
+    echo "upstream repository instead." >&2
+    exit 1
+  fi
+
+  # Air-gapped by construction: the agent wheel and its dependency wheels are all
+  # served by this one server, so pip resolves the whole closure from --find-links
+  # with the index switched off. No PyPI, no compiler on the node -- it reaches
+  # exactly one host, the one it is enrolling against.
+  AGENT_PIP_ARGS=(
+    --no-index
+    --find-links "${SERVER%/}/agent/dist/"
+    "borg-ui-agent==${PINNED_AGENT_VERSION}"
+  )
+}
+
+AGENT_PIP_ARGS=()
+resolve_agent_package_source
+
+# The agent wheel requires Python 3.11+. Under --no-index pip reports only "no
+# matching distribution", which hides the real cause, so name it here. Every
+# source needs it -- the wheel does not change with --agent-source git.
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+  echo "The agent package needs Python 3.11 or newer; this machine has $(python3 -V 2>&1)." >&2
+  echo "Install a newer python3 and re-run." >&2
+  exit 1
+fi
+
+python3 -m venv "${AGENT_ROOT}/.venv"
+"${AGENT_ROOT}/.venv/bin/pip" install --upgrade --force-reinstall "${AGENT_PIP_ARGS[@]}"
 
 if [[ "${REINSTALL}" == "1" ]]; then
   echo "Preserving existing agent registration at /etc/borg-ui-agent/config.toml."
@@ -410,6 +847,235 @@ ${SERVICE_CAPABILITIES}
 WantedBy=multi-user.target
 SERVICE
 
+# Everything the self-upgrade helper needs, in a file only root can write. The
+# helper takes no arguments and reads only this, so a compromised agent cannot
+# redirect the install source, change the service user, or inject installer
+# flags. That is what makes the sudoers rule safe to grant.
+write_upgrade_conf() {
+  local agent_id borg_install_mode
+
+  agent_id="$(sed -nE 's/^agent_id[[:space:]]*=[[:space:]]*"(.*)"[[:space:]]*$/\1/p' \
+    /etc/borg-ui-agent/config.toml | head -n 1)"
+  # config.toml belongs to the service user, and root sources what we write
+  # below, so anything but a plain identifier here would be a root shell for a
+  # compromised agent.
+  if [[ ! "${agent_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Could not read a usable agent_id from" >&2
+    echo "/etc/borg-ui-agent/config.toml; skipping remote upgrade setup. This" >&2
+    echo "endpoint stays on the manual reinstall path." >&2
+    return 1
+  fi
+
+  if [[ "${BORG_VERSION_SET}" == "0" && "${SKIP_BORG_INSTALL}" == "1" ]] &&
+    [[ -r "${UPGRADE_CONF}" ]]; then
+    # A bare --reinstall skips Borg by default. That is a choice about this run,
+    # not about the endpoint, so keep whatever mode was recorded rather than
+    # pinning every future remote upgrade to "skip".
+    borg_install_mode="$(sed -nE 's/^BORG_INSTALL_MODE="(.*)"$/\1/p' \
+      "${UPGRADE_CONF}" | head -n 1)"
+  fi
+  if [[ -z "${borg_install_mode:-}" ]]; then
+    if [[ "${SKIP_BORG_INSTALL}" == "1" ]]; then
+      borg_install_mode="skip"
+    else
+      borg_install_mode="${BORG_VERSION}"
+    fi
+  fi
+
+  if [[ ! "${SERVER%/}" =~ ^https?://[A-Za-z0-9._:/-]+$ ]]; then
+    echo "Server URL '${SERVER}' is not a plain URL; skipping remote upgrade" >&2
+    echo "setup. This endpoint stays on the manual reinstall path." >&2
+    return 1
+  fi
+
+  install -o root -g root -m 0644 /dev/null "${UPGRADE_CONF}"
+  cat >"${UPGRADE_CONF}" <<CONF
+# Written by the Borg UI agent installer. Read by
+# ${AGENT_ROOT}/bin/borg-ui-agent-upgrade, which takes no arguments.
+SERVER="${SERVER%/}"
+AGENT_ID="${agent_id}"
+BORG_INSTALL_MODE="${borg_install_mode}"
+BORG_SOURCE="${BORG_SOURCE}"
+SERVICE_USER_MODE="${SERVICE_USER_MODE}"
+SERVICE_USER="${SERVICE_USER}"
+SERVICE_GROUP="${SERVICE_GROUP}"
+AGENT_ROOT="${AGENT_ROOT}"
+CONF
+}
+
+write_upgrade_helper() {
+  install -d -o root -g root -m 0755 "${AGENT_ROOT}/bin"
+  cat >"${UPGRADE_HELPER}" <<'UPGRADE_HELPER'
+#!/usr/bin/env bash
+# Installed by the Borg UI agent installer. Started as root by
+# borg-ui-agent-upgrade.service, which the agent may start through one narrow
+# sudoers rule.
+#
+# It takes NO ARGUMENTS on purpose. Every parameter comes from
+# /etc/borg-ui-agent-upgrade.conf, which sits outside the agent-owned config
+# directory and only root can write, so a compromised agent cannot change the
+# install source, the service user, or the installer flags. Adding an argument
+# here would undo that.
+set -euo pipefail
+
+# The two overrides are test seams. systemd passes no environment from whoever
+# starts the unit, so the only way to use them is to already be root.
+etc="${BORG_UI_UPGRADE_ETC:-/etc/borg-ui-agent}"
+conf="${BORG_UI_UPGRADE_CONF:-/etc/borg-ui-agent-upgrade.conf}"
+agent_config="${etc}/config.toml"
+
+# systemd re-runs a .path unit for as long as the trigger is there, so clear it
+# before doing anything that can fail.
+rm -f "${BORG_UI_UPGRADE_TRIGGER:-/etc/borg-ui-agent/upgrade-requested}"
+
+if [[ ! -r "${conf}" ]]; then
+  echo "Missing ${conf}; nothing to upgrade from." >&2
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+. "${conf}"
+
+for required in SERVER AGENT_ID BORG_INSTALL_MODE SERVICE_USER AGENT_ROOT; do
+  if [[ -z "${!required:-}" ]]; then
+    echo "${conf} is missing ${required}." >&2
+    exit 1
+  fi
+done
+
+# This script runs what it downloads, as root. An http URL is refused rather
+# than downgraded to a warning.
+if [[ "${SERVER}" != https://* ]]; then
+  echo "Remote upgrade requires an https server URL; ${conf} names ${SERVER}." >&2
+  exit 1
+fi
+
+# A config left behind by an earlier enrollment must not be able to point a
+# live agent's upgrade at a host it no longer talks to.
+enrolled_server=""
+if [[ -r "${agent_config}" ]]; then
+  enrolled_server="$(sed -nE 's/^server_url[[:space:]]*=[[:space:]]*"(.*)"[[:space:]]*$/\1/p' \
+    "${agent_config}" | head -n 1)"
+fi
+if [[ "${enrolled_server%/}" != "${SERVER%/}" ]]; then
+  echo "${conf} names ${SERVER}, but this agent is enrolled against" >&2
+  echo "'${enrolled_server}'. Refusing to upgrade." >&2
+  exit 1
+fi
+
+workdir="$(mktemp -d)"
+trap 'rm -rf "${workdir}"' EXIT
+
+# --proto '=https' holds across redirects, and --max-redirs 0 means there are
+# none to hold across: any redirect is an error rather than a hop to somewhere
+# this script would then execute as root.
+fetch() {
+  curl -fsS --proto '=https' --tlsv1.2 --max-redirs 0 -o "$2" "$1"
+}
+
+query="?agent_id=${AGENT_ID}"
+fetch "${SERVER%/}/agent/install.sh${query}" "${workdir}/install.sh"
+fetch "${SERVER%/}/agent/install.sh.sha256${query}" "${workdir}/install.sh.sha256"
+
+expected="$(tr -d '[:space:]' <"${workdir}/install.sh.sha256")"
+actual="$(sha256sum "${workdir}/install.sh" | awk '{print $1}')"
+if [[ -z "${expected}" || "${expected}" != "${actual}" ]]; then
+  echo "Installer checksum mismatch; expected '${expected}', got '${actual}'." >&2
+  echo "Nothing was executed." >&2
+  exit 1
+fi
+
+args=(--reinstall --service-user "${SERVICE_USER}")
+if [[ "${BORG_INSTALL_MODE}" == "skip" ]]; then
+  args+=(--skip-borg-install)
+else
+  args+=(--borg-version "${BORG_INSTALL_MODE}")
+  # Without this an endpoint installed from distribution packages would be
+  # repointed at the server's static binaries by its first upgrade.
+  args+=(--borg-source "${BORG_SOURCE:-server}")
+fi
+
+echo "Reinstalling the Borg UI agent from ${SERVER}."
+bash "${workdir}/install.sh" "${args[@]}"
+UPGRADE_HELPER
+  chown root:root "${UPGRADE_HELPER}"
+  chmod 0755 "${UPGRADE_HELPER}"
+}
+
+write_upgrade_unit() {
+  cat >"${UPGRADE_UNIT}" <<UPGRADE_UNIT_FILE
+[Unit]
+Description=Borg UI agent self-upgrade
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${AGENT_ROOT}/bin/borg-ui-agent-upgrade
+UPGRADE_UNIT_FILE
+  chown root:root "${UPGRADE_UNIT}"
+  chmod 0644 "${UPGRADE_UNIT}"
+}
+
+# The escalation, and the whole of it: the agent creates one file, systemd
+# notices and runs the helper as root. There is no sudo, no setuid binary and
+# no argument the agent can pass, so nothing here has to survive the agent unit
+# being run with NoNewPrivileges=true, which is what defeats sudo.
+write_upgrade_path_unit() {
+  cat >"${UPGRADE_PATH_UNIT}" <<'UPGRADE_PATH_FILE'
+[Unit]
+Description=Borg UI agent self-upgrade request
+
+[Path]
+PathExists=/etc/borg-ui-agent/upgrade-requested
+Unit=borg-ui-agent-upgrade.service
+
+[Install]
+WantedBy=multi-user.target
+UPGRADE_PATH_FILE
+  chown root:root "${UPGRADE_PATH_UNIT}"
+  chmod 0644 "${UPGRADE_PATH_UNIT}"
+
+  # A trigger left over from before, or created while the path unit was off,
+  # would fire the helper the moment the unit starts, running a second
+  # installer as root on top of this one.
+  rm -f "${UPGRADE_TRIGGER}"
+
+  # The unit files are new, so systemd has to be told about them before the
+  # path unit can be enabled. The reload at the end of the script is too late.
+  systemctl daemon-reload
+  systemctl enable --now borg-ui-agent-upgrade.path
+}
+
+remove_upgrade_artifacts() {
+  systemctl disable --now borg-ui-agent-upgrade.path >/dev/null 2>&1 || true
+  rm -f "${UPGRADE_PATH_UNIT}" "${UPGRADE_UNIT}" "${UPGRADE_HELPER}" \
+    "${UPGRADE_CONF}" "${UPGRADE_TRIGGER}"
+  # An install that predates the path unit granted the agent a sudoers rule.
+  # Take it away rather than leaving a live escalation behind.
+  rm -f /etc/sudoers.d/borg-ui-agent-upgrade
+}
+
+if [[ "${REMOTE_UPGRADE}" == "1" ]] && write_upgrade_conf; then
+  write_upgrade_helper
+  write_upgrade_unit
+  # An unwatched trigger makes the helper unreachable, so do not leave the unit
+  # and helper behind pretending otherwise.
+  if write_upgrade_path_unit; then
+    rm -f "${NO_REMOTE_UPGRADE_MARKER}"
+    rm -f /etc/sudoers.d/borg-ui-agent-upgrade
+    echo "Remote upgrade is available on this endpoint."
+  else
+    remove_upgrade_artifacts
+  fi
+else
+  remove_upgrade_artifacts
+  if [[ "${REMOTE_UPGRADE}" == "0" ]]; then
+    install -o root -g root -m 0644 /dev/null "${NO_REMOTE_UPGRADE_MARKER}"
+    echo "Remote upgrade declined. Update this endpoint with --reinstall."
+  fi
+fi
+
 /opt/borg-ui-agent/.venv/bin/borg-ui-agent service-check \
   --user "${SERVICE_USER}" \
   --group "${SERVICE_GROUP}" \
@@ -429,7 +1095,498 @@ fi
 echo "Check status with: systemctl status borg-ui-agent"
 """
 
+UNINSTALLER_SCRIPT = r"""#!/usr/bin/env bash
+# Removes the Borg UI agent from this machine.
+#
+# Deliberately not `set -e`: every removal tolerates a missing target, and a
+# half-removed machine is worse than a fully reported one. Failures are
+# collected and printed at the end (spec section 6.5).
+set -uo pipefail
+
+# Overridable so the test harness can point the whole inventory at a tmpdir.
+# A real run is piped into `sudo bash` with none of these set, so each takes
+# its real path.
+AGENT_ROOT="${AGENT_ROOT:-/opt/borg-ui-agent}"
+CONFIG_DIR="${CONFIG_DIR:-/etc/borg-ui-agent}"
+CONFIG_FILE="${CONFIG_FILE:-${CONFIG_DIR}/config.toml}"
+UPGRADE_TRIGGER="${UPGRADE_TRIGGER:-${CONFIG_DIR}/upgrade-requested}"
+SERVICE_UNIT="${SERVICE_UNIT:-/etc/systemd/system/borg-ui-agent.service}"
+UPGRADE_UNIT="${UPGRADE_UNIT:-/etc/systemd/system/borg-ui-agent-upgrade.service}"
+UPGRADE_PATH_UNIT="${UPGRADE_PATH_UNIT:-/etc/systemd/system/borg-ui-agent-upgrade.path}"
+UPGRADE_CONF="${UPGRADE_CONF:-/etc/borg-ui-agent-upgrade.conf}"
+UPGRADE_HELPER="${UPGRADE_HELPER:-${AGENT_ROOT}/bin/borg-ui-agent-upgrade}"
+LEGACY_SUDOERS="${LEGACY_SUDOERS:-/etc/sudoers.d/borg-ui-agent-upgrade}"
+NO_REMOTE_UPGRADE_MARKER="${NO_REMOTE_UPGRADE_MARKER:-/etc/borg-ui-agent-no-remote-upgrade}"
+STATE_DIR="${STATE_DIR:-/var/lib/borg-ui-agent}"
+BORG1_LINK="${BORG1_LINK:-/usr/local/bin/borg}"
+BORG2_LINK="${BORG2_LINK:-/usr/local/bin/borg2}"
+DEDICATED_USER="${DEDICATED_USER:-borg-ui-agent}"
+UNREGISTER_TIMEOUT="${UNREGISTER_TIMEOUT:-5}"
+
+KEEP_BORG="0"
+KEEP_USER="0"
+KEEP_CONFIG="0"
+
+FAILURES=()
+
+note_failure() {
+  FAILURES+=("$1")
+}
+
+# Wrapped so the test harness can stub them. No logic of their own.
+run_systemctl() {
+  systemctl "$@" >/dev/null 2>&1
+}
+
+run_userdel() {
+  userdel --remove "$1" >/dev/null 2>&1
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  curl -fsSL http://SERVER:PORT/agent/uninstall.sh | sudo bash
+
+Removes the Borg UI agent from this machine: the service, the upgrade helper,
+the virtualenv, the configuration, and the dedicated service user.
+
+Your own Borg installation and your backup repositories are never touched.
+
+Options:
+  --keep-borg     Leave the Borg binaries this installer placed, and their
+                  symlinks, in place
+  --keep-user     Leave the dedicated borg-ui-agent user and its state
+                  directory in place
+  --keep-config   Leave /etc/borg-ui-agent/config.toml in place, for a
+                  reinstall against the same registration
+  --help          Print this message
+
+A Borg installed by your distribution is never removed, with or without
+--keep-borg. A service user that is not the dedicated borg-ui-agent account is
+never deleted, with or without --keep-user.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --keep-borg) KEEP_BORG="1"; shift ;;
+    --keep-user) KEEP_USER="1"; shift ;;
+    --keep-config) KEEP_CONFIG="1"; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *)
+      echo "Unknown option: $1" >&2
+      echo "Run with --help for usage." >&2
+      exit 2
+      ;;
+  esac
+done
+stop_service() {
+  run_systemctl disable --now borg-ui-agent
+}
+
+# Split from stop_service on purpose. remove_service_user reads User= from this
+# unit to decide whether the account is ours to delete, so the unit has to
+# outlive that decision. Removing it earlier does not fail loudly: it makes the
+# dedicated-account removal a silent no-op on every real run.
+remove_service_unit() {
+  rm -f "${SERVICE_UNIT}" || note_failure "could not remove ${SERVICE_UNIT}"
+}
+
+# Spec section 6.2 says to reuse the installer's remove_upgrade_artifacts
+# (app/api/agent_installer.py:1050). The installer and the uninstaller are two
+# separate bash strings served to different machines, so there is no runtime to
+# share: what is reused is the inventory, item for item. If the installer's
+# list ever grows, this one has to grow with it, and a stale copy here leaves
+# an escalation path behind on a machine that is meant to be clean.
+remove_upgrade_artifacts() {
+  run_systemctl disable --now borg-ui-agent-upgrade.path
+  rm -f "${UPGRADE_PATH_UNIT}" "${UPGRADE_UNIT}" "${UPGRADE_HELPER}" \
+    "${UPGRADE_CONF}" "${UPGRADE_TRIGGER}" \
+    || note_failure "could not remove the upgrade artifacts"
+  # An install that predates the path unit granted the agent a sudoers rule.
+  # Take it away rather than leaving a live escalation behind on a machine
+  # that is supposed to have no Borg UI on it.
+  rm -f "${LEGACY_SUDOERS}" || note_failure "could not remove ${LEGACY_SUDOERS}"
+}
+
+# SAFETY RULE 1 (spec section 6.2). A link is ours only when it resolves to a
+# path under AGENT_ROOT, which is where the installer's forwarder scripts live.
+# The same test _classify_install_source uses to label a binary
+# "borg-ui-installer" in the UI, so the card and this script agree by
+# construction. A distro Borg at /usr/bin/borg, or a link an operator pointed
+# somewhere else, is left exactly as it is: removing a system-package Borg
+# would break Borg for everything else on the machine.
+remove_borg_links() {
+  if [[ "${KEEP_BORG}" == "1" ]]; then
+    echo "Leaving the Borg binaries and their symlinks in place."
+    return 0
+  fi
+
+  local link resolved root
+  root="$(cd "${AGENT_ROOT}" 2>/dev/null && pwd -P)" || root=""
+  for link in "${BORG1_LINK}" "${BORG2_LINK}"; do
+    [[ -L "${link}" ]] || continue
+    resolved="$(readlink -f "${link}" 2>/dev/null || true)"
+    if [[ -n "${root}" && "${resolved}" == "${root}"/* ]]; then
+      rm -f "${link}" || note_failure "could not remove ${link}"
+    else
+      echo "Leaving ${link} alone: it does not point into ${AGENT_ROOT}."
+    fi
+  done
+}
+
+# SAFETY RULE 2 (spec section 6.2). The account is deleted only when the unit
+# says the service ran as the dedicated account this installer creates. An
+# install run with --service-user current binds the unit to the operator's own
+# login account, and deleting that would take their home directory with it.
+# A missing unit tells us nothing, so it deletes nothing.
+remove_service_user() {
+  if [[ "${KEEP_USER}" == "1" ]]; then
+    echo "Leaving the service user and its state directory in place."
+    return 0
+  fi
+
+  rm -rf "${STATE_DIR}" || note_failure "could not remove ${STATE_DIR}"
+
+  local unit_user=""
+  if [[ -r "${SERVICE_UNIT}" ]]; then
+    unit_user="$(awk -F= '/^User=/ {print $2; exit}' "${SERVICE_UNIT}" 2>/dev/null || true)"
+  fi
+
+  if [[ "${unit_user}" != "${DEDICATED_USER}" ]]; then
+    if [[ -n "${unit_user}" ]]; then
+      echo "Leaving the '${unit_user}' account alone: only the dedicated ${DEDICATED_USER} account is removed."
+    fi
+    return 0
+  fi
+
+  # A swallowed failure here is the worst kind: the account survives and the
+  # script still reports a clean removal. systemctl's status stays unchecked on
+  # purpose, because disabling an already-absent unit is the idempotent case.
+  if ! run_userdel "${DEDICATED_USER}"; then
+    note_failure "could not delete the ${DEDICATED_USER} account"
+  fi
+}
+
+remove_agent_files() {
+  rm -rf "${AGENT_ROOT}" || note_failure "could not remove ${AGENT_ROOT}"
+  rm -f "${NO_REMOTE_UPGRADE_MARKER}" \
+    || note_failure "could not remove ${NO_REMOTE_UPGRADE_MARKER}"
+
+  if [[ "${KEEP_CONFIG}" == "1" ]]; then
+    # The operator asked to keep the file, not to keep the upgrade trigger:
+    # an unwatched trigger left behind is a request nothing will ever serve.
+    rm -f "${UPGRADE_TRIGGER}" || note_failure "could not remove ${UPGRADE_TRIGGER}"
+    echo "Keeping ${CONFIG_FILE}."
+    return 0
+  fi
+
+  rm -rf "${CONFIG_DIR}" || note_failure "could not remove ${CONFIG_DIR}"
+}
+
+report() {
+  # The early return is load-bearing, not just tidy: under `set -u`, bash 3.2
+  # (which macOS ships, and which runs these tests locally) aborts on
+  # "${FAILURES[@]}" when the array is empty. Expanding it only after the count
+  # check is what keeps the happy path working there. If you restructure this,
+  # check it on bash 3.2, not only on CI's bash 5.
+  if [[ ${#FAILURES[@]} -eq 0 ]]; then
+    echo "Borg UI agent removed."
+    return 0
+  fi
+  echo "Borg UI agent removed, with problems:" >&2
+  local failure
+  for failure in "${FAILURES[@]}"; do
+    echo "  - ${failure}" >&2
+  done
+  return 1
+}
+
+# Best effort, and deliberately so (spec section 6.4). The server marks the
+# machine revoked, so the card reflects reality without the operator clicking
+# Delete. A stranded agent cannot reach its server, which is a likely reason to
+# be uninstalling in the first place, so a failure here reports and continues.
+#
+# The token is read from the config and sent only to the server_url recorded in
+# that same file, never to a URL passed on the command line, so a pasted script
+# cannot be steered into exfiltrating the credential. It is never echoed.
+unregister() {
+  if [[ ! -r "${CONFIG_FILE}" ]]; then
+    echo "No readable config at ${CONFIG_FILE}; skipping the unregister call."
+    return 0
+  fi
+
+  local server token
+  server="$(awk -F'"' '/^server_url[[:space:]]*=/ {print $2; exit}' "${CONFIG_FILE}")"
+  token="$(awk -F'"' '/^agent_token[[:space:]]*=/ {print $2; exit}' "${CONFIG_FILE}")"
+
+  if [[ -z "${server}" || -z "${token}" ]]; then
+    echo "The config carries no server URL and token; skipping the unregister call."
+    return 0
+  fi
+
+  # The header goes in on stdin rather than as an argument: a command line is
+  # world-readable through ps, and this one runs as root. curl's config format
+  # escapes backslash and double quote inside a quoted value.
+  local quoted="${token//\\/\\\\}"
+  quoted="${quoted//\"/\\\"}"
+
+  if printf 'header = "X-Borg-Agent-Authorization: Bearer %s"\n' "${quoted}" \
+    | curl -fsS --max-time "${UNREGISTER_TIMEOUT}" -X POST --config - \
+      "${server%/}/api/agents/unregister" >/dev/null 2>&1; then
+    echo "Server notified: this endpoint is now revoked."
+  else
+    echo "Could not reach ${server} to unregister. Removing locally anyway."
+  fi
+  return 0
+}
+
+if [[ "$(id -u)" != "0" ]]; then
+  echo "This must run as root. Pipe it into 'sudo bash'." >&2
+  exit 1
+fi
+
+unregister
+stop_service
+remove_upgrade_artifacts
+remove_borg_links
+remove_service_user
+remove_service_unit
+remove_agent_files
+run_systemctl daemon-reload
+report
+"""
+
+
+def _installed_borg_version(interface_factory, label: str) -> str | None:
+    """The exact Borg version this server runs, or None if it has none.
+
+    Read from the binary rather than kept as a constant, so it cannot drift
+    from what the server actually executes when a base image is bumped.
+    """
+    try:
+        raw = interface_factory().get_version()
+    except Exception as exc:  # a missing binary must not break the installer
+        logger.warning(
+            "Could not determine server Borg version", borg=label, error=str(exc)
+        )
+        return None
+
+    match = re.search(r"\d+\.\d+(?:\.\d+)?(?:[A-Za-z]\d+)?", raw or "")
+    return match.group(0) if match else None
+
+
+def _agent_dist_dir() -> Path:
+    return Path(os.getenv("AGENT_PACKAGE_DIR", DEFAULT_AGENT_PACKAGE_DIR))
+
+
+def agent_package_path() -> Path | None:
+    """The agent wheel built into this image, if present."""
+    wheels = sorted(_agent_dist_dir().glob("borg_ui_agent-*.whl"))
+    return wheels[-1] if wheels else None
+
+
+def agent_package_version() -> str | None:
+    """The version of the agent wheel this image serves, if any.
+
+    The installer pins the version and installs `borg-ui-agent==<version>` from the
+    served wheelhouse, so the node runs the agent this server was built with.
+    """
+    package = agent_package_path()
+    if package is None:
+        return None
+    # Wheel filename: {name}-{version}-{python}-{abi}-{platform}.whl
+    parts = package.stem.split("-")
+    return parts[1] if len(parts) >= 2 else None
+
+
+# A pin is interpolated into a block the endpoint executes as root, and it
+# arrives from the database rather than from a filename on this server. One
+# conservative shape for anything that claims to be a version: no quotes, no
+# spaces, no shell metacharacters, and short enough to be a version rather
+# than a payload.
+_SAFE_PIN = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
+
+
+@dataclass(frozen=True)
+class InstallerPins:
+    """The versions the script served to one endpoint pins.
+
+    `agent_version` of None means track the wheel this server serves.
+    `desired_borg_version` of None means leave the installed Borg alone.
+    """
+
+    agent_version: Optional[str] = None
+    desired_borg_version: Optional[str] = None
+
+
+def installer_pins_for_agent(db: Session, agent_id: Optional[str]) -> InstallerPins:
+    """One endpoint's pins, or the unpinned defaults.
+
+    An unknown agent_id is deliberately not an error. This is the public
+    install endpoint: first-time enrollment has no agent row yet, and
+    answering differently for a known and an unknown id would make the route a
+    probe for which agent ids exist.
+
+    Both values are whitelisted here, at the boundary between the database and
+    a root-executed script, rather than trusted from the PUT route that wrote
+    them. That route validates, but a row can predate a validation rule or be
+    edited by hand, and the cost of the check is a regex.
+    """
+    if not agent_id:
+        return InstallerPins()
+
+    agent = db.query(AgentMachine).filter(AgentMachine.agent_id == agent_id).first()
+    if agent is None:
+        return InstallerPins()
+
+    agent_version = agent.desired_agent_version
+    # fullmatch, not match: `$` also matches just before a trailing newline, so
+    # `match` would accept "0.1.3\n" and interpolate the newline into the
+    # script's PINNED_AGENT_VERSION assignment.
+    if agent_version is not None and _SAFE_PIN.fullmatch(agent_version) is None:
+        logger.warning(
+            "agent_installer_pin_refused",
+            agent_id=agent_id,
+            field="desired_agent_version",
+        )
+        agent_version = None
+
+    borg_version = agent.desired_borg_version
+    if borg_version not in ("1", "2"):
+        if borg_version:
+            logger.warning(
+                "agent_installer_pin_refused",
+                agent_id=agent_id,
+                field="desired_borg_version",
+            )
+        borg_version = None
+
+    return InstallerPins(agent_version=agent_version, desired_borg_version=borg_version)
+
+
+def render_installer_script(pins: Optional[InstallerPins] = None) -> str:
+    """Pin the installer to the versions this server runs and this endpoint
+    wants.
+
+    Only the delimited block at the top of the script is rewritten. The rest is
+    served verbatim, so the script in the repository stays the script that runs.
+
+    `pins` default to unpinned, which is first-time enrollment and every
+    request that names no agent: the served wheel and no Borg override, which
+    is what this function pinned for every caller before phase 5.
+    """
+    pins = pins or InstallerPins()
+    versions = {
+        "1": _installed_borg_version(BorgInterface, "borg1"),
+        "2": _installed_borg_version(Borg2Interface, "borg2"),
+    }
+
+    pinning = "\n".join(
+        [
+            PINNING_BEGIN,
+            "# Filled in by the Borg UI instance that served this script.",
+            f'PINNED_BORG1_VERSION="{versions["1"] or ""}"',
+            f'PINNED_BORG2_VERSION="{versions["2"] or ""}"',
+            f'PINNED_BORG_BINARIES="{binary_table(versions)}"',
+            f'PINNED_AGENT_VERSION="'
+            f'{pins.agent_version or agent_package_version() or ""}"',
+            f'PINNED_DESIRED_BORG_VERSION="{pins.desired_borg_version or ""}"',
+            PINNING_END,
+        ]
+    )
+
+    start = INSTALLER_SCRIPT.index(PINNING_BEGIN)
+    end = INSTALLER_SCRIPT.index(PINNING_END) + len(PINNING_END)
+    return INSTALLER_SCRIPT[:start] + pinning + INSTALLER_SCRIPT[end:]
+
 
 @router.get("/agent/install.sh")
-async def get_agent_installer() -> Response:
-    return Response(content=INSTALLER_SCRIPT, media_type="text/x-shellscript")
+async def get_agent_installer(
+    agent_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+) -> Response:
+    # render_installer_script runs `borg --version` (a blocking subprocess) and
+    # touches the filesystem, so it is offloaded to a worker thread rather than run
+    # on the event loop of this public endpoint. The pins are resolved before that
+    # hand-off: an InstallerPins is plain strings, so no ORM object bound to this
+    # request's session is touched from the worker thread.
+    pins = installer_pins_for_agent(db, agent_id)
+    script = await asyncio.to_thread(render_installer_script, pins)
+    return Response(content=script, media_type="text/x-shellscript")
+
+
+@router.get("/agent/install.sh.sha256")
+async def get_agent_installer_checksum(
+    agent_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+) -> Response:
+    """The SHA256 of the script this server serves at /agent/install.sh.
+
+    The self-upgrade helper runs the downloaded script as root, so it verifies
+    the download against this before executing anything. Rendered through the
+    same function as the script itself, for the same endpoint, so the two agree
+    for as long as the server's pinned versions and that endpoint's pins do not
+    change between the helper's two requests. A server restarted into a new
+    release in that window, or a pin changed in it, makes the helper refuse and
+    retry later, which is the direction to fail in.
+    """
+    pins = installer_pins_for_agent(db, agent_id)
+    script = await asyncio.to_thread(render_installer_script, pins)
+    digest = hashlib.sha256(script.encode("utf-8")).hexdigest()
+    return Response(content=f"{digest}\n", media_type="text/plain")
+
+
+@router.get("/agent/uninstall.sh")
+async def get_agent_uninstaller() -> Response:
+    """The uninstaller this server serves, identical for every caller.
+
+    Unauthenticated, matching install.sh beside it. Acceptable because the
+    script is static: it carries no credential, no pins and no per-agent data,
+    and does nothing unless an operator with root on a machine chooses to run
+    it there. It reveals only that a Borg UI server is present, which
+    install.sh already reveals (spec section 8).
+
+    Takes no query parameters and touches no database, so unlike the installer
+    it needs neither a session nor a worker thread.
+    """
+    return Response(content=UNINSTALLER_SCRIPT, media_type="text/x-shellscript")
+
+
+@router.get("/agent/dist/")
+async def get_agent_dist_index() -> Response:
+    """A find-links index of the agent wheelhouse this image serves.
+
+    The installer runs `pip install --no-index --find-links <server>/agent/dist/`,
+    so the agent and its whole dependency closure come from this one server and the
+    install is air-gapped: pip reads this page, follows the wheel links, and never
+    touches an index. A node installs the agent belonging to the server it enrols
+    against, which matters whenever a deployment runs ahead of the default branch.
+    """
+    wheels = sorted(_agent_dist_dir().glob("*.whl"))
+    links = "\n".join(f'    <a href="{w.name}">{w.name}</a><br>' for w in wheels)
+    html = (
+        "<!DOCTYPE html>\n"
+        "<html><head><title>borg-ui-agent wheelhouse</title></head>\n"
+        f"<body>\n{links}\n</body></html>\n"
+    )
+    return Response(content=html, media_type="text/html")
+
+
+@router.get("/agent/dist/{filename}")
+async def get_agent_wheel(filename: str) -> FileResponse:
+    """Serve one wheel from the agent wheelhouse."""
+    # A path parameter never spans '/', but reject anything that is not a plain
+    # wheel filename sitting directly in the dist dir, so nothing outside it can be
+    # reached.
+    if filename != Path(filename).name or not filename.endswith(".whl"):
+        raise HTTPException(status_code=404, detail="Not found")
+    wheel = _agent_dist_dir() / filename
+    if not wheel.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    return FileResponse(
+        wheel,
+        media_type="application/octet-stream",
+        filename=filename,
+    )

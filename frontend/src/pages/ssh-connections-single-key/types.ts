@@ -22,10 +22,13 @@ export interface SSHConnection {
   ssh_path_prefix?: string
   mount_point?: string
   status: string
+  shell_restricted?: boolean
   last_test?: string
   last_success?: string
   error_message?: string
   storage?: StorageInfo | null
+  host_key_verified?: boolean
+  host_key_fingerprint?: string | null
   created_at: string
 }
 

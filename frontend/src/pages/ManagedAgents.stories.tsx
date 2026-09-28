@@ -232,14 +232,26 @@ export const FleetOverview: Story = {
         <Stack
           direction={{ xs: 'column', md: 'row' }}
           spacing={2}
-          justifyContent="space-between"
-          alignItems={{ xs: 'stretch', md: 'center' }}
+          sx={{
+            justifyContent: 'space-between',
+            alignItems: { xs: 'stretch', md: 'center' },
+          }}
         >
           <Box>
-            <Typography variant="h4" fontWeight={700}>
+            <Typography
+              variant="h4"
+              sx={{
+                fontWeight: 700,
+              }}
+            >
               Managed Agents
             </Typography>
-            <Typography color="text.secondary" sx={{ mt: 0.5 }}>
+            <Typography
+              sx={{
+                color: 'text.secondary',
+                mt: 0.5,
+              }}
+            >
               Lightweight machines connected to this Borg UI server
             </Typography>
           </Box>
@@ -272,13 +284,32 @@ export const FleetOverview: Story = {
                     borderColor: 'divider',
                   }}
                 >
-                  <Stack direction="row" spacing={0.75} alignItems="center" color="text.secondary">
+                  <Stack
+                    direction="row"
+                    spacing={0.75}
+                    sx={{
+                      alignItems: 'center',
+                      color: 'text.secondary',
+                    }}
+                  >
                     <Icon size={15} />
-                    <Typography variant="caption" fontWeight={700} textTransform="uppercase">
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        fontWeight: 700,
+                        textTransform: 'uppercase',
+                      }}
+                    >
                       {stat.label}
                     </Typography>
                   </Stack>
-                  <Typography variant="h5" fontWeight={700} sx={{ mt: 0.5 }}>
+                  <Typography
+                    variant="h5"
+                    sx={{
+                      fontWeight: 700,
+                      mt: 0.5,
+                    }}
+                  >
                     {stat.value}
                   </Typography>
                 </Box>
@@ -288,7 +319,13 @@ export const FleetOverview: Story = {
         </Paper>
 
         <Box>
-          <Typography variant="h6" fontWeight={700} sx={{ mb: 1.5 }}>
+          <Typography
+            variant="h6"
+            sx={{
+              fontWeight: 700,
+              mb: 1.5,
+            }}
+          >
             Fleet
           </Typography>
           <AgentList
@@ -306,7 +343,13 @@ export const FleetOverview: Story = {
         <Divider />
 
         <Box>
-          <Typography variant="h6" fontWeight={700} sx={{ mb: 1.5 }}>
+          <Typography
+            variant="h6"
+            sx={{
+              fontWeight: 700,
+              mb: 1.5,
+            }}
+          >
             Jobs
           </Typography>
           <JobsTable
@@ -319,7 +362,13 @@ export const FleetOverview: Story = {
         </Box>
 
         <Box>
-          <Typography variant="h6" fontWeight={700} sx={{ mb: 1.5 }}>
+          <Typography
+            variant="h6"
+            sx={{
+              fontWeight: 700,
+              mb: 1.5,
+            }}
+          >
             Enrollment Tokens
           </Typography>
           <TokensTable tokens={tokens} onRevoke={() => {}} isRevoking={false} />
@@ -351,10 +400,20 @@ export const SetupHelpDetails: Story = {
       <Paper variant="outlined" sx={{ maxWidth: 820, mx: 'auto', p: 3, borderRadius: 2 }}>
         <Stack spacing={2}>
           <Box>
-            <Typography variant="h5" fontWeight={700}>
+            <Typography
+              variant="h5"
+              sx={{
+                fontWeight: 700,
+              }}
+            >
               Agent Setup Help
             </Typography>
-            <Typography color="text.secondary" sx={{ mt: 0.5 }}>
+            <Typography
+              sx={{
+                color: 'text.secondary',
+                mt: 0.5,
+              }}
+            >
               Fresh-machine install, registration URL, and startup guidance
             </Typography>
           </Box>
@@ -579,5 +638,160 @@ export const AgentJobLogs: Story = {
     <Box sx={{ p: 3, bgcolor: 'background.default', minHeight: '100vh' }}>
       <AgentJobLogsDialog job={jobs[0]} logs={jobLogs} onClose={() => {}} />
     </Box>
+  ),
+}
+
+export const AgentFleetVersionStates: Story = {
+  name: 'Agent list with mixed agent versions',
+  render: () => (
+    <AgentList
+      agents={[
+        {
+          ...agents[0],
+          name: 'Production NAS',
+          agent_version: '0.1.2',
+          available_agent_version: '0.1.3',
+          upgrade_status: 'outdated',
+        },
+        {
+          ...agents[1],
+          name: 'Finance Workstation',
+          agent_version: '0.1.3',
+          available_agent_version: '0.1.3',
+          upgrade_status: 'up_to_date',
+        },
+        {
+          ...agents[0],
+          id: 91,
+          agent_id: 'agt_pinned_91',
+          name: 'Legacy Print Server',
+          agent_version: '0.1.1',
+          desired_agent_version: '0.1.1',
+          available_agent_version: '0.1.3',
+          upgrade_status: 'pinned',
+        },
+        {
+          ...agents[0],
+          id: 92,
+          agent_id: 'agt_unknown_92',
+          name: 'Newly Enrolled Laptop',
+          agent_version: null,
+          available_agent_version: '0.1.3',
+          upgrade_status: 'unknown',
+        },
+      ]}
+      serverUrl="https://borg-ui.example.com"
+      onCopy={() => {}}
+      onRevoke={() => {}}
+      onDelete={() => {}}
+      onViewLogs={() => {}}
+      isRevoking={false}
+      isDeleting={false}
+    />
+  ),
+}
+
+const offlineAgents = [
+  {
+    ...agents[0],
+    id: 93,
+    agent_id: 'agt_offline_93',
+    name: 'Stranded NAS',
+    status: 'offline',
+    agent_version: '0.1.4',
+    available_agent_version: '0.1.5',
+  },
+  {
+    ...agents[1],
+    id: 94,
+    agent_id: 'agt_offline_94',
+    name: 'Relocated Server',
+    status: 'offline',
+    agent_version: '0.1.5',
+    available_agent_version: '0.1.5',
+  },
+]
+
+export const AgentFleetOfflineRecovery: Story = {
+  name: 'Agent list with offline endpoints and the server URL hint',
+  render: () => (
+    <AgentList
+      agents={offlineAgents}
+      serverUrl="https://borg-ui.example.com"
+      onCopy={() => {}}
+      onRevoke={() => {}}
+      onDelete={() => {}}
+      onViewLogs={() => {}}
+      isRevoking={false}
+      isDeleting={false}
+    />
+  ),
+}
+
+export const AgentFleetOfflineRecoveryMobile: Story = {
+  ...AgentFleetOfflineRecovery,
+  name: 'Agent list with offline endpoints, mobile',
+  parameters: { viewport: { defaultViewport: 'mobile1' } },
+}
+
+export const AgentFleetUpgradeSelection: Story = {
+  name: 'Agent list with endpoints selected for a fleet upgrade',
+  // The bulk bar is hidden at zero selected, so the snapshot has to tick a box
+  // to cover it. Matches the play convention in BackendTargetSwitcher.stories.
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 0))
+    canvasElement.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click()
+  },
+  render: () => (
+    <AgentList
+      agents={[
+        {
+          ...agents[0],
+          name: 'Production NAS',
+          agent_version: '0.1.2',
+          available_agent_version: '0.1.3',
+          upgrade_status: 'outdated',
+          self_upgrade_supported: true,
+        },
+        {
+          ...agents[1],
+          name: 'Finance Workstation',
+          agent_version: '0.1.2',
+          available_agent_version: '0.1.3',
+          upgrade_status: 'outdated',
+          self_upgrade_supported: true,
+        },
+        {
+          ...agents[0],
+          id: 93,
+          agent_id: 'agt_waiting_93',
+          name: 'Build Server',
+          agent_version: '0.1.2',
+          available_agent_version: '0.1.3',
+          upgrade_status: 'outdated',
+          self_upgrade_supported: true,
+          upgrade_state: 'queued',
+          upgrade_requested_at: null,
+        },
+        {
+          ...agents[0],
+          id: 94,
+          agent_id: 'agt_manual_94',
+          name: 'Legacy Print Server',
+          agent_version: '0.1.2',
+          available_agent_version: '0.1.3',
+          upgrade_status: 'outdated',
+          self_upgrade_supported: false,
+        },
+      ]}
+      serverUrl="https://borg-ui.example.com"
+      onCopy={() => {}}
+      onRevoke={() => {}}
+      onDelete={() => {}}
+      onViewLogs={() => {}}
+      onUpgradeMany={() => {}}
+      isRevoking={false}
+      isDeleting={false}
+    />
   ),
 }

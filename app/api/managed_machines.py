@@ -2,15 +2,21 @@ import ipaddress
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, defer
 import structlog
 
+from app.api.agent_installer import agent_package_version
+from app.api.agents import FINAL_AGENT_JOB_STATUSES, _cancel_agent_job
 from app.core.agent_auth import AGENT_TOKEN_PREFIX_LENGTH
-from app.core.agent_constants import AGENT_FILESYSTEM_BROWSE_TIMEOUT_SECONDS
+from app.core.agent_versions import compute_agent_upgrade_status
+from app.core.agent_constants import (
+    AGENT_FILESYSTEM_BROWSE_TIMEOUT_SECONDS,
+)
 from app.core.features import require_feature_access
 from app.core.security import get_current_admin_user, get_password_hash
 from app.database.database import get_db
@@ -32,6 +38,7 @@ from app.services.agent_connection_manager import (
     AgentCommandTimeout,
     AgentConnectionUnavailable,
 )
+from app.services.agent_upgrades import release_agent_upgrade_waves
 from app.services.log_policy import get_log_save_policy, job_has_logs_by_policy
 from app.utils.datetime_utils import serialize_datetime
 
@@ -105,6 +112,17 @@ class AgentMachineResponse(BaseModel):
     os: Optional[str] = None
     arch: Optional[str] = None
     agent_version: Optional[str] = None
+    desired_agent_version: Optional[str] = None
+    desired_borg_version: Optional[str] = None
+    available_agent_version: Optional[str] = None
+    upgrade_status: str = "unknown"
+    # None until the agent has reported its capabilities at least once. An
+    # endpoint that has never checked in has not said it cannot upgrade
+    # itself, and must not be labelled manual-only for it.
+    self_upgrade_supported: Optional[bool] = None
+    upgrade_state: Optional[str] = None
+    upgrade_requested_at: Optional[datetime] = None
+    upgrade_error: Optional[str] = None
     default_path: Optional[str] = None
     borg_versions: Optional[list[dict[str, Any]]] = None
     capabilities: Optional[list[str]] = None
@@ -467,6 +485,40 @@ async def revoke_enrollment_token(
         )
 
 
+class AgentDesiredVersionRequest(BaseModel):
+    """Pin an endpoint to a version, or clear the pin by sending nulls."""
+
+    desired_agent_version: Optional[str] = None
+    desired_borg_version: Optional[Literal["1", "2"]] = None
+
+
+class AgentUpgradeRequest(BaseModel):
+    """Ask each named endpoint to reinstall itself."""
+
+    agent_machine_ids: list[int]
+
+
+def _agent_machine_response(
+    agent: AgentMachine, *, available: Optional[str]
+) -> AgentMachineResponse:
+    """Serialize one agent together with its computed upgrade status.
+
+    ``available`` is passed in rather than resolved here so a list response
+    reads the served wheel version once instead of once per agent.
+    """
+    response = AgentMachineResponse.model_validate(agent)
+    response.available_agent_version = available
+    response.upgrade_status = compute_agent_upgrade_status(
+        reported=agent.agent_version,
+        desired=agent.desired_agent_version,
+        available=available,
+    )
+    response.self_upgrade_supported = (
+        None if agent.capabilities is None else "self_upgrade" in agent.capabilities
+    )
+    return response
+
+
 @router.get("/agents", response_model=list[AgentMachineResponse])
 async def list_agent_machines(
     _: User = Depends(get_current_admin_user),
@@ -490,7 +542,197 @@ async def list_agent_machines(
             changed = True
     if changed:
         db.commit()
-    return agents
+    available = agent_package_version()
+    return [_agent_machine_response(agent, available=available) for agent in agents]
+
+
+@router.put(
+    "/agents/{agent_machine_id}/desired-version",
+    response_model=AgentMachineResponse,
+)
+async def set_agent_desired_version(
+    agent_machine_id: int,
+    payload: AgentDesiredVersionRequest,
+    _: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Pin this endpoint to an agent version, or clear the pin so it tracks the
+    server again."""
+    agent = (
+        db.query(AgentMachine)
+        .filter(
+            AgentMachine.id == agent_machine_id,
+            AgentMachine.status != "deleted",
+        )
+        .first()
+    )
+    if agent is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"key": "backend.errors.agents.agentNotFound"},
+        )
+
+    available = agent_package_version()
+    if (
+        payload.desired_agent_version is not None
+        and payload.desired_agent_version != available
+    ):
+        # The installer installs from this server's wheelhouse and nowhere
+        # else, so a pin to any other version could never be satisfied.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"key": "backend.errors.agents.desiredVersionUnavailable"},
+        )
+
+    agent.desired_agent_version = payload.desired_agent_version
+    agent.desired_borg_version = payload.desired_borg_version
+    agent.updated_at = _now_utc()
+    db.commit()
+    db.refresh(agent)
+    return _agent_machine_response(agent, available=available)
+
+
+# An upgrade job is completed as soon as the endpoint acknowledges the request,
+# so a job still in one of these is one nothing has answered for yet.
+UPGRADE_IN_FLIGHT_STATUSES = ("queued", "claimed", "running", "cancel_requested")
+
+
+@router.post("/agents/upgrade")
+async def upgrade_agent_machines(
+    payload: AgentUpgradeRequest,
+    current_user: User = Depends(require_managed_agents_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Ask each named endpoint to reinstall itself.
+
+    Validation runs over the whole request before anything is created: a
+    partial success that reports as a full one is the failure mode to avoid.
+    The agent is killed by the thing it is reporting on, so the job records
+    only that the upgrade was requested; the outcome is resolved by the
+    register path and the reaper (spec section 7.1).
+    """
+    # Deduplicated first: an upgrade restarts the endpoint, so two jobs for one
+    # machine could restart it twice or race two reinstalls against each other.
+    wanted = list(dict.fromkeys(payload.agent_machine_ids))
+    agents = (
+        db.query(AgentMachine)
+        .filter(AgentMachine.id.in_(wanted), AgentMachine.status != "deleted")
+        .all()
+        if wanted
+        else []
+    )
+    found = {agent.id: agent for agent in agents}
+    if len(found) != len(wanted):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"key": "backend.errors.agents.agentNotFound"},
+        )
+
+    available = agent_package_version()
+    for agent_id in wanted:
+        agent = found[agent_id]
+        if not (agent.capabilities and "self_upgrade" in agent.capabilities):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"key": "backend.errors.agents.upgradeUnsupported"},
+            )
+        # The installer installs from this server's wheelhouse and nowhere
+        # else, so an unpinned endpoint on a server with no wheel, and a pin
+        # this server can no longer serve (the pin outlived a server upgrade),
+        # are both unsatisfiable. Reject them here rather than restarting the
+        # endpoint into a reinstall that cannot produce the target.
+        target = agent.desired_agent_version or available
+        if not target or target != available:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"key": "backend.errors.agents.upgradeTargetUnavailable"},
+            )
+
+    for agent_id in wanted:
+        agent = found[agent_id]
+        existing = (
+            db.query(AgentJob)
+            .filter(
+                AgentJob.agent_machine_id == agent.id,
+                AgentJob.job_type == "agent_upgrade",
+                AgentJob.status.in_(UPGRADE_IN_FLIGHT_STATUSES),
+            )
+            .first()
+        )
+        if existing is not None:
+            # Idempotent under a double click or a client retry: the endpoint
+            # is already restarting for a request nobody has answered for yet.
+            continue
+        # Accept, do not dispatch. The conditional write is what makes two
+        # concurrent requests safe: an endpoint already queued or already
+        # upgrading keeps the state it has, because an upgrade restarts the
+        # machine and a double click must not restart it twice.
+        db.query(AgentMachine).filter(
+            AgentMachine.id == agent.id,
+            or_(
+                AgentMachine.upgrade_state.is_(None),
+                AgentMachine.upgrade_state.notin_(("queued", "requested")),
+            ),
+        ).update(
+            {
+                AgentMachine.upgrade_state: "queued",
+                # Deliberately not stamped here: the reaper times an endpoint
+                # out from upgrade_requested_at, and time spent waiting for a
+                # wave is not time the endpoint failed to come back. It is
+                # stamped when the endpoint is actually dispatched.
+                AgentMachine.upgrade_requested_at: None,
+                AgentMachine.upgrade_target_version: (
+                    agent.desired_agent_version or available
+                ),
+                AgentMachine.upgrade_error: None,
+            },
+            synchronize_session=False,
+        )
+        db.commit()
+
+    # Release the first wave inline so a request within the cap starts at once
+    # rather than waiting up to a reaper interval. Everything over the cap is
+    # left queued and picked up by the reaper as slots free (spec section 8).
+    await release_agent_upgrade_waves(db)
+
+    results = []
+    for agent_id in wanted:
+        agent = db.query(AgentMachine).filter(AgentMachine.id == agent_id).first()
+        results.append(
+            {
+                "agent_machine_id": agent_id,
+                # None while queued: the job is created at dispatch, so an
+                # earlier upgrade's job must not be reported as this one's.
+                "job_id": None
+                if agent.upgrade_state == "queued"
+                else _last_upgrade_job_id(db, agent),
+                # An endpoint skipped above because a dispatch was already in
+                # flight for it may not have reached "requested" yet, and the
+                # caller is owed a state either way.
+                "state": agent.upgrade_state or "requested",
+            }
+        )
+
+    logger.info(
+        "Agent upgrades requested",
+        user=current_user.username,
+        agent_machine_ids=wanted,
+    )
+    return {"results": results}
+
+
+def _last_upgrade_job_id(db: Session, agent: AgentMachine) -> Optional[int]:
+    """The job that requested the upgrade this agent is still waiting on."""
+    job = (
+        db.query(AgentJob)
+        .filter(
+            AgentJob.agent_machine_id == agent.id,
+            AgentJob.job_type == "agent_upgrade",
+        )
+        .order_by(AgentJob.id.desc())
+        .first()
+    )
+    return job.id if job else None
 
 
 @router.post(
@@ -517,9 +759,11 @@ async def create_agent_backup_job(
         )
 
     now = _now_utc()
+    from app.services.repository_executor import BACKUP_AGENT_JOB_TYPE
+
     job = AgentJob(
         agent_machine_id=agent.id,
-        job_type="backup",
+        job_type=BACKUP_AGENT_JOB_TYPE,
         status="queued",
         payload=_build_backup_job_payload(payload),
         created_at=now,
@@ -765,17 +1009,34 @@ async def delete_agent_machine(
             detail={"key": "backend.errors.agents.agentNotFound"},
         )
 
+    now = _now_utc()
+    # Nothing will ever claim this agent's pending jobs, and admission counts
+    # them as live work on their repositories until they end. Runs on every
+    # delete request, not only the first, so a retry still clears jobs an
+    # earlier (pre-fix) deletion left behind. The shared cancel path also
+    # finalizes the linked backup / operation rows.
+    pending_jobs = (
+        db.query(AgentJob)
+        .filter(
+            AgentJob.agent_machine_id == agent.id,
+            AgentJob.status.notin_(FINAL_AGENT_JOB_STATUSES),
+        )
+        .all()
+    )
+    for job in pending_jobs:
+        _cancel_agent_job(job, db, completed_at=now)
+        job.error_message = "Agent deleted"
+
     if agent.status != "deleted":
-        now = _now_utc()
         agent.status = "deleted"
         agent.deleted_at = now
         agent.updated_at = now
-        db.commit()
         logger.info(
             "Agent machine deleted",
             user=current_user.username,
             agent_id=agent.agent_id,
         )
+    db.commit()
 
 
 DEFAULT_AGENT_JOBS_LIMIT = 200
@@ -851,15 +1112,29 @@ async def request_agent_job_cancel(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"key": "backend.errors.agents.jobNotFound"},
         )
-    if job.status in ("completed", "failed", "canceled"):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"key": "backend.errors.agents.jobAlreadyFinished"},
-        )
+    already_finished = HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"key": "backend.errors.agents.jobAlreadyFinished"},
+    )
+    if job.status in FINAL_AGENT_JOB_STATUSES:
+        raise already_finished
 
-    job.status = "cancel_requested"
-    job.updated_at = _now_utc()
+    # A verdict the agent commits after the check above must stand: the
+    # request only applies while the job is still unfinished.
+    requested = (
+        db.query(AgentJob)
+        .filter(
+            AgentJob.id == job.id,
+            AgentJob.status.notin_(FINAL_AGENT_JOB_STATUSES),
+        )
+        .update(
+            {AgentJob.status: "cancel_requested", AgentJob.updated_at: _now_utc()},
+            synchronize_session=False,
+        )
+    )
     db.commit()
+    if not requested:
+        raise already_finished
     db.refresh(job)
     await dispatch_agent_cancel_if_connected(job)
     logger.info(

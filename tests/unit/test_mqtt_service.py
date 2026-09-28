@@ -19,7 +19,6 @@ import pytest
 import paho.mqtt.client as mqtt
 
 from app.database.models import (
-    BackupJob,
     Repository,
     MQTTSyncState,
 )
@@ -36,6 +35,8 @@ from app.services.mqtt_service import (
     REPOSITORY_SENSOR_DEFINITIONS,
 )
 from app.utils.datetime_utils import serialize_datetime
+from app.services.operations.backup_facade import resolve_backup_job
+from tests.utils.operations import seed_job_operation
 
 
 # =============================================================================
@@ -86,14 +87,15 @@ def _create_mqtt_service_configured() -> MQTTService:
 @pytest.mark.unit
 def test_publish_server_state_uses_latest_terminal_job_timestamp(db_session):
     terminal_time = datetime(2026, 2, 22, 14, 1, 14)
-    job = BackupJob(
+    job = seed_job_operation(
+        db_session,
+        "backup",
         repository="/tmp/repo",
         status="completed",
         started_at=datetime(2026, 2, 22, 14, 0, 0),
         completed_at=terminal_time,
         created_at=datetime(2026, 2, 22, 14, 0, 0),
     )
-    db_session.add(job)
     db_session.commit()
 
     mqtt = MQTTService()
@@ -149,14 +151,15 @@ def test_publish_repository_data_uses_latest_job_timestamp(db_session):
     db_session.commit()
     db_session.refresh(repo)
 
-    latest_job = BackupJob(
+    latest_job = seed_job_operation(
+        db_session,
+        "backup",
         repository=repo.path,
         status="completed",
         started_at=datetime(2026, 2, 22, 14, 0, 0),
         completed_at=terminal_time,
         created_at=datetime(2026, 2, 22, 14, 0, 0),
     )
-    db_session.add(latest_job)
     db_session.commit()
 
     mqtt = MQTTService()
@@ -188,17 +191,23 @@ def test_publish_repository_data_uses_latest_job_timestamp(db_session):
 
 @pytest.mark.unit
 def test_fetch_latest_backup_jobs_by_repository_uses_latest_row(db_session):
-    old_repo1_job = BackupJob(
+    old_repo1_job = seed_job_operation(
+        db_session,
+        "backup",
         repository="/tmp/repo1",
         status="completed",
         created_at=datetime(2026, 2, 20, 12, 0, 0),
     )
-    new_repo1_job = BackupJob(
+    new_repo1_job = seed_job_operation(
+        db_session,
+        "backup",
         repository="/tmp/repo1",
         status="failed",
         created_at=datetime(2026, 2, 22, 12, 0, 0),
     )
-    repo2_job = BackupJob(
+    repo2_job = seed_job_operation(
+        db_session,
+        "backup",
         repository="/tmp/repo2",
         status="completed",
         created_at=datetime(2026, 2, 21, 12, 0, 0),
@@ -315,12 +324,16 @@ class TestBackupJobQueryService:
 
     def test_fetch_latest_backup_jobs_single_job_per_repo(self, db_session):
         """Should fetch one job per repository."""
-        job1 = BackupJob(
+        job1 = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo1",
             status="completed",
             created_at=datetime(2026, 2, 20, 12, 0, 0),
         )
-        job2 = BackupJob(
+        job2 = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo2",
             status="failed",
             created_at=datetime(2026, 2, 21, 12, 0, 0),
@@ -337,12 +350,16 @@ class TestBackupJobQueryService:
 
     def test_fetch_latest_backup_jobs_prefers_newest_job(self, db_session):
         """Should prefer most recent job by created_at."""
-        old_job = BackupJob(
+        old_job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo1",
             status="completed",
             created_at=datetime(2026, 2, 20, 12, 0, 0),
         )
-        new_job = BackupJob(
+        new_job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo1",
             status="failed",
             created_at=datetime(2026, 2, 22, 12, 0, 0),
@@ -358,8 +375,20 @@ class TestBackupJobQueryService:
     def test_fetch_latest_backup_jobs_tiebreaker_by_id(self, db_session):
         """Should use ID as tiebreaker when created_at is same."""
         same_time = datetime(2026, 2, 22, 12, 0, 0)
-        job1 = BackupJob(repository="/repo1", status="completed", created_at=same_time)
-        job2 = BackupJob(repository="/repo1", status="failed", created_at=same_time)
+        job1 = seed_job_operation(
+            db_session,
+            "backup",
+            repository="/repo1",
+            status="completed",
+            created_at=same_time,
+        )
+        job2 = seed_job_operation(
+            db_session,
+            "backup",
+            repository="/repo1",
+            status="failed",
+            created_at=same_time,
+        )
         db_session.add_all([job1, job2])
         db_session.commit()
 
@@ -371,9 +400,19 @@ class TestBackupJobQueryService:
 
     def test_fetch_latest_backup_jobs_ignores_null_repository(self, db_session):
         """Should ignore jobs with null repository."""
-        job1 = BackupJob(repository=None, status="completed", created_at=datetime.now())
-        job2 = BackupJob(
-            repository="/repo1", status="completed", created_at=datetime.now()
+        job1 = seed_job_operation(
+            db_session,
+            "backup",
+            repository=None,
+            status="completed",
+            created_at=datetime.now(),
+        )
+        job2 = seed_job_operation(
+            db_session,
+            "backup",
+            repository="/repo1",
+            status="completed",
+            created_at=datetime.now(),
         )
         db_session.add_all([job1, job2])
         db_session.commit()
@@ -386,13 +425,17 @@ class TestBackupJobQueryService:
 
     def test_fetch_running_backup_jobs_by_repository(self, db_session):
         """Should fetch only running jobs."""
-        running_job = BackupJob(
+        running_job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo1",
             status="running",
             created_at=datetime(2026, 2, 22, 12, 0, 0),
             started_at=datetime(2026, 2, 22, 12, 1, 0),
         )
-        completed_job = BackupJob(
+        completed_job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo1",
             status="completed",
             created_at=datetime(2026, 2, 22, 11, 0, 0),
@@ -408,13 +451,17 @@ class TestBackupJobQueryService:
 
     def test_fetch_running_jobs_orders_by_started_at(self, db_session):
         """Should order running jobs by started_at."""
-        older_running = BackupJob(
+        older_running = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo1",
             status="running",
             created_at=datetime(2026, 2, 22, 12, 0, 0),
             started_at=datetime(2026, 2, 22, 12, 5, 0),
         )
-        newer_running = BackupJob(
+        newer_running = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo1",
             status="running",
             created_at=datetime(2026, 2, 22, 11, 0, 0),
@@ -431,12 +478,16 @@ class TestBackupJobQueryService:
 
     def test_fetch_failed_repositories(self, db_session):
         """Should identify repositories whose latest job failed."""
-        failed_job = BackupJob(
+        failed_job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo1",
             status="failed",
             created_at=datetime(2026, 2, 22, 12, 0, 0),
         )
-        completed_job = BackupJob(
+        completed_job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo2",
             status="completed",
             created_at=datetime(2026, 2, 22, 12, 0, 0),
@@ -458,12 +509,16 @@ class TestBackupJobQueryService:
 
     def test_fetch_failed_repositories_ignores_nonfailed_statuses(self, db_session):
         """Should only return failed repositories."""
-        completed_job = BackupJob(
+        completed_job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo1",
             status="completed",
             created_at=datetime(2026, 2, 22, 12, 0, 0),
         )
-        completed_with_warnings_job = BackupJob(
+        completed_with_warnings_job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo2",
             status="completed_with_warnings",
             created_at=datetime(2026, 2, 22, 12, 0, 0),
@@ -486,29 +541,6 @@ class TestBackupJobQueryService:
 @pytest.mark.unit
 class TestRepositoryStatePublisher:
     """Tests for RepositoryStatePublisher."""
-
-    @pytest.mark.parametrize(
-        "size_str,expected",
-        [
-            ("0", 0),
-            ("100", 100),
-            ("1 KB", 1024),
-            ("1KB", 1024),
-            ("2 MB", 2 * 1024**2),
-            ("3 GB", 3 * 1024**3),
-            ("4 TB", 4 * 1024**4),
-            ("5 PB", 5 * 1024**5),
-            ("1.5 GB", int(1.5 * 1024**3)),
-            ("", 0),
-            ("invalid", 0),
-            ("  2.5 MB  ", int(2.5 * 1024**2)),
-        ],
-    )
-    def test_parse_size_to_bytes(self, size_str, expected):
-        """Should parse various size formats correctly."""
-        publisher = RepositoryStatePublisher(Mock())
-        result = publisher.parse_size_to_bytes(size_str)
-        assert result == expected
 
     def test_get_repository_status_failed(self, db_session):
         """Should return 'failed' for repositories in failed set."""
@@ -614,6 +646,57 @@ class TestRepositoryStatePublisher:
         # Verify all expected methods were called
         assert mqtt_service.publish.call_count >= 5  # At least 5 topics
 
+    def test_publish_repository_data_reports_the_stored_size_number(self, db_session):
+        """The size topic carries the stored number where a measurement wrote
+        it; the formatted string is only the fallback for a row without one."""
+        repo = Repository(
+            name="Measured",
+            path="/repo/measured",
+            total_size="2.19 GB",
+            total_size_bytes=2_350_000_000,
+            archive_count=1,
+        )
+        db_session.add(repo)
+        db_session.commit()
+        db_session.refresh(repo)
+
+        mqtt_service = _create_mqtt_service_configured()
+        publisher = RepositoryStatePublisher(mqtt_service)
+
+        assert publisher.publish_repository_data(
+            repo,
+            failed_repository_ids=set(),
+            latest_jobs_by_repository={},
+            running_jobs_by_repository={},
+        )
+        sizes = [
+            call.args[1]
+            for call in mqtt_service.publish.call_args_list
+            if call.args and call.args[0] == f"repositories/{repo.id}/size"
+        ]
+        assert sizes == [{"total": 2_350_000_000}]
+
+    @pytest.mark.parametrize("size_bytes", [None, 0])
+    def test_publish_repository_data_distinguishes_unknown_from_empty(
+        self, db_session, size_bytes
+    ):
+        repo = Repository(
+            name="Size state", path="/repo/size-state", total_size_bytes=size_bytes
+        )
+        db_session.add(repo)
+        db_session.commit()
+        mqtt_service = _create_mqtt_service_configured()
+        publisher = RepositoryStatePublisher(mqtt_service)
+
+        assert publisher.publish_repository_data(repo, set(), {}, {})
+
+        sizes = [
+            call.args[1]
+            for call in mqtt_service.publish.call_args_list
+            if call.args and call.args[0] == f"repositories/{repo.id}/size"
+        ]
+        assert sizes == [{"total": size_bytes}]
+
     def test_publish_repository_data_with_running_job(self, db_session):
         """Should include running job data in progress payload."""
         repo = Repository(name="Test", path="/repo")
@@ -621,7 +704,9 @@ class TestRepositoryStatePublisher:
         db_session.commit()
         db_session.refresh(repo)
 
-        running_job = BackupJob(
+        running_job = seed_job_operation(
+            db_session,
+            "backup",
             repository=repo.path,
             status="running",
             progress_percent=45.5,
@@ -637,7 +722,9 @@ class TestRepositoryStatePublisher:
             repo,
             failed_repository_ids=set(),
             latest_jobs_by_repository={},
-            running_jobs_by_repository={repo.path: running_job},
+            running_jobs_by_repository={
+                repo.path: resolve_backup_job(db_session, running_job.id)
+            },
         )
 
         assert result is True
@@ -673,7 +760,9 @@ class TestServerStatePublisher:
         mock_datetime.timedelta = timedelta  # Pass through timedelta
         mock_datetime.timezone = timezone  # Pass through timezone
 
-        running_job = BackupJob(
+        running_job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo",
             status="running",
             progress_percent=50.0,
@@ -681,7 +770,6 @@ class TestServerStatePublisher:
             started_at=datetime(2026, 2, 22, 12, 0, 0, tzinfo=timezone.utc),
             created_at=datetime(2026, 2, 22, 11, 55, 0, tzinfo=timezone.utc),
         )
-        db_session.add(running_job)
         db_session.commit()
 
         mqtt_service = _create_mqtt_service_configured()
@@ -706,14 +794,15 @@ class TestServerStatePublisher:
 
     def test_publish_server_state_with_completed_job(self, db_session):
         """Should publish idle state with last completed job details."""
-        completed_job = BackupJob(
+        completed_job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo",
             status="completed",
             started_at=datetime(2026, 2, 22, 12, 0, 0, tzinfo=timezone.utc),
             completed_at=datetime(2026, 2, 22, 13, 0, 0, tzinfo=timezone.utc),
             created_at=datetime(2026, 2, 22, 11, 55, 0, tzinfo=timezone.utc),
         )
-        db_session.add(completed_job)
         db_session.commit()
 
         mqtt_service = _create_mqtt_service_configured()
@@ -732,7 +821,9 @@ class TestServerStatePublisher:
 
     def test_publish_server_state_with_failed_job(self, db_session):
         """Should publish failure state with error message."""
-        failed_job = BackupJob(
+        failed_job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo",
             status="failed",
             error_message="Connection timeout",
@@ -740,7 +831,6 @@ class TestServerStatePublisher:
             completed_at=datetime(2026, 2, 22, 12, 30, 0, tzinfo=timezone.utc),
             created_at=datetime(2026, 2, 22, 11, 55, 0, tzinfo=timezone.utc),
         )
-        db_session.add(failed_job)
         db_session.commit()
 
         mqtt_service = _create_mqtt_service_configured()
@@ -755,14 +845,15 @@ class TestServerStatePublisher:
 
     def test_publish_server_state_uses_correct_timestamp_priority(self, db_session):
         """Should prioritize completed_at over started_at over created_at."""
-        job = BackupJob(
+        job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo",
             status="completed",
             created_at=datetime(2026, 2, 22, 11, 0, 0, tzinfo=timezone.utc),
             started_at=datetime(2026, 2, 22, 12, 0, 0, tzinfo=timezone.utc),
             completed_at=datetime(2026, 2, 22, 13, 0, 0, tzinfo=timezone.utc),
         )
-        db_session.add(job)
         db_session.commit()
 
         mqtt_service = _create_mqtt_service_configured()
@@ -779,13 +870,14 @@ class TestServerStatePublisher:
 
     def test_publish_server_state_completed_with_warnings_is_success(self, db_session):
         """Should treat 'completed_with_warnings' as success."""
-        job = BackupJob(
+        job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo",
             status="completed_with_warnings",
             completed_at=datetime(2026, 2, 22, 13, 0, 0, tzinfo=timezone.utc),
             created_at=datetime(2026, 2, 22, 12, 0, 0, tzinfo=timezone.utc),
         )
-        db_session.add(job)
         db_session.commit()
 
         mqtt_service = _create_mqtt_service_configured()
@@ -1523,11 +1615,6 @@ class TestMQTTServiceStateSync:
 class TestMQTTServiceEdgeCases:
     """Tests for edge cases and error handling."""
 
-    def test_parse_size_with_none(self):
-        """Should handle None size string."""
-        publisher = RepositoryStatePublisher(Mock())
-        assert publisher.parse_size_to_bytes(None) == 0
-
     def test_repository_status_with_none_id(self):
         """Should handle repository with no ID."""
         publisher = RepositoryStatePublisher(Mock())
@@ -1592,14 +1679,15 @@ class TestMQTTServiceEdgeCases:
 
     def test_job_with_missing_timestamps(self, db_session):
         """Should handle job with null timestamps."""
-        job = BackupJob(
+        job = seed_job_operation(
+            db_session,
+            "backup",
             repository="/repo",
             status="running",
             created_at=None,
             started_at=None,
             completed_at=None,
         )
-        db_session.add(job)
         db_session.commit()
 
         mqtt_service = _create_mqtt_service_configured()
@@ -1675,12 +1763,13 @@ class TestMQTTIntegrationScenarios:
         assert service.setup_repository_sensors.called
 
         # 2. Run backup
-        job = BackupJob(
+        job = seed_job_operation(
+            db_session,
+            "backup",
             repository=repo.path,
             status="running",
             created_at=datetime.now(timezone.utc),
         )
-        db_session.add(job)
         db_session.commit()
 
         result = service.sync_state_with_db(db_session, reason="backup started")
@@ -1714,14 +1803,15 @@ class TestMQTTIntegrationScenarios:
             db_session.commit()
             db_session.refresh(repo)
 
-            job = BackupJob(
+            job = seed_job_operation(
+                db_session,
+                "backup",
                 repository=repo.path,
                 status="running",
                 progress_percent=50 + i * 10,
                 created_at=datetime.now(timezone.utc),
                 started_at=datetime.now(timezone.utc),
             )
-            db_session.add(job)
 
         db_session.commit()
 

@@ -3,10 +3,18 @@ Comprehensive unit tests for restore API endpoints
 """
 
 import pytest
-from unittest.mock import ANY, patch, AsyncMock
+from pathlib import Path
+from unittest.mock import patch, AsyncMock
 from fastapi.testclient import TestClient
-from app.database.models import Repository, RestoreJob, SystemSettings
+from app.database.models import (
+    Operation,
+    OperationRestoreDetails,
+    Repository,
+    SystemSettings,
+)
 from tests.unit.helpers import assert_auth_required
+from app.services.operations.restore_facade import resolve_restore_job
+from tests.utils.operations import seed_job_operation
 
 
 def _set_log_save_policy(test_db, policy: str) -> None:
@@ -329,12 +337,12 @@ class TestRestoreStart:
 
         assert response.status_code == 200
 
-    def test_start_restore_accepts_repository_id_in_repository_field(
+    def test_start_restore_enqueues_an_operation_with_details(
         self, test_client: TestClient, admin_headers, test_db
     ):
         repo = Repository(
-            name="Test Repo",
-            path="/test/repo",
+            name="Restore Repo",
+            path="/test/restore-repo",
             encryption="none",
             repository_type="local",
         )
@@ -342,87 +350,293 @@ class TestRestoreStart:
         test_db.commit()
         test_db.refresh(repo)
 
+        # The live runner may dispatch the row before this test reads it back;
+        # a mocked service keeps that harmless. The assertions below do not
+        # depend on whether it ran.
         with patch(
-            "app.api.restore.asyncio.create_task", return_value=object()
-        ) as mock_create_task:
-            response = test_client.post(
-                "/api/restore/start",
-                json={
-                    "repository_id": repo.id,
-                    "repository": str(repo.id),
-                    "archive": "test-archive",
-                    "paths": ["/file.txt"],
-                    "destination": "/restore",
-                },
-                headers=admin_headers,
-            )
-
-        assert response.status_code == 200
-        job = test_db.query(RestoreJob).order_by(RestoreJob.id.desc()).first()
-        assert job is not None
-        assert job.repository == repo.path
-        scheduled = mock_create_task.call_args.args[0]
-        scheduled.close()
-
-    def test_start_restore_passes_restore_layout_and_path_metadata(
-        self, test_client: TestClient, admin_headers, test_db
-    ):
-        repo = Repository(
-            name="Test Repo",
-            path="/test/repo",
-            encryption="none",
-            repository_type="local",
-        )
-        test_db.add(repo)
-        test_db.commit()
-        test_db.refresh(repo)
-
-        with (
-            patch(
-                "app.api.restore.restore_service.execute_restore",
-                new_callable=AsyncMock,
-            ) as mock_execute_restore,
-            patch(
-                "app.api.restore.asyncio.create_task", return_value=object()
-            ) as mock_create_task,
+            "app.services.restore_service.restore_service.execute_restore",
+            new=AsyncMock(return_value=None),
         ):
             response = test_client.post(
                 "/api/restore/start",
                 json={
-                    "repository_id": repo.id,
                     "repository": repo.path,
+                    "repository_id": repo.id,
                     "archive": "test-archive",
-                    "paths": ["home/username/folder1/folder2"],
-                    "destination": "/recovery/folder1/folder2",
+                    "paths": ["docs/"],
+                    "destination": "/restore/target",
                     "restore_layout": "contents_only",
-                    "path_metadata": [
-                        {
-                            "path": "home/username/folder1/folder2",
-                            "type": "directory",
-                        }
-                    ],
+                    "path_metadata": [{"path": "docs/", "type": "directory"}],
                 },
                 headers=admin_headers,
             )
 
         assert response.status_code == 200
-        mock_execute_restore.assert_called_once_with(
-            ANY,
-            repo.path,
-            "test-archive",
-            "/recovery/folder1/folder2",
-            ["home/username/folder1/folder2"],
+        body = response.json()
+        assert body["status"] == "pending"
+        assert body["message"] == "backend.success.restore.restoreJobStarted"
+
+        operation = test_db.get(Operation, body["job_id"])
+        assert operation.kind == "restore"
+        assert operation.category == "restore"
+        assert operation.trigger == "manual"
+        assert operation.repository_id == repo.id
+        assert operation.execution_mode == "server"
+        assert operation.params == {
+            "archive_name": "test-archive",
+            "paths": ["docs/"],
+            "restore_layout": "contents_only",
+            "path_metadata": [{"path": "docs/", "type": "directory"}],
+        }
+        details = test_db.get(OperationRestoreDetails, operation.id)
+        assert details.archive == "test-archive"
+        assert details.destination == "/restore/target"
+        assert details.destination_type == "local"
+        assert details.repository_type == "local"
+
+    def test_start_restore_records_the_ssh_destination_on_the_details_row(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        from app.database.models import SSHConnection
+
+        repo = Repository(
+            name="Restore Repo",
+            path="/test/restore-repo",
+            encryption="none",
             repository_type="local",
-            destination_type="local",
-            destination_connection_id=None,
-            ssh_connection_id=None,
-            restore_layout="contents_only",
-            path_metadata=[
-                {"path": "home/username/folder1/folder2", "type": "directory"}
-            ],
         )
-        scheduled = mock_create_task.call_args.args[0]
-        scheduled.close()
+        connection = SSHConnection(host="backup.example", username="borg", port=22)
+        test_db.add_all([repo, connection])
+        test_db.commit()
+        test_db.refresh(repo)
+        test_db.refresh(connection)
+
+        with patch(
+            "app.services.restore_service.restore_service.execute_restore",
+            new=AsyncMock(return_value=None),
+        ):
+            response = test_client.post(
+                "/api/restore/start",
+                json={
+                    "repository": repo.path,
+                    "repository_id": repo.id,
+                    "archive": "test-archive",
+                    "paths": [],
+                    "destination": "/srv/restore",
+                    "destination_type": "ssh",
+                    "destination_connection_id": connection.id,
+                },
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        details = test_db.get(OperationRestoreDetails, response.json()["job_id"])
+        assert details.destination_type == "ssh"
+        assert details.destination_connection_id == connection.id
+        assert details.destination_hostname == "backup.example"
+
+    def test_status_reads_an_operation_with_the_legacy_shape(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        from app.services.operations.details import restore_details
+
+        repo = Repository(
+            name="Restore Repo",
+            path="/test/restore-repo",
+            encryption="none",
+            repository_type="local",
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        op = Operation(
+            repository_id=repo.id,
+            kind="restore",
+            category="restore",
+            status="running",
+            trigger="manual",
+            priority=0,
+            run_id="run-status",
+            progress_percent=40.0,
+            params={"archive_name": "test-archive"},
+        )
+        test_db.add(op)
+        test_db.flush()
+        details = restore_details(test_db, op)
+        details.archive = "test-archive"
+        details.destination = "/restore/target"
+        details.original_size = 10 * 1024 * 1024
+        details.restored_size = 4 * 1024 * 1024
+        details.restore_speed = 2.0
+        details.nfiles = 7
+        details.current_file = "docs/report.txt"
+        test_db.commit()
+
+        response = test_client.get(
+            f"/api/restore/status/{op.id}", headers=admin_headers
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["id"] == op.id
+        assert body["repository"] == repo.path
+        assert body["archive"] == "test-archive"
+        assert body["destination"] == "/restore/target"
+        assert body["status"] == "running"
+        assert body["progress"] == 40
+        assert body["progress_details"] == {
+            "nfiles": 7,
+            "current_file": "docs/report.txt",
+            "progress_percent": 40.0,
+            "restore_speed": 2.0,
+            "estimated_time_remaining": 3,
+        }
+
+    def test_list_unions_operations_and_legacy_rows(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        from app.services.operations.details import restore_details
+
+        repo = Repository(
+            name="Restore Repo",
+            path="/test/restore-repo",
+            encryption="none",
+            repository_type="local",
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        legacy = seed_job_operation(
+            test_db,
+            "restore",
+            repository=repo.path,
+            archive="old",
+            destination="/x",
+            status="completed",
+        )
+        op = Operation(
+            repository_id=repo.id,
+            kind="restore",
+            category="restore",
+            status="completed",
+            trigger="manual",
+            priority=0,
+            run_id="run-list",
+            params={"archive_name": "new"},
+        )
+        test_db.add_all([legacy, op])
+        test_db.flush()
+        restore_details(test_db, op).archive = "new"
+        test_db.commit()
+
+        response = test_client.get("/api/restore/jobs", headers=admin_headers)
+
+        assert response.status_code == 200
+        archives = {job["archive"] for job in response.json()["jobs"]}
+        assert archives == {"old", "new"}
+
+    def test_list_reads_each_operation_log_file_once(
+        self, test_client: TestClient, admin_headers, test_db, tmp_path
+    ):
+        """The log lives in a file now, not on the row, so the list route has
+        to read it once per job rather than once per use of it. Archives.tsx
+        polls this route every three seconds at the default limit."""
+        from app.services.operations.details import restore_details
+
+        _set_log_save_policy(test_db, "all_jobs")
+        repo = Repository(
+            name="Restore Repo",
+            path="/test/restore-repo",
+            encryption="none",
+            repository_type="local",
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        reads: list[str] = []
+        log_files = []
+        for index in range(3):
+            log_file = tmp_path / f"restore-{index}.log"
+            log_file.write_text("extracted a file\n", encoding="utf-8")
+            log_files.append(log_file)
+            op = Operation(
+                repository_id=repo.id,
+                kind="restore",
+                category="restore",
+                status="completed",
+                trigger="manual",
+                priority=0,
+                run_id=f"run-read-{index}",
+                log_file_path=str(log_file),
+                params={"archive_name": f"archive-{index}"},
+            )
+            test_db.add(op)
+            test_db.flush()
+            restore_details(test_db, op).archive = f"archive-{index}"
+        test_db.commit()
+
+        real_read_text = Path.read_text
+
+        def counting_read_text(self, *args, **kwargs):
+            reads.append(str(self))
+            return real_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", counting_read_text):
+            response = test_client.get("/api/restore/jobs", headers=admin_headers)
+
+        assert response.status_code == 200
+        assert len(response.json()["jobs"]) == 3
+        for log_file in log_files:
+            assert reads.count(str(log_file)) == 1
+
+    def test_cancel_running_operation_kills_the_process_and_flags_the_runner(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        from app.services.operations.restore_facade import CANCELLED_BY_USER
+
+        repo = Repository(
+            name="Restore Repo",
+            path="/test/restore-repo",
+            encryption="none",
+            repository_type="local",
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        op = Operation(
+            repository_id=repo.id,
+            kind="restore",
+            category="restore",
+            status="running",
+            trigger="manual",
+            priority=0,
+            run_id="run-cancel",
+        )
+        test_db.add(op)
+        test_db.commit()
+
+        with (
+            patch(
+                "app.api.restore.operation_runner.request_cancel",
+                new=AsyncMock(return_value=True),
+            ) as request_cancel,
+            patch(
+                "app.api.restore.restore_service.cancel_restore",
+                new=AsyncMock(return_value=True),
+            ) as cancel_restore,
+        ):
+            response = test_client.post(
+                f"/api/restore/cancel/{op.id}", headers=admin_headers
+            )
+
+        assert response.status_code == 200
+        assert response.json()["process_terminated"] is True
+        request_cancel.assert_awaited_once_with(op.id)
+        cancel_restore.assert_awaited_once_with(op.id)
+        test_db.expire_all()
+        assert op.status == "cancelled"
+        assert op.error_message == CANCELLED_BY_USER
+        assert op.completed_at is not None
 
 
 @pytest.mark.unit
@@ -500,13 +714,14 @@ class TestRestoreJobs:
         test_db.commit()
         test_db.refresh(repo)
 
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository=repo.path,
             archive="test-archive",
             destination="/restore/target",
             status="running",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -524,7 +739,7 @@ class TestRestoreJobs:
         mock_cancel.assert_awaited_once_with(job.id)
 
         test_db.expire_all()
-        refreshed = test_db.query(RestoreJob).filter(RestoreJob.id == job.id).first()
+        refreshed = resolve_restore_job(test_db, job.id)
         assert refreshed.status == "cancelled"
         assert refreshed.completed_at is not None
 
@@ -544,13 +759,14 @@ class TestRestoreJobs:
         test_db.commit()
         test_db.refresh(repo)
 
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository=repo.path,
             archive="test-archive",
             destination="/restore/target",
             status="completed",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -582,11 +798,12 @@ class TestRestoreSpeedAndETA:
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Test that restore job API responses include speed and ETA fields"""
-        from app.database.models import RestoreJob
         from datetime import datetime, timezone
 
         # Create a running restore job with speed and ETA
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository="/test/repo",
             archive="test-archive",
             destination="/test/dest",
@@ -595,12 +812,13 @@ class TestRestoreSpeedAndETA:
             nfiles=100,
             current_file="/test/file.txt",
             progress_percent=45.5,
-            original_size=10485760,  # 10 MB
-            restored_size=4767744,  # ~4.5 MB
+            # The ETA is derived from what is left and the speed (phase 7), so
+            # the sizes below are the 135 seconds this asserts: 1670 MiB left
+            # at 12.34 MB/s.
+            original_size=1755889664,
+            restored_size=4767744,
             restore_speed=12.34,  # MB/s
-            estimated_time_remaining=135,  # seconds
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -624,7 +842,6 @@ class TestRestoreSpeedAndETA:
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Test that restore jobs list includes speed and ETA fields"""
-        from app.database.models import RestoreJob
         from datetime import datetime, timezone
 
         # Create restore jobs with different states
@@ -651,8 +868,7 @@ class TestRestoreSpeedAndETA:
         ]
 
         for job_data in jobs_data:
-            job = RestoreJob(**job_data)
-            test_db.add(job)
+            job = seed_job_operation(test_db, "restore", **job_data)
         test_db.commit()
 
         # Get jobs list
@@ -673,15 +889,15 @@ class TestRestoreSpeedAndETA:
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Test that restore speed defaults to 0.0 when not set"""
-        from app.database.models import RestoreJob
 
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository="/test/repo",
             archive="test-archive",
             destination="/test/dest",
             status="pending",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -699,10 +915,11 @@ class TestRestoreSpeedAndETA:
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Test that ETA is 0 when restore speed is 0"""
-        from app.database.models import RestoreJob
         from datetime import datetime, timezone
 
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository="/test/repo",
             archive="test-archive",
             destination="/test/dest",
@@ -713,7 +930,6 @@ class TestRestoreSpeedAndETA:
             restore_speed=0.0,  # No speed yet
             estimated_time_remaining=0,
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -730,10 +946,11 @@ class TestRestoreSpeedAndETA:
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Test that completed restore jobs preserve final speed"""
-        from app.database.models import RestoreJob
         from datetime import datetime, timezone
 
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository="/test/repo",
             archive="test-archive",
             destination="/test/dest",
@@ -746,7 +963,6 @@ class TestRestoreSpeedAndETA:
             estimated_time_remaining=0,
             progress_percent=100.0,
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -770,11 +986,12 @@ class TestRestoreJobLogs:
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Test that /api/restore/jobs endpoint includes logs field"""
-        from app.database.models import RestoreJob
         from datetime import datetime, timezone
 
         _set_log_save_policy(test_db, "all_jobs")
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository="/test/repo",
             archive="test-archive",
             destination="/test/dest",
@@ -783,7 +1000,6 @@ class TestRestoreJobLogs:
             completed_at=datetime.now(timezone.utc),
             logs="Test log line 1\nTest log line 2\nRestore completed",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -798,17 +1014,18 @@ class TestRestoreJobLogs:
         our_job = next((j for j in data["jobs"] if j["id"] == job.id), None)
         assert our_job is not None
         assert "logs" in our_job
-        assert our_job["logs"] == job.logs
+        assert our_job["logs"] == "Test log line 1\nTest log line 2\nRestore completed"
 
     def test_restore_job_status_includes_logs(
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Test that /api/restore/status/{id} endpoint includes logs field"""
-        from app.database.models import RestoreJob
         from datetime import datetime, timezone
 
         _set_log_save_policy(test_db, "all_jobs")
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository="/test/repo",
             archive="test-archive",
             destination="/test/dest",
@@ -817,7 +1034,6 @@ class TestRestoreJobLogs:
             completed_at=datetime.now(timezone.utc),
             logs="Detailed restore logs here\nProgress: 100%\nSuccess",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -828,7 +1044,7 @@ class TestRestoreJobLogs:
         assert response.status_code == 200
         data = response.json()
         assert "logs" in data
-        assert data["logs"] == job.logs
+        assert data["logs"] == "Detailed restore logs here\nProgress: 100%\nSuccess"
 
     def test_restore_logs_follow_log_save_policy(
         self, test_client: TestClient, admin_headers, test_db
@@ -836,7 +1052,9 @@ class TestRestoreJobLogs:
         from datetime import datetime, timezone
 
         _set_log_save_policy(test_db, "failed_only")
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository="/test/repo",
             archive="test-archive",
             destination="/test/dest",
@@ -845,7 +1063,6 @@ class TestRestoreJobLogs:
             completed_at=datetime.now(timezone.utc),
             logs="successful restore log",
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -865,11 +1082,14 @@ class TestRestoreJobLogs:
     def test_restore_jobs_with_null_logs(
         self, test_client: TestClient, admin_headers, test_db
     ):
-        """Test that jobs with null logs return null in API"""
-        from app.database.models import RestoreJob
+        """A running restore has written no log file yet, so its `logs` reads
+        as empty text rather than null: the operation keeps its log in a file
+        (spec 6.1), not in a nullable column."""
         from datetime import datetime, timezone
 
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository="/test/repo",
             archive="test-archive",
             destination="/test/dest",
@@ -877,7 +1097,6 @@ class TestRestoreJobLogs:
             started_at=datetime.now(timezone.utc),
             logs=None,  # No logs yet for running job
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -887,17 +1106,18 @@ class TestRestoreJobLogs:
         data = response.json()
         our_job = next((j for j in data["jobs"] if j["id"] == job.id), None)
         assert our_job is not None
-        assert our_job["logs"] is None
+        assert our_job["logs"] == ""
 
     def test_restore_jobs_with_empty_logs(
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Test that jobs with empty string logs return empty string"""
-        from app.database.models import RestoreJob
         from datetime import datetime, timezone
 
         _set_log_save_policy(test_db, "all_jobs")
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository="/test/repo",
             archive="test-archive",
             destination="/test/dest",
@@ -906,7 +1126,6 @@ class TestRestoreJobLogs:
             completed_at=datetime.now(timezone.utc),
             logs="",  # Empty logs
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -923,7 +1142,6 @@ class TestRestoreJobLogs:
         self, test_client: TestClient, admin_headers, test_db
     ):
         """Test that multiline logs are preserved correctly"""
-        from app.database.models import RestoreJob
         from datetime import datetime, timezone
 
         _set_log_save_policy(test_db, "all_jobs")
@@ -936,7 +1154,9 @@ Progress: 75%
 Progress: 100%
 Restore completed successfully"""
 
-        job = RestoreJob(
+        job = seed_job_operation(
+            test_db,
+            "restore",
             repository="/test/repo",
             archive="test-archive",
             destination="/test/dest",
@@ -945,7 +1165,6 @@ Restore completed successfully"""
             completed_at=datetime.now(timezone.utc),
             logs=multiline_logs,
         )
-        test_db.add(job)
         test_db.commit()
         test_db.refresh(job)
 
@@ -959,3 +1178,56 @@ Restore completed successfully"""
         # Verify line breaks are preserved
         assert "\n" in data["logs"]
         assert data["logs"].count("\n") == multiline_logs.count("\n")
+
+
+@pytest.mark.unit
+class TestRestoreRequestShape:
+    """The restore request model carries no dry-run switch. Dry-run restore is
+    the dedicated preview route, which runs borg extract with --dry-run."""
+
+    def test_restore_request_has_no_dry_run_field(self):
+        from app.api.restore import RestoreRequest
+
+        assert "dry_run" not in RestoreRequest.model_fields
+
+    def test_start_ignores_a_dry_run_field_a_client_still_sends(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """Pydantic ignores unknown fields, so a client still sending dry_run
+        gets exactly the behaviour it got before the field was removed: a real
+        restore, enqueued the same way, with nothing recorded about dry run."""
+        repo = Repository(
+            name="Dry Run Repo",
+            path="/test/dry-run-repo",
+            encryption="none",
+            repository_type="local",
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+
+        with patch(
+            "app.services.restore_service.restore_service.execute_restore",
+            new=AsyncMock(return_value=None),
+        ):
+            response = test_client.post(
+                "/api/restore/start",
+                json={
+                    "repository": repo.path,
+                    "repository_id": repo.id,
+                    "archive": "test-archive",
+                    "paths": ["docs/"],
+                    "destination": "/restore/target",
+                    "dry_run": True,
+                },
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "pending"
+
+        operation = test_db.get(Operation, body["job_id"])
+        assert operation.kind == "restore"
+        assert operation.repository_id == repo.id
+        assert "dry_run" not in operation.params

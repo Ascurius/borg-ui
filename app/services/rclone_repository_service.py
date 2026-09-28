@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import os
 import shlex
 import shutil
@@ -13,11 +14,16 @@ from urllib.parse import urlparse
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.services.operations.enqueue import enqueue
+from app.services.operations.rclone_facade import (
+    LEGACY_TO_TRIGGER,
+    RcloneSyncFacade,
+    resolve_rclone_job,
+)
 from app.database.models import (
     Repository,
     RepositoryStorage,
     RcloneRemote,
-    RcloneSyncJob,
 )
 from app.services.agent_job_dispatcher import dispatch_agent_job_best_effort
 from app.services.repository_executor import (
@@ -297,8 +303,41 @@ class RcloneRepositoryService:
             raise ValueError("SSH cloud mirror mount did not return a mount point")
         return mount_point, mount_id, mount_service
 
+    def _rclone_config_section(self, remote: RcloneRemote) -> dict[str, str]:
+        """Read a remote's real values from the server's rclone.conf.
+
+        redacted_config stores secrets as "***" for display, so it cannot be
+        used to build a working config for an agent.
+        """
+        config_path = remote.config_path or str(
+            Path(settings.rclone_config_root) / "rclone.conf"
+        )
+        parser = configparser.RawConfigParser()
+        try:
+            with open(config_path, encoding="utf-8") as handle:
+                parser.read_file(handle)
+        # UnicodeError too: a config with non-UTF-8 bytes raises
+        # UnicodeDecodeError, which is a ValueError rather than an OSError and
+        # would otherwise escape and fail the whole stats refresh.
+        except (OSError, UnicodeError, configparser.Error):
+            return {}
+        if not parser.has_section(remote.name):
+            return {}
+        return dict(parser.items(remote.name))
+
     def _agent_rclone_config(self, remote: RcloneRemote) -> dict[str, str]:
-        values = dict(remote.redacted_config or {})
+        # The agent writes these into its own rclone.conf and runs rclone
+        # against it, so the values have to be the real ones. Building this
+        # from redacted_config sent "***" as token, client_id and
+        # client_secret, and rclone failed before touching the network with
+        # "invalid character '*' looking for beginning of value" -- which
+        # surfaces only as "exited with code 1".
+        values = self._rclone_config_section(remote)
+        if not values:
+            # No readable section: fall back to what is known rather than
+            # sending nothing, so a misconfigured path fails in rclone with
+            # a message about the remote instead of a missing type.
+            values = dict(remote.redacted_config or {})
         values["type"] = str(values.get("type") or remote.provider).strip()
         return {
             str(key): _stringify_config_value(value)
@@ -398,41 +437,32 @@ class RcloneRepositoryService:
         target = self.compose_target(remote, storage.rclone_remote_path)
         started_at = datetime.now(timezone.utc)
         if job_id is not None:
-            sync_job = (
-                db.query(RcloneSyncJob)
-                .filter(
-                    RcloneSyncJob.id == job_id,
-                    RcloneSyncJob.repository_id == repository.id,
-                )
-                .first()
-            )
-            if sync_job is None:
+            # The runner dispatched this one and passed its own operation id.
+            sync_job = resolve_rclone_job(db, job_id)
+            if sync_job is None or sync_job.repository_id != repository.id:
                 raise ValueError(f"rclone sync job {job_id} was not found")
-            sync_job.direction = storage.sync_direction
-            sync_job.operation = "sync"
-            sync_job.status = "running"
-            sync_job.triggered_by = triggered_by
-            sync_job.scheduled_for = (
-                to_utc_naive(scheduled_for) if scheduled_for else None
-            )
-            sync_job.started_at = started_at
-            sync_job.completed_at = None
-            sync_job.error_text = None
         else:
-            sync_job = RcloneSyncJob(
+            operation = enqueue(
+                db,
+                "rclone_sync",
                 repository_id=repository.id,
-                direction=storage.sync_direction,
-                operation="sync",
-                status="running",
-                triggered_by=triggered_by,
-                scheduled_for=to_utc_naive(scheduled_for) if scheduled_for else None,
-                started_at=started_at,
+                trigger=LEGACY_TO_TRIGGER.get(triggered_by, "manual"),
+                commit=False,
             )
-            db.add(sync_job)
+            sync_job = RcloneSyncFacade(db, operation)
+        sync_job.direction = storage.sync_direction
+        sync_job.operation = "sync"
+        sync_job.status = "running"
+        sync_job.triggered_by = triggered_by
+        sync_job.scheduled_for = to_utc_naive(scheduled_for) if scheduled_for else None
+        sync_job.started_at = started_at
+        sync_job.completed_at = None
+        sync_job.error_text = None
         storage.sync_status = "syncing"
         storage.last_sync_error = None
+        # No db.refresh(sync_job): a facade is not a mapped instance, its
+        # mapped object is the operation it wraps.
         db.commit()
-        db.refresh(sync_job)
         mount_id = None
         mount_service = None
         try:
@@ -508,28 +538,41 @@ class RcloneRepositoryService:
         repository: Repository,
         *,
         timeout: int | None = None,
+        job_id: int | None = None,
     ) -> dict[str, Any]:
         storage = self.get_storage(db, repository.id)
         remote = self.get_remote(db, storage)
         target = self.compose_target(remote, storage.rclone_remote_path)
+        # Resolve the job before creating the temp directory: a bad id raises
+        # here, and every later failure path removes the directory itself.
+        if job_id is not None:
+            hydrate_job = resolve_rclone_job(db, job_id)
+            if hydrate_job is None or hydrate_job.repository_id != repository.id:
+                raise ValueError(f"rclone hydrate job {job_id} was not found")
+        else:
+            operation = enqueue(
+                db,
+                "rclone_sync",
+                repository_id=repository.id,
+                trigger="manual",
+                commit=False,
+            )
+            hydrate_job = RcloneSyncFacade(db, operation)
         parent = Path(storage.cache_path).parent
         parent.mkdir(parents=True, exist_ok=True)
         temp_dir = tempfile.mkdtemp(
             prefix=f".hydrate-{repository.id}-", dir=str(parent)
         )
-        hydrate_job = RcloneSyncJob(
-            repository_id=repository.id,
-            direction="remote_to_cache",
-            operation="hydrate",
-            status="running",
-            triggered_by="manual",
-            started_at=datetime.now(timezone.utc),
-        )
-        db.add(hydrate_job)
+        hydrate_job.direction = "remote_to_cache"
+        hydrate_job.operation = "hydrate"
+        hydrate_job.status = "running"
+        hydrate_job.triggered_by = "manual"
+        hydrate_job.started_at = datetime.now(timezone.utc)
+        hydrate_job.completed_at = None
+        hydrate_job.error_text = None
         storage.sync_status = "hydrating"
         storage.last_sync_error = None
         db.commit()
-        db.refresh(hydrate_job)
         try:
             result = await self.service.sync(
                 target,

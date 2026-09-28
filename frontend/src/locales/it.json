@@ -25,9 +25,18 @@
       "clear": "Pulisci",
       "reset": "Reimposta",
       "deploy": "Distribuisci",
-      "view": "Visualizza"
+      "view": "Visualizza",
+      "collapse": "Comprimi",
+      "expand": "Espandi"
     },
     "status": "Stato",
+    "loading": "Caricamento...",
+    "search": "Cerca",
+    "noResults": "Nessun risultato trovato",
+    "password": {
+      "show": "Mostra password",
+      "hide": "Nascondi password"
+    },
     "never": "Mai",
     "na": "N/D",
     "unknown": "Sconosciuto",
@@ -60,7 +69,7 @@
     }
   },
   "login": {
-    "title": "Borg Web UI",
+    "title": "Borg UI",
     "subtitle": "Inserisci le credenziali per continuare",
     "username": "Nome utente",
     "password": "Password",
@@ -124,6 +133,7 @@
     "badges": {
       "new": "Nuovo"
     },
+    "comingSoon": "Prossimamente",
     "settings": {
       "personal": "Personali",
       "system": "Sistema",
@@ -145,9 +155,13 @@
       "scripts": "Script",
       "users": "Utenti",
       "exportImport": "Esporta/Importa",
-      "beta": "Beta"
+      "beta": "Beta",
+      "backgroundWork": "Lavoro in background"
     },
     "menu": {
+      "openDrawer": "Apri navigazione",
+      "userMenu": "Menu utente",
+      "enterpriseDeployment": "Distribuzione Enterprise",
       "accountAndSecurityDesc": "Profilo, password, 2FA, passkey",
       "appearanceDesc": "Tema",
       "notificationsDesc": "Avvisi e preferenze",
@@ -257,7 +271,376 @@
   "managedAgents": {
     "planGate": {
       "message": "Gli agenti gestiti richiedono Pro o Enterprise. Effettua l'upgrade per registrare macchine remote ed eseguire job con agenti."
+    },
+    "agent": "Agente",
+    "page": {
+      "title": "Agenti gestiti",
+      "subtitle": "Macchine leggere connesse a questo server Borg UI",
+      "refresh": "Aggiorna",
+      "refreshing": "Aggiornamento degli agenti",
+      "addAgent": "Aggiungi agente",
+      "unknownAgent": "Agente sconosciuto",
+      "never": "Mai",
+      "none": "Nessuno",
+      "noneReported": "Nessuno segnalato",
+      "notReported": "Non segnalato",
+      "os": "SO",
+      "lastSeen": "Ultimo accesso",
+      "agentVersion": "Versione agente",
+      "borg": "Borg",
+      "capabilities": "Capacità",
+      "emptyAgents": "Nessun agente registrato.",
+      "emptyJobs": "Nessun processo agente ancora.",
+      "emptyTokens": "Nessun token di registrazione creato.",
+      "tabs": {
+        "agents": "Agenti",
+        "jobs": "Processi",
+        "tokens": "Token di registrazione"
+      },
+      "toasts": {
+        "tokenCreated": "Token di registrazione creato",
+        "tokenRevoked": "Token di registrazione revocato",
+        "agentRevoked": "Agente revocato",
+        "agentDeleted": "Agente eliminato",
+        "cancellationRequested": "Annullamento richiesto",
+        "copied": "Copiato",
+        "agentVersionPinned": "Blocco versione salvato",
+        "agentUpgradeRequested_one": "Aggiornamento richiesto",
+        "agentUpgradeRequested_other": "Aggiornamento richiesto per {{count}} endpoint"
+      },
+      "errors": {
+        "revokeToken": "Impossibile revocare il token di registrazione",
+        "revokeAgent": "Impossibile revocare l'agente",
+        "deleteAgent": "Impossibile eliminare l'agente",
+        "cancelJob": "Impossibile annullare il processo",
+        "runDiagnostics": "Impossibile eseguire la diagnostica",
+        "upgradeAgent": "Non è stato possibile richiedere l'aggiornamento",
+        "pinAgentVersion": "Non è stato possibile salvare il blocco versione"
+      },
+      "table": {
+        "job": "Processo",
+        "status": "Stato",
+        "progress": "Avanzamento",
+        "updated": "Aggiornato",
+        "actions": "Azioni",
+        "name": "Nome",
+        "prefix": "Prefisso",
+        "expires": "Scade"
+      },
+      "actions": {
+        "runDiagnostics": "Esegui diagnostica",
+        "viewAgentLogs": "Visualizza registri agente",
+        "reinstallAgent": "Reinstalla agente",
+        "revokeAccess": "Revoca accesso",
+        "revokeAgent": "Revoca agente",
+        "deleteAgent": "Elimina agente",
+        "viewLogs": "Visualizza registri",
+        "cancelJob": "Annulla processo",
+        "revokeToken": "Revoca token",
+        "upgradeAgent": "Aggiorna questo endpoint",
+        "pinAgentVersion": "Blocca la versione di questo endpoint",
+        "changeServerUrl": "Cambia URL del server",
+        "uninstallAgent": "Disinstalla l'agente"
+      },
+      "noBorg": {
+        "title": "Nessun binario Borg utilizzabile segnalato",
+        "description": "Installa Borg su questo agente oppure rigenera il comando di configurazione con l'installazione di Borg abilitata."
+      },
+      "deleteDialog": {
+        "title": "Elimina agente",
+        "confirm": "Elimina agente",
+        "description": "L'eliminazione lo rimuove dall'elenco della flotta. Il servizio locale potrebbe continuare a essere eseguito finché non viene rimosso sul client."
+      },
+      "reinstallDialog": {
+        "title": "Reinstalla agente",
+        "copyCommand": "Copia comando di reinstallazione",
+        "description": "Esegui questo comando sulla macchina registrata per aggiornare il pacchetto dell'agente Borg UI e riavviare il servizio systemd. Non sono richiesti token o passaggi di registrazione.",
+        "configPreserved": "Lo script conserva la configurazione dell'agente esistente in",
+        "serviceUserPreserved": "Il servizio continua inoltre a essere eseguito con l'utente registrato nella sua unità systemd: esegui il comando da qualsiasi account con sudo.",
+        "borgInstallation": "Installazione di Borg",
+        "borgSelectionHint": "Selezionando le versioni di Borg quei binari sull'agente vengono aggiornati alle versioni offerte da questo server. Lascia la selezione su Salta se non intendi eseguire un upgrade di Borg.",
+        "borgOptions": {
+          "borg1": {
+            "label": "Borg 1.x",
+            "description": "Verifica o aggiorna Borg 1 come 'borg' alla versione di questo server."
+          },
+          "borg2": {
+            "label": "Solo Borg 2.x beta",
+            "description": "Verifica o aggiorna Borg 2 come 'borg2' alla versione di questo server."
+          },
+          "both": {
+            "label": "Borg 1.x e Borg 2.x beta",
+            "description": "Verifica o aggiorna Borg 1 come 'borg' e Borg 2 come 'borg2' alle versioni di questo server."
+          },
+          "skip": {
+            "label": "Salta installazione Borg",
+            "description": "Predefinito. Aggiorna solo il pacchetto dell'agente; i binari di Borg restano intatti."
+          }
+        }
+      },
+      "logs": {
+        "agent": "Registri agente",
+        "agentTitle": "Registri agente - {{name}}",
+        "job": "Processo agente",
+        "jobTitle": "Registri processo agente - Processo #{{id}}"
+      },
+      "diagnostics": {
+        "title": "Diagnostica agente",
+        "running": "Diagnostica in esecuzione",
+        "runCheck": "Esegui controllo",
+        "description": "Verifica la sessione agente in uscita e, facoltativamente, prova una destinazione TCP dall'host dell'agente.",
+        "invalidPort": "Inserisci una porta TCP compresa tra 1 e 65535.",
+        "invalidTimeout": "Inserisci un timeout compreso tra 0,5 e 10 secondi.",
+        "advancedSummary": "Avanzato: prova un altro servizio",
+        "advancedDescription": "Verifica se questo agente può raggiungere un servizio separato. Lascia vuoto per la diagnostica normale.",
+        "serviceHost": "Host del servizio",
+        "serviceHostHelper": "Servizio facoltativo da testare da questo agente",
+        "servicePort": "Porta del servizio",
+        "timeout": "Timeout",
+        "seconds": "Secondi",
+        "timeoutRange": "0,5-10 secondi",
+        "sessionHealthy": "Sessione integra",
+        "agentOffline": "Agente offline",
+        "timedOut": "Tempo scaduto",
+        "sessionFailed": "Sessione non riuscita",
+        "tcpReachable": "TCP raggiungibile",
+        "tcpFailed": "TCP non riuscito",
+        "emptyResult": "Esegui un controllo per verificare la sessione agente attiva. Aggiungi un host e una porta per testare la raggiungibilità TCP dall'host dell'agente.",
+        "unavailable": "La diagnostica non è disponibile in questa superficie di storia o test."
+      },
+      "upgrade": {
+        "upToDate": "Aggiornato",
+        "outdated": "Aggiornamento disponibile",
+        "ahead": "Più recente del server",
+        "pinned": "Bloccato",
+        "unknown": "Versione sconosciuta",
+        "targetTooltip": "Questo server fornisce la versione {{version}} dell'agente",
+        "pinnedTooltip": "Bloccato alla versione {{version}} e non seguirà il server",
+        "unknownTooltip": "Questo endpoint non ha segnalato una versione confrontabile",
+        "outdatedCount_one": "{{count}} endpoint esegue un agente più vecchio",
+        "outdatedCount_other": "{{count}} endpoint eseguono un agente più vecchio",
+        "bannerBody": "La versione attuale dell'agente è {{version}}.",
+        "bannerMixedTargets": "Ognuno punta alla propria versione configurata.",
+        "manualOnly": "Solo aggiornamenti manuali",
+        "manualOnlyTooltip": "Questo endpoint non ha l'helper di autoaggiornamento, quindi si aggiorna eseguendo il comando di reinstallazione sulla macchina. Una reinstallazione lo prepara agli aggiornamenti dal server.",
+        "selectedCount_one": "{{count}} endpoint selezionato",
+        "selectedCount_other": "{{count}} endpoint selezionati",
+        "upgradeSelected_one": "Aggiorna {{count}} endpoint",
+        "upgradeSelected_other": "Aggiorna {{count}} endpoint",
+        "selectAgent": "Seleziona {{name}}",
+        "clearSelection": "Deseleziona",
+        "bannerManualOnly_one": "{{count}} endpoint richiede una reinstallazione manuale dalla sua scheda prima di poter essere aggiornato da qui.",
+        "bannerManualOnly_other": "{{count}} endpoint richiedono una reinstallazione manuale dalle loro schede prima di poter essere aggiornati da qui.",
+        "upgradeAll": "Aggiorna tutti ({{count}})"
+      },
+      "upgradeDialog": {
+        "title_one": "Aggiorna questo endpoint",
+        "title_other": "Aggiorna {{count}} endpoint",
+        "description": "L'endpoint si reinstalla da questo server.",
+        "descriptionWithVersion_one": "L'endpoint si reinstalla da questo server e torna con la versione {{version}}.",
+        "descriptionWithVersion_other": "Ogni endpoint si reinstalla da questo server e torna con la versione {{version}}.",
+        "mixedTargets": "Ogni endpoint si reinstalla da questo server e torna con la propria versione configurata.",
+        "disconnectWarning_one": "Durante l'operazione si disconnette per un breve periodo.",
+        "disconnectWarning_other": "Ognuno si disconnette per un breve periodo e vengono aggiornati pochi alla volta, quindi alcuni attendono prima di iniziare.",
+        "busyWarning": "Un endpoint che sta eseguendo un backup rifiuta l'aggiornamento, quindi riprova quando è inattivo.",
+        "confirm": "Aggiorna"
+      },
+      "upgradeState": {
+        "upgrading": "Aggiornamento",
+        "upgradingTo": "Aggiornamento alla {{version}}",
+        "upgradingTooltip": "L'endpoint si sta reinstallando e si riconnetterà da solo.",
+        "failed": "Aggiornamento non riuscito",
+        "failedHint": "L'endpoint non è tornato in tempo. Reinstallalo manualmente.",
+        "queued": "In attesa di aggiornamento",
+        "queuedTooltip": "In coda dietro ad altri endpoint. Parte da solo quando si libera uno slot."
+      },
+      "pinControl": {
+        "title": "Blocco versione",
+        "hint": "Per impostazione predefinita un endpoint segue la versione distribuita da questo server. Bloccalo per tenerlo su una versione specifica.",
+        "agentVersionLabel": "Versione agente",
+        "trackServer": "Segui il server",
+        "borgVersionLabel": "Versione Borg",
+        "leaveAsInstalled": "Lascia come installata",
+        "borgHint": "La scelta di Borg viene applicata al prossimo aggiornamento di questo endpoint.",
+        "save": "Salva",
+        "unavailableVersion": "{{version}} (non più distribuita)"
+      },
+      "borgPin": {
+        "active": "Borg {{version}}",
+        "activeTooltip": "Fissato a Borg {{version}}, la versione che questo endpoint segnala.",
+        "pending": "Borg {{version}} in attesa",
+        "pendingTooltip": "Fissato a Borg {{version}}, ma questo endpoint non segnala ancora quella versione. Il prossimo aggiornamento la installerà."
+      },
+      "setServerDialog": {
+        "title": "Cambia URL del server",
+        "description": "Punta questo endpoint a un altro indirizzo di Borg UI. Mantiene identità, credenziale e cronologia, quindi non serve un nuovo token di registrazione.",
+        "fieldLabel": "Nuovo URL del server",
+        "fieldHelper": "Precompilato con l'indirizzo di questo server. Modificalo se l'endpoint deve raggiungere Borg UI altrove, per esempio tramite un reverse proxy.",
+        "invalidUrl": "Inserisci un URL completo che inizi con http:// o https://, senza virgolette, barra verticale o barra rovesciata.",
+        "copyCommand": "Copia comando",
+        "runHint": "Esegui questo comando sull'endpoint, con un utente che può usare sudo.",
+        "statusHint": "Non sai quale indirizzo ha ora l'endpoint? Esegui borg-ui-agent status su di esso."
+      },
+      "offlineStatusHint": "Esegui borg-ui-agent status sull'endpoint per vedere l'indirizzo del server che ha ora.",
+      "uninstallDialog": {
+        "title": "Disinstalla l'agente",
+        "description": "Esegui questo comando sull'endpoint per rimuovere completamente Borg UI. L'agente si deregistra per primo, quindi questa scheda si aggiorna da sola.",
+        "removesTitle": "Cosa viene rimosso",
+        "removesService": "Il servizio borg-ui-agent e il suo assistente di aggiornamento",
+        "removesVenv": "L'ambiente virtuale in /opt/borg-ui-agent",
+        "removesConfig": "La configurazione in /etc/borg-ui-agent, credenziale inclusa",
+        "removesUser": "L'utente di servizio dedicato borg-ui-agent, se l'installazione ne ha creato uno",
+        "keepsBorg": "La tua installazione di Borg non viene toccata. Vengono rimossi solo i binari collocati da questo programma di installazione.",
+        "keepsRepositories": "I tuoi repository di backup non vengono toccati.",
+        "copyCommand": "Copia comando"
+      },
+      "insecureCommandWarning": "Questo server è raggiungibile in HTTP non cifrato, quindi il comando scarica uno script in chiaro e lo esegue come root. Chiunque si trovi sul percorso di rete può sostituire ciò che viene scaricato. Metti il server dietro HTTPS prima di eseguirlo fuori da una rete di cui ti fidi."
+    },
+    "installCommand": {
+      "title": "Comando di installazione",
+      "copy": "Copia comando di installazione",
+      "description": "Esegui il comando sul computer Linux. Il programma di installazione registra l'agente e abilita il servizio systemd per impostazione predefinita.",
+      "connected": "{{name}} connesso",
+      "waiting": "In attesa della connessione dell'agente…",
+      "connectedDescription": "Puoi chiudere questa finestra; l'agente continuerà a funzionare.",
+      "waitingDescription": "Questa pagina si aggiornerà automaticamente al termine dell'installazione."
+    },
+    "setupGuide": {
+      "summary": "Esegui questa operazione su un computer remoto per registrarlo con questo server Borg UI.",
+      "help": "Guida alla configurazione",
+      "title": "Guida alla configurazione dell'agente",
+      "copySetupCommand": "Copia comando di configurazione",
+      "copyInstallCommands": "Copia comandi di installazione",
+      "copyStatusCommand": "Copia comando di stato",
+      "copySystemdCommands": "Copia comandi systemd",
+      "steps": {
+        "install": {
+          "title": "1. Esegui il programma di installazione Linux",
+          "description": "Esegui questa operazione sul computer Linux che possiede i file di cui Borg deve eseguire il backup. Il programma di installazione installa le dipendenze, registra l'agente e abilita il servizio systemd. Per impostazione predefinita, il servizio viene eseguito come l'utente che ha invocato sudo, quindi i percorsi del repository e delle origini devono essere accessibili a tale utente."
+        },
+        "server": {
+          "title": "2. URL del server e token",
+          "description": "L'URL del server deve essere raggiungibile dal computer client. localhost funziona solo quando l'agente e Borg UI sono sullo stesso computer. I client remoti devono usare un nome host Borg UI, un indirizzo IP o un URL HTTPS raggiungibile. I token di registrazione sono credenziali temporanee di configurazione; l'agente registrato conserva le proprie credenziali fino alla revoca o all'eliminazione."
+        },
+        "troubleshooting": {
+          "title": "3. Risoluzione manuale dei problemi",
+          "descriptionPrefix": "L'installazione manuale rimane utile per la risoluzione dei problemi. Il codice sorgente dell'agente si trova nella",
+          "link": "directory dell'agente Borg UI"
+        },
+        "service": {
+          "title": "4. Controlli del servizio",
+          "description": "Il programma di installazione abilita systemd per impostazione predefinita, così l'agente sopravvive al riavvio. Usa questi comandi solo quando controlli o ripari un'installazione manuale."
+        }
+      }
+    },
+    "add": {
+      "title": "Aggiungi agente",
+      "steps": {
+        "target": "Destinazione",
+        "details": "Dettagli",
+        "install": "Installa"
+      },
+      "errors": {
+        "createToken": "Impossibile creare il token di registrazione"
+      },
+      "platform": "Piattaforma",
+      "platforms": {
+        "linux": "Linux",
+        "macos": "macOS",
+        "windows": "Windows"
+      },
+      "selected": "Selezionato",
+      "comingLater": "Disponibile in seguito",
+      "serverUrl": "URL del server",
+      "localhostWarning": "localhost funziona solo quando l'agente e Borg UI sono sullo stesso computer. I computer remoti richiedono un nome host, un indirizzo IP o un URL HTTPS raggiungibile.",
+      "serverUrlHelper": "Questo URL deve essere raggiungibile dal computer dell'agente.",
+      "agentName": "Nome agente",
+      "defaultPath": "Percorso predefinito",
+      "defaultPathHelper": "Directory iniziale per esplorare i file di questo agente.",
+      "tokenExpiry": "Scadenza del token",
+      "expiry": {
+        "1h": "1 ora",
+        "24h": "24 ore",
+        "7d": "7 giorni",
+        "30d": "30 giorni",
+        "never": "Mai"
+      },
+      "serviceUser": "Utente del servizio",
+      "serviceUsers": {
+        "current": {
+          "label": "Utente di installazione",
+          "description": "L'agente può accedere agli stessi file dell'utente che esegue il programma di installazione."
+        },
+        "dedicated": {
+          "label": "Utente borg-ui-agent dedicato",
+          "description": "Usa un account separato con privilegi ridotti per un isolamento più rigoroso."
+        },
+        "root": {
+          "label": "Root",
+          "description": "Usa questa opzione solo quando l'agente deve eseguire il backup di percorsi di proprietà di root."
+        }
+      },
+      "rootWarning": "La modalità root consente a questo agente di eseguire operazioni Borg a livello root. Usala solo per percorsi di proprietà di root.",
+      "borgInstallation": "Installazione di Borg",
+      "borgOptions": {
+        "borg1": {
+          "label": "Borg 1.x",
+          "description": "Predefinito. Installa o verifica Borg 1 come 'borg'."
+        },
+        "borg2": {
+          "label": "Solo Borg 2.x beta",
+          "description": "Opzione sperimentale avanzata. Installa o verifica Borg 2 come 'borg2'."
+        },
+        "both": {
+          "label": "Borg 1.x e Borg 2.x beta",
+          "description": "Opzione sperimentale avanzata. Mantiene Borg 1 come 'borg' e Borg 2 come 'borg2'."
+        },
+        "skip": {
+          "label": "Salta installazione Borg",
+          "description": "Usa questa opzione quando Borg è gestito separatamente sul computer dell'agente."
+        }
+      },
+      "generateInstallCommand": "Genera comando di installazione"
     }
+  },
+  "apiTokens": {
+    "title": "Token API",
+    "description": "Accesso programmatico, mostrato una sola volta alla creazione",
+    "empty": "Nessun token",
+    "prefix": "Prefisso",
+    "created": "Creato",
+    "lastUsed": "Ultimo utilizzo",
+    "revoke": "Revoca token",
+    "revoked": "Token revocato",
+    "name": "Nome token",
+    "namePlaceholder": "ad es. distribuzione CI, domotica",
+    "generateTitle": "Genera token API",
+    "newTokenTitle": "Il tuo nuovo token API",
+    "copyWarning": "Copia ora questo token. Non potrai più visualizzarlo.",
+    "copied": "Copiato!",
+    "copyToClipboard": "Copia negli appunti",
+    "closeWithoutCopyingTitle": "Chiudere senza copiare?",
+    "closeWithoutCopyingDescription": "Non hai copiato il token. Dopo la chiusura di questa finestra non potrà essere recuperato.",
+    "closeAnyway": "Chiudi comunque",
+    "errors": {
+      "generate": "Impossibile generare il token",
+      "revoke": "Impossibile revocare il token"
+    }
+  },
+  "accountPassword": {
+    "title": "Cambia password",
+    "current": "Password attuale",
+    "new": "Nuova password",
+    "confirm": "Conferma password",
+    "mismatch": "Le password non corrispondono",
+    "saving": "Salvataggio",
+    "update": "Aggiorna password"
+  },
+  "mountSuccess": {
+    "title": "Archivio montato",
+    "accessViaDocker": "Accesso tramite Docker:",
+    "copied": "Copiato!",
+    "copyCommand": "Copia comando"
   },
   "cloudStorage": {
     "title": "Archiviazione cloud",
@@ -286,6 +669,9 @@
     "storagePercentUsed": "{{value}}% usato",
     "noStorageInfo": "Nessuna info storage",
     "configSourceLabel": "Configurazione",
+    "configSource": {
+      "managed": "Gestita"
+    },
     "managedConfig": "rclone.conf gestito dal server",
     "editRemote": "Modifica remoto",
     "deleteRemote": "Elimina remoto",
@@ -361,11 +747,20 @@
     "failed": "Fallito",
     "running": "In esecuzione",
     "pending": "In attesa",
-    "cancelled": "Annullato"
+    "cancelled": "Annullato",
+    "skipped": "Saltato",
+    "queued": "In coda",
+    "warnings": "Avvisi"
   },
   "dashboard": {
     "title": "Dashboard",
     "subtitle": "Panoramica completa della tua infrastruttura di backup",
+    "spaceSavings": {
+      "title": "Spazio che potresti liberare",
+      "line": "almeno {{size}} con {{retention}}",
+      "hint": "Libera il massimo tra le regole confrontate. Apri per visualizzarne l'anteprima.",
+      "stale": "potrebbe essere cambiato"
+    },
     "stats": {
       "repositories": "Repository",
       "sshRemote": "SSH remoto",
@@ -486,6 +881,8 @@
       "ariaLabel": "Attività di backup negli ultimi 14 giorni",
       "today": "oggi",
       "legendFailed": "falliti",
+      "cellTitle_one": "{{type}}: {{count}} esecuzione, fallite: {{failed}}",
+      "cellTitle_other": "{{type}}: {{count}} esecuzioni, fallite: {{failed}}",
       "jobType": {
         "backup": "backup",
         "check": "controllo",
@@ -555,7 +952,7 @@
     "tabs": {
       "ariaLabel": "Tipo di operazione di backup",
       "backupPlans": "Piani di backup",
-      "legacyBackup": "Backup legacy"
+      "legacyBackup": "Automazioni di backup"
     },
     "planRun": {
       "title": "Esegui un piano di backup",
@@ -635,14 +1032,200 @@
     "noRepositories": "Nessun repository trovato. Crea prima un repository.",
     "selectRepository": "Seleziona un repository per visualizzare i suoi archivi",
     "deletionStarted": "Eliminazione archivio avviata in background (ID Job: {{id}})",
+    "openFullPage": "Apri pagina completa",
     "mountTimeout": "Timeout mount: I repository di grandi dimensioni potrebbero richiedere più tempo per il mount.",
     "mountFailed": "Impossibile montare l'archivio: {{error}}",
     "restoreStarted": "Job di ripristino avviato! Controlla la scheda Attività per monitorare i progressi.",
+    "restorePanel": {
+      "label": "Avanzamento del ripristino",
+      "pending": "Ripristino in coda",
+      "running": "Ripristino in corso…",
+      "completed": "Ripristino completato",
+      "completed_with_warnings": "Ripristino completato con avvisi",
+      "failed": "Ripristino non riuscito",
+      "cancelled": "Ripristino annullato",
+      "unavailable": "Stato non disponibile",
+      "unavailableHint": "Impossibile leggere lo stato del job. Il ripristino potrebbe essere ancora in corso. Controlla Attività.",
+      "waiting": "In attesa dell'avvio del job…",
+      "restoringTo_one": "{{count}} file finora in {{path}}",
+      "restoringTo_other": "{{count}} file finora in {{path}}",
+      "restoredTo_one": "{{count}} file ripristinato in {{path}}",
+      "restoredTo_other": "{{count}} file ripristinati in {{path}}",
+      "noDetails": "Nessun dettaglio riportato.",
+      "viewActivity": "Vedi in Attività",
+      "dismiss": "Chiudi"
+    },
     "mountSuccess": "Archivio montato con successo!\n\nIl mount è all'interno del container. Per accedere ai file, esegui:\n\n{{command}}",
     "toasts": {
       "deleteFailed": "Impossibile eliminare l'archivio",
       "restoreFailed": "Impossibile avviare il ripristino",
-      "notSelected": "Repository o archivio non selezionato"
+      "notSelected": "Repository o archivio non selezionato",
+      "archiveUnavailable": "Questo archivio non è ancora nell’elenco. Aggiorna e riprova."
+    },
+    "sync": {
+      "fresh": "Sincronizzato {{ago}}",
+      "syncing": "Sincronizzazione in corso",
+      "stale": "La sincronizzazione non è aggiornata",
+      "never": "Non ancora indicizzato"
+    },
+    "view": {
+      "heatmap": "Mappa di calore",
+      "list": "Elenco",
+      "growth": "Crescita",
+      "scaleDays": "Giorni",
+      "scaleHours": "Ore",
+      "scaleLabel": "Scala"
+    },
+    "heatmap": {
+      "title": "Calendario dei backup",
+      "summary": "{{count}} archivi in {{days}} giorni, dal {{first}} al {{last}}",
+      "none": "Nessun archivio",
+      "archives_one": "{{count}} archivio",
+      "archives_other": "{{count}} archivi",
+      "missed": "Esecuzione attesa, nessun archivio e nessuna esecuzione registrata",
+      "sizeOutlier": "Insolitamente piccolo",
+      "durationOutlier": "Insolitamente lento",
+      "unusualRun": "Dimensione o durata insolita",
+      "legendLess": "Meno",
+      "legendMore": "Più",
+      "tooltip": "{{count}} il {{date}} · {{size}} · {{duration}}",
+      "missedTotal_one": "{{count}} giorno",
+      "missedTotal_other": "{{count}} giorni",
+      "pickArchive": "{{count}} archivi il {{date}}",
+      "legendMissed": "Nessun dato registrato",
+      "cadenceUnknown": "nessuna pianificazione nota, quindi nessun giorno viene giudicato"
+    },
+    "growth": {
+      "title": "Crescita del repository",
+      "legendRepository": "Dimensione del repository dopo questo backup",
+      "legendSource": "Dimensione sorgente (prima della deduplica)",
+      "staleNote_one": "{{count}} archivio viene rimisurato dopo la rimozione di archivi. I suoi valori mostrano l'ultima misurazione.",
+      "staleNote_other": "{{count}} archivi vengono rimisurati dopo la rimozione di archivi. I loro valori mostrano l'ultima misurazione.",
+      "unmeasuredNote_one": "{{count}} archivio non è ancora misurato e non viene disegnato.",
+      "unmeasuredNote_other": "{{count}} archivi non sono ancora misurati e non vengono disegnati.",
+      "empty": "Il grafico della crescita richiede almeno due archivi misurati.",
+      "tooltipAdded": "Dati esclusivi",
+      "tooltipRepository": "Dimensione del repository dopo",
+      "tooltipSource": "Dimensione sorgente",
+      "tooltipStale": "Misurazione obsoleta",
+      "openArchive": "Apri archivio"
+    },
+    "search": {
+      "placeholder": "Cerca file in questo repository",
+      "title": "Risultati di ricerca",
+      "present": "Nell'ultimo",
+      "absent": "Non nell'ultimo",
+      "empty": "Nessun file corrispondente",
+      "truncated": "Mostrando i primi {{count}} risultati",
+      "locked": "{{count}} file corrispondono. Pro li elenca tutti, qui ci sono i primi {{shown}}.",
+      "lockedCapped": "Più di {{count}} file corrispondono. Pro li elenca tutti, qui ci sono i primi {{shown}}.",
+      "lastSeen": "Visto l’ultima volta il {{date}}",
+      "inArchives_one": "in {{count}} archivio",
+      "inArchives_other": "in {{count}} archivi",
+      "selectPrompt": "Scegli un file per vedere gli archivi in cui è stato salvato.",
+      "typeToSearch": "Digita un nome di file per cercare in questo repository."
+    },
+    "detail": {
+      "tabChanges": "Modifiche",
+      "tabChangesWithCounts": "Modifiche (+{{added}} −{{removed}} ~{{modified}})",
+      "tabFiles": "File",
+      "loadFailed": "Questo archivio non può essere caricato.",
+      "restore": "Ripristina",
+      "mount": "Monta",
+      "delete": "Elimina",
+      "tabChangesLabel": "Modifiche",
+      "stats": {
+        "addedToRepository": "Aggiunto al repository",
+        "addedHint": "Dati presenti solo in questo archivio. Eliminandolo si libera almeno questo spazio.",
+        "filesChanged": "File modificati",
+        "filesChangedNotIndexed": "Non ancora indicizzato",
+        "filesChangedUnavailable": "Non disponibile per questo repository",
+        "dataBackedUp": "Dati salvati",
+        "files": "File",
+        "duration": "Durata",
+        "compression": "Compressione",
+        "compressionNotReported": "Non riportato da questa versione di Borg",
+        "remeasuring": "Nuova misurazione dopo la rimozione di archivi",
+        "notMeasured": "Non ancora misurato",
+        "vsPrevious": "rispetto al precedente"
+      }
+    },
+    "changes": {
+      "search": "Filtra per percorso",
+      "noMatch": "Nessuna modifica corrisponde a quel percorso",
+      "compareWith": "Confronta con",
+      "net": "Netto",
+      "added": "Aggiunto",
+      "removed": "Rimosso",
+      "modified": "Modificato",
+      "summaryRow": "{{count}} altri in {{path}}",
+      "truncated": "L'indice di questo archivio è stato troncato al limite di righe, quindi alcuni percorsi sono riassunti.",
+      "pending": "Questo archivio non è stato ancora indicizzato.",
+      "locked": "Pro elenca i file dietro questi numeri, con filtri e ricerca per percorso.",
+      "skipped": "L'indicizzazione della cronologia è stata saltata per questo archivio.",
+      "failed": "Non è stato possibile indicizzare questo archivio. Ricostruire l'indice della cronologia riprova.",
+      "rebuildLink": "Ricostruisci l'indice della cronologia",
+      "rebuildFailed": "Non è stato possibile avviare la ricostruzione della cronologia.",
+      "rebuildStarted": "La ricostruzione della cronologia è stata messa in coda.",
+      "empty": "Nessuna modifica tra questi archivi.",
+      "loadFailed": "Non è stato possibile caricare le modifiche di questo archivio.",
+      "showMore": "Mostra altro",
+      "filterLabel": "Tipo di modifica",
+      "delta": "{{sign}}{{size}}",
+      "summaryFolder": "Cartella",
+      "agentUnsupported": "La cronologia delle modifiche richiede un agente in grado di generarla: a questo repository non è assegnato un agente utilizzabile, oppure il suo agente è precedente alla cronologia delle modifiche. Assegnare o abilitare un agente, oppure aggiornarlo."
+    },
+    "files": {
+      "size": "Dimensione",
+      "modified": "Modificato",
+      "owner": "Proprietario",
+      "permissions": "Permessi",
+      "restore": "Ripristina",
+      "download": "Scarica",
+      "downloadFolder": "Scarica cartella",
+      "history": "Cronologia",
+      "firstSeen": "Visto per la prima volta",
+      "unchanged": "Invariato",
+      "changed": "Modificato",
+      "restoreThis": "Ripristina questo",
+      "notPresent_one": "Non presente in {{count}} archivio precedente",
+      "notPresent_other": "Non presente in {{count}} archivi precedenti",
+      "selected": "{{count}} selezionati ({{size}})",
+      "selectedCount": "{{count}} selezionati",
+      "restoreSelection": "Ripristina selezione",
+      "selectionBar": "Selezione",
+      "clearSelection": "Annulla selezione",
+      "showSelected": "Mostra selezione",
+      "hideSelected": "Nascondi selezione",
+      "removeFromSelection": "Rimuovi {{name}}",
+      "searchInArchive": "Cerca in questo archivio",
+      "folderMetadata": "Cartella",
+      "noSelection": "Seleziona un file o una cartella per vedere i dettagli.",
+      "path": "Percorso",
+      "historyEmpty": "Nessun archivio precedente contiene questo percorso.",
+      "historyLocked": "Pro mostra ogni versione con la sua dimensione e ripristina il file da una qualsiasi.",
+      "historyLockedSummary": "{{count}} versioni, dal {{first}} al {{last}}.",
+      "type": "Tipo",
+      "typeFile": "File",
+      "typeDirectory": "Cartella",
+      "historyUnavailableAgent": "La cronologia delle modifiche richiede un agente in grado di generarla: a questo repository non è assegnato un agente utilizzabile, oppure il suo agente è precedente alla cronologia delle modifiche. Assegnare o abilitare un agente, oppure aggiornarlo.",
+      "historyNotIndexed": "Questo repository non è ancora stato indicizzato.",
+      "historyCoverage_one": "{{indexed}} di {{count}} archivio indicizzato",
+      "historyCoverage_other": "{{indexed}} di {{count}} archivi indicizzati",
+      "historyEmptyIndexed": "Nessuno degli archivi indicizzati contiene questo percorso.",
+      "historyFailed": "Impossibile indicizzare questo repository."
+    },
+    "toolbarOperations": "Operazioni",
+    "hourly": {
+      "window": "Ultime {{count}} settimane, una riga per ora",
+      "tooltip": "{{count}} alle {{time}} il {{date}}",
+      "none": "Nessun archivio nelle ultime {{count}} settimane."
+    },
+    "indexMode": {
+      "archivesTitle": "Solo archivi per questo repository",
+      "offTitle": "Il lavoro in background è disattivato per questo repository",
+      "description": "La cronologia dei file non viene costruita qui, quindi non viene indicizzato nulla di nuovo. Quanto già memorizzato viene mantenuto e semplicemente non aggiornato.",
+      "changeSetting": "Modificalo nelle impostazioni del repository"
     }
   },
   "restore": {
@@ -691,7 +1274,7 @@
     "createBackup": "Crea Pianificazione Backup",
     "createBackupPlan": "Crea piano di backup",
     "createSchedule": "Crea pianificazione",
-    "createLegacySchedule": "Crea pianificazione legacy",
+    "createLegacySchedule": "Crea automazione di backup",
     "addCheck": "Aggiungi Pianificazione Controllo",
     "addRestoreCheck": "Aggiungi controllo di ripristino",
     "tabs": {
@@ -723,11 +1306,25 @@
       "runCompact": "Compatta",
       "runCompactTip": "Il repository viene compattato dopo ogni backup",
       "runCheck": "Controlla",
-      "runCheckTip": "Il controllo di integrità viene eseguito dopo ogni backup (oltre a qualsiasi controllo pianificato qui sotto)"
+      "runCheckTip": "Il controllo di integrità viene eseguito dopo ogni backup (oltre a qualsiasi controllo pianificato qui sotto)",
+      "collapse": "Comprimi",
+      "expand": "Espandi",
+      "togglePlan": "{{action}} {{name}}"
     },
     "noRepositories": "Devi creare almeno un repository prima di pianificare i backup.",
-    "legacyBackupSchedulesTitle": "Pianificazioni backup legacy",
-    "legacyBackupSchedulesDescription": "Le pianificazioni esistenti basate su repository continuano a essere eseguite qui. I nuovi backup pianificati dovrebbero essere creati come piani di backup.",
+    "legacyBackupSchedulesTitle": "Automazioni di backup",
+    "legacyBackupSchedulesDescription": "Automazioni di backup personalizzate basate su repository, incluse esecuzioni a orario fisso e in base alla disponibilità.",
+    "trigger": {
+      "catchUp": "Esegui i backup mancati quando la sorgente diventa disponibile",
+      "label": "Attivatore di esecuzione",
+      "fixedTime": "A un orario fisso",
+      "whenAvailable": "Quando la sorgente è disponibile",
+      "availabilityDescription": "Borg UI controlla una sorgente raggiungibile ed esegue il backup quando è trascorso l'intervallo minimo.",
+      "checkInterval": "Controlla ogni (minuti)",
+      "checkIntervalHelper": "Con quale frequenza Borg UI controlla se la sorgente è disponibile.",
+      "minimumInterval": "Intervallo minimo dopo un'esecuzione riuscita (ore)",
+      "minimumIntervalHelper": "Borg UI non avvierà un altro backup prima che questo intervallo sia trascorso."
+    },
     "confirmRunNow": "Eseguire \"{{name}}\" ora?",
     "maintenance": {
       "pruning": "Pulizia archivi in corso...",
@@ -739,6 +1336,18 @@
       "completed": "Manutenzione completata"
     },
     "card": {
+      "serviceTypes": {
+        "webhook": "Webhook",
+        "slack": "Slack",
+        "discord": "Discord",
+        "telegram": "Telegram",
+        "email": "Email",
+        "teams": "Teams",
+        "pushover": "Pushover",
+        "ntfy": "Ntfy",
+        "gotify": "Gotify",
+        "matrix": "Matrix"
+      },
       "stats": {
         "schedule": "Pianificazione",
         "repository": "Repository",
@@ -821,6 +1430,18 @@
     "title": "Piani di backup",
     "subtitle": "Definisci sorgenti, impostazioni, pianificazioni e i repository in cui ogni backup scrive.",
     "loading": "Caricamento piani di backup...",
+    "select": {
+      "source": {
+        "local": "Sorgente locale",
+        "remote": "Sorgente remota",
+        "agent": "Agente gestito",
+        "mixed": "Più sorgenti"
+      },
+      "repositories_one": "{{count}} repository",
+      "repositories_other": "{{count}} repository",
+      "scheduled": "Pianificato",
+      "manual": "Manuale"
+    },
     "runTooltipPro": "Questo piano usa più repository o esecuzione parallela. Modificalo o passa a Pro per eseguirlo.",
     "runTooltipProFeature": "Questo piano usa {{feature}}, che richiede Pro. Modificalo o passa a Pro per eseguirlo.",
     "runTooltipProFeatures": "Questo piano usa funzioni solo Pro: {{features}}. Modificalo o passa a Pro per eseguirlo.",
@@ -905,7 +1526,11 @@
       "nextRun": "Prossima esecuzione: {{date}}",
       "repositoryFallback": "Repository",
       "moreRepositories": "+{{count}} altri",
-      "runningNow": "In corso"
+      "runningNow": "In corso",
+      "repositoryCountPartial": "{{enabled}} di {{total}} repository",
+      "skippedRepositoriesTooltip": "Saltati durante le esecuzioni: {{names}}",
+      "skippedLabel": "Saltati",
+      "clickToResumeRepository": "Riprendi i backup su {{name}}"
     },
     "statuses": {
       "unknown": "Sconosciuto",
@@ -937,7 +1562,9 @@
       "repositoryCreateFailed": "Impossibile creare il repository",
       "multiRepositoryRequiresPro": "Più repository in un piano di backup richiedono Pro",
       "selectSourceConnection": "Seleziona un client remoto prima di sfogliare i percorsi sorgente",
-      "scriptCreateFailed": "Creazione dello script generato fallita"
+      "scriptCreateFailed": "Creazione dello script generato fallita",
+      "repositoryToggled": "Repository aggiornato",
+      "repositoryToggleFailed": "Impossibile aggiornare il repository"
     },
     "sourceChooser": {
       "summaryTitle": "Sorgente di backup",
@@ -1135,6 +1762,8 @@
       "runsOnServer": "Esegue sul server Borg UI",
       "runsOnSshHost": "Esegue sull'host SSH",
       "runsOnManagedAgent": "Esegue sull'agente gestito",
+      "directOnSourceTitle": "Esegue il backup direttamente sulla macchina sorgente",
+      "directOnSourceDescription": "Borg UI esegue Borg tramite SSH e mostra qui l'avanzamento.",
       "sourceMustMatchAgent": "Questo repository è controllato da {{agent}}, quindi anche le sorgenti devono risiedere su {{agent}}.",
       "agentRepoSshUnsupported": "I repository di proprietà di un agente non possono utilizzare destinazioni repository SSH.",
       "serverToAgentRepo": "Borg UI non può inviare percorsi locali del server in un repository di proprietà di un agente.",
@@ -1448,6 +2077,7 @@
       "encryption": "Crittografia"
     },
     "observeOnly": "Solo Osservazione",
+    "deleteConfirmation": "Vuoi davvero eliminare il repository \"{{name}}\"?",
     "buttons": {
       "info": "Info",
       "check": "Controlla",
@@ -1488,7 +2118,6 @@
       "checkFailed": "Impossibile avviare il controllo",
       "compactStarted": "Operazione di compattazione avviata",
       "compactFailed": "Impossibile avviare la compattazione",
-      "dryRunCompleted": "Prova simulata completata - rivedi i risultati qui sotto",
       "pruneStarted": "Job di pulizia avviato",
       "pruned": "Repository pulito con successo!",
       "pruneFailed": "Impossibile pulire il repository",
@@ -1517,9 +2146,11 @@
   },
   "activity": {
     "title": "Attività",
-    "subtitle": "Visualizza tutte le operazioni e i relativi log",
+    "subtitle": "Ogni esecuzione su ogni repository, la più recente prima",
     "actions": {
-      "refresh": "Aggiorna attività"
+      "refresh": "Aggiorna attività",
+      "loadMore": "Carica altri",
+      "loadingMore": "Caricamento..."
     },
     "filters": {
       "type": "Tipo",
@@ -1536,7 +2167,8 @@
         "package": "Pacchetto",
         "rcloneSync": "Sync cloud",
         "rcloneHydrate": "Idratazione cloud",
-        "scriptExecution": "Script"
+        "scriptExecution": "Script",
+        "availabilityCheck": "Verifica disponibilità"
       },
       "statuses": {
         "completed": "Completato",
@@ -1544,12 +2176,117 @@
         "needsBackup": "Backup richiesto",
         "failed": "Fallito",
         "running": "In Esecuzione",
-        "pending": "In Attesa"
+        "pending": "In Attesa",
+        "skipped": "Saltato"
       }
     },
     "empty": {
       "title": "Nessuna attività trovata",
       "message": "Non ci sono operazioni corrispondenti ai tuoi filtri"
+    },
+    "filterCategory": "Categoria",
+    "filterTrigger": "Trigger",
+    "allTriggers": "Tutti i trigger",
+    "triggers": {
+      "manual": "Manuale",
+      "schedule": "Pianificazione",
+      "plan": "Piano",
+      "import": "Importazione",
+      "followup": "Follow-up",
+      "reconcile": "Riconciliazione",
+      "retry": "Nuovo tentativo",
+      "preview": "Anteprima prune",
+      "previewAuto": "Automatico · Anteprima prune"
+    },
+    "runTitle": {
+      "reconcile": "Riconciliazione",
+      "manual": "Ricostruzione",
+      "retry": "Nuovo tentativo",
+      "import": "Importazione"
+    },
+    "followupsCollapsed": "{{count}} passaggi",
+    "operations": "Operazioni",
+    "runChain": {
+      "allSucceeded": "Tutti riusciti",
+      "failed": "{{count}} non riusciti",
+      "failed_one": "{{count}} non riuscito",
+      "active": "{{count}} in corso",
+      "cancelled": "{{count}} annullati",
+      "cancelled_one": "{{count}} annullato"
+    },
+    "followupsCollapsed_one": "{{count}} passaggio",
+    "repositoryView": {
+      "back": "Tutta l'attività",
+      "subtitle": "Esecuzioni su questo repository, dalla più recente",
+      "today": "Oggi",
+      "yesterday": "Ieri",
+      "empty": "Nessuna esecuzione di questo repository corrisponde a questi filtri.",
+      "loadFailed": "Impossibile caricare le esecuzioni.",
+      "logs": "Log",
+      "errorDetails": "Dettagli errore",
+      "triggerSource": {
+        "plan": "Piano: {{name}}",
+        "schedule": "Pianificazione: {{name}}"
+      }
+    },
+    "repositoryScope": {
+      "label": "Repository",
+      "all": "Tutti i repository"
+    },
+    "indexHiddenTooltip": "Le esecuzioni di indice restano nascoste finché non selezioni questo",
+    "umbrella": {
+      "plan": "Piano · {{name}}",
+      "schedule": "Pianificazione · {{name}}"
+    },
+    "day": {
+      "today": "Oggi",
+      "yesterday": "Ieri",
+      "unknown": "Senza data"
+    },
+    "summary": {
+      "runs": "{{count}} esecuzioni",
+      "runs_one": "{{count}} esecuzione",
+      "repositories": "su {{count}} repository",
+      "repositories_one": "su {{count}} repository",
+      "indexHidden": "esecuzioni di indice nascoste"
+    },
+    "runningNow": {
+      "title": "In corso"
+    },
+    "health": {
+      "backup": "Backup",
+      "check": "Verifica",
+      "prune": "Prune",
+      "compact": "Compact",
+      "index": "Indice",
+      "mirror": "Mirror",
+      "running": "In corso",
+      "overdue": "in ritardo"
+    },
+    "hook": {
+      "pre": "Script pre-backup",
+      "post": "Script post-backup",
+      "sourcePre": "Script pre-backup della sorgente",
+      "sourcePost": "Script post-backup della sorgente",
+      "other": "Script"
+    },
+    "planRun": {
+      "repositories": "{{count}} repository",
+      "repositories_one": "{{count}} repository",
+      "members": "{{count}} esecuzioni",
+      "members_one": "{{count}} esecuzione",
+      "trigger": {
+        "manual": "Manuale",
+        "schedule": "Pianificato",
+        "retry": "Nuovo tentativo",
+        "availability": "Disponibilità"
+      }
+    }
+  },
+  "availabilitySchedule": {
+    "skipReasons": {
+      "minimumIntervalNotElapsed": "Intervallo minimo non ancora trascorso",
+      "sourceUnavailable": "Origine non disponibile"
     }
   },
   "cloudStorageJobs": {
@@ -1923,6 +2660,7 @@
     },
     "systemKey": {
       "title": "Chiave SSH di Sistema",
+      "defaultDescription": "Chiave SSH di sistema per tutte le connessioni remote",
       "noKey": "Nessuna chiave SSH di sistema trovata. Generane una nuova o importane una esistente.",
       "generate": "Genera Chiave SSH di Sistema",
       "import": "Importa Chiave Esistente",
@@ -1988,6 +2726,9 @@
       "presetHetzner": "Hetzner Storage Box",
       "presetHetznerDescription": "Repository Storage Box tramite il servizio SSH esteso di Hetzner.",
       "presetHetznerDefaults": "Porta 23, distribuzione SFTP attiva, percorso predefinito /home",
+      "presetRsyncNet": "rsync.net",
+      "presetRsyncNetDescription": "Account SSH semplice con Borg preinstallato e shell limitata.",
+      "presetRsyncNetDefaults": "Porta 22, distribuzione SFTP attiva, percorso predefinito /",
       "presetNas": "NAS",
       "presetNasDescription": "Synology, Unraid o NAS simile con mappatura dei percorsi SSH.",
       "presetNasDefaults": "Porta 22, percorso predefinito /backups, prefisso percorso SSH /volume1",
@@ -2131,7 +2872,26 @@
       "keyDeleteFailed": "Impossibile eliminare la chiave SSH",
       "publicKeyCopied": "Chiave pubblica copiata negli appunti!",
       "diagnosticsComplete": "Diagnostica completata",
-      "diagnosticsFailed": "Impossibile eseguire la diagnostica"
+      "diagnosticsFailed": "Impossibile eseguire la diagnostica",
+      "hostKeyTrusted": "Chiave host resa attendibile",
+      "hostKeyTrustFailed": "Impossibile rendere attendibile la chiave host",
+      "hostKeyForgotten": "Chiave host dimenticata. La prossima connessione dovrà verificarla di nuovo.",
+      "hostKeyForgetFailed": "Impossibile dimenticare la chiave host",
+      "hostKeyReadFailed": "Impossibile leggere la chiave host"
+    },
+    "hostKeyDialog": {
+      "title": "Chiave host",
+      "subtitle": "La chiave che {{host}}:{{port}} presenta durante la connessione.",
+      "trusted": "Questa chiave host è considerata attendibile. Le connessioni a questa macchina vengono verificate con essa.",
+      "unknown": "Nessuna chiave host è ancora attendibile per questa connessione, quindi la macchina che risponde a questo indirizzo non è autenticata.",
+      "changed": "La chiave presentata da questo host non è quella che Borg UI considera attendibile. Può trattarsi di una rotazione della chiave oppure di qualcuno che risponde al suo posto. Verificatela sull'host prima di fidarvi.",
+      "unreachable": "Non è stato possibile leggere la chiave host. La macchina potrebbe essere spenta o irraggiungibile.",
+      "trustedFingerprint": "Impronta attendibile",
+      "observedFingerprint": "Impronta presentata ora dall'host",
+      "compareHint": "Confrontatela con l'output di ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub sull'host stesso.",
+      "trust": "Considera attendibile questa chiave",
+      "trustNewKey": "Considera attendibile la nuova chiave",
+      "forget": "Dimentica questa chiave"
     }
   },
   "scripts": {
@@ -2234,8 +2994,8 @@
       "rcloneHydrate": "Idrata cache locale",
       "enableCloudMirror": "Abilita mirror cloud",
       "backupNow": "Backup Ora",
-      "legacyBackup": "Backup legacy",
-      "legacyBackupTooltip": "Esegui il vecchio backup basato sul repository usando i percorsi sorgente legacy di questo repository",
+      "legacyBackup": "Esegui automazione di backup",
+      "legacyBackupTooltip": "Esegui l'automazione di backup basata sul repository usando i percorsi sorgente configurati del repository",
       "backupPlanRequired": "Crea un piano di backup per definire le sorgenti",
       "viewArchives": "Visualizza Archivi",
       "viewBackupPlans": "Visualizza piani di backup collegati",
@@ -2244,7 +3004,9 @@
       "delete": "Elimina",
       "permanentDelete": "Elimina file definitivamente",
       "createBackupPlan": "Crea piano di backup",
-      "createBackupPlanSourceRequired": "Aggiungi percorsi sorgente prima di creare un piano di backup"
+      "createBackupPlanSourceRequired": "Aggiungi percorsi sorgente prima di creare un piano di backup",
+      "operations": "Operazioni",
+      "prunePreview": "Anteprima prune"
     },
     "legacySources": {
       "title": "Impostazioni sorgente legacy",
@@ -2253,6 +3015,10 @@
     "edit": "Modifica",
     "lastCheck": "Ultimo Controllo",
     "lastCompact": "Ultima Compattazione",
+    "lastPrune": "Ultimo Sfoltimento",
+    "lastIndex": "Ultima Indicizzazione",
+    "backgroundWorkOff": "Lavoro in background disattivato",
+    "backgroundWorkOffHint": "L'indicizzazione in background è disattivata per questo repository. Può essere modificata nelle impostazioni del repository, in Avanzate.",
     "tomorrow": "Domani",
     "schedulePaused": "Pianificazione in pausa",
     "schedulePausedWithName": "{{name}} in pausa",
@@ -2399,19 +3165,6 @@
       "encryption": "Crittografia",
       "lastModified": "Ultima Modifica",
       "repositoryLocation": "Posizione Repository",
-      "storageStatistics": "Statistiche Archiviazione",
-      "totalSize": "Dimensione Totale",
-      "usedOnDisk": "Usato su Disco",
-      "uniqueData": "Dati Unici",
-      "totalChunks": "Chunk Totali",
-      "uniqueChunks": "Chunk Unici",
-      "files": "File",
-      "archiveCount": "Archivi",
-      "latestBackupSize": "Dimensione ultimo backup",
-      "firstBackup": "Primo backup",
-      "latestBackup": "Ultimo backup",
-      "noBackupsYet": "Ancora nessun backup",
-      "noBackupsDesc": "Questo repository è stato inizializzato ma non contiene archivi. Le statistiche di archiviazione appariranno qui dopo aver creato il primo backup.",
       "loadFailed": "Impossibile caricare le informazioni del repository. Assicurati che il repository sia accessibile e inizializzato correttamente.",
       "v2PlanRequired": "Questo repository usa Borg 2. I tuoi dati sono al sicuro. Aggiorna a Pro per visualizzare i dettagli.",
       "exportKeyfileTooltip": "Esporta file chiave. Conservalo al sicuro!"
@@ -2422,7 +3175,8 @@
       "warningPanel": "Questa non è l'eliminazione del repository. Borg UI manterrà il record del repository, le pianificazioni, gli script, le impostazioni di connessione e la capacità di backup futuri. I dati degli archivi selezionati in questa anteprima non possono essere ripristinati tramite Borg UI dopo il completamento della cancellazione.",
       "previewButton": "Genera anteprima cancellazione",
       "previewReady": "Anteprima pronta",
-      "previewScope": "{{count}} archivi selezionati per la cancellazione",
+      "previewScope_one": "{{count}} archivio selezionato per la cancellazione",
+      "previewScope_other": "{{count}} archivi selezionati per la cancellazione",
       "dryRunOutput": "Output prova simulata",
       "emptyState": "Nessun archivio trovato in questo repository. Non c'è nulla da cancellare.",
       "staleState": "L'elenco degli archivi è cambiato dopo la generazione di questa anteprima. Genera una nuova anteprima prima di cancellare.",
@@ -2478,7 +3232,7 @@
     "prune": {
       "whatDoesPruningDo": "Cosa fa la pulizia?",
       "explanation": "La pulizia elimina automaticamente gli archivi vecchi in base a regole di conservazione. Questo aiuta a gestire la dimensione del repository mantenendo solo i backup necessari.",
-      "dryRunTip": "Suggerimento: Esegui sempre prima una \"Prova Simulata\" per vedere cosa verrà eliminato!",
+      "dryRunTip": "Suggerimento: prima visualizza l'anteprima per vedere quali archivi verrebbero eliminati e cosa libererebbero.",
       "retentionPolicy": "Politica di Conservazione",
       "retentionDescription": "Specifica quanti backup mantenere per ogni periodo di tempo",
       "keepWithin": "Mantieni entro",
@@ -2517,7 +3271,7 @@
       "dryRunSuccess": "Prova simulata completata con successo. Rivedi l'output sopra per vedere quali archivi verrebbero eliminati. Se tutto sembra corretto, clicca \"Pulisci Archivi\" per eseguire.",
       "warningTitle": "Attenzione: Gli archivi eliminati non possono essere recuperati!",
       "warningCompact": "Dopo la pulizia, esegui \"Compatta\" per liberare effettivamente spazio su disco.",
-      "dryRunButton": "Prova Simulata (Anteprima)",
+      "dryRunButton": "Anteprima",
       "resultsTitle": "Risultati",
       "dryRunPreviewBadge": "ANTEPRIMA",
       "pruneCompleteBadge": "COMPLETATO",
@@ -2554,8 +3308,11 @@
       "edit": "Modifica",
       "duplicate": "Duplica",
       "delete": "Elimina",
+      "deleting": "Eliminazione in corso...",
       "viewLogs": "Visualizza Log",
       "viewArchive": "Visualizza Archivio",
+      "viewArchivePruned": "Archivio rimosso",
+      "viewArchiveUnindexed": "Archivio non ancora indicizzato, riprova dopo la prossima sincronizzazione",
       "downloadLogs": "Scarica Log",
       "errorDetails": "Dettagli Errore",
       "cancel": "Annulla",
@@ -2586,10 +3343,14 @@
       "check": "Controllo Repository",
       "compact": "Compattazione",
       "prune": "Pulizia",
+      "pruneDryRun": "Prune (prova)",
+      "pruneDryRunPolicy": "Prova di prune · {{retention}}",
       "package": "Installazione Pacchetto",
       "rcloneSync": "Sync cloud",
       "rcloneHydrate": "Idratazione cloud",
-      "scriptExecution": "Script"
+      "scriptExecution": "Script",
+      "availabilityCheck": "Verifica disponibilità",
+      "backupPlanRun": "Esecuzione del piano"
     },
     "scheduledById": "Pianificato (ID: {{id}})",
     "backupPlanByName": "Piano di backup: {{name}}",
@@ -2660,15 +3421,6 @@
     "columnType": "Tipo",
     "columnDate": "Data",
     "columnActions": "Azioni"
-  },
-  "repositoryInfo": {
-    "title": "Informazioni Repository",
-    "encryption": "Crittografia",
-    "location": "Posizione",
-    "totalSize": "Dimensione Totale",
-    "archives": "Archivi",
-    "lastModified": "Ultima Modifica",
-    "na": "N/D"
   },
   "systemSettings": {
     "title": "Impostazioni di Sistema",
@@ -2863,7 +3615,9 @@
     "failedToSaveTimeoutSettings": "Impossibile salvare le impostazioni di timeout",
     "statsRefreshStarted": "Aggiornamento statistiche avviato",
     "statsRefreshCompleted": "Aggiornamento statistiche completato",
-    "failedToStartStatsRefresh": "Impossibile avviare l'aggiornamento delle statistiche"
+    "failedToStartStatsRefresh": "Impossibile avviare l'aggiornamento delle statistiche",
+    "autoPrunePreviewLabel": "Anteprime di prune automatiche",
+    "autoPrunePreviewHelper": "Confronta le regole di conservazione da solo quando cambia l'elenco degli archivi e quando si apre la pagina di anteprima del prune. Se disattivato, il confronto viene eseguito solo quando premi Confronta ora."
   },
   "monitoringReports": {
     "title": "Monitoraggio e report",
@@ -2909,6 +3663,191 @@
     "reportSent": "Report backup inviato per {{count}} repository",
     "failedToSend": "Impossibile inviare il report backup",
     "lastReport": "Ultimo report:"
+  },
+  "operations": {
+    "category": {
+      "import": "Importa",
+      "backup": "Backup",
+      "restore": "Ripristina",
+      "maintenance": "Manutenzione",
+      "index": "Indice",
+      "mirror": "Mirror",
+      "system": "Sistema"
+    },
+    "background": {
+      "retry": "Riprova",
+      "plan": "piano",
+      "stage": {
+        "connect": "Connetti",
+        "stats": "Statistiche",
+        "archives": "Elenco archivi",
+        "history": "Cronologia file",
+        "retention": "Anteprima conservazione"
+      },
+      "workers_one": "{{count}} worker",
+      "workers_other": "{{count}} worker",
+      "title": "Lavoro in background",
+      "pauseFailed": "Impossibile modificare lo stato della coda in background.",
+      "rebuildFailed": "Non è stato possibile avviare la ricostruzione.",
+      "queueFailed": "Impossibile caricare la coda in background.",
+      "pauseAdminOnly": "Solo gli amministratori possono mettere in pausa il lavoro in background.",
+      "reason": {
+        "paused": "In pausa",
+        "lane_busy": "{{kind}} ancora in esecuzione",
+        "index_busy": "In attesa che termini l'altro lavoro di indice di questo repository",
+        "workers": "In attesa di un worker di indicizzazione",
+        "queued": "Prossimo in coda",
+        "upstream_paused": "In attesa di una fase in pausa"
+      },
+      "foregroundRunning": "{{kind}} in esecuzione da {{elapsed}}",
+      "viewRuns": "Vedi esecuzioni",
+      "stageFailed": "Fallito",
+      "repositoryColumn": "Repository",
+      "workersDecrease": "Meno worker di indicizzazione",
+      "workersIncrease": "Più worker di indicizzazione",
+      "workersFailed": "Impossibile cambiare il numero di worker.",
+      "pausedBanner": "Il lavoro in background è in pausa. I passaggi in coda non partiranno finché non riprendi.",
+      "subtitle": "Cosa sta facendo Borg UI sui tuoi repository e cosa conserva per ciascuno di essi.",
+      "rebuildRow": "Ricostruisci {{repository}}",
+      "rebuildSummaryAll": "Ricostruisci tutto per {{repository}}. Navigazione e backup continuano a funzionare nel frattempo; i nuovi dati sostituiscono i vecchi al termine di ogni passaggio.",
+      "hub": {
+        "repositories_one": "{{count}} repository",
+        "repositories_other": "{{count}} repository",
+        "archives_one": "{{count, number}} archivio indicizzato",
+        "archives_other": "{{count, number}} archivi indicizzati",
+        "rows_one": "{{count, number}} riga di cronologia",
+        "rows_other": "{{count, number}} righe di cronologia",
+        "bytes": "circa {{size}} su disco",
+        "reconcileEvery": "La riconciliazione viene eseguita ogni {{minutes}} minuti. L'ultima è stata eseguita {{ago}}.",
+        "reconcileNever": "Nessuna riconciliazione è ancora stata eseguita. Viene eseguita ogni {{minutes}} minuti.",
+        "reconcileOff": "La riconciliazione automatica è disattivata perché l'intervallo delle statistiche è 0.",
+        "reconcileHelp": "Una riconciliazione controlla ogni repository alla ricerca di archivi creati o eliminati fuori da Borg UI e aggiorna i dati derivati.",
+        "reconcileNow": "Riconcilia ora",
+        "reconcileStarted_one": "Riconciliazione in coda per {{count}} repository.",
+        "reconcileStarted_other": "Riconciliazione in coda per {{count}} repository.",
+        "reconcileNone": "Ogni repository ha già lavoro di indicizzazione in coda.",
+        "reconcileFailed": "Impossibile avviare la riconciliazione.",
+        "reconcileAdminOnly": "Solo gli amministratori possono avviare una riconciliazione.",
+        "attention_zero": "Niente richiede attenzione",
+        "attention_one": "{{count}} richiede attenzione",
+        "attention_other": "{{count}} richiedono attenzione",
+        "attentionStale_one": "{{count}} obsoleto",
+        "attentionStale_other": "{{count}} obsoleti",
+        "attentionNever_one": "{{count}} mai indicizzato",
+        "attentionNever_other": "{{count}} mai indicizzati",
+        "attentionHistory_one": "{{count}} con cronologia fallita o troncata",
+        "attentionHistory_other": "{{count}} con cronologia fallita o troncata",
+        "attentionRunning_one": "{{count}} in esecuzione",
+        "attentionRunning_other": "{{count}} in esecuzione",
+        "filterName": "Filtra per nome",
+        "filterShow": "Mostra",
+        "filterAll": "Tutti i repository",
+        "filterAttention": "Richiede attenzione",
+        "filterStale": "Obsoleto",
+        "filterNever": "Mai indicizzato",
+        "filterHistory": "Cronologia fallita o troncata",
+        "filterRunning": "In esecuzione",
+        "sortBy": "Ordina per",
+        "sortName": "Nome",
+        "sortRows": "Righe di cronologia",
+        "sortSynced": "Ultimo aggiornamento",
+        "showMore_one": "Mostra {{count}} in più",
+        "showMore_other": "Mostra {{count}} in più",
+        "shownOf": "Mostrati {{shown}} di {{total}}",
+        "noMatchTitle": "Nessun repository corrisponde",
+        "noMatchDescription": "Cambia il filtro o cancellalo per vedere tutti i repository.",
+        "rowArchives_one": "{{count, number}} archivio",
+        "rowArchives_other": "{{count, number}} archivi",
+        "historyCoverage": "{{indexed}} di {{total}} indicizzati",
+        "historyRows_one": "{{count, number}} riga",
+        "historyRows_other": "{{count, number}} righe",
+        "historyFailed_one": "{{count}} non riuscito",
+        "historyFailed_other": "{{count}} non riusciti",
+        "historyTruncated_one": "{{count}} troncato",
+        "historyTruncated_other": "{{count}} troncati",
+        "historyPending_one": "{{count}} in attesa",
+        "historyPending_other": "{{count}} in attesa",
+        "historyNone": "Ancora nessuna cronologia dei file",
+        "historyShare": "{{percent}}% di tutte le righe di cronologia",
+        "syncOff": "Non aggiornato",
+        "modeArchives": "Solo archivi",
+        "modeOff": "Non indicizzato",
+        "trackOff": "Il lavoro in background è disattivato per questo repository",
+        "statsNever": "Non ancora aggiornato",
+        "openDetails": "Apri i dettagli di {{repository}}",
+        "noRepositoriesTitle": "Ancora nessun repository",
+        "noRepositoriesDescription": "Aggiungi o importa un repository e i suoi dati derivati compariranno qui.",
+        "loadFailed": "Impossibile caricare il riepilogo dei repository.",
+        "detailFailedTitle": "Archivi la cui cronologia dei file non è riuscita",
+        "detailTruncatedTitle": "Archivi con cronologia dei file troncata",
+        "detailAttempts_one": "{{count}} tentativo",
+        "detailAttempts_other": "{{count}} tentativi",
+        "detailPartial": "La cronologia dei file copre {{indexed}} di {{total}} archivi.",
+        "detailAllIndexed": "Ogni archivio ha la sua cronologia dei file.",
+        "detailHint": "Ricostruisci per indicizzare di nuovo questi archivi.",
+        "viewIndexRuns": "Vedi esecuzioni di indicizzazione",
+        "openRepository": "Apri repository",
+        "historyAgentUnsupported": "Richiede un agente in grado di farlo",
+        "updatedAgo": "Aggiornato {{ago}}",
+        "updatedNever": "Non ancora aggiornato",
+        "statsLastRefreshed": "Ultimo aggiornamento"
+      },
+      "rebuildTitle": "Ricostruisci i dati derivati",
+      "rebuildAction": "Ricostruisci",
+      "currentRun": "Esecuzione corrente",
+      "strip": {
+        "idle": "Inattiva",
+        "running_one": "{{count}} in corso",
+        "running_other": "{{count}} in corso",
+        "waiting_one": "{{count}} in attesa",
+        "waiting_other": "{{count}} in attesa",
+        "failed_one": "{{count}} non riuscita",
+        "failed_other": "{{count}} non riuscite",
+        "paused": "In pausa",
+        "pauseStage": "Metti in pausa {{stage}}",
+        "resumeStage": "Riprendi {{stage}}",
+        "label": "Fasi in background",
+        "off": "Disattivato"
+      },
+      "pauseAll": "Metti tutto in pausa",
+      "resumeAll": "Riprendi tutto",
+      "currentStageColumn": "Fase attuale",
+      "lastUpdatedColumn": "Ultimo aggiornamento"
+    },
+    "status": {
+      "queued": "In coda",
+      "running": "In esecuzione",
+      "completed": "Completato",
+      "completed_with_warnings": "Completato con avvisi",
+      "failed": "Non riuscito",
+      "cancelled": "Annullato",
+      "skipped": "Saltato"
+    },
+    "kind": {
+      "import_connect": "Connetti repository",
+      "backup": "backup",
+      "restore": "ripristina",
+      "restore_check": "verifica ripristino",
+      "check": "verifica",
+      "prune": "potatura",
+      "compact": "compattazione",
+      "delete_archive": "elimina archivio",
+      "wipe": "cancella",
+      "rclone_sync": "sincronizzazione mirror",
+      "package_install": "installazione pacchetto",
+      "stats": "Aggiorna statistiche",
+      "archive_sync": "Sincronizza elenco archivi",
+      "history_index": "Indicizza cronologia file",
+      "history_merge": "Consolida cronologia rimossa",
+      "prune_compare": "Confronta conservazione",
+      "prune_dry_run": "prune (prova)",
+      "prune_dry_run_policy": "prova · {{retention}}",
+      "prune_dry_run_auto": "prune automatico (prova) · {{retention}}",
+      "script_execution": "script",
+      "availability_check": "controllo disponibilità",
+      "rclone_hydrate": "idratazione mirror",
+      "package": "installazione pacchetto"
+    }
   },
   "notifications": {
     "title": "Servizi di Notifica",
@@ -3186,6 +4125,7 @@
     "subtitle": "Configura archiviazione, conservazione e pulizia dei log dei job",
     "storageUsage": "Utilizzo dello spazio",
     "storageUsageDesc": "Utilizzo attuale dello spazio dei log e statistiche",
+    "storageUnavailable": "I dati sullo spazio dei log non sono disponibili al momento; lo spazio potrebbe comunque essere pieno.",
     "totalSize": "Dimensione totale",
     "fileCount": "Numero di file",
     "oldestLog": "Log più vecchio",
@@ -3358,7 +4298,7 @@
   },
   "archiveNameTemplate": {
     "label": "Template Nome Archivio",
-    "hint": "Personalizza la denominazione dell'archivio. Segnaposto disponibili: {job_name}, {now}, {date}, {time}, {timestamp}",
+    "hint": "Personalizza la denominazione dell'archivio. Segnaposto disponibili: {job_name}, {now}, {utcnow}, {date}, {time}, {timestamp}. {now}, {date} e {time} usano l'ora locale della macchina che crea l'archivio, {utcnow} usa UTC e {timestamp} è tempo Unix. L'anteprima usa l'orologio del browser.",
     "preview": "Anteprima:"
   },
   "remoteMachineCard": {
@@ -3368,12 +4308,22 @@
       "testing": "Test in corso",
       "unknown": "Sconosciuto"
     },
+    "restricted": {
+      "label": "Solo Borg",
+      "tooltip": "La shell remota è limitata a Borg. Navigazione e informazioni storage non sono disponibili per questa connessione.",
+      "storage": "Storage non disponibile (solo Borg)"
+    },
     "storage": "Archiviazione",
     "mountPoint": "Punto di Mount",
     "actions": {
       "edit": "Modifica",
       "delete": "Elimina",
       "deploy": "Distribuisci Chiave"
+    },
+    "hostKey": {
+      "verified": "Chiave host verificata",
+      "unverified": "Chiave host non verificata",
+      "action": "Chiave host"
     }
   },
   "restoreJobCard": {
@@ -3476,6 +4426,11 @@
     "noScheduledChecks": "Nessun controllo pianificato",
     "noScheduledChecksDesc": "Configura controlli automatici del repository per garantire l'integrità dei dati",
     "needRepository": "Devi creare almeno un repository prima di pianificare i controlli.",
+    "repositoryNotFound": "Repository non trovato",
+    "status": {
+      "cancelled": "Annullato",
+      "running": "In esecuzione"
+    },
     "historyTitle": "Cronologia controlli pianificati",
     "historyShowing": "Mostra {{filtered}} di {{total}} job di controllo pianificato",
     "historyShowingFiltered": "Mostra {{filtered}} di {{total}} job di controllo pianificato (filtrati)",
@@ -3573,6 +4528,10 @@
     "canaryModeHint": "La modalità canary aggiunge un piccolo file canary di Borg UI ai backup futuri finché è attiva, poi lo verifica dall'archivio più recente. Funziona dopo il prossimo backup.",
     "canaryUnavailableObserveOnly": "La modalità canary non è disponibile per i repository solo osservazione perché Borg UI non crea i loro backup. Usa percorsi di prova selezionati o una verifica dell'intero archivio.",
     "noBackupYet": "Nessun backup",
+    "timeLabels": {
+      "storedUtc": "Memorizzato in UTC",
+      "localTimezone": "Il tuo fuso orario locale"
+    },
     "probeModeHint": "La modalità percorsi di prova ripristina file reali che scegli tu. Usala per verifiche più approfondite su percorsi critici senza estrarre l'intero archivio.",
     "fullArchiveWarning": "Le verifiche dell'intero archivio possono essere costose su repository grandi. Usale raramente e solo se hai spazio temporaneo e una finestra di manutenzione adeguata."
   },
@@ -3630,7 +4589,11 @@
     "moveUp": "Sposta su",
     "moveDown": "Sposta giù",
     "remove": "Rimuovi",
-    "searchOrAddMore": "Cerca o aggiungi altri..."
+    "searchOrAddMore": "Cerca o aggiungi altri...",
+    "skipped": "Saltato",
+    "skip": "Salta durante le esecuzioni",
+    "resume": "Riprendi i backup",
+    "lastEnabled": "Almeno un repository deve restare attivo"
   },
   "wizard": {
     "steps": {
@@ -3666,6 +4629,7 @@
       "remoteSshfsNote": "Le directory remote vengono montate tramite SSHFS preservando i loro percorsi originali. I pattern di esclusione funzionano come per le sorgenti locali (es., */var/cache/*)."
     },
     "dataSource": {
+      "note": "Nota:",
       "title": "Dove si trovano i dati di cui vuoi fare il backup?",
       "localDescription": "Backup dei dati da questo server (filesystem locali o montati)",
       "agentLocalDescription": "Esegui il backup dei percorsi dal filesystem dell'agente gestito selezionato",
@@ -3684,6 +4648,9 @@
       "remoteSshNote": "Il server Borg UI si connetterà via SSH alla macchina remota per sfogliare e fare il backup delle directory selezionate. Assicurati che la connessione SSH sia configurata correttamente con i permessi necessari."
     },
     "location": {
+      "borgVersion": "Versione di Borg",
+      "beta": "Beta",
+      "borg2": "Borg 2",
       "repositoryNameLabel": "Nome Repository",
       "repositoryNameHelper": "Un nome descrittivo per identificare questo repository",
       "repositoryModeLabel": "Modalità Repository",
@@ -3729,6 +4696,14 @@
       "rcloneOAuthBorgUiHelper": "Borg UI riceve il callback del provider lato server. Quando il provider indica che l'autorizzazione è completa, torna qui; questa finestra controllerà automaticamente.",
       "rcloneOAuthLoopbackHelper": "rclone userà il proprio callback loopback locale. Usalo solo quando il browser può raggiungere lo stesso host del processo rclone.",
       "rcloneOAuthSetupMissing": "L'OAuth gestito da Borg UI non è configurato per questo provider.",
+      "rcloneProviderSearchPlaceholder": "Cerca provider",
+      "rcloneProviderSearchNoResults": "Nessun provider trovato",
+      "rcloneDefaultProviders": {
+        "localLabel": "File system locale",
+        "localDescription": "Remoto per percorso locale.",
+        "customLabel": "Backend rclone personalizzato",
+        "customDescription": "Configurazione manuale per qualsiasi backend rclone."
+      },
       "rcloneOAuthCallbackUrl": "Callback Borg UI: {{url}}",
       "rcloneOAuthModeBorgUi": "Callback Borg UI",
       "rcloneOAuthModeLoopback": "loopback rclone",
@@ -3846,6 +4821,8 @@
       "useFolder": "Usa cartella"
     },
     "restoreDestination": {
+      "port": "Porta {{port}}",
+      "connected": "Connesso",
       "title": "Dove devono essere ripristinati i file?",
       "subtitle": "Seleziona la destinazione e la posizione per i tuoi file ripristinati",
       "borgUiServerDesc": "Ripristina sull'archiviazione locale di questo server",
@@ -3888,7 +4865,9 @@
       "selectDirTooltip": "Seleziona directory e tutto il contenuto",
       "helpText": "Clicca sui file per selezionarli, o sulle cartelle per navigare. Usa la casella di controllo accanto alle cartelle per selezionare intere directory.",
       "failedToLoadContents": "Impossibile caricare il contenuto dell'archivio",
-      "loadContentsTimeout": "Ancora in caricamento — questo archivio richiede più tempo del previsto. Riprova tra un momento."
+      "loadContentsTimeout": "Ancora in caricamento — questo archivio richiede più tempo del previsto. Riprova tra un momento.",
+      "filterPlaceholder": "Filtra questa cartella",
+      "filterLabel": "Filtra i file in questa cartella"
     },
     "restorePath": {
       "title": "Scegli posizione di ripristino",
@@ -3981,6 +4960,9 @@
       "compression": "Compressione",
       "customFlags": "Flag Personalizzati",
       "repositoryInitialized": "Il repository verrà inizializzato",
+      "readyToInitialize": "Pronto per l'inizializzazione",
+      "hidePassphrase": "Nascondi passphrase",
+      "showPassphrase": "Mostra passphrase",
       "repositoryImportNote": "Il repository verrà verificato prima dell'importazione. Assicurati che la passphrase sia corretta.",
       "repositoryEditNote": "Le modifiche verranno salvate nella configurazione del repository."
     },
@@ -4001,6 +4983,44 @@
       "passphrasePlaceholderCreate": "Inserisci passphrase",
       "passphraseHelperEdit": "Opzionale - lascia vuoto per mantenere l'ultima passphrase salvata",
       "passphraseHelperCreate": "Conservala al sicuro - senza di essa non puoi accedere ai backup!",
+      "options": {
+        "repokey": {
+          "label": "Chiave del repository",
+          "description": "Chiave memorizzata nel repository (consigliato)"
+        },
+        "repokey-blake2": {
+          "label": "Chiave del repository (BLAKE2)",
+          "description": "Variante di hashing più veloce"
+        },
+        "keyfile": {
+          "label": "File chiave",
+          "description": "Chiave memorizzata in un file separato"
+        },
+        "keyfile-blake2": {
+          "label": "File chiave (BLAKE2)",
+          "description": "File chiave con hashing più veloce"
+        },
+        "repokey-aes-ocb": {
+          "label": "Chiave del repository (AES-OCB)",
+          "description": "Predefinito per Borg 2 · consigliato"
+        },
+        "repokey-chacha20-poly1305": {
+          "label": "Chiave del repository (ChaCha20)",
+          "description": "Cifrario AEAD alternativo"
+        },
+        "keyfile-aes-ocb": {
+          "label": "File chiave (AES-OCB)",
+          "description": "Chiave memorizzata in un file separato"
+        },
+        "keyfile-chacha20-poly1305": {
+          "label": "File chiave (ChaCha20)",
+          "description": "File chiave con ChaCha20"
+        },
+        "none": {
+          "label": "Nessuna",
+          "description": "Nessuna crittografia (non consigliato)"
+        }
+      },
       "borgKeyfileTitle": "File Chiave Borg (Opzionale)",
       "borgKeyfileDesc": "I file chiave Borg sono tipicamente archiviati senza estensione in ~/.config/borg/keys/",
       "uploadFile": "Carica File",
@@ -4024,6 +5044,7 @@
         "selectAtLeastOne": "Seleziona almeno un repository per continuare."
       },
       "maintenance": {
+        "caution": "Attenzione:",
         "title": "Opzioni Manutenzione",
         "subtitle": "Esegui pulizia e compattazione dopo i backup per gestire lo spazio su disco.",
         "info": "La pulizia rimuove gli archivi vecchi. La compattazione recupera spazio su disco.",
@@ -4034,6 +5055,10 @@
         "compactAfterPruneDesc": "Recupera spazio su disco liberando segmenti",
         "compactInfo": "La compattazione recupera spazio su disco dopo la pulizia. Potrebbe richiedere tempo su repository di grandi dimensioni."
       },
+      "stepIndicator": {
+        "progress": "Passaggio {{current}} / {{total}}",
+        "goToStep": "Vai al passaggio {{step}}: {{label}}"
+      },
       "config": {
         "scheduleLabel": "Pianificazione (Espressione Cron)",
         "scheduleHelper": "Clicca l'icona dell'orologio per usare il costruttore visivo.",
@@ -4042,6 +5067,8 @@
       },
       "review": {
         "readyToCreate": "Pronto per creare la pianificazione!",
+        "ready": "Pronto",
+        "keep": "Conserva:",
         "reviewAndConfirm": "Rivedi e conferma qui sotto.",
         "jobSummary": "Riepilogo Job",
         "name": "Nome",
@@ -4067,16 +5094,50 @@
       }
     }
   },
-  "repositoryStatsGrid": {
-    "totalArchives": "Archivi Totali",
-    "originalSize": "Dimensione totale archivi",
-    "originalSizeTooltip": "Dimensione logica totale di tutti i dati salvati in tutti gli archivi prima di compressione e deduplicazione",
-    "compressedSize": "Dimensione archivi compressa",
-    "compressedSizeTooltip": "Dimensione totale di tutti i dati degli archivi dopo la compressione, prima della deduplicazione su tutti gli archivi",
-    "numberOfFiles": "Numero di file",
-    "numberOfFilesTooltip": "Numero totale di file in tutti gli archivi",
-    "repositorySize": "Dimensione repository",
-    "repositorySizeTooltip": "Spazio di archiviazione realmente usato dal repository su disco dopo compressione e deduplicazione su tutti gli archivi"
+  "repositoryStats": {
+    "freeSpace": "Libera spazio",
+    "heading": "Statistiche di archiviazione",
+    "archives": "Archivi",
+    "originalSize": "Dimensione originale",
+    "usedOnDisk": "Usato su disco",
+    "spaceSaved": "Spazio risparmiato",
+    "backupSpan": "Periodo dei backup",
+    "backupSpanValue": "dal {{first}} al {{last}}",
+    "latestArchiveFiles": "File nell'ultimo archivio",
+    "unknown": "Sconosciuto",
+    "unknownHint": "Non ancora misurato",
+    "pending": "In attesa",
+    "pendingHint": "L'indice degli archivi sta raggiungendo il repository",
+    "indexing": "Indicizzazione…",
+    "indexingArchivesHint": "L'elenco degli archivi è in lettura",
+    "indexingSizeHint": "La dimensione del repository è in misurazione",
+    "updated": "Aggiornato {{ago}}",
+    "updating": "Aggiornamento in corso",
+    "notIndexed": "Non ancora indicizzato",
+    "source": {
+      "borg1_cache_stats": "borg info",
+      "borg2_index": "indice di Borg 2",
+      "storage_used": "spazio di archiviazione",
+      "compact_stats": "ultimo compact"
+    },
+    "sourceHint": {
+      "borg1_cache_stats": "Dimensione deduplicata dalle statistiche della cache di Borg",
+      "borg2_index": "Somma di tutti gli oggetti nell'indice dei chunk del repository",
+      "storage_used": "Byte che il repository occupa sul suo spazio di archiviazione",
+      "compact_stats": "Dimensione del repository riportata dall'ultimo compact"
+    },
+    "originalSizeHint": {
+      "borg1_cache_stats": "Dimensione originale di tutti gli archivi, dalle statistiche della cache di Borg",
+      "compact_stats": "Dimensione originale di tutti gli archivi, riportata dall'ultimo compact",
+      "archives": "Somma della dimensione originale di tutti gli archivi visti dall'ultimo elenco"
+    },
+    "spaceSavedHint": "Dimensione originale divisa per lo spazio usato su disco: deduplicazione e compressione insieme",
+    "spaceSavedUnknownHint": "Nulla per cui dividere",
+    "spaceSavedMixedHint": "La dimensione originale e lo spazio usato su disco sono stati misurati in momenti diversi",
+    "backupSpanHint": "L'archivio più vecchio e quello più recente",
+    "latestArchiveFilesHint": "Numero di file nell'archivio più recente, non un totale",
+    "refresh": "Aggiorna da Borg",
+    "refreshed": "Informazioni del repository aggiornate"
   },
   "upcomingJobs": {
     "title": "Prossimi Job (Prossime 24 Ore)",
@@ -4130,21 +5191,28 @@
     "title": "Contenuto Archivio",
     "loading": "Caricamento contenuto archivio...",
     "slowLoadingHint": "Questo archivio è grande, quindi elencare i suoi file richiede un po' più di tempo. Un attimo — succede solo la prima volta, poi viene messo in cache.",
+    "loadFailed": "Impossibile caricare il contenuto dell'archivio.",
+    "retry": "Riprova",
     "emptyDirectory": "Questa directory è vuota",
     "emptyArchive": "Questo archivio è vuoto",
     "emptyArchiveDesc": "Nessun file è stato salvato in questo archivio. Questo può accadere se la directory sorgente era vuota o inaccessibile durante il backup.",
     "noInfo": "Nessuna informazione sull'archivio disponibile",
     "root": "Radice",
     "downloadFile": "Scarica file",
+    "downloadFolder": "Scarica cartella",
     "managedCanaryLabel": "Canary Borg UI",
     "managedCanaryDescription": "File canary gestiti per i controlli di ripristino. Borg UI li aggiunge ai backup mentre la modalità canary è attiva.",
     "managedCanaryBanner": "Questa cartella è gestita da Borg UI per i controlli di ripristino canary. Puoi lasciarla invariata.",
     "managedCanaryProbeDisabled": "I percorsi canary vengono verificati automaticamente dalla modalità canary.",
+    "includedByParent": "Incluso con {{parent}}. Deseleziona {{parent}} per scegliere gli elementi al suo interno.",
     "failedToDownloadFile": "Impossibile scaricare il file",
+    "failedToDownloadFolder": "Impossibile scaricare la cartella",
     "downloadPreparing": "Preparazione del download di {{name}}…",
+    "downloadFolderPreparing": "Preparazione del download della cartella {{name}}…",
     "downloadingBytes": "Download… {{size}}",
     "downloadingPercent": "Download… {{percent}}% ({{size}})",
-    "downloadComplete": "{{name}} scaricato"
+    "downloadComplete": "{{name}} scaricato",
+    "downloadFolderComplete": "{{name}} scaricato"
   },
   "codeEditor": {
     "loading": "Caricamento editor..."
@@ -4172,7 +5240,9 @@
     "copyToClipboard": "Copia negli appunti",
     "copied": "Copiato!",
     "commandCopied": "Comando copiato negli appunti",
-    "copyFailed": "Impossibile copiare negli appunti"
+    "copyFailed": "Impossibile copiare negli appunti",
+    "remoteServeCommand": "Comando remoto (per chiavi limitate)",
+    "remoteServeCommandDesc": "Borg lo esegue sull'host del repository. Un wrapper forced-command in authorized_keys deve accettarlo."
   },
   "cronBuilderComponent": {
     "runEvery": "Esegui ogni",
@@ -4415,11 +5485,18 @@
     "creating": "Creazione in corso...",
     "create": "Crea",
     "failedToLoad": "Impossibile caricare la directory",
+    "selectAgentFirst": "Seleziona un agente prima di esplorare.",
+    "selectRemoteFirst": "Seleziona prima un remoto rclone.",
+    "createFailed": "Impossibile creare la cartella",
     "chips": {
       "remote": "Remoto",
       "host": "Host",
       "borg": "Borg"
     }
+  },
+  "repoSelect": {
+    "label": "Repository",
+    "placeholder": "Seleziona un repository"
   },
   "cronExpressionInput": {
     "label": "Pianificazione"
@@ -4431,6 +5508,17 @@
     "selectPath": "Seleziona Percorso"
   },
   "cache": {
+    "redis": "Redis",
+    "inMemory": "In memoria",
+    "connection": "Connessione",
+    "externalRedis": "Redis esterno",
+    "localDocker": "Docker locale",
+    "durationDays_one": "{{count}} giorno",
+    "durationDays_other": "{{count}} giorni",
+    "durationHours_one": "{{count}} ora",
+    "durationHours_other": "{{count}} ore",
+    "durationMinutes_one": "{{count}} minuto",
+    "durationMinutes_other": "{{count}} minuti",
     "subtitle": "Monitora e configura il sistema di cache degli archivi basato su Redis per una navigazione più veloce",
     "cacheStatus": "Stato Cache",
     "cachedArchives": "Entità in cache",
@@ -4517,7 +5605,6 @@
   },
   "repositoryInfoDialog": {
     "failedToDownloadKeyfile": "Impossibile scaricare il file chiave",
-    "noArchivesDescription": "Questo repository è stato inizializzato ma non contiene archivi. Le statistiche di archiviazione appariranno qui dopo aver creato il primo backup.",
     "failedToLoad": "Impossibile caricare le informazioni del repository. Assicurati che il repository sia accessibile e inizializzato correttamente.",
     "recovery": {
       "title": "Comandi di recupero",
@@ -4549,6 +5636,8 @@
     },
     "confirmRemove": "Rimuovere questo script dal repository?",
     "parametersConfigured": "{{count}} parametro(i) configurati",
+    "parameterCount_one": "{{count}} parametro",
+    "parameterCount_other": "{{count}} parametri",
     "tooltips": {
       "testScript": "Esegui il test di questo script",
       "parametersOutOfSync": "I parametri necessitano attenzione - la definizione dello script è cambiata",
@@ -4567,7 +5656,13 @@
       "continueOnErrorHelperText": "Sovrascrivi predefinito: Se selezionato, il backup procederà anche se questo script fallisce.",
       "onFailureLabel": "Se questo script fallisce:",
       "cancel": "Annulla",
-      "assignScript": "Assegna Script"
+      "assignScript": "Assegna Script",
+      "inlineScriptReplacementWarning": "L'aggiunta di uno script dalla libreria sostituirà lo script inline corrente per questo hook."
+    },
+    "testDialog": {
+      "title": "Test: {{scriptName}}",
+      "exitCode": "Uscita: {{code}}",
+      "duration": "{{seconds}}s"
     },
     "parametersDialog": {
       "title": "Configura Parametri Script: {{scriptName}}",
@@ -4699,8 +5794,12 @@
         "jobNotFound": "Lavoro agente non trovato",
         "jobNotStartable": "Questo lavoro agente non può essere avviato",
         "repositoryOperationFailed": "L'operazione repository dell'agente non è riuscita",
+        "repositoryOperationFailedWithReason": "L'operazione repository dell'agente non è riuscita: {{reason}}",
         "repositoryOperationTimeout": "L'operazione repository dell'agente è scaduta",
-        "unsupportedJobKind": "Tipo di lavoro agente non supportato"
+        "unsupportedJobKind": "Tipo di lavoro agente non supportato",
+        "desiredVersionUnavailable": "Quella versione dell'agente non è disponibile su questo server.",
+        "upgradeUnsupported": "Questo endpoint non può ancora aggiornarsi da solo. Reinstallalo una volta con il comando della finestra di reinstallazione.",
+        "upgradeTargetUnavailable": "Questo server non distribuisce una versione dell'agente a cui aggiornare."
       },
       "repo": {
         "repositoryNotFound": "Repository non trovato",
@@ -4714,6 +5813,8 @@
         "permissionDeniedCreateDirectory": "Permesso negato: impossibile creare la directory in '{{path}}'. Per archiviare repository sulla tua macchina host, usa percorsi che iniziano con '/local/'.",
         "permissionDeniedCreateParentDirectory": "Permesso negato: impossibile creare la directory padre '{{path}}'. Assicurati che la directory esista sulla tua macchina host con i permessi corretti.",
         "encryptedPassphraseRequired": "La passphrase è richiesta per la modalità di crittografia '{{mode}}'",
+        "agentBorg2Unavailable": "Questo endpoint non ha Borg 2 installato, quindi non è possibile creare o aprire un repository Borg 2. Installa Borg 2 sull'endpoint oppure scegli Borg 1.",
+        "agentBorg2TooOld": "Il Borg 2 di questo endpoint è {{version}}; borg-ui richiede {{minimum}} o successivo per un repository Borg 2. Aggiorna Borg 2 sull'endpoint oppure scegli Borg 1.",
         "agentPassphraseUnavailable": "Questo agent gestito non ha segnalato una BORG_PASSPHRASE, quindi non può aprire un repository crittografato. Imposta BORG_PASSPHRASE nell'ambiente dell'agent oppure inserisci qui una passphrase.",
         "encryptedPassphraseIncorrect": "Il repository è crittografato ma la passphrase non è corretta o mancante. Fornisci la passphrase corretta.",
         "encryptionKeyfileNotRequired": "Il repository usa la crittografia '{{mode}}', che non richiede un file chiave. Il caricamento del file chiave è necessario solo per le modalità di crittografia 'keyfile' o 'keyfile-blake2'.",
@@ -4846,6 +5947,7 @@
       },
       "backupPlans": {
         "nameRequired": "Il nome del piano di backup è obbligatorio.",
+        "nameExists": "Esiste già un piano di backup con questo nome.",
         "clearLegacyRepositoryNotSelected": "Impossibile cancellare le impostazioni sorgente legacy per un repository non selezionato in questo piano di backup.",
         "retryUnsupported": "Questa esecuzione del piano di backup non può essere ritentata."
       },
@@ -4890,7 +5992,7 @@
         "adminAccessRequired": "Accesso amministratore richiesto",
         "cannotEnableAsBackupSource": "Impossibile abilitare come sorgente di backup: {{error}}",
         "connectionTestFailed": "Test connessione SSH fallito: {{error}}",
-        "failedCollectStorage": "Impossibile raccogliere informazioni di archiviazione",
+        "failedCollectStorage": "Le informazioni storage non sono disponibili per questa connessione.",
         "failedGenerateKey": "Impossibile generare la chiave SSH: {{error}}",
         "invalidKeyType": "Tipo chiave non valido. Deve essere uno di: {{types}}",
         "invalidPrivateKeyFormat": "Formato chiave privata non valido",
@@ -4926,7 +6028,10 @@
         "failedDeleteSshKey": "Impossibile eliminare la chiave SSH: {{error}}",
         "failedToggleBackupSource": "Impossibile cambiare lo stato della sorgente di backup: {{error}}",
         "failedListBackupSources": "Impossibile elencare le sorgenti di backup: {{error}}",
-        "failedVerifyBorgInstallation": "Impossibile verificare l'installazione di Borg: {{error}}"
+        "failedVerifyBorgInstallation": "Impossibile verificare l'installazione di Borg: {{error}}",
+        "failedReadHostKey": "Impossibile leggere la chiave host: {{error}}",
+        "hostKeyChangedWhileConfirming": "La chiave host è cambiata durante la conferma. Ricontrollatela prima di renderla attendibile.",
+        "failedStoreHostKey": "Impossibile salvare la chiave host: {{error}}"
       },
       "settings": {
         "adminAccessRequired": "Accesso amministratore richiesto",
@@ -4972,6 +6077,8 @@
       "activity": {
         "adminOnlyDelete": "Solo gli amministratori possono eliminare le voci di job",
         "cannotDeleteRunningJob": "Impossibile eliminare un job in esecuzione. Annullalo prima o attendi il completamento.",
+        "planRunHasFailedOperation": "Questa esecuzione del piano ha un'operazione non riuscita. Elimina invece quell'operazione.",
+        "cannotCancelWhileRunning": "I job {{jobType}} non possono essere annullati durante l'esecuzione",
         "invalidJobType": "Tipo di job non valido: {{jobType}}",
         "jobNotFound": "Job {{jobType}} non trovato",
         "cannotDownloadLogsForRunningJob": "Impossibile scaricare i log per un job in esecuzione",
@@ -4982,11 +6089,14 @@
         "deleteAlreadyRunning": "L'operazione di eliminazione è già in esecuzione per questo archivio (ID Job: {{jobId}})",
         "deleteJobNotFound": "Job di eliminazione non trovato",
         "failedGetArchiveContents": "Impossibile ottenere il contenuto dell'archivio",
+        "unsupportedRepositoryVersion": "Questo repository usa la versione di formato {{version}}, che la build di Borg 2 su questo server non può leggere. Borg 2 è ancora in beta e il formato del repository è cambiato tra le beta. Ricrea il repository con la build attuale oppure installa la build di Borg 2 che lo ha creato.",
         "failedGetArchiveInfo": "Impossibile ottenere le informazioni dell'archivio",
         "failedListArchives": "Impossibile elencare gli archivi",
         "repositoryNotFound": "Repository non trovato",
         "fileNotFoundAfterExtraction": "File non trovato dopo l'estrazione",
-        "failedExtractFile": "Impossibile estrarre il file: {{error}}"
+        "failedExtractFile": "Impossibile estrarre il file: {{error}}",
+        "historyUnavailableForAgent": "La cronologia delle modifiche non è disponibile per i repository il cui agente non può generarla, quindi non c'è nulla da ricostruire. Assegnare o abilitare un agente, oppure aggiornarne uno precedente alla cronologia delle modifiche.",
+        "historyRunning": "La cronologia delle modifiche di questo repository è ancora in costruzione e quell'esecuzione non si è fermata quando è stato richiesto (operazione {{operationId}}). Ricostruirla ora cancellerebbe righe che quell'esecuzione riscriverebbe, quindi attendere il termine e riprovare."
       },
       "borg": {
         "repositoryDoesNotExist": "Il repository non esiste nel percorso specificato",
@@ -5090,6 +6200,16 @@
       },
       "jobs": {
         "repositoryOperationActive": "Un'altra operazione è già in corso su questo repository. Attendi che finisca e riprova."
+      },
+      "prune": {
+        "noKeepRule": "Imposta almeno una regola di conservazione prima di visualizzare l'anteprima o eseguire un prune.",
+        "dryRunFailed": "L'esecuzione di prova di Borg è fallita.",
+        "comparisonRunning": "È già in corso un confronto delle regole di conservazione per questo repository.",
+        "candidateNotStored": "Questo criterio non è ancora stato confrontato. Esegui un confronto per vederlo.",
+        "autoPreviewOff": "Le anteprime di prune automatiche sono disattivate."
+      },
+      "operations": {
+        "unknownStage": "Fase in background sconosciuta."
       }
     },
     "success": {
@@ -5150,6 +6270,7 @@
         "connectionDeleted": "Connessione SSH eliminata con successo",
         "connectionTestFailed": "Test connessione SSH fallito",
         "connectionTestSuccess": "Test connessione SSH riuscito",
+        "connectionTestSuccessRestricted": "La connessione SSH funziona. La shell remota è limitata a Borg, quindi navigazione e informazioni storage non sono disponibili.",
         "connectionUpdated": "Connessione SSH aggiornata con successo",
         "sshKeyCreated": "Chiave SSH creata con successo",
         "sshKeyDeleted": "Chiave SSH eliminata con successo",
@@ -5161,7 +6282,9 @@
         "sshKeyUpdated": "Chiave SSH aggiornata con successo",
         "storageRefreshed": "Informazioni archiviazione aggiornate con successo",
         "systemKeyGenerated": "Chiave SSH di sistema generata con successo",
-        "systemKeyImported": "Chiave SSH di sistema importata con successo"
+        "systemKeyImported": "Chiave SSH di sistema importata con successo",
+        "hostKeyTrusted": "Chiave host resa attendibile",
+        "hostKeyForgotten": "Chiave host dimenticata"
       },
       "packages": {
         "installationInProgress": "Installazione del pacchetto '{{name}}' già in corso",
@@ -5201,6 +6324,7 @@
     },
     "currentPlan": "Piano attuale",
     "fullAccessLabel": "Accesso completo",
+    "featureTrialLabel": "Anteprima Pro",
     "planSuffix": "Piano",
     "activeStatus": "Attivo",
     "descriptionCommunity": "Funzionalità di backup essenziali incluse",
@@ -5248,7 +6372,16 @@
     "upgradeNudgeAfterTitle": "Sblocca di più con Pro o Enterprise",
     "upgradeNudgePro": "Pro",
     "upgradeNudgeEnterprise": "Enterprise",
-    "viewUpgradeOptions": "Visualizza le opzioni di upgrade"
+    "viewUpgradeOptions": "Visualizza le opzioni di upgrade",
+    "expiredUpgradeCta": "Ripristina le funzioni Pro",
+    "daysShort_one": "{{count}} giorno rimasto",
+    "daysShort_other": "{{count}} giorni rimasti",
+    "liteLabel": "Pro Lite",
+    "liteDescription": "Tutte le funzioni Pro su una sola installazione",
+    "featureTrialCountdown_one": "{{count}} giorno di anteprima Pro rimasto",
+    "featureTrialCountdown_other": "{{count}} giorni di anteprima Pro rimasti",
+    "featureTrialEndsNotice": "Il {{date}} queste funzioni verranno bloccate di nuovo. Passa a Pro per mantenerle.",
+    "featureTrialOpens": "Aperte durante l'anteprima"
   },
   "licensing": {
     "title": "Licenze",
@@ -5258,16 +6391,51 @@
     "instanceIdValue": "ID istanza: {{instanceId}}",
     "licenseIdValue": "Licenza attiva: {{licenseId}}",
     "expiresAtValue": "Scade il: {{date}}",
-    "viewPlanDetails": "Visualizza i dettagli del piano →"
+    "viewPlanDetails": "Visualizza i dettagli del piano →",
+    "statusActive": "Attiva",
+    "statusFullAccess": "Accesso completo",
+    "statusExpired": "Scaduta",
+    "statusCommunity": "Community",
+    "validUntil": "Valida fino al {{date}}",
+    "validIndefinitely": "Questa licenza non ha una data di scadenza.",
+    "noPaidLicence": "Nessuna licenza a pagamento su questa istanza.",
+    "instanceIdLabel": "ID istanza",
+    "licenseIdLabel": "ID licenza",
+    "expiresLabel": "Scade il",
+    "copyValue": "Copia",
+    "copied": "Copiato",
+    "seats": {
+      "title": "Installazioni con questa licenza",
+      "subtitle": "Tutte le installazioni che occupano al momento un posto di questa licenza.",
+      "usage": "{{used}} posti su {{total}} in uso",
+      "empty": "Nessuna installazione occupa un posto di questa licenza in questo momento.",
+      "thisInstance": "Questa istanza",
+      "currentHint": "Usa Disattiva qui sopra per liberare questo posto.",
+      "unknownHost": "Host sconosciuto",
+      "meta": "Versione {{version}} · attivata {{activated}} · vista l'ultima volta {{lastSeen}}",
+      "releaseButton": "Libera posto",
+      "confirmTitle": "Liberare questo posto?",
+      "confirmBody": "{{instance}} tornerà a Community al prossimo controllo. Liberare il suo posto perché un'altra installazione possa usarlo?",
+      "releaseSuccess": "Posto liberato.",
+      "releaseFailed": "Non è stato possibile liberare quel posto.",
+      "loadFailed": "Non è stato possibile caricare i posti di questa licenza."
+    }
   },
   "upgradePrompt": {
     "featureLabel": "Funzionalità {{plan}}",
     "defaultMessage": "Questa funzionalità richiede il piano {{plan}}.",
     "requiresPlan": "Richiede il piano {{plan}}",
     "buyLink": "Passa a borgui.com",
-    "learnMore": "Scopri cosa include →"
+    "learnMore": "Scopri cosa include →",
+    "trialFailed": "Non è stato possibile avviare la prova. Riprova più tardi.",
+    "trialNeedsAdmin": "Chiedi a un amministratore di avviare la prova.",
+    "trialUnavailable": "Al momento non è disponibile una prova gratuita.",
+    "trialEnded": "La tua anteprima Pro è terminata.",
+    "tryFree": "Provala gratis"
   },
   "announcements": {
+    "latestRelease": "Ultima versione",
+    "close": "Chiudi annuncio",
     "highlights": "Novità",
     "viewDetails": "Visualizza dettagli",
     "remindLater": "Ricordamelo più tardi",
@@ -5279,6 +6447,114 @@
       "maintenance_notice": "Avviso di manutenzione",
       "migration_notice": "Avviso di migrazione",
       "custom_announcement": "Annuncio"
+    }
+  },
+  "repositoryIndexMode": {
+    "label": "Indicizzazione in background",
+    "mode": {
+      "full": {
+        "title": "Tutto",
+        "cost": "Mantiene aggiornati elenco degli archivi, cronologia dei file, stato e dimensioni."
+      },
+      "archives": {
+        "title": "Solo archivi",
+        "cost": "Mantiene aggiornati elenco degli archivi, mappa di calore, stato ed età dell'ultimo backup, senza confrontare i file. Ideale per repository troppo grandi da confrontare."
+      },
+      "off": {
+        "title": "Disattivata",
+        "cost": "Non aggiorna nulla. L'elenco degli archivi non verrà più aggiornato. Ideale per remoti lenti o raramente raggiungibili."
+      }
+    },
+    "excludes": "Percorsi da saltare",
+    "excludesHelp": "Un pattern glob per riga. La cronologia dei file ignora i percorsi corrispondenti.",
+    "excludesInactive": "Questi pattern valgono per la cronologia dei file, che questa modalità non costruisce."
+  },
+  "prunePreview": {
+    "title": "Anteprima prune",
+    "crumbRepositories": "Repository",
+    "retention": "Conservazione",
+    "prefilledPlan": "Precompilato dal piano {{name}}. Le modifiche qui sono solo un'anteprima finché non si esegue il prune.",
+    "prefilledLastPrune": "Precompilato dall'ultimo prune manuale.",
+    "prefilledDefault": "Conservazione predefinita.",
+    "reset": "Ripristina",
+    "refresh": "Aggiorna anteprima",
+    "refreshedAt": "Anteprima aggiornata {{when}}",
+    "deleted": "Archivi eliminati",
+    "ofTotal": "di {{total}}",
+    "kept": "{{count}} conservati",
+    "freed": "Spazio liberato",
+    "atLeast": "almeno {{size}}",
+    "freedSub": "cifra esatta dopo prune e compact",
+    "deletedCount": "{{count}} eliminati",
+    "lostShort": "{{count}} file persi per sempre",
+    "before": "Ingombro prima",
+    "after": "Ingombro dopo",
+    "atMost": "al massimo",
+    "notMeasured": "non misurato",
+    "heatmapTitle": "Cosa resta, cosa va",
+    "legendKept": "Conservato",
+    "legendDeleted": "Eliminato",
+    "legendMixed": "Giorno misto",
+    "cellKept": "{{name}}: conservato, regola {{rule}}",
+    "cellDeleted": "{{name}}: verrebbe eliminato",
+    "rankedTitle": "Archivi eliminati ordinati per spazio liberato",
+    "remeasured": "Rimisurati ora per {{count}} candidati",
+    "remeasuredPartial": "Rimisurati i {{cap}} più vecchi su {{count}}; il resto usa il valore memorizzato",
+    "remeasuring": "in rimisurazione",
+    "showAll": "Mostra tutti i {{count}}",
+    "lostTitle": "File persi per sempre",
+    "lostSummary": "{{count}} file, {{size}}, nessun archivio superstite li contiene",
+    "lostLocked": "Pro elenca questi file, la loro dimensione e l'archivio che ha conservato ciascuno per ultimo.",
+    "lostNone": "Nessun file viene perso: ogni percorso contenuto in un archivio eliminato sopravvive in un archivio conservato.",
+    "lostUnknown": "Nessun file perso trovato, ma l'indice è incompleto, quindi questa risposta non è definitiva.",
+    "lostPath": "Percorso",
+    "lostSize": "Dimensione",
+    "lostHeldBy": "Conservato l'ultima volta in",
+    "lostSearch": "Filtra per percorso",
+    "lostNoMatch": "Nessun file elencato corrisponde",
+    "lostMore": "altri {{count}}, dal più grande",
+    "lostAgent": "I repository eseguiti tramite agente non hanno un indice cronologico, quindi i file persi non possono essere calcolati.",
+    "lostUnavailable": "L'indice cronologico non è disponibile per questo repository.",
+    "warnIncomplete": "Indice incompleto per {{count}} archivi. I file contenuti solo in quegli archivi potrebbero mancare dall'elenco.",
+    "warnIndexNow": "Apri gli archivi",
+    "warnLowerBound": "Lo spazio liberato è un valore minimo. Borg non riporta statistiche per insieme prima di un prune; i chunk condivisi solo tra archivi eliminati vengono liberati ma non conteggiati qui.",
+    "showLog": "Mostra output di Borg ({{deleted}} verrebbero eliminati, {{kept}} conservati)",
+    "cancel": "Annulla",
+    "runNow": "Esegui prune ora, elimina {{count}} archivi",
+    "confirmTitle": "Eliminare {{count}} archivi?",
+    "confirmBody": "Questo esegue il prune con la conservazione mostrata. Gli archivi eliminati non possono essere recuperati.",
+    "confirm": "Conferma",
+    "dryRunFailed": "L'esecuzione di prova di Borg è fallita. L'output è sotto.",
+    "previewFailed": "Impossibile generare l'anteprima (HTTP {{status}}). Riprova quando il repository è libero.",
+    "defaultsFailed": "Impossibile caricare la conservazione predefinita.",
+    "retry": "Riprova",
+    "noKeepRule": "Imposta almeno una regola di conservazione.",
+    "compare": {
+      "title": "Regole confrontate",
+      "intro": "Gli stessi archivi con altre regole di conservazione. Scegli una riga per visualizzarne l'anteprima completa.",
+      "computedOn": "Confrontato il {{date}}",
+      "stale": "I valori potrebbero essere cambiati dall'ultimo confronto.",
+      "notYet": "Non ancora confrontato.",
+      "compareNow": "Confronta ora",
+      "comparing": "Confronto in corso, questo esegue una prova per ogni regola.",
+      "colPolicy": "Regola",
+      "colRetention": "Conservazione",
+      "colKept": "Mantenuti",
+      "colDeleted": "Eliminati",
+      "colFree": "Libererebbe",
+      "colLost": "Dati dei file persi",
+      "current": "Attuale",
+      "currentNoPolicy": "Nessuna regola",
+      "editing": "In modifica",
+      "presets": {
+        "standard": "Standard",
+        "longer": "Più lunga",
+        "wide": "Ampia"
+      },
+      "partial": "Alcune dimensioni sono valori memorizzati, non ricalcolati.",
+      "refreshFailed": "Impossibile avviare il confronto.",
+      "autoOff": "Le anteprime di prune automatiche sono disattivate, quindi questo confronto non è aggiornato e non viene mostrato. Premi Confronta ora per eseguirlo.",
+      "autoOffAction": "Attiva nelle Impostazioni"
     }
   }
 }

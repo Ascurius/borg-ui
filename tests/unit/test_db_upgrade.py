@@ -1,0 +1,745 @@
+"""Tests for the one-time upgrade onto the Alembic baseline.
+
+The Postgres tests are skipped unless BORG_TEST_POSTGRES_URL is set, but they
+are not optional detail: SQLite advances its own ids and forgives a missing
+setval, so the sequence step can only ever be proven against Postgres.
+"""
+
+import os
+from datetime import datetime
+
+import pytest
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.orm import sessionmaker
+
+from app.database.database import Base
+from app.database.legacy_job_tables import create_legacy_job_tables
+from app.database.db_upgrade import (
+    _TRANSFORM_SENTINELS,
+    _catch_up_source,
+    _finalise,
+    _unresolved_transforms,
+    alembic_init,
+)
+from app.database.models import BackupPlanRun, BackupPlanRunRepository
+from app.database.models import Archive, ArchiveChange, Repository, User
+
+POSTGRES_URL = os.getenv("BORG_TEST_POSTGRES_URL")
+requires_postgres = pytest.mark.skipif(
+    not POSTGRES_URL, reason="BORG_TEST_POSTGRES_URL is not set"
+)
+
+
+def _add_legacy_job_schema(engine):
+    """The job schema a pre-cut database had.
+
+    The models lost the legacy job tables and the three link columns in phase
+    9, so a database built from `Base.metadata` alone is not what the frozen
+    pre-Alembic ladder expects to find. The frozen definitions put them back.
+    """
+    with engine.begin() as conn:
+        create_legacy_job_tables(conn)
+        for table in (
+            "agent_jobs",
+            "script_executions",
+            "backup_plan_run_repositories",
+        ):
+            conn.execute(
+                text(
+                    f"ALTER TABLE {table} ADD COLUMN backup_job_id INTEGER "
+                    "REFERENCES backup_jobs(id)"
+                )
+            )
+        for table in ("agent_jobs", "script_executions"):
+            conn.execute(
+                text(f"CREATE INDEX ix_{table}_backup_job_id ON {table}(backup_job_id)")
+            )
+
+
+def _legacy_db(path, populate=None, extra_columns=()):
+    """A database as it looks before the cut: the model's tables, no stamp.
+
+    Foreign keys are deliberately left unenforced while building, so a test can
+    create the kind of dangling reference a real install accumulated while
+    migration 075 had the pragma switched off.
+    """
+    engine = create_engine(f"sqlite:///{path}")
+    Base.metadata.create_all(engine)
+    _add_legacy_job_schema(engine)
+    with engine.begin() as conn:
+        for table, column, ddl in extra_columns:
+            conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {ddl}'))
+    if populate:
+        session = sessionmaker(bind=engine)()
+        populate(session)
+        session.commit()
+        session.close()
+    engine.dispose()
+    return engine
+
+
+def _open(path):
+    return sessionmaker(bind=create_engine(f"sqlite:///{path}"))()
+
+
+@pytest.mark.unit
+def test_fresh_install_builds_the_baseline_and_stays_put(tmp_path):
+    db = tmp_path / "borg.db"
+
+    report = alembic_init(db)
+
+    assert report.action == "fresh"
+    assert report.rows == 0
+    assert db.exists()
+    # No data means nothing to move aside, so no rollback file is invented.
+    assert not (tmp_path / "borg_bak.db").exists()
+
+
+@pytest.mark.unit
+def test_restart_of_a_fresh_install_does_nothing(tmp_path):
+    db = tmp_path / "borg.db"
+    alembic_init(db)
+
+    assert alembic_init(db).action == "skipped"
+    # An empty database is legitimately empty: a third boot must not mistake it
+    # for unfinished work and migrate it on top of its own rollback.
+    assert alembic_init(db).action == "skipped"
+    assert not (tmp_path / "borg_bak.db").exists()
+
+
+@pytest.mark.unit
+def test_transfer_keeps_every_row_and_moves_the_source_aside(tmp_path):
+    db = tmp_path / "borg.db"
+
+    def populate(s):
+        for i in range(3):
+            s.add(Repository(name=f"repo-{i}", path=f"/srv/repo-{i}"))
+        s.add(User(username="admin", password_hash="x"))
+
+    _legacy_db(db, populate)
+
+    report = alembic_init(db)
+
+    assert report.action == "transferred"
+    assert report.rows == 4
+    assert report.source_kept_at == tmp_path / "borg_bak.db"
+    assert (tmp_path / "borg_bak.db").exists()
+    assert not (tmp_path / "borg_new.db").exists()
+
+    session = _open(db)
+    assert session.query(Repository).count() == 3
+    assert session.query(User).count() == 1
+    assert {r.name for r in session.query(Repository)} == {"repo-0", "repo-1", "repo-2"}
+    session.close()
+
+
+@pytest.mark.unit
+def test_restart_after_a_transfer_does_not_touch_the_rollback(tmp_path):
+    db = tmp_path / "borg.db"
+    _legacy_db(db, lambda s: s.add(Repository(name="r", path="/srv/r")))
+    alembic_init(db)
+    backup_bytes = (tmp_path / "borg_bak.db").read_bytes()
+
+    assert alembic_init(db).action == "skipped"
+
+    # The rollback is the original database; a restart must not overwrite it
+    # with the already migrated one.
+    assert (tmp_path / "borg_bak.db").read_bytes() == backup_bytes
+
+
+@pytest.mark.unit
+def test_a_column_no_model_has_is_dropped_and_reported(tmp_path):
+    db = tmp_path / "borg.db"
+    _legacy_db(
+        db,
+        lambda s: s.add(User(username="admin", password_hash="x")),
+        extra_columns=[("users", "organization_name", "VARCHAR")],
+    )
+
+    report = alembic_init(db)
+
+    users = next(t for t in report.tables if t.name == "users")
+    # organization_name is in no model, so the copy leaves it behind and reports it.
+    # The catch-up ladder can add other columns the baseline dropped (profile_type,
+    # from migration 082), dropped and reported the same way -- so assert membership,
+    # not the exact set.
+    assert "organization_name" in users.dropped_columns
+    assert users.rows == 1
+    assert any("organization_name" in line for line in report.lines())
+
+
+@pytest.mark.unit
+def test_a_row_pointing_at_a_deleted_row_is_kept_and_its_pointer_cleared(tmp_path):
+    db = tmp_path / "borg.db"
+
+    def populate(s):
+        s.add(Repository(id=1, name="r", path="/srv/r"))
+        s.add(
+            BackupPlanRun(
+                id=1, backup_plan_id=None, trigger="manual", status="completed"
+            )
+        )
+        s.flush()
+        s.add(BackupPlanRunRepository(backup_plan_run_id=1, repository_id=1))
+
+    _legacy_db(db, populate)
+    # backup_job_id 999 never existed: exactly what an install collects while
+    # foreign keys are silently switched off. The column is a raw one now, since
+    # phase 9 took it off the model.
+    engine = create_engine(f"sqlite:///{db}")
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE backup_plan_run_repositories SET backup_job_id = 999")
+        )
+    engine.dispose()
+
+    report = alembic_init(db)
+
+    junction = next(
+        t for t in report.tables if t.name == "backup_plan_run_repositories"
+    )
+    assert junction.orphans_cleared == {"backup_job_id": 1}
+    assert junction.rows == 1  # kept, not dropped
+
+    session = _open(db)
+    row = session.query(BackupPlanRunRepository).one()
+    assert row.backup_operation_id is None
+    assert row.repository_id == 1
+    session.close()
+
+
+@pytest.mark.unit
+def test_a_required_pointer_at_a_deleted_row_drops_the_row_and_its_children(
+    tmp_path,
+):
+    # Issue #1215: repositories deleted before foreign keys were enforced left
+    # their check jobs and archives behind. repository_id is NOT NULL, so the
+    # rows cannot be kept with the pointer cleared; the transfer used to refuse.
+    db = tmp_path / "borg.db"
+
+    def populate(s):
+        s.add(Repository(id=1, name="r", path="/srv/r"))
+        s.flush()
+        for archive_id, repo_id in ((1, 1), (2, 999)):
+            s.add(
+                Archive(
+                    id=archive_id,
+                    repository_id=repo_id,
+                    borg_id=f"b{archive_id}",
+                    name=f"a{archive_id}",
+                    series="a",
+                    start=datetime(2026, 1, 1),
+                )
+            )
+        s.flush()
+        # The change on archive 2 points at a row that exists in the source but
+        # is dropped on the way over, so only the cascade can catch it.
+        for archive_id in (1, 2):
+            s.add(ArchiveChange(archive_id=archive_id, path="/x", change="added"))
+
+    _legacy_db(db, populate)
+    engine = create_engine(f"sqlite:///{db}")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO check_jobs "
+                "(id, repository_id, status, scheduled_check, created_at) VALUES "
+                "(1, 1, 'completed', 0, '2026-01-01 00:00:00'), "
+                "(2, 999, 'completed', 0, '2026-01-01 00:00:00')"
+            )
+        )
+    engine.dispose()
+
+    report = alembic_init(db)
+
+    by_name = {t.name: t for t in report.tables}
+    assert by_name["check_jobs"].orphans_dropped == 1
+    assert by_name["check_jobs"].rows == 1
+    assert by_name["archives"].orphans_dropped == 1
+    assert by_name["archive_changes"].orphans_dropped == 1
+
+    session = _open(db)
+    assert [a.id for a in session.query(Archive).all()] == [1]
+    assert [c.archive_id for c in session.query(ArchiveChange).all()] == [1]
+    session.close()
+
+
+@pytest.mark.unit
+def test_a_self_reference_pointing_forward_survives(tmp_path):
+    """The case real data cannot prove.
+
+    A row may reference one with a higher id, so no insert order satisfies the
+    constraint; the value has to be set after every row exists. No install we
+    have has such a row, so only a made-up one covers it.
+    """
+    db = tmp_path / "borg.db"
+
+    def populate(s):
+        s.add(Repository(id=1, name="r", path="/srv/r"))
+        s.add(
+            BackupPlanRun(
+                id=1, trigger="manual", status="failed", retry_source_run_id=2
+            )
+        )
+        s.add(BackupPlanRun(id=2, trigger="manual", status="completed"))
+
+    _legacy_db(db, populate)
+
+    report = alembic_init(db)
+
+    assert report.action == "transferred"
+    session = _open(db)
+    assert session.get(BackupPlanRun, 1).retry_source_run_id == 2
+    assert session.get(BackupPlanRun, 2).retry_source_run_id is None
+    session.close()
+
+
+@pytest.mark.unit
+def test_an_existing_rollback_is_never_overwritten(tmp_path):
+    db = tmp_path / "borg.db"
+    _legacy_db(db, lambda s: s.add(Repository(name="r", path="/srv/r")))
+    (tmp_path / "borg_bak.db").write_text("an older rollback nobody may lose")
+
+    with pytest.raises(RuntimeError, match="refusing to overwrite the rollback"):
+        alembic_init(db)
+
+    assert (tmp_path / "borg_bak.db").read_text() == "an older rollback nobody may lose"
+    assert db.exists()
+
+
+@pytest.mark.unit
+def test_a_postgres_migration_leaves_the_sqlite_in_place(tmp_path):
+    """Postgres is the live database after the transfer, so the SQLite file is not
+    moved aside -- it stays under its own name as the rollback, and reverting is
+    just removing DATABASE_URL. Exercised on `_finalise` directly, where the source
+    is settled; the full Postgres transfer path needs a running Postgres."""
+    db = tmp_path / "borg.db"
+    db.write_text("the live sqlite database")
+
+    kept = _finalise(db, None, to_postgres=True)
+
+    assert kept == db
+    assert db.exists() and db.read_text() == "the live sqlite database"
+    assert not (tmp_path / "borg_bak.db").exists()  # not renamed, no rollback minted
+
+
+@pytest.mark.unit
+def test_a_postgres_migration_does_not_collide_with_an_earlier_rollback(tmp_path):
+    """A database taken SQLite -> Alembic in place, then later to Postgres, has a
+    `_bak` beside it from the first step. Because the Postgres path leaves the
+    source under its own name, that older rollback is never in the way."""
+    db = tmp_path / "borg.db"
+    db.write_text("the live sqlite database")
+    (tmp_path / "borg_bak.db").write_text("the rollback from the in-place upgrade")
+
+    kept = _finalise(db, None, to_postgres=True)  # must not raise
+
+    assert kept == db
+    assert (
+        tmp_path / "borg_bak.db"
+    ).read_text() == "the rollback from the in-place upgrade"
+
+
+@pytest.mark.unit
+def test_the_target_enforces_foreign_keys(tmp_path):
+    """Without this the SQLite path would accept what Postgres rejects, and
+    every SQLite-only test here would pass while proving nothing."""
+    db = tmp_path / "borg.db"
+    alembic_init(db)
+
+    from app.database.db_upgrade import _engine
+
+    with _engine(f"sqlite:///{db}").connect() as conn:
+        assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+
+
+@pytest.mark.unit
+@requires_postgres
+def test_transfer_to_postgres_advances_every_sequence(tmp_path):
+    """SQLite derives the next id from the data; Postgres does not.
+
+    Without setval the first insert that does not name an id collides with a
+    transferred row. This cannot be caught on SQLite at all.
+    """
+    db = tmp_path / "borg.db"
+
+    def populate(s):
+        for i in range(1, 4):
+            s.add(Repository(id=i, name=f"repo-{i}", path=f"/srv/repo-{i}"))
+
+    _legacy_db(db, populate)
+    _reset_postgres()
+
+    report = alembic_init(db, POSTGRES_URL)
+
+    assert report.action == "transferred"
+    assert report.sequences_reset > 0
+
+    session = sessionmaker(bind=create_engine(POSTGRES_URL))()
+    fresh = Repository(name="after-transfer", path="/srv/new")
+    session.add(fresh)
+    session.flush()
+    assert fresh.id > 3  # would be 1 and collide without setval
+    session.rollback()
+    session.close()
+
+
+@pytest.mark.unit
+@requires_postgres
+def test_a_leftover_sqlite_file_next_to_a_migrated_postgres_is_ignored(tmp_path):
+    """Once Postgres is at head it IS the database; a SQLite file in the data dir
+    is irrelevant -- it may be a deliberately kept rollback, or one an entrypoint
+    script recreated empty. Either way the boot must not stall on it."""
+    db = tmp_path / "borg.db"
+    _legacy_db(db, lambda s: s.add(Repository(name="r", path="/srv/r")))
+    _reset_postgres()
+    assert alembic_init(db, POSTGRES_URL).action == "transferred"
+
+    # The source file is still there (the transfer left it as the rollback), and
+    # a fresh empty one could even reappear. Neither triggers another transfer.
+    assert alembic_init(db, POSTGRES_URL).action == "skipped"
+    db.write_bytes(b"")  # an empty file an entrypoint script might recreate
+    assert alembic_init(db, POSTGRES_URL).action == "skipped"
+
+
+def _reset_postgres():
+    engine = create_engine(POSTGRES_URL)
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+    engine.dispose()
+
+
+@pytest.mark.unit
+def test_a_pre_transform_source_is_migrated_then_transferred(tmp_path):
+    """A database from before migration 034 still keeps its check schedule as
+    repositories.check_interval_days, a column the baseline dropped. The catch-up
+    runs the legacy ladder on a throwaway copy first, so 034 turns the interval
+    into a cron expression before a single row is copied -- the schedule is carried
+    forward, not lost, and no manual stop on an intermediate release is needed."""
+    db = tmp_path / "borg.db"
+    _legacy_db(
+        db,
+        lambda s: s.add(Repository(id=1, name="r", path="/srv/r")),
+        extra_columns=[("repositories", "check_interval_days", "INTEGER")],
+    )
+    # a weekly schedule stored the old way -- an interval, not yet a cron expression
+    with create_engine(f"sqlite:///{db}").begin() as conn:
+        conn.execute(
+            text("UPDATE repositories SET check_interval_days = 7 WHERE id = 1")
+        )
+
+    report = alembic_init(db)
+
+    assert report.action == "transferred"
+    session = _open(db)
+    # migration 034's conversion: 7 days -> weekly on Sunday at 2 AM
+    assert session.get(Repository, 1).check_cron_expression == "0 2 * * 0"
+    session.close()
+
+    # the interval was transformed away by the ladder, not dropped by the copy: the
+    # copy never saw the column, so it is not among the report's dropped columns.
+    repos = next((t for t in report.tables if t.name == "repositories"), None)
+    assert "check_interval_days" not in (repos.dropped_columns if repos else [])
+
+
+@pytest.mark.unit
+def test_a_database_too_old_for_the_catch_up_is_refused_and_left_untouched(
+    tmp_path, monkeypatch
+):
+    """The safety net. The ladder is lenient, so a sentinel can survive it -- a
+    database older than the oldest migration, or a migration that raised. When one
+    does, the upgrade refuses before copying anything: the source is untouched and
+    remains the database, with no half-built target and no rollback invented."""
+    db = tmp_path / "borg.db"
+    _legacy_db(
+        db,
+        lambda s: s.add(Repository(id=1, name="r", path="/srv/r")),
+        extra_columns=[("repositories", "check_interval_days", "INTEGER")],
+    )
+    # a ladder that could not perform the transform (here: 034 raised and was skipped)
+    monkeypatch.setattr(
+        "app.database.migrations.run_migrations",
+        lambda engine: ["034_convert_check_interval_to_cron"],
+    )
+
+    with pytest.raises(RuntimeError, match="older than the automatic upgrade"):
+        alembic_init(db)
+
+    assert db.exists()
+    assert not (tmp_path / "borg_bak.db").exists()
+    assert not (tmp_path / "borg_new.db").exists()
+    assert not (tmp_path / "borg_catchup.db").exists()
+    cols = {
+        c["name"]
+        for c in inspect(create_engine(f"sqlite:///{db}")).get_columns("repositories")
+    }
+    assert "check_interval_days" in cols  # the source was not migrated in place
+
+
+@pytest.mark.unit
+def test_the_whole_legacy_ladder_runs_clean_on_a_representative_schema(tmp_path):
+    """The automated twin of running the upgrade against a real database.
+
+    Every one of the 135 frozen migrations either applies or defensively no-ops
+    against a populated, current-shaped schema, and none raises. A future migration
+    that is not idempotent on an already-migrated database would surface here as a
+    non-empty failure list -- rather than as a silent skip the safety net then has
+    to catch in production. This is the coverage a faithful "database at version N"
+    cannot give us: the old startup built its schema with create_all first, so a
+    historical schema cannot be reconstructed from the current models alone."""
+    from app.database.migrations import run_migrations
+
+    db = tmp_path / "borg.db"
+    _legacy_db(db, lambda s: s.add(Repository(id=1, name="r", path="/srv/r")))
+
+    failed = run_migrations(create_engine(f"sqlite:///{db}"))
+
+    assert failed == [], f"legacy migrations raised: {failed}"
+
+
+@pytest.mark.unit
+def test_a_pre_028_source_is_split_and_keeps_its_original(tmp_path):
+    """The second data-moving transform (028). An old database carries a single
+    repositories.hook_timeout; the ladder backfills the pre_/post_hook_timeout
+    split from it. Unlike 034 the baseline kept hook_timeout, so its value survives
+    the copy regardless -- which is why it is not a sentinel -- but the split still
+    has to be reproduced, and this proves it end to end."""
+    db = tmp_path / "borg.db"
+    _legacy_db(db, lambda s: s.add(Repository(id=1, name="r", path="/srv/r")))
+    with create_engine(f"sqlite:///{db}").begin() as conn:
+        # a source from before the split: the two halves do not exist yet
+        conn.execute(text("ALTER TABLE repositories DROP COLUMN pre_hook_timeout"))
+        conn.execute(text("ALTER TABLE repositories DROP COLUMN post_hook_timeout"))
+        conn.execute(text("UPDATE repositories SET hook_timeout = 120 WHERE id = 1"))
+
+    assert alembic_init(db).action == "transferred"
+
+    with create_engine(f"sqlite:///{db}").connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT hook_timeout, pre_hook_timeout, post_hook_timeout "
+                "FROM repositories WHERE id = 1"
+            )
+        ).one()
+    assert row == (120, 120, 120)
+
+
+def _boom(*_args, **_kwargs):
+    raise AssertionError("the legacy ladder must not run on an Alembic database")
+
+
+@pytest.mark.unit
+def test_an_alembic_database_at_head_is_left_to_alembic_not_the_ladder(
+    tmp_path, monkeypatch
+):
+    """Steady state: a restart of a migrated database does nothing, and never
+    reaches for the legacy ladder. A sentinel column added by hand would trip the
+    catch-up if it ran -- proof by silence that it does not."""
+    db = tmp_path / "borg.db"
+    alembic_init(db)  # now Alembic-managed and at head
+    with create_engine(f"sqlite:///{db}").begin() as conn:
+        conn.execute(
+            text("ALTER TABLE repositories ADD COLUMN check_interval_days INT")
+        )
+
+    import app.database.migrations as legacy
+
+    monkeypatch.setattr(legacy, "run_migrations", _boom)
+
+    assert alembic_init(db).action == "skipped"
+
+
+@pytest.mark.unit
+def test_an_alembic_database_behind_head_follows_alembic_not_the_ladder(
+    tmp_path, monkeypatch
+):
+    """The durable fork, for the day a second revision exists. A managed database
+    that is merely behind head is moved forward by Alembic -- not misread as legacy
+    and dragged through the ladder. Simulate a pending revision by reporting the
+    baseline as behind head."""
+    db = tmp_path / "borg.db"
+    alembic_init(db)  # Alembic-managed
+    with create_engine(f"sqlite:///{db}").begin() as conn:
+        conn.execute(
+            text("ALTER TABLE repositories ADD COLUMN check_interval_days INT")
+        )
+
+    import app.database.db_upgrade as dbu
+    import app.database.migrations as legacy
+
+    monkeypatch.setattr(legacy, "run_migrations", _boom)
+    monkeypatch.setattr(dbu, "_is_at_head", lambda engine: False)  # look one behind
+
+    report = alembic_init(db)
+
+    assert report.action == "migrated"
+    # the ladder never ran (it would have raised), and the source was upgraded in
+    # place -- no transfer, no rollback file, the hand-added column untouched.
+    assert not (tmp_path / "borg_bak.db").exists()
+    cols = {
+        c["name"]
+        for c in inspect(create_engine(f"sqlite:///{db}")).get_columns("repositories")
+    }
+    assert "check_interval_days" in cols
+
+
+@pytest.mark.unit
+def test_catch_up_skips_the_ladder_on_an_already_alembic_source(tmp_path, monkeypatch):
+    """The source side of the same rule: the legacy ladder must never run against a
+    database that already has alembic_version. It is only reached when an Alembic
+    SQLite database is moved into a fresh Postgres (the target is empty, so the
+    durable fork does not short-circuit); the ladder would be a no-op there, but it
+    must not run at all. Exercise the function directly -- the SQLite-to-SQLite path
+    never reaches it, because an Alembic source is caught by the fork first."""
+    db = tmp_path / "borg.db"
+    alembic_init(db)  # a fresh Alembic-managed database, stamped at head
+
+    import app.database.migrations as legacy
+
+    monkeypatch.setattr(legacy, "run_migrations", _boom)  # blow up if the ladder runs
+
+    catch_up = tmp_path / "borg_catchup.db"
+    _catch_up_source(db, catch_up)  # must not raise
+
+    # the snapshot is kept for the transfer to copy from, and it carries the stamp
+    assert catch_up.exists()
+    with create_engine(f"sqlite:///{catch_up}").connect() as conn:
+        assert inspect(conn).has_table("alembic_version")
+
+
+@pytest.mark.unit
+@requires_postgres
+def test_an_alembic_sqlite_moves_to_postgres_without_running_the_ladder(
+    tmp_path, monkeypatch
+):
+    """End to end: a SQLite database already on Alembic, then pointed at Postgres,
+    copies its rows across without walking the legacy ladder again."""
+    db = tmp_path / "borg.db"
+    alembic_init(db)  # fresh Alembic SQLite, at head, no rollback file to collide
+    session = sessionmaker(bind=create_engine(f"sqlite:///{db}"))()
+    session.add(Repository(name="r", path="/srv/r"))
+    session.commit()
+    session.close()
+    _reset_postgres()
+
+    import app.database.migrations as legacy
+
+    monkeypatch.setattr(legacy, "run_migrations", _boom)  # the ladder must not run
+
+    report = alembic_init(db, POSTGRES_URL)
+
+    assert report.action == "transferred"
+    session = sessionmaker(bind=create_engine(POSTGRES_URL))()
+    assert session.query(Repository).count() == 1
+    session.close()
+
+
+@pytest.mark.unit
+def test_unresolved_transforms_ignores_a_fully_migrated_source():
+    assert (
+        _unresolved_transforms({"repositories": {"id", "check_cron_expression"}}) == []
+    )
+    assert _unresolved_transforms({}) == []
+
+
+@pytest.mark.unit
+def test_sentinel_columns_are_absent_from_the_baseline():
+    """A sentinel only holds while its column is genuinely gone from the baseline.
+    If a future baseline re-adds one, the copy would preserve it and the safety net
+    would wrongly refuse a healthy database -- catch that here."""
+    baseline = {
+        name: {c.name for c in table.columns}
+        for name, table in Base.metadata.tables.items()
+    }
+    for table, column, _ in _TRANSFORM_SENTINELS:
+        assert column not in baseline.get(table, set()), (
+            f"{table}.{column} is a sentinel but still exists in the baseline"
+        )
+
+
+@pytest.mark.unit
+def test_legacy_job_rows_reach_operations_through_the_transfer(tmp_path, monkeypatch):
+    """A v2.2.x database has backup_jobs and friends; the transfer must land
+    them at the pre-collapse revision so the collapse copies them."""
+    monkeypatch.setattr("app.config.settings.data_dir", str(tmp_path))
+    from app.database import legacy_job_tables as legacy
+    from app.database.models import Operation
+
+    db = tmp_path / "borg.db"
+
+    def populate(s):
+        s.add(Repository(id=1, name="r", path="/srv/r"))
+
+    _legacy_db(db, populate)
+    engine = create_engine(f"sqlite:///{db}")
+    with engine.begin() as conn:
+        conn.execute(
+            legacy.backup_jobs.insert().values(
+                id=1,
+                repository="/srv/r",
+                repository_id=1,
+                status="completed",
+                created_at=datetime(2026, 1, 1),
+            )
+        )
+        conn.execute(
+            legacy.check_jobs.insert().values(
+                id=1,
+                repository_id=1,
+                status="failed",
+                created_at=datetime(2026, 1, 1),
+            )
+        )
+    engine.dispose()
+
+    report = alembic_init(db)
+
+    assert report.action == "transferred"
+    session = _open(db)
+    kinds = sorted(op.kind for op in session.query(Operation).all())
+    assert kinds == ["backup", "check"]
+    session.close()
+    with create_engine(f"sqlite:///{db}").connect() as conn:
+        assert "backup_jobs" not in inspect(conn).get_table_names()
+
+
+@pytest.mark.unit
+def test_a_transferred_plaintext_passphrase_is_readable_after_the_upgrade(tmp_path):
+    # Issue #1211: the encrypt-passphrase revision sits before the transfer
+    # point, so it ran on an empty table and the copied rows stayed plaintext.
+    db = tmp_path / "borg.db"
+    _legacy_db(db, lambda s: s.add(Repository(name="r", path="/srv/r")))
+    engine = create_engine(f"sqlite:///{db}")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE repositories SET passphrase = 'plain secret'"))
+    engine.dispose()
+
+    alembic_init(db)
+
+    session = _open(db)
+    assert session.query(Repository).one().passphrase == "plain secret"
+    raw = session.execute(text("SELECT passphrase FROM repositories")).scalar()
+    assert raw != "plain secret"
+    session.close()
+
+
+@pytest.mark.unit
+def test_an_install_stuck_on_2_3_0_with_a_plaintext_passphrase_is_repaired(tmp_path):
+    db = tmp_path / "borg.db"
+    alembic_init(db)
+    session = _open(db)
+    session.add(Repository(name="r", path="/srv/r"))
+    session.commit()
+    session.close()
+    engine = create_engine(f"sqlite:///{db}")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE repositories SET passphrase = 'plain secret'"))
+        conn.execute(text("UPDATE alembic_version SET version_num = 'e1a2b3c4d5f6'"))
+    engine.dispose()
+
+    assert alembic_init(db).action == "migrated"
+
+    session = _open(db)
+    assert session.query(Repository).one().passphrase == "plain secret"
+    session.close()

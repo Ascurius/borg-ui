@@ -10,6 +10,12 @@ import * as useAnalyticsModule from '../../hooks/useAnalytics'
 vi.mock('../../hooks/useMaintenanceJobs')
 vi.mock('../../hooks/useAnalytics')
 
+const navigateMock = vi.fn()
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom')
+  return { ...actual, useNavigate: () => navigateMock }
+})
+
 describe('RepositoryCard', () => {
   const mockRepository = {
     id: 1,
@@ -22,6 +28,8 @@ describe('RepositoryCard', () => {
     last_backup: '2024-01-20T10:30:00Z',
     last_check: '2024-01-19T09:00:00Z',
     last_compact: '2024-01-18T08:00:00Z',
+    last_prune: '2024-01-17T12:00:00Z',
+    last_index: '2024-01-20T12:30:00Z',
     total_size: '10.5 GB',
     archive_count: 25,
     created_at: '2024-01-01T00:00:00Z',
@@ -34,11 +42,31 @@ describe('RepositoryCard', () => {
     next_run: null,
   }
 
+  const storedSize = {
+    size_bytes: 2_523_456_789,
+    size_source: 'borg2_index' as const,
+    measured_at: '2024-01-20T10:35:00Z',
+    last_modified: '2024-01-20T10:30:00Z',
+    archives_consistent: null,
+    archives_listed: null,
+    original_size: null,
+    original_size_source: null,
+    original_size_at: null,
+    compressed_size: null,
+    deduplicated_size: null,
+    latest_archive_files: null,
+    first_backup_at: null,
+    last_backup_at: null,
+    compact: null,
+    compact_at: null,
+  }
+
   const mockCallbacks = {
     onViewInfo: vi.fn(),
     onCheck: vi.fn(),
     onCompact: vi.fn(),
     onPrune: vi.fn(),
+    onPrunePreview: vi.fn(),
     onWipeContents: vi.fn(),
     onBreakLock: vi.fn(),
     onEdit: vi.fn(),
@@ -336,8 +364,12 @@ describe('RepositoryCard', () => {
       expect(screen.getByText('Mirror failed')).toBeInTheDocument()
     })
 
-    it('renders N/A for missing total size', () => {
-      const repoWithoutSize = { ...mockRepository, total_size: null }
+    it('renders Unknown, not N/A or 0 B, for a size that was not measured', () => {
+      const repoWithoutSize = {
+        ...mockRepository,
+        total_size: null,
+        storage: { ...storedSize, size_bytes: null, size_source: null, measured_at: null },
+      }
       renderWithProviders(
         <RepositoryCard
           repository={repoWithoutSize}
@@ -348,7 +380,138 @@ describe('RepositoryCard', () => {
         />
       )
 
-      expect(screen.getByText('N/A')).toBeInTheDocument()
+      expect(screen.getByText('Unknown')).toBeInTheDocument()
+      expect(screen.queryByText('N/A')).not.toBeInTheDocument()
+      expect(screen.queryByText('0 B')).not.toBeInTheDocument()
+    })
+
+    it("reads the stored size under the card's own label", () => {
+      renderWithProviders(
+        <RepositoryCard
+          repository={{ ...mockRepository, borg_version: 2, storage: storedSize }}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      expect(screen.getByText('Total Size')).toBeInTheDocument()
+      expect(screen.getByText('2.35 GB')).toBeInTheDocument()
+      expect(screen.queryByText('10.5 GB')).not.toBeInTheDocument()
+    })
+
+    it('keeps the label for a Borg 1 cache figure too', () => {
+      renderWithProviders(
+        <RepositoryCard
+          repository={{
+            ...mockRepository,
+            borg_version: 1,
+            storage: { ...storedSize, size_source: 'borg1_cache_stats' },
+          }}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      expect(screen.getByText('Total Size')).toBeInTheDocument()
+      expect(screen.getByText('2.35 GB')).toBeInTheDocument()
+    })
+
+    it('shows unknown when the list payload carries an explicit null storage', () => {
+      renderWithProviders(
+        <RepositoryCard
+          repository={{ ...mockRepository, storage: null }}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      expect(screen.getByText('Total Size')).toBeInTheDocument()
+      expect(screen.getByText('Unknown')).toBeInTheDocument()
+      expect(screen.queryByText('10.5 GB')).not.toBeInTheDocument()
+    })
+
+    it('keeps the formatted string when the response carries no storage payload', () => {
+      renderWithProviders(
+        <RepositoryCard
+          repository={mockRepository}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      expect(screen.getByText('Total Size')).toBeInTheDocument()
+      expect(screen.getByText('10.5 GB')).toBeInTheDocument()
+    })
+
+    it('says indexing instead of 0 archives, no size and never while the import chain runs', () => {
+      renderWithProviders(
+        <RepositoryCard
+          repository={{
+            ...mockRepository,
+            archive_count: 0,
+            last_backup: null,
+            total_size: null,
+            storage: { ...storedSize, size_bytes: null, size_source: null, measured_at: null },
+            index_pending_kinds: ['archive_sync', 'history_index', 'stats'],
+          }}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      expect(screen.getAllByText('Indexing…')).toHaveLength(3)
+      expect(screen.queryByText('Never')).not.toBeInTheDocument()
+      expect(screen.queryByText('N/A')).not.toBeInTheDocument()
+    })
+
+    it('keeps 0 archives and never for a settled empty repository while a listing waits', () => {
+      renderWithProviders(
+        <RepositoryCard
+          repository={{
+            ...mockRepository,
+            archive_count: 0,
+            last_backup: null,
+            storage: { ...storedSize, archives_listed: true },
+            index_pending_kinds: ['archive_sync'],
+          }}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      expect(screen.queryByText('Indexing…')).not.toBeInTheDocument()
+      expect(screen.getByText('Never')).toBeInTheDocument()
+    })
+
+    it('shows the listed archives while only the size is still being measured', () => {
+      renderWithProviders(
+        <RepositoryCard
+          repository={{
+            ...mockRepository,
+            storage: { ...storedSize, size_bytes: null, size_source: null, measured_at: null },
+            index_pending_kinds: ['stats'],
+          }}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      expect(screen.getByText('25')).toBeInTheDocument()
+      expect(screen.getAllByText('Indexing…')).toHaveLength(1)
     })
 
     it('renders encryption type', () => {
@@ -364,6 +527,94 @@ describe('RepositoryCard', () => {
 
       expect(screen.getByText(/^Encryption:/i)).toBeInTheDocument()
       expect(screen.getByText('repokey')).toBeInTheDocument()
+    })
+
+    it('renders last prune and last index in the metadata row', () => {
+      renderWithProviders(
+        <RepositoryCard
+          repository={mockRepository}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      expect(screen.getByText(/^Last Prune:/i).parentElement).toHaveTextContent(/Jan 17, 2024/)
+      expect(screen.getByText(/^Last Index:/i).parentElement).toHaveTextContent(/Jan 20, 2024/)
+    })
+
+    it('shows "Never" for last prune and last index without history', () => {
+      renderWithProviders(
+        <RepositoryCard
+          repository={{ ...mockRepository, last_prune: null, last_index: null }}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      const labels = [screen.getByText(/^Last Prune:/i), screen.getByText(/^Last Index:/i)]
+      for (const label of labels) {
+        expect(label.parentElement).toHaveTextContent(/Never/)
+      }
+    })
+
+    it('says background work is off instead of "Never" on both entries', () => {
+      // Spec 6.8: neither value can move while the mode is `off`, so
+      // "Never" would be a wrong answer rather than an empty one.
+      renderWithProviders(
+        <RepositoryCard
+          repository={{
+            ...mockRepository,
+            index_mode: 'off',
+            last_prune: null,
+            last_index: null,
+          }}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      const labels = [screen.getByText(/^Last Prune:/i), screen.getByText(/^Last Index:/i)]
+      for (const label of labels) {
+        expect(label.parentElement).toHaveTextContent(/Background work is off/i)
+        expect(label.parentElement).not.toHaveTextContent(/Never/)
+      }
+    })
+
+    it('leaves an archives-mode repository reading normally', () => {
+      renderWithProviders(
+        <RepositoryCard
+          repository={{ ...mockRepository, index_mode: 'archives' }}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      expect(screen.getByText(/^Last Index:/i).parentElement).toHaveTextContent(/Jan 20, 2024/)
+    })
+
+    it('omits last prune and last index when the backend does not send them', () => {
+      const olderPayload = { ...mockRepository, last_prune: undefined, last_index: undefined }
+      renderWithProviders(
+        <RepositoryCard
+          repository={olderPayload}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      expect(screen.queryByText(/^Last Prune:/i)).not.toBeInTheDocument()
+      expect(screen.queryByText(/^Last Index:/i)).not.toBeInTheDocument()
+      expect(screen.getByText(/^Last Compact:/i)).toBeInTheDocument()
     })
 
     it('renders compression with label', () => {
@@ -476,10 +727,12 @@ describe('RepositoryCard', () => {
         />
       )
 
-      expect(screen.queryByRole('button', { name: /Legacy Backup/i })).not.toBeInTheDocument()
+      expect(
+        screen.queryByRole('button', { name: /Run backup automation/i })
+      ).not.toBeInTheDocument()
     })
 
-    it('shows legacy backup button for full mode repositories with source paths', () => {
+    it('shows backup automations button for full mode repositories with source paths', () => {
       renderWithProviders(
         <RepositoryCard
           repository={mockRepository}
@@ -490,7 +743,7 @@ describe('RepositoryCard', () => {
         />
       )
 
-      expect(screen.getByRole('button', { name: /Legacy Backup/i })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /Run backup automation/i })).toBeInTheDocument()
     })
 
     it('shows Create Backup Plan as the primary repository backup action', () => {
@@ -505,7 +758,9 @@ describe('RepositoryCard', () => {
       )
 
       expect(screen.getByRole('button', { name: /Create Backup Plan/i })).toBeInTheDocument()
-      expect(screen.queryByRole('button', { name: /Legacy Backup/i })).not.toBeInTheDocument()
+      expect(
+        screen.queryByRole('button', { name: /Run backup automation/i })
+      ).not.toBeInTheDocument()
     })
 
     it('hides Compact and Prune buttons for observe mode but still allows Delete', () => {
@@ -521,7 +776,7 @@ describe('RepositoryCard', () => {
       )
 
       expect(screen.queryByRole('button', { name: /Compact/i })).not.toBeInTheDocument()
-      expect(screen.queryByRole('button', { name: /Prune/i })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: /^Prune$/i })).not.toBeInTheDocument()
       expect(screen.getByRole('button', { name: /Delete/i })).toBeInTheDocument()
     })
 
@@ -538,7 +793,7 @@ describe('RepositoryCard', () => {
       )
 
       expect(screen.getByRole('button', { name: /Compact/i })).toBeInTheDocument()
-      expect(screen.getByRole('button', { name: /Prune/i })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /^Prune$/i })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: /Break Lock/i })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: /Wipe contents/i })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: /Delete/i })).toBeInTheDocument()
@@ -685,8 +940,23 @@ describe('RepositoryCard', () => {
         />
       )
 
-      fireEvent.click(screen.getByRole('button', { name: /Prune/i }))
+      fireEvent.click(screen.getByRole('button', { name: /^Prune$/i }))
       expect(mockCallbacks.onPrune).toHaveBeenCalledTimes(1)
+    })
+
+    it('calls onPrunePreview when Prune preview button is clicked', () => {
+      renderWithProviders(
+        <RepositoryCard
+          repository={mockRepository}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /prune preview/i }))
+      expect(mockCallbacks.onPrunePreview).toHaveBeenCalledTimes(1)
     })
 
     it('calls onWipeContents when Wipe contents button is clicked', () => {
@@ -720,7 +990,7 @@ describe('RepositoryCard', () => {
       expect(mockCallbacks.onBreakLock).toHaveBeenCalledTimes(1)
     })
 
-    it('calls onBackupNow and tracks event when Legacy Backup button is clicked', () => {
+    it('calls onBackupNow and tracks event when Run backup automation is clicked', () => {
       renderWithProviders(
         <RepositoryCard
           repository={mockRepository}
@@ -731,7 +1001,7 @@ describe('RepositoryCard', () => {
         />
       )
 
-      fireEvent.click(screen.getByRole('button', { name: /Legacy Backup/i }))
+      fireEvent.click(screen.getByRole('button', { name: /Run backup automation/i }))
       expect(mockCallbacks.onBackupNow).toHaveBeenCalledTimes(1)
       expect(mockAnalyticsTracking.trackBackup).toHaveBeenCalledWith(
         'Start',
@@ -769,6 +1039,21 @@ describe('RepositoryCard', () => {
       fireEvent.click(screen.getByRole('button', { name: /View Archives/i }))
       expect(mockCallbacks.onViewArchives).toHaveBeenCalledTimes(1)
       expect(mockAnalyticsTracking.trackArchive).toHaveBeenCalledWith('View', mockRepository)
+    })
+
+    it('navigates to Activity with the repository filter pinned when Operations is clicked', () => {
+      renderWithProviders(
+        <RepositoryCard
+          repository={mockRepository}
+          isInJobsSet={false}
+          canManageRepository={true}
+          getCompressionLabel={mockGetCompressionLabel}
+          {...mockCallbacks}
+        />
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /Operations/i }))
+      expect(navigateMock).toHaveBeenCalledWith(`/activity?repository_id=${mockRepository.id}`)
     })
 
     it('calls onViewBackupPlans and tracks event when View linked backup plans button is clicked', () => {
@@ -881,8 +1166,9 @@ describe('RepositoryCard', () => {
       expect(screen.getByRole('button', { name: /Info/i })).toBeDisabled()
       expect(screen.getByRole('button', { name: /Check/i })).toBeDisabled()
       expect(screen.getByRole('button', { name: /Compact/i })).toBeDisabled()
-      expect(screen.getByRole('button', { name: /Prune/i })).toBeDisabled()
-      expect(screen.getByRole('button', { name: /Legacy Backup/i })).toBeDisabled()
+      expect(screen.getByRole('button', { name: /^Prune$/i })).toBeDisabled()
+      expect(screen.getByRole('button', { name: /prune preview/i })).toBeDisabled()
+      expect(screen.getByRole('button', { name: /Run backup automation/i })).toBeDisabled()
       expect(screen.getByRole('button', { name: /Create Backup Plan/i })).toBeDisabled()
       expect(screen.getByRole('button', { name: /View Archives/i })).toBeDisabled()
     })
@@ -1365,8 +1651,8 @@ describe('RepositoryCard', () => {
       expect(screen.getByRole('button', { name: /Info/i })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: /Check/i })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: /Compact/i })).toBeInTheDocument()
-      expect(screen.getByRole('button', { name: /Prune/i })).toBeInTheDocument()
-      expect(screen.getByRole('button', { name: /Legacy Backup/i })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /^Prune$/i })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /Run backup automation/i })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: /Create Backup Plan/i })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: /View Archives/i })).toBeInTheDocument()
 

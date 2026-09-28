@@ -1,9 +1,16 @@
+import json
+import os
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.websockets import WebSocketDisconnect
 
+import app.config as app_config
+from app.api.agents import _handle_agent_session_message
 from app.core.agent_auth import AGENT_AUTH_HEADER, AGENT_TOKEN_PREFIX_LENGTH
 from app.core.security import get_password_hash
 from app.database.models import (
@@ -11,9 +18,16 @@ from app.database.models import (
     AgentJob,
     AgentJobLog,
     AgentMachine,
-    BackupJob,
+    BackupPlan,
     LicensingState,
+    Operation,
+    Repository,
 )
+from app.services.operations.executors import load_default_executors
+from app.services.operations.backup_facade import resolve_backup_job
+from app.database.models import BackupPlanRun
+from tests.utils.agent_jobs import agent_maintenance_job
+from tests.utils.operations import seed_job_operation
 
 
 def _set_plan(test_db, plan: str) -> None:
@@ -165,22 +179,22 @@ class TestAgentRegistrationAndHeartbeat:
             json={
                 "name": "odroid setup",
                 "expires_in_minutes": 60,
-                "default_path": " /home/karanhudia ",
+                "default_path": " /home/alex ",
             },
             headers=admin_headers,
         )
         assert enrollment.status_code == 201
-        assert enrollment.json()["default_path"] == "/home/karanhudia"
+        assert enrollment.json()["default_path"] == "/home/alex"
 
         registered = _register_agent(test_client, enrollment.json()["token"])
         agent = _get_agent(test_db, registered["agent_id"])
-        assert agent.default_path == "/home/karanhudia"
+        assert agent.default_path == "/home/alex"
 
         response = test_client.get(
             "/api/managed-machines/agents", headers=admin_headers
         )
         assert response.status_code == 200
-        assert response.json()[0]["default_path"] == "/home/karanhudia"
+        assert response.json()[0]["default_path"] == "/home/alex"
 
     def test_register_agent_consumes_enrollment_token_and_lists_machine(
         self, test_client: TestClient, test_db, admin_headers
@@ -770,10 +784,11 @@ class TestAgentJobTransport:
         )
         agent = _get_agent(test_db, registered["agent_id"])
         job = _create_agent_job(test_db, agent, status="running")
-        backup_job = BackupJob(repository="/repo", status="running")
-        test_db.add(backup_job)
+        backup_job = seed_job_operation(
+            test_db, "backup", repository="/repo", status="running"
+        )
         test_db.commit()
-        job.backup_job_id = backup_job.id
+        job.operation_id = backup_job.id
         test_db.commit()
         headers = _agent_headers(registered["agent_token"])
 
@@ -792,6 +807,7 @@ class TestAgentJobTransport:
 
         test_db.refresh(job)
         test_db.refresh(backup_job)
+        backup_job = resolve_backup_job(test_db, backup_job.id)
         assert job.status == "completed_with_warnings"
         assert "jobCompletedWithWarning" in (job.error_message or "")
         assert backup_job.status == "completed_with_warnings"
@@ -806,6 +822,293 @@ class TestAgentJobTransport:
             headers=headers,
         )
         assert repeated.status_code == 200
+
+    def _running_backup(self, test_client, test_db, admin_headers):
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        job = _create_agent_job(test_db, agent, status="running")
+        backup_job = seed_job_operation(
+            test_db, "backup", repository="/repo", status="running"
+        )
+        test_db.commit()
+        job.operation_id = backup_job.id
+        test_db.commit()
+        headers = _agent_headers(registered["agent_token"])
+        # the last progress report before the completion: Borg reports at
+        # most once a second, so its counters lag the archive's
+        progress = test_client.post(
+            f"/api/agents/jobs/{job.id}/progress",
+            json={
+                "original_size": 1024,
+                "compressed_size": 512,
+                "deduplicated_size": 128,
+                "nfiles": 3,
+            },
+            headers=headers,
+        )
+        assert progress.status_code == 200
+        return job, backup_job.id, headers
+
+    def test_backup_final_counters_come_with_the_completion(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        """#1125: progress and completion travel on different paths and
+        progress is refused once the job is final, so the counters the
+        completion carries are the ones the backup keeps."""
+        job, backup_job_id, headers = self._running_backup(
+            test_client, test_db, admin_headers
+        )
+
+        complete = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={
+                "result": {
+                    "archive_name": "a1",
+                    "return_code": 0,
+                    "archive_stats": {
+                        "original_size": 600000,
+                        "compressed_size": 600009,
+                        "deduplicated_size": 4096,
+                        "nfiles": 30,
+                    },
+                }
+            },
+            headers=headers,
+        )
+        assert complete.status_code == 200
+        late = test_client.post(
+            f"/api/agents/jobs/{job.id}/progress",
+            json={"original_size": 2048, "nfiles": 5},
+            headers=headers,
+        )
+        assert late.status_code == 409
+
+        test_db.refresh(job)
+        backup_job = resolve_backup_job(test_db, backup_job_id)
+        for row in (job, backup_job):
+            assert row.original_size == 600000
+            assert row.compressed_size == 600009
+            assert row.deduplicated_size == 4096
+            assert row.nfiles == 30
+        assert backup_job.status == "completed"
+
+    @pytest.mark.parametrize(
+        ("archive_stats", "expected"),
+        [
+            # an agent before 0.1.9 reports none: the last progress stands
+            (None, (1024, 512, 128, 3)),
+            # Borg 2 has no compressed or deduplicated size in `archive.stats`
+            ({"original_size": 600000, "nfiles": 30}, (600000, 512, 128, 30)),
+            # a field in another shape is not taken
+            (
+                {
+                    "original_size": -1,
+                    "compressed_size": "600009",
+                    "deduplicated_size": True,
+                    "nfiles": 2**31,
+                },
+                (1024, 512, 128, 3),
+            ),
+            ("600000", (1024, 512, 128, 3)),
+        ],
+    )
+    def test_backup_counters_the_completion_does_not_carry_stay(
+        self, test_client: TestClient, test_db, admin_headers, archive_stats, expected
+    ):
+        job, backup_job_id, headers = self._running_backup(
+            test_client, test_db, admin_headers
+        )
+        result = {"archive_name": "a1", "return_code": 1}
+        if archive_stats is not None:
+            result["archive_stats"] = archive_stats
+
+        complete = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={"result": result},
+            headers=headers,
+        )
+        assert complete.status_code == 200
+        assert complete.json()["status"] == "completed_with_warnings"
+
+        test_db.refresh(job)
+        backup_job = resolve_backup_job(test_db, backup_job_id)
+        for row in (job, backup_job):
+            assert (
+                row.original_size,
+                row.compressed_size,
+                row.deduplicated_size,
+                row.nfiles,
+            ) == expected
+
+    def test_completed_backup_job_enqueues_index_followups(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        """A completed agent backup no longer writes last_backup itself; it
+        enqueues the backup follow-up chain, and archive_sync derives the
+        column from the listing (#933)."""
+        load_default_executors()
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        repo = Repository(name="linked", path="/repo", encryption="none")
+        test_db.add(repo)
+        test_db.commit()
+        job = _create_agent_job(test_db, agent, status="running")
+        backup_job = seed_job_operation(
+            test_db,
+            "backup",
+            repository="/repo",
+            repository_id=repo.id,
+            status="running",
+        )
+        test_db.commit()
+        job.operation_id = backup_job.id
+        test_db.commit()
+
+        complete = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={"result": {"archive_name": "a1", "return_code": 0}},
+            headers=_agent_headers(registered["agent_token"]),
+        )
+        assert complete.status_code == 200
+
+        test_db.refresh(repo)
+        assert repo.last_backup is None
+        ops = (
+            test_db.query(Operation)
+            .filter(Operation.repository_id == repo.id)
+            .order_by(Operation.id)
+            .all()
+        )
+        followups = [o for o in ops if o.id != backup_job.id]
+        assert [o.kind for o in followups][:1] == ["archive_sync"]
+        assert {o.trigger for o in followups} == {"followup"}
+
+    def test_agent_job_links_a_backup_operation_and_cancels_it(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        """An AgentJob transporting a backup operation is found through
+        `operation_id`, and cancelling it while it is still queued writes
+        `cancelled` on the operation."""
+        from app.database.models import Operation
+        from app.services.operations.backup_facade import BackupJobFacade
+        from app.services.repository_executor import (
+            cancel_agent_backup_job,
+            get_agent_job_for_backup,
+        )
+
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        repo = Repository(name="linked", path="/repo", encryption="none")
+        test_db.add(repo)
+        test_db.commit()
+        operation = Operation(
+            repository_id=repo.id,
+            kind="backup",
+            category="backup",
+            status="running",
+            trigger="manual",
+            priority=0,
+            run_id="run-1",
+            params={"executor": "agent"},
+        )
+        test_db.add(operation)
+        test_db.commit()
+        agent_job = _create_agent_job(test_db, agent, status="queued")
+        agent_job.operation_id = operation.id
+        test_db.commit()
+
+        facade = BackupJobFacade(test_db, operation)
+        assert get_agent_job_for_backup(test_db, facade).id == agent_job.id
+
+        cancelled_job, _ = cancel_agent_backup_job(test_db, facade)
+        test_db.commit()
+        test_db.refresh(agent_job)
+        test_db.refresh(operation)
+        assert cancelled_job.id == agent_job.id
+        assert agent_job.status == "canceled"
+        assert operation.status == "cancelled"
+
+    def test_failed_followup_enqueue_never_fails_the_backup(
+        self, test_client: TestClient, test_db, admin_headers, monkeypatch
+    ):
+        """A flush failure inside the follow-up enqueue (here a colliding
+        Operation id, the shape enqueue() produces) is undone in its own
+        savepoint: the completion still succeeds and the terminal state of
+        the agent job and the backup job is committed, with no chain rows."""
+        from sqlalchemy.exc import IntegrityError
+
+        load_default_executors()
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        repo = Repository(name="linked", path="/repo", encryption="none")
+        test_db.add(repo)
+        test_db.commit()
+        from app.services.operations.enqueue import enqueue
+
+        existing = enqueue(test_db, "stats", repository_id=repo.id)
+        job = _create_agent_job(test_db, agent, status="running")
+        backup_job = seed_job_operation(
+            test_db,
+            "backup",
+            repository="/repo",
+            repository_id=repo.id,
+            status="running",
+        )
+        test_db.commit()
+        job.operation_id = backup_job.id
+        test_db.commit()
+        seen = {}
+
+        def colliding_enqueue(db, repository_id, **kwargs):
+            db.add(
+                Operation(
+                    id=existing.id,
+                    run_id=existing.run_id,
+                    kind="archive_sync",
+                    category="index",
+                    status="queued",
+                    trigger="followup",
+                    repository_id=repository_id,
+                )
+            )
+            try:
+                db.flush()
+            except IntegrityError as exc:
+                seen["error"] = exc
+                raise
+            raise AssertionError("the colliding flush did not fail")
+
+        monkeypatch.setattr(
+            "app.api.agents.enqueue_backup_followups", colliding_enqueue
+        )
+        complete = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={"result": {"archive_name": "a1", "return_code": 0}},
+            headers=_agent_headers(registered["agent_token"]),
+        )
+        assert complete.status_code == 200, complete.text
+        assert "error" in seen
+        test_db.expire_all()
+        assert test_db.get(AgentJob, job.id).status == "completed"
+        assert resolve_backup_job(test_db, backup_job.id).status == "completed"
+        assert resolve_backup_job(test_db, backup_job.id).archive_name == "a1"
+        # The backup itself plus the one index row the colliding enqueue left.
+        assert (
+            test_db.query(Operation).filter(Operation.repository_id == repo.id).count()
+            == 2
+        )
 
     def test_modern_warning_range_counts_as_warning(
         self, test_client: TestClient, test_db, admin_headers
@@ -851,6 +1154,42 @@ class TestAgentJobTransport:
         test_db.refresh(job)
         assert job.status == "failed"
         assert "exited with code 2" in (job.error_message or "")
+
+    @pytest.mark.parametrize("malformed", ["2", 2.0, True, [1]])
+    def test_malformed_return_code_in_completion_report_fails_closed(
+        self, test_client: TestClient, test_db, admin_headers, malformed
+    ):
+        """A completion report is only trusted with an int return code;
+        anything else fails the job (and its linked backup job) instead of
+        slipping past the classification as a success."""
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        job = _create_agent_job(test_db, agent, status="running")
+        backup_job = seed_job_operation(
+            test_db, "backup", repository="/repo", status="running"
+        )
+        test_db.commit()
+        job.operation_id = backup_job.id
+        test_db.commit()
+        headers = _agent_headers(registered["agent_token"])
+
+        complete = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={"result": {"return_code": malformed}},
+            headers=headers,
+        )
+        assert complete.status_code == 200
+        assert complete.json()["status"] == "failed"
+
+        test_db.refresh(job)
+        test_db.refresh(backup_job)
+        backup_job = resolve_backup_job(test_db, backup_job.id)
+        assert job.status == "failed"
+        assert "malformed return code" in (job.error_message or "")
+        assert backup_job.status == "failed"
 
     def test_repeated_complete_report_is_idempotent(
         self, test_client: TestClient, test_db, admin_headers
@@ -968,6 +1307,44 @@ class TestAgentJobTransport:
         assert job.status == "failed"
         assert "no client is waiting" in (job.error_message or "")
 
+    def test_heartbeat_fails_stale_diff_job_instead_of_rerunning_it(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        # The diff's consumer is the history index run that registered the
+        # relay channel. Once it stopped waiting, a rerun would stream a
+        # whole diff into the drain for nobody and hold the repository
+        # meanwhile; the index run retries on its own budget.
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        stale_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+        job = self._create_repository_job(
+            test_db,
+            agent,
+            job_kind="repository.diff",
+            operation={"archive": "daily-2", "predecessor": "daily-1"},
+            stale_at=stale_at,
+        )
+
+        response = test_client.post(
+            "/api/agents/heartbeat",
+            json={
+                "agent_id": registered["agent_id"],
+                "agent_version": "0.1.6",
+                "borg_versions": [],
+                "capabilities": ["repository.diff"],
+                "running_job_ids": [],
+            },
+            headers=_agent_headers(registered["agent_token"]),
+        )
+
+        assert response.status_code == 200
+        test_db.refresh(job)
+        assert job.status == "failed"
+        assert "no client is waiting" in (job.error_message or "")
+
     def test_heartbeat_requeues_stale_durable_repository_job(
         self, test_client: TestClient, test_db, admin_headers
     ):
@@ -981,7 +1358,9 @@ class TestAgentJobTransport:
             test_db,
             agent,
             job_kind="repository.check",
-            operation={"maintenance_job": {"kind": "check", "id": 1}},
+            operation={
+                "maintenance_job": {"kind": "check", "id": 1, "table": "operations"}
+            },
             stale_at=stale_at,
         )
 
@@ -1057,6 +1436,110 @@ class TestAgentJobTransport:
 
         assert response.status_code == 200
         assert response.json() == {"accepted": False, "size": 0}
+
+    def test_upload_job_artifact_refuses_a_diff_without_draining_it(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        # A listing nobody consumes must not be produced to the end: the
+        # route answers at once instead of draining the body, and the agent
+        # ends borg on the refusal.
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        job = self._create_repository_job(
+            test_db,
+            agent,
+            job_kind="repository.diff",
+            operation={"archive": "b", "predecessor": "a"},
+            stale_at=datetime.now(timezone.utc),
+        )
+
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/artifact",
+            content=b'{"path": "orphaned"}\n',
+            headers=_agent_headers(registered["agent_token"]),
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"accepted": False, "size": 0}
+        # The refusal alone may not reach borg in time (a proxy can go on
+        # draining the body): the job is cancelled as well.
+        test_db.refresh(job)
+        assert job.status == "cancel_requested"
+
+    def test_upload_job_artifact_cancels_a_diff_whose_consumer_left_mid_stream(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        # The consumer leaves while chunks are flowing: the relay refuses
+        # the push, the route stops relaying and cancels the job, so the
+        # agent ends borg instead of streaming the rest into the drain.
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        job = self._create_repository_job(
+            test_db,
+            agent,
+            job_kind="repository.diff",
+            operation={"archive": "b", "predecessor": "a"},
+            stale_at=datetime.now(timezone.utc),
+        )
+
+        from app.services.agent_artifact_relay import agent_artifact_relay
+
+        agent_artifact_relay.register(job.id)
+        try:
+            with patch.object(
+                agent_artifact_relay, "push", AsyncMock(return_value=False)
+            ) as push:
+                response = test_client.post(
+                    f"/api/agents/jobs/{job.id}/artifact",
+                    content=b'{"path": "a"}\n',
+                    headers=_agent_headers(registered["agent_token"]),
+                )
+        finally:
+            agent_artifact_relay.unregister(job.id)
+
+        assert response.status_code == 200
+        assert response.json() == {"accepted": False, "size": 14}
+        push.assert_awaited_once()
+        test_db.refresh(job)
+        assert job.status == "cancel_requested"
+
+    def test_upload_job_artifact_reports_an_empty_body_nobody_consumed(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        # An empty body pushes no chunk, so the relay's close is the only
+        # call that can notice the consumer left; its answer is the
+        # response, not the `delivered` the loop never touched.
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        job = _create_agent_job(test_db, agent, status="running")
+
+        from app.services.agent_artifact_relay import agent_artifact_relay
+
+        agent_artifact_relay.register(job.id)
+        try:
+            with patch.object(
+                agent_artifact_relay, "close", AsyncMock(return_value=False)
+            ) as close:
+                response = test_client.post(
+                    f"/api/agents/jobs/{job.id}/artifact",
+                    content=b"",
+                    headers=_agent_headers(registered["agent_token"]),
+                )
+        finally:
+            agent_artifact_relay.unregister(job.id)
+
+        assert response.status_code == 200
+        assert response.json() == {"accepted": False, "size": 0}
+        close.assert_awaited_once_with(job.id, confirm_timeout=None)
 
     def test_agent_cannot_mutate_another_agents_job(
         self, test_client: TestClient, test_db, admin_headers
@@ -1214,13 +1697,13 @@ class TestAgentJobReaper:
 
     def test_fails_linked_backup_job(self, test_client, test_db, admin_headers):
         from app.services.agent_job_reaper import reap_stale_agent_jobs
-        from app.database.models import BackupJob
 
-        backup_job = BackupJob(
+        backup_job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/repo",
             status="running",
         )
-        test_db.add(backup_job)
         test_db.commit()
         test_db.refresh(backup_job)
 
@@ -1233,7 +1716,7 @@ class TestAgentJobReaper:
         stale_at = datetime.now(timezone.utc) - timedelta(minutes=30)
         # Link and stale-ify in a single commit; updated_at has an onupdate, so a
         # later separate commit would refresh the timestamp and un-stale the job.
-        job.backup_job_id = backup_job.id
+        job.operation_id = backup_job.id
         job.started_at = stale_at
         job.updated_at = stale_at
         test_db.commit()
@@ -1248,12 +1731,12 @@ class TestAgentJobReaper:
         self, test_client, test_db, admin_headers
     ):
         from app.services.agent_job_reaper import reap_stale_agent_jobs
-        from app.database.models import BackupJob
 
         # An already-finished backup must not be flipped back to failed when its
         # AgentJob gets stale-reaped after the fact.
-        backup_job = BackupJob(repository="/repo", status="completed")
-        test_db.add(backup_job)
+        backup_job = seed_job_operation(
+            test_db, "backup", repository="/repo", status="completed"
+        )
         test_db.commit()
         test_db.refresh(backup_job)
 
@@ -1264,7 +1747,7 @@ class TestAgentJobReaper:
         agent = _get_agent(test_db, registered["agent_id"])
         job = _create_agent_job(test_db, agent, status="running")
         stale_at = datetime.now(timezone.utc) - timedelta(minutes=30)
-        job.backup_job_id = backup_job.id
+        job.operation_id = backup_job.id
         job.started_at = stale_at
         job.updated_at = stale_at
         test_db.commit()
@@ -1273,3 +1756,1716 @@ class TestAgentJobReaper:
 
         test_db.refresh(backup_job)
         assert backup_job.status == "completed"
+
+
+NOTIFIER_PATCH_TARGET = "app.services.agent_job_notifications.notification_service"
+
+
+@pytest.mark.unit
+class TestAgentJobNotifications:
+    """Agent-executed jobs must fire the same user-facing notifications the
+    server-side execution paths send from inside their services."""
+
+    def _register(self, test_client, test_db, admin_headers):
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        return agent, _agent_headers(registered["agent_token"])
+
+    def _linked_backup_job(self, test_db, agent, *, agent_status="running"):
+        backup_job = seed_job_operation(
+            test_db, "backup", repository="/repo", status="running"
+        )
+        test_db.commit()
+        test_db.refresh(backup_job)
+        job = _create_agent_job(test_db, agent, status=agent_status)
+        job.operation_id = backup_job.id
+        test_db.commit()
+        return job, backup_job
+
+    def test_completed_backup_job_sends_success_notification(
+        self, test_client, test_db, admin_headers
+    ):
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        job, backup_job = self._linked_backup_job(test_db, agent)
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            response = test_client.post(
+                f"/api/agents/jobs/{job.id}/complete",
+                json={"result": {"archive_name": "agent-archive", "return_code": 0}},
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        notifier.send_backup_success.assert_awaited_once()
+        args = notifier.send_backup_success.await_args.args
+        assert args[1] == "/repo"
+        assert args[2] == "agent-archive"
+        notifier.send_backup_warning.assert_not_awaited()
+        notifier.send_backup_failure.assert_not_awaited()
+
+    def test_warning_completion_sends_warning_notification(
+        self, test_client, test_db, admin_headers
+    ):
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        job, backup_job = self._linked_backup_job(test_db, agent)
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            response = test_client.post(
+                f"/api/agents/jobs/{job.id}/complete",
+                json={"result": {"archive_name": "agent-archive", "return_code": 1}},
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        notifier.send_backup_warning.assert_awaited_once()
+        notifier.send_backup_success.assert_not_awaited()
+
+    def test_error_return_code_sends_failure_notification(
+        self, test_client, test_db, admin_headers
+    ):
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        job, backup_job = self._linked_backup_job(test_db, agent)
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            response = test_client.post(
+                f"/api/agents/jobs/{job.id}/complete",
+                json={"result": {"return_code": 2}},
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        notifier.send_backup_failure.assert_awaited_once()
+        args = notifier.send_backup_failure.await_args.args
+        assert args[1] == "/repo"
+        assert "borg exited with code 2" in args[2]
+        assert args[3] == backup_job.id
+        notifier.send_backup_success.assert_not_awaited()
+
+    def test_failed_job_sends_failure_notification(
+        self, test_client, test_db, admin_headers
+    ):
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        job, backup_job = self._linked_backup_job(test_db, agent)
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            response = test_client.post(
+                f"/api/agents/jobs/{job.id}/fail",
+                json={"error_message": "disk full", "return_code": 2},
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        notifier.send_backup_failure.assert_awaited_once()
+        args = notifier.send_backup_failure.await_args.args
+        assert args[2] == "disk full"
+
+    def test_repeated_completion_does_not_duplicate_notification(
+        self, test_client, test_db, admin_headers
+    ):
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        job, backup_job = self._linked_backup_job(test_db, agent)
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            for _ in range(2):
+                response = test_client.post(
+                    f"/api/agents/jobs/{job.id}/complete",
+                    json={
+                        "result": {"archive_name": "agent-archive", "return_code": 0}
+                    },
+                    headers=headers,
+                )
+                assert response.status_code == 200
+
+        notifier.send_backup_success.assert_awaited_once()
+
+    def test_first_start_report_sends_backup_start_notification(
+        self, test_client, test_db, admin_headers
+    ):
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        job, backup_job = self._linked_backup_job(
+            test_db, agent, agent_status="claimed"
+        )
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            for _ in range(2):
+                response = test_client.post(
+                    f"/api/agents/jobs/{job.id}/start",
+                    json={},
+                    headers=headers,
+                )
+                assert response.status_code == 200
+
+        notifier.send_backup_start.assert_awaited_once()
+        args = notifier.send_backup_start.await_args.args
+        assert args[1] == "/repo"
+
+    def _agent_check_job(self, test_db, agent, *, name="agent-check-repo"):
+        repository = Repository(name=name, path=f"/{name}")
+        test_db.add(repository)
+        test_db.commit()
+        test_db.refresh(repository)
+        check_job = seed_job_operation(
+            test_db, "check", repository_id=repository.id, status="running"
+        )
+        test_db.commit()
+        test_db.refresh(check_job)
+        now = datetime.now(timezone.utc)
+        job = agent_maintenance_job(
+            test_db,
+            agent,
+            "check",
+            check_job.id,
+            repository=repository,
+            created_at=now,
+            updated_at=now,
+        )
+        test_db.refresh(job)
+        return job, check_job, repository
+
+    def test_agent_check_completion_sends_check_notification(
+        self, test_client, test_db, admin_headers
+    ):
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        job, check_job, repository = self._agent_check_job(test_db, agent)
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            response = test_client.post(
+                f"/api/agents/jobs/{job.id}/complete",
+                json={"result": {"return_code": 0}},
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        notifier.send_check_completion.assert_awaited_once()
+        kwargs = notifier.send_check_completion.await_args.kwargs
+        assert kwargs["status"] == "completed"
+        assert kwargs["repository_name"] == repository.name
+        assert kwargs["check_type"] == "manual"
+
+    def test_agent_check_failure_sends_check_notification(
+        self, test_client, test_db, admin_headers
+    ):
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        job, check_job, repository = self._agent_check_job(
+            test_db, agent, name="agent-check-repo-2"
+        )
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            response = test_client.post(
+                f"/api/agents/jobs/{job.id}/fail",
+                json={"error_message": "check failed", "return_code": 2},
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        notifier.send_check_completion.assert_awaited_once()
+        kwargs = notifier.send_check_completion.await_args.kwargs
+        assert kwargs["status"] == "failed"
+        assert kwargs["error_message"] == "check failed"
+
+    async def test_notify_backup_job_finished_prefers_plan_name(self, test_db):
+        from app.services.agent_job_notifications import notify_backup_job_finished
+
+        plan = BackupPlan(name="nightly", source_directories="[]")
+        test_db.add(plan)
+        test_db.commit()
+        test_db.refresh(plan)
+        # An operation names its plan through the run, which is where the
+        # facade reads `backup_plan_id` from.
+        run = BackupPlanRun(backup_plan_id=plan.id, trigger="manual", status="running")
+        test_db.add(run)
+        test_db.commit()
+        backup_job = resolve_backup_job(
+            test_db,
+            seed_job_operation(
+                test_db,
+                "backup",
+                repository="/repo",
+                status="failed",
+                backup_plan_run_id=run.id,
+                error_message="agent session lost",
+            ).id,
+        )
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            await notify_backup_job_finished(
+                test_db, resolve_backup_job(test_db, backup_job.id)
+            )
+
+        notifier.send_backup_failure.assert_awaited_once()
+        args = notifier.send_backup_failure.await_args.args
+        assert args[2] == "agent session lost"
+        assert args[4] == "nightly"
+
+    async def test_notify_backup_job_finished_skips_cancelled(self, test_db):
+        from app.services.agent_job_notifications import notify_backup_job_finished
+
+        backup_job = seed_job_operation(
+            test_db, "backup", repository="/repo", status="cancelled"
+        )
+        test_db.commit()
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            await notify_backup_job_finished(
+                test_db, resolve_backup_job(test_db, backup_job.id)
+            )
+
+        notifier.send_backup_failure.assert_not_awaited()
+        notifier.send_backup_success.assert_not_awaited()
+
+    def test_reaper_collects_failed_backup_jobs_for_notification(
+        self, test_client, test_db, admin_headers
+    ):
+        from app.services.agent_job_reaper import reap_stale_agent_jobs
+
+        agent, _headers = self._register(test_client, test_db, admin_headers)
+        backup_job = seed_job_operation(
+            test_db, "backup", repository="/repo", status="running"
+        )
+        test_db.commit()
+        test_db.refresh(backup_job)
+        job = _create_agent_job(test_db, agent, status="running")
+        stale_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+        job.operation_id = backup_job.id
+        job.started_at = stale_at
+        job.updated_at = stale_at
+        test_db.commit()
+
+        failed_backup_job_ids: list[int] = []
+        reaped = reap_stale_agent_jobs(
+            test_db, failed_backup_job_ids=failed_backup_job_ids
+        )
+
+        assert reaped == 1
+        assert failed_backup_job_ids == [backup_job.id]
+
+    def test_reaper_does_not_collect_terminal_backup_jobs(
+        self, test_client, test_db, admin_headers
+    ):
+        from app.services.agent_job_reaper import reap_stale_agent_jobs
+
+        agent, _headers = self._register(test_client, test_db, admin_headers)
+        backup_job = seed_job_operation(
+            test_db, "backup", repository="/repo", status="completed"
+        )
+        test_db.commit()
+        test_db.refresh(backup_job)
+        job = _create_agent_job(test_db, agent, status="running")
+        stale_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+        job.operation_id = backup_job.id
+        job.started_at = stale_at
+        job.updated_at = stale_at
+        test_db.commit()
+
+        failed_backup_job_ids: list[int] = []
+        reap_stale_agent_jobs(test_db, failed_backup_job_ids=failed_backup_job_ids)
+
+        assert failed_backup_job_ids == []
+
+    def test_stale_completion_report_cannot_double_finalize(
+        self, test_client, test_db, admin_headers
+    ):
+        from sqlalchemy.orm import Session as SASession
+
+        from app.api.agents import _complete_agent_job
+
+        agent, _headers = self._register(test_client, test_db, admin_headers)
+        job, backup_job = self._linked_backup_job(test_db, agent)
+
+        # A second session models the other transport holding a stale view of
+        # the still-running job (its read transaction already closed, as after
+        # a completed request cycle).
+        stale_db = SASession(bind=test_db.get_bind(), expire_on_commit=False)
+        try:
+            stale_job = stale_db.query(AgentJob).filter(AgentJob.id == job.id).first()
+            assert stale_job.status == "running"
+            stale_db.commit()
+
+            # The reaper (or the other transport) finalizes the job first.
+            test_db.query(AgentJob).filter(AgentJob.id == job.id).update(
+                {AgentJob.status: "failed", AgentJob.error_message: "reaped"},
+                synchronize_session=False,
+            )
+            test_db.query(Operation).filter(Operation.id == backup_job.id).update(
+                {Operation.status: "failed", Operation.error_message: "reaped"},
+                synchronize_session=False,
+            )
+            test_db.commit()
+
+            transitioned = _complete_agent_job(
+                stale_job, stale_db, result={"archive_name": "late", "return_code": 0}
+            )
+            stale_db.commit()
+            assert transitioned is False
+        finally:
+            stale_db.close()
+
+        test_db.expire_all()
+        assert (
+            test_db.query(AgentJob).filter(AgentJob.id == job.id).first().status
+            == "failed"
+        )
+        linked = test_db.get(Operation, backup_job.id)
+        assert linked.status == "failed"
+        assert linked.error_message == "reaped"
+
+    def test_stale_start_report_does_not_claim_start_notification(
+        self, test_client, test_db, admin_headers
+    ):
+        from sqlalchemy.orm import Session as SASession
+
+        from app.api.agents import _mark_agent_job_started
+
+        agent, _headers = self._register(test_client, test_db, admin_headers)
+        job, backup_job = self._linked_backup_job(
+            test_db, agent, agent_status="claimed"
+        )
+
+        stale_db = SASession(bind=test_db.get_bind(), expire_on_commit=False)
+        try:
+            stale_job = stale_db.query(AgentJob).filter(AgentJob.id == job.id).first()
+            stale_db.commit()
+
+            first = _mark_agent_job_started(job, test_db)
+            test_db.commit()
+            assert first is not None
+
+            second = _mark_agent_job_started(stale_job, stale_db)
+            stale_db.commit()
+            assert second is None
+        finally:
+            stale_db.close()
+
+    def test_requeued_job_does_not_claim_the_start_notification_twice(
+        self, test_client, test_db, admin_headers
+    ):
+        """A reconnect after a requeue must not notify a second time. The
+        requeue clears `started_at`, so the claim hangs off its own marker."""
+        from app.api.agents import _mark_agent_job_started, _requeue_stale_agent_jobs
+
+        agent, _headers = self._register(test_client, test_db, admin_headers)
+        job, _backup_job = self._linked_backup_job(
+            test_db, agent, agent_status="claimed"
+        )
+
+        assert _mark_agent_job_started(job, test_db) is not None
+        test_db.commit()
+
+        stale_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        test_db.query(AgentJob).filter(AgentJob.id == job.id).update(
+            {AgentJob.updated_at: stale_at, AgentJob.started_at: stale_at},
+            synchronize_session=False,
+        )
+        test_db.commit()
+        test_db.expire_all()
+        job = test_db.query(AgentJob).filter(AgentJob.id == job.id).first()
+        _requeue_stale_agent_jobs(
+            test_db, agent, now=datetime.now(timezone.utc), running_job_ids=[]
+        )
+        test_db.commit()
+        assert job.status == "queued"
+        assert job.started_at is None
+
+        assert _mark_agent_job_started(job, test_db) is None
+
+    async def test_expired_object_reads_stay_inside_notification_boundary(
+        self, test_db
+    ):
+        from app.services.agent_job_notifications import notify_backup_job_finished
+
+        backup_job = seed_job_operation(
+            test_db, "backup", repository="/repo", status="failed", error_message="x"
+        )
+        test_db.commit()
+        facade = resolve_backup_job(test_db, backup_job.id)
+        # Detached + expired: every attribute read raises, modeling a refresh
+        # failure on the committed (expired) row after the job turned final.
+        test_db.expire(backup_job)
+        test_db.expunge(backup_job)
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            await notify_backup_job_finished(test_db, facade)
+
+        notifier.send_backup_failure.assert_not_awaited()
+
+    async def test_notifier_failure_does_not_propagate(self, test_db):
+        from app.services.agent_job_notifications import notify_backup_job_finished
+
+        backup_job = seed_job_operation(
+            test_db, "backup", repository="/repo", status="failed", error_message="x"
+        )
+        test_db.commit()
+        test_db.refresh(backup_job)
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            notifier.send_backup_failure.side_effect = RuntimeError("boom")
+            await notify_backup_job_finished(
+                test_db, resolve_backup_job(test_db, backup_job.id)
+            )
+
+        notifier.send_backup_failure.assert_awaited_once()
+
+    def test_stale_cancel_report_cannot_overwrite_terminal_state(
+        self, test_client, test_db, admin_headers
+    ):
+        from sqlalchemy.orm import Session as SASession
+
+        from app.api.agents import _cancel_agent_job
+
+        agent, _headers = self._register(test_client, test_db, admin_headers)
+        job, backup_job = self._linked_backup_job(test_db, agent)
+
+        stale_db = SASession(bind=test_db.get_bind(), expire_on_commit=False)
+        try:
+            stale_job = stale_db.query(AgentJob).filter(AgentJob.id == job.id).first()
+            stale_db.commit()
+
+            test_db.query(AgentJob).filter(AgentJob.id == job.id).update(
+                {AgentJob.status: "failed", AgentJob.error_message: "reaped"},
+                synchronize_session=False,
+            )
+            test_db.query(Operation).filter(Operation.id == backup_job.id).update(
+                {Operation.status: "failed", Operation.error_message: "reaped"},
+                synchronize_session=False,
+            )
+            test_db.commit()
+
+            _cancel_agent_job(stale_job, stale_db)
+            stale_db.commit()
+        finally:
+            stale_db.close()
+
+        test_db.expire_all()
+        assert (
+            test_db.query(AgentJob).filter(AgentJob.id == job.id).first().status
+            == "failed"
+        )
+        assert test_db.get(Operation, backup_job.id).status == "failed"
+
+    def _running_compact_operation(self, test_db, repository):
+        operation = Operation(
+            repository_id=repository.id,
+            kind="compact",
+            category="maintenance",
+            status="running",
+            trigger="manual",
+            priority=10,
+            run_id="run-compact",
+        )
+        test_db.add(operation)
+        test_db.commit()
+        return operation
+
+    def _compact_agent_job(self, test_db, agent, repository, operation):
+        now = datetime.now(timezone.utc)
+        job = agent_maintenance_job(
+            test_db,
+            agent,
+            "compact",
+            operation.id,
+            repository=repository,
+            created_at=now,
+            updated_at=now,
+        )
+        return job
+
+    def _post_stats_line(self, test_client, headers, job, sequence, message):
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/logs",
+            json={
+                "sequence": sequence,
+                "stream": "stderr",
+                "message": json.dumps(
+                    {
+                        "type": "log_message",
+                        "levelname": "INFO",
+                        "name": "borg.archiver.compact_cmd",
+                        "message": message,
+                    }
+                ),
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+
+    def test_agent_compact_completion_takes_stats_from_the_completion_report(
+        self, test_client, test_db, admin_headers
+    ):
+        """An agent from release 0.1.4 parses its own `compact --stats`
+        output and sends the statistics with its completion; they land on
+        the operation's result and fill a size nothing has measured (#931).
+        No log line is needed for that."""
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        repository = Repository(
+            name="agent-compact-repo", path="/agent-compact", borg_version=2
+        )
+        test_db.add(repository)
+        test_db.commit()
+        operation = self._running_compact_operation(test_db, repository)
+        job = self._compact_agent_job(test_db, agent, repository, operation)
+        stats = {
+            "repository_size": 502_000,
+            "compaction_saved": 0,
+            "size_precision": "exact",
+        }
+        # stored as reported, so only the known fields in their shapes are
+        reported = {
+            **stats,
+            "deduplication_factor": -1.5,
+            "compression_factor": 2,
+            "object_count": 1e300,
+            "source_size": -1,
+            "archive_count": True,
+            "padding": "x" * 1000,
+        }
+        stats["compression_factor"] = 2.0
+
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={"result": {"return_code": 0, "stats": reported}},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        test_db.refresh(operation)
+        test_db.refresh(repository)
+        assert operation.status == "completed"
+        assert operation.result["stats"] == stats
+        assert repository.total_size == "490.23 KB"
+        assert repository.total_size_source == "compact_stats"
+
+        status = test_client.get(
+            f"/api/repositories/compact-jobs/{operation.id}",
+            headers=admin_headers,
+        )
+        assert status.status_code == 200, status.text
+        assert status.json()["stats"]["repository_size"] == 502_000
+
+    def test_agent_compact_report_with_a_figure_beyond_borgs_range(
+        self, test_client, test_db, admin_headers
+    ):
+        """A `repository_size` no Borg printed (too large for a float) is not
+        a statistics block: the completion goes through, the compact records
+        no statistics, and a precision label that is not one of the two
+        known values is dropped rather than trusted."""
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        repository = Repository(
+            name="agent-compact-huge",
+            path="/agent-compact-huge",
+            borg_version=2,
+            total_size="keep",
+            total_size_source="storage_used",
+        )
+        test_db.add(repository)
+        test_db.commit()
+        operation = self._running_compact_operation(test_db, repository)
+        job = self._compact_agent_job(test_db, agent, repository, operation)
+
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={
+                "result": {
+                    "return_code": 0,
+                    "stats": {
+                        "repository_size": 10**400,
+                        "compression_factor": 10**400,
+                        "size_precision": "exact",
+                    },
+                }
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        test_db.refresh(operation)
+        test_db.refresh(repository)
+        assert operation.status == "completed"
+        assert (operation.result or {}).get("stats") is None
+        assert repository.total_size == "keep"
+
+        # a label outside the known two counts as rounded: a store walk
+        # stays; a factor that is not a finite number is dropped, not stored
+        operation2 = self._running_compact_operation(test_db, repository)
+        job2 = self._compact_agent_job(test_db, agent, repository, operation2)
+        response = test_client.post(
+            f"/api/agents/jobs/{job2.id}/complete",
+            content=json.dumps(
+                {
+                    "result": {
+                        "return_code": 0,
+                        "stats": {
+                            "repository_size": 5,
+                            "deduplication_factor": 1e400,
+                            "size_precision": "guess",
+                        },
+                    }
+                }
+            ),
+            headers={**headers, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 200, response.text
+        test_db.refresh(operation2)
+        test_db.refresh(repository)
+        assert operation2.result["stats"] == {"repository_size": 5}
+        assert repository.total_size == "keep"
+        assert repository.total_size_source == "storage_used"
+        status = test_client.get(
+            f"/api/repositories/compact-jobs/{operation2.id}", headers=admin_headers
+        )
+        assert status.status_code == 200, status.text
+
+    def test_agent_compact_completion_parses_the_log_when_the_report_has_no_stats(
+        self, test_client, test_db, admin_headers
+    ):
+        """An agent that streamed the statistics lines but reported none
+        (the build before the report carried them) still gets them parsed
+        from the tail of its log at completion; a report whose `stats` is
+        not a statistics block counts as none."""
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        repository = Repository(
+            name="agent-compact-log", path="/agent-compact-log", borg_version=2
+        )
+        test_db.add(repository)
+        test_db.commit()
+        operation = self._running_compact_operation(test_db, repository)
+        job = self._compact_agent_job(test_db, agent, repository, operation)
+        for sequence in range(1, 80):
+            self._post_stats_line(
+                test_client, headers, job, sequence, f"line {sequence}"
+            )
+        # two lines flushed in one frame land in one row
+        frames = "\n".join(
+            json.dumps({"type": "log_message", "levelname": "INFO", "message": m})
+            for m in (
+                "Repository size is 502000 B in 6 objects.",
+                "Compaction saved 0 B.",
+            )
+        )
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/logs",
+            json={"sequence": 80, "stream": "stderr", "message": frames},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={"result": {"return_code": 0, "stats": {"repository_size": "6"}}},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        test_db.refresh(operation)
+        test_db.refresh(repository)
+        assert operation.status == "completed"
+        assert operation.result["stats"]["repository_size"] == 502_000
+        assert operation.result["stats"]["compaction_saved"] == 0
+        assert repository.total_size == "490.23 KB"
+        assert repository.total_size_source == "compact_stats"
+
+    def test_agent_compact_completion_without_stats_records_none(
+        self, test_client, test_db, admin_headers
+    ):
+        """Seen live: the agent's last log lines and its completion travel
+        on different paths, and the completion can win by 150 ms. With no
+        statistics in the report and none in the log yet, this compact
+        records none and the size stays as it was; nothing re-reads the
+        lines that arrive later."""
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        repository = Repository(
+            name="agent-compact-late",
+            path="/agent-compact-late",
+            borg_version=2,
+            total_size="keep",
+            total_size_source="storage_used",
+        )
+        test_db.add(repository)
+        test_db.commit()
+        operation = self._running_compact_operation(test_db, repository)
+        job = self._compact_agent_job(test_db, agent, repository, operation)
+
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={"result": {"return_code": 0}},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        self._post_stats_line(
+            test_client, headers, job, 1, "Repository size is 502000 B in 6 objects."
+        )
+        test_db.refresh(operation)
+        test_db.refresh(repository)
+        assert operation.status == "completed"
+        assert (operation.result or {}).get("stats") is None
+        assert repository.total_size == "keep"
+        assert repository.total_size_source == "storage_used"
+
+    def test_agent_compact_report_for_a_borg1_repository_is_not_believed(
+        self, test_client, test_db, admin_headers
+    ):
+        """Borg 1 compact prints no statistics; a report that carries some
+        for a Borg 1 repository does not touch the size."""
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        repository = Repository(
+            name="agent-compact-borg1", path="/agent-compact-borg1", borg_version=1
+        )
+        test_db.add(repository)
+        test_db.commit()
+        operation = self._running_compact_operation(test_db, repository)
+        job = self._compact_agent_job(test_db, agent, repository, operation)
+
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={
+                "result": {
+                    "return_code": 0,
+                    "stats": {"repository_size": 5, "size_precision": "exact"},
+                }
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        test_db.refresh(operation)
+        test_db.refresh(repository)
+        assert operation.status == "completed"
+        assert (operation.result or {}).get("stats") is None
+        assert repository.total_size is None
+
+    def test_agent_compact_with_a_warning_exit_keeps_its_statistics(
+        self, test_client, test_db, admin_headers
+    ):
+        """A compact that warned ran through: the operation ends
+        `completed_with_warnings` and the statistics of its report are
+        stored and acted on like those of a clean run."""
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        repository = Repository(
+            name="agent-compact-warn", path="/agent-compact-warn", borg_version=2
+        )
+        test_db.add(repository)
+        test_db.commit()
+        operation = self._running_compact_operation(test_db, repository)
+        job = self._compact_agent_job(test_db, agent, repository, operation)
+
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={
+                "result": {
+                    "return_code": 1,
+                    "status": "completed_with_warnings",
+                    "stats": {"repository_size": 502_000, "size_precision": "exact"},
+                }
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        test_db.refresh(operation)
+        test_db.refresh(repository)
+        assert operation.status == "completed_with_warnings"
+        assert operation.result["stats"]["repository_size"] == 502_000
+        assert repository.total_size == "490.23 KB"
+        assert repository.last_compact is not None
+
+    def test_agent_compact_statistics_keep_a_measured_size(
+        self, test_client, test_db, admin_headers
+    ):
+        """The statistics always land on the operation; a size the chunk
+        index measured is not replaced by the compact's pack file figure
+        (the `stats` follow-up measures again after every compact)."""
+        agent, headers = self._register(test_client, test_db, admin_headers)
+        repository = Repository(
+            name="agent-compact-measured",
+            path="/agent-compact-measured",
+            borg_version=2,
+            total_size="7.00 GB",
+            total_size_source="borg2_index",
+        )
+        test_db.add(repository)
+        test_db.commit()
+        operation = self._running_compact_operation(test_db, repository)
+        job = self._compact_agent_job(test_db, agent, repository, operation)
+
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={
+                "result": {
+                    "return_code": 0,
+                    "stats": {"repository_size": 5, "size_precision": "exact"},
+                }
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200
+        test_db.refresh(operation)
+        test_db.refresh(repository)
+        assert operation.result["stats"]["repository_size"] == 5
+        assert repository.total_size == "7.00 GB"
+        assert repository.total_size_source == "borg2_index"
+
+
+@pytest.mark.unit
+class TestAgentTimezone:
+    """The agent's reported IANA zone interprets borg's local-time archive
+    timestamps; only resolvable names may be stored."""
+
+    def _register_with_timezone(self, test_client, admin_headers, tz):
+        enrollment = _create_enrollment_token(test_client, admin_headers)
+        response = test_client.post(
+            "/api/agents/register",
+            json={
+                "enrollment_token": enrollment["token"],
+                "name": "tz-agent",
+                "hostname": "tz.local",
+                "os": "linux",
+                "arch": "amd64",
+                "agent_version": "0.1.1",
+                "timezone": tz,
+                "borg_versions": [],
+                "capabilities": ["backup.create"],
+            },
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    def test_register_persists_valid_timezone(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        registered = self._register_with_timezone(
+            test_client, admin_headers, "Europe/Berlin"
+        )
+
+        agent = _get_agent(test_db, registered["agent_id"])
+        assert agent.timezone == "Europe/Berlin"
+
+    def test_register_drops_invalid_timezone(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        registered = self._register_with_timezone(
+            test_client, admin_headers, "Not/AZone"
+        )
+
+        agent = _get_agent(test_db, registered["agent_id"])
+        assert agent.timezone is None
+
+    def test_heartbeat_updates_timezone_but_keeps_it_on_omission(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        registered = self._register_with_timezone(
+            test_client, admin_headers, "Europe/Berlin"
+        )
+        headers = _agent_headers(registered["agent_token"])
+
+        heartbeat = {
+            "agent_id": registered["agent_id"],
+            "hostname": "tz.local",
+            "agent_version": "0.1.1",
+            "borg_versions": [],
+            "capabilities": ["backup.create"],
+            "running_job_ids": [],
+        }
+
+        # A heartbeat without a zone (old agent) must not erase the stored one.
+        response = test_client.post(
+            "/api/agents/heartbeat", json=heartbeat, headers=headers
+        )
+        assert response.status_code == 200
+        agent = _get_agent(test_db, registered["agent_id"])
+        assert agent.timezone == "Europe/Berlin"
+
+        response = test_client.post(
+            "/api/agents/heartbeat",
+            json={**heartbeat, "timezone": "America/New_York"},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        test_db.refresh(agent)
+        assert agent.timezone == "America/New_York"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_waiter_returns_on_a_completion_with_warnings(
+    test_client, test_db, admin_headers
+):
+    """An agent that ran a Borg command through with a warning exit reports
+    a completion, which the server records as `completed_with_warnings`;
+    the waiter of a delegated maintenance operation must return on it,
+    not poll until the timeout."""
+    from app.services.repository_executor import (
+        wait_for_agent_repository_operation_job,
+    )
+
+    registered = _register_agent(
+        test_client, _create_enrollment_token(test_client, admin_headers)["token"]
+    )
+    agent = _get_agent(test_db, registered["agent_id"])
+    job = _create_agent_job(test_db, agent, status="completed_with_warnings")
+    job.result = {"return_code": 1, "stats": {"repository_size": 5}}
+    test_db.commit()
+
+    result = await wait_for_agent_repository_operation_job(
+        test_db, job.id, timeout_seconds=2, poll_interval_seconds=0.01
+    )
+    assert result["stats"] == {"repository_size": 5}
+
+    job.status = "failed"
+    job.error_message = "borg exited with code 2"
+    test_db.commit()
+    with pytest.raises(HTTPException) as excinfo:
+        await wait_for_agent_repository_operation_job(
+            test_db, job.id, timeout_seconds=2, poll_interval_seconds=0.01
+        )
+    assert excinfo.value.status_code == 502
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_waiter_surfaces_borgs_reason_from_stdout(
+    test_client, test_db, admin_headers
+):
+    """Borg prints an argument error on stdout, so a stderr-only reader left
+    the operator with a bare "operation failed". The reason must reach the
+    detail's params, which is the only part the frontend renders."""
+    from app.services.repository_executor import (
+        wait_for_agent_repository_operation_job,
+    )
+
+    registered = _register_agent(
+        test_client, _create_enrollment_token(test_client, admin_headers)["token"]
+    )
+    agent = _get_agent(test_db, registered["agent_id"])
+    job = _create_agent_job(test_db, agent, status="failed")
+    job.error_message = "repository.init exited with code 2"
+    for sequence, message in enumerate(
+        [
+            "Starting repository.init: borg2 -r /repo repo-create -e aes256-ocb",
+            "usage: borg2 [options] repo-create [-h]",
+            "error: argument -e/--encryption: invalid choice: 'aes256-ocb'",
+        ]
+    ):
+        test_db.add(
+            AgentJobLog(
+                agent_job_id=job.id,
+                sequence=sequence,
+                stream="stdout",
+                message=message,
+                created_at=datetime.utcnow(),
+            )
+        )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await wait_for_agent_repository_operation_job(
+            test_db, job.id, timeout_seconds=2, poll_interval_seconds=0.01
+        )
+    detail = excinfo.value.detail
+    assert detail["key"] == (
+        "backend.errors.agents.repositoryOperationFailedWithReason"
+    )
+    assert detail["params"]["reason"] == (
+        "repository.init exited with code 2: "
+        "error: argument -e/--encryption: invalid choice: 'aes256-ocb'"
+    )
+
+    # stderr still wins when the agent wrote one, and the preamble never does.
+    test_db.add(
+        AgentJobLog(
+            agent_job_id=job.id,
+            sequence=3,
+            stream="stderr",
+            message="Repository /repo already exists.",
+            created_at=datetime.utcnow(),
+        )
+    )
+    test_db.commit()
+    with pytest.raises(HTTPException) as excinfo:
+        await wait_for_agent_repository_operation_job(
+            test_db, job.id, timeout_seconds=2, poll_interval_seconds=0.01
+        )
+    assert excinfo.value.detail["params"]["reason"].endswith(
+        "Repository /repo already exists."
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_script_and_backup_waiters_return_on_a_completion_with_warnings(
+    test_client, test_db, admin_headers
+):
+    """The other waiters share the terminal set: a hook script or a backup
+    whose agent job ended `completed_with_warnings` must not be polled
+    forever."""
+    from app.services.repository_executor import (
+        wait_for_agent_backup_job,
+        wait_for_agent_script_job,
+    )
+
+    registered = _register_agent(
+        test_client, _create_enrollment_token(test_client, admin_headers)["token"]
+    )
+    agent = _get_agent(test_db, registered["agent_id"])
+    script_job = _create_agent_job(test_db, agent, status="completed_with_warnings")
+    script_job.result = {"return_code": 1}
+    backup_job = seed_job_operation(
+        test_db, "backup", repository="/repo", status="completed_with_warnings"
+    )
+    test_db.commit()
+    agent_backup_job = _create_agent_job(
+        test_db, agent, status="completed_with_warnings"
+    )
+    agent_backup_job.operation_id = backup_job.id
+    test_db.commit()
+
+    snapshot = await wait_for_agent_script_job(
+        test_db, script_job.id, timeout_seconds=2, poll_interval_seconds=0.01
+    )
+    assert snapshot["status"] == "completed_with_warnings"
+    assert snapshot["result"] == {"return_code": 1}
+
+    status_value = await wait_for_agent_backup_job(
+        test_db,
+        agent_backup_job.id,
+        backup_job.id,
+        lambda: False,
+        poll_interval_seconds=0.01,
+    )
+    assert status_value == "completed_with_warnings"
+
+
+class TestAgentOperationLogLateLines:
+    """An agent sends its log lines over the session and its outcome over
+    REST, so the outcome often lands first. The operation's log file still
+    ends up with the whole transcript, in sequence order (#1076)."""
+
+    @pytest.fixture(autouse=True)
+    def _log_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(app_config.settings, "data_dir", str(tmp_path))
+
+    def _setup(self, test_client, test_db, admin_headers):
+        registered = _register_agent(
+            test_client, _create_enrollment_token(test_client, admin_headers)["token"]
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        repository = Repository(name="agent-prune-log", path="/agent-prune-log")
+        test_db.add(repository)
+        test_db.commit()
+        operation = Operation(
+            repository_id=repository.id,
+            kind="prune",
+            category="maintenance",
+            status="running",
+            trigger="manual",
+            priority=10,
+            run_id="run-prune-log",
+        )
+        test_db.add(operation)
+        test_db.commit()
+        job = agent_maintenance_job(
+            test_db, agent, "prune", operation.id, repository=repository
+        )
+        return agent, _agent_headers(registered["agent_token"]), operation, job
+
+    def _post_line(self, test_client, headers, job, sequence):
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/logs",
+            json={
+                "sequence": sequence,
+                "stream": "stderr",
+                "message": f"line {sequence}",
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+
+    def _finish(self, test_client, headers, job, outcome):
+        if outcome == "complete":
+            body = {"result": {"return_code": 0}}
+        else:
+            body = {"error_message": "borg exited with code 2", "return_code": 2}
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/{outcome}", json=body, headers=headers
+        )
+        assert response.status_code == 200, response.text
+
+    def _log(self, test_db, operation):
+        test_db.refresh(operation)
+        with open(operation.log_file_path, encoding="utf-8") as handle:
+            return handle.read()
+
+    @pytest.mark.parametrize("outcome", ["complete", "fail"])
+    def test_lines_after_the_outcome_complete_the_file_in_order(
+        self, test_client, test_db, admin_headers, outcome
+    ):
+        _, headers, operation, job = self._setup(test_client, test_db, admin_headers)
+        self._post_line(test_client, headers, job, 1)
+        self._finish(test_client, headers, job, outcome)
+        assert self._log(test_db, operation) == "line 1"
+
+        self._post_line(test_client, headers, job, 3)
+        self._post_line(test_client, headers, job, 2)
+        self._post_line(test_client, headers, job, 2)
+
+        assert self._log(test_db, operation) == "line 1\nline 2\nline 3"
+
+    @pytest.mark.asyncio
+    async def test_session_lines_after_the_outcome_complete_the_file(
+        self, test_client, test_db, admin_headers
+    ):
+        agent, headers, operation, job = self._setup(
+            test_client, test_db, admin_headers
+        )
+        self._finish(test_client, headers, job, "complete")
+        assert self._log(test_db, operation) == ""
+
+        for sequence in (1, 2):
+            await _handle_agent_session_message(
+                test_db,
+                agent.id,
+                {
+                    "type": "log",
+                    "job_id": job.id,
+                    "sequence": sequence,
+                    "stream": "stderr",
+                    "message": f"line {sequence}",
+                },
+            )
+
+        # the socket keeps its database session; no transaction is left open
+        assert not test_db.in_transaction()
+        assert self._log(test_db, operation) == "line 1\nline 2"
+
+    def test_a_line_while_the_job_runs_writes_no_file(
+        self, test_client, test_db, admin_headers
+    ):
+        _, headers, operation, job = self._setup(test_client, test_db, admin_headers)
+        self._post_line(test_client, headers, job, 1)
+
+        test_db.refresh(operation)
+        assert operation.log_file_path is None
+
+    def test_a_removed_log_file_is_not_written_again(
+        self, test_client, test_db, admin_headers
+    ):
+        _, headers, operation, job = self._setup(test_client, test_db, admin_headers)
+        self._finish(test_client, headers, job, "complete")
+        test_db.refresh(operation)
+        os.remove(operation.log_file_path)
+
+        self._post_line(test_client, headers, job, 1)
+
+        assert not os.path.exists(operation.log_file_path)
+
+    def test_a_file_removed_by_retention_before_an_append_is_not_created_again(
+        self, test_client, test_db, admin_headers
+    ):
+        """Log retention forgets the path and unlinks the file on its own
+        thread; here it does so right before the append opens the file."""
+        _, headers, operation, job = self._setup(test_client, test_db, admin_headers)
+        self._post_line(test_client, headers, job, 1)
+        self._finish(test_client, headers, job, "complete")
+        test_db.refresh(operation)
+        path = operation.log_file_path
+        real_open = os.open
+
+        def retention_removes_then_open(file, flags, *args, **kwargs):
+            if file == path and os.path.exists(path):
+                os.remove(path)
+            return real_open(file, flags, *args, **kwargs)
+
+        with patch("app.api.agents.os.open", side_effect=retention_removes_then_open):
+            self._post_line(test_client, headers, job, 2)
+
+        assert not os.path.exists(path)
+
+    def test_a_file_removed_by_retention_during_a_rewrite_is_removed_again(
+        self, test_client, test_db, admin_headers
+    ):
+        """Retention runs between the rewrite's existence check and its
+        rename; the renamed file would name nothing, so it goes again."""
+        from app.services.job_history_retention import purge_operation_log_files
+
+        _, headers, operation, job = self._setup(test_client, test_db, admin_headers)
+        self._post_line(test_client, headers, job, 1)
+        self._finish(test_client, headers, job, "complete")
+        self._post_line(test_client, headers, job, 3)
+        test_db.refresh(operation)
+        path = operation.log_file_path
+        operation_id = operation.id
+        real_replace = os.replace
+
+        def retention_then_replace(src, dst):
+            purge_operation_log_files(test_db, (Operation.id == operation_id,))
+            assert not os.path.exists(path)
+            return real_replace(src, dst)
+
+        with patch("app.api.agents.os.replace", side_effect=retention_then_replace):
+            self._post_line(test_client, headers, job, 2)
+
+        assert not os.path.exists(path)
+        assert not os.path.exists(f"{path}.tmp")
+        test_db.expire_all()
+        assert test_db.get(Operation, operation_id).log_file_path is None
+
+    def test_a_failed_rewrite_keeps_the_previous_file(
+        self, test_client, test_db, admin_headers
+    ):
+        _, headers, operation, job = self._setup(test_client, test_db, admin_headers)
+        self._post_line(test_client, headers, job, 1)
+        self._finish(test_client, headers, job, "complete")
+        self._post_line(test_client, headers, job, 3)
+
+        with patch("app.api.agents.os.replace", side_effect=OSError("disk full")):
+            self._post_line(test_client, headers, job, 2)
+
+        assert self._log(test_db, operation) == "line 1\nline 3"
+        assert not os.path.exists(f"{operation.log_file_path}.tmp")
+
+    @pytest.mark.asyncio
+    async def test_a_backup_jobs_lines_skip_the_completion_query(
+        self, test_client, test_db, admin_headers
+    ):
+        """The completion helper runs for every ingested line. A job whose
+        payload names no maintenance kind never reaches an operation's log
+        file, so its lines cost no status query, and the payload is read
+        before the commit expires the row (no refresh)."""
+        from types import SimpleNamespace
+
+        from sqlalchemy import event
+
+        agent, headers, _, _ = self._setup(test_client, test_db, admin_headers)
+        backup = AgentJob(
+            agent_machine_id=agent.id,
+            job_type="backup",
+            status="completed",
+            payload={"job_kind": "backup.create"},
+        )
+        test_db.add(backup)
+        test_db.commit()
+        backup_id = backup.id
+
+        selects = []
+
+        def record(conn, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().startswith("SELECT") and "FROM agent_jobs" in (
+                statement
+            ):
+                selects.append(" ".join(statement.split()))
+
+        engine = test_db.get_bind()
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            self._post_line(test_client, headers, SimpleNamespace(id=backup_id), 1)
+            await _handle_agent_session_message(
+                test_db,
+                agent.id,
+                {
+                    "type": "log",
+                    "job_id": backup_id,
+                    "sequence": 2,
+                    "stream": "stderr",
+                    "message": "line 2",
+                },
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+
+        # Only the handlers' own lookup of the agent's job, once per line.
+        assert len(selects) == 2
+        assert all("agent_jobs.agent_machine_id = ?" in s for s in selects)
+        assert test_db.query(AgentJobLog).filter_by(agent_job_id=backup_id).count() == 2
+
+    @pytest.mark.asyncio
+    async def test_a_failure_while_completing_the_file_keeps_upload_and_session(
+        self, test_client, test_db, admin_headers
+    ):
+        agent, headers, operation, job = self._setup(
+            test_client, test_db, admin_headers
+        )
+        self._finish(test_client, headers, job, "complete")
+
+        with patch(
+            "app.api.agents._get_repository_operation_job",
+            side_effect=SQLAlchemyError("connection lost"),
+        ):
+            self._post_line(test_client, headers, job, 1)
+            await _handle_agent_session_message(
+                test_db,
+                agent.id,
+                {
+                    "type": "log",
+                    "job_id": job.id,
+                    "sequence": 2,
+                    "stream": "stderr",
+                    "message": "line 2",
+                },
+            )
+
+        assert test_db.query(AgentJobLog).filter_by(agent_job_id=job.id).count() == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_fail_report_carries_borgs_reason_before_its_log_line(
+    test_client, test_db, admin_headers
+):
+    """The agent's stderr log line often lands after its failure report; the
+    reason must come from the report's own stderr tail (#1056)."""
+    from app.services.repository_executor import (
+        wait_for_agent_repository_operation_job,
+    )
+
+    registered = _register_agent(
+        test_client, _create_enrollment_token(test_client, admin_headers)["token"]
+    )
+    agent = _get_agent(test_db, registered["agent_id"])
+    job = _create_agent_job(test_db, agent, status="running")
+    lock_line = "Failed to create/acquire the lock /repo/lock.exclusive (timeout)."
+
+    response = test_client.post(
+        f"/api/agents/jobs/{job.id}/fail",
+        json={
+            "error_message": "repository.list_archives exited with code 2",
+            "return_code": 2,
+            "stderr_tail": f"some earlier line\n{lock_line}",
+            "failure_kind": "lock_contention",
+        },
+        headers=_agent_headers(registered["agent_token"]),
+    )
+    assert response.status_code == 200
+
+    with pytest.raises(HTTPException) as excinfo:
+        await wait_for_agent_repository_operation_job(
+            test_db, job.id, timeout_seconds=2, poll_interval_seconds=0.01
+        )
+    assert excinfo.value.detail["params"]["reason"] == (
+        f"repository.list_archives exited with code 2: {lock_line}"
+    )
+
+
+@pytest.mark.unit
+class TestLockContentionDeferral:
+    """A lock failure of a runner-driven maintenance job leaves its operation
+    row for the runner to run again (#1056)."""
+
+    def _flagged_check_job(self, test_client, test_db, admin_headers):
+        from app.services.repository_executor import LOCK_CONTENTION_DEFERS_KEY
+
+        registered = _register_agent(
+            test_client, _create_enrollment_token(test_client, admin_headers)["token"]
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        repository = Repository(name="locked-repo", path="/locked-repo")
+        test_db.add(repository)
+        test_db.commit()
+        operation = seed_job_operation(
+            test_db, "check", repository_id=repository.id, status="running"
+        )
+        test_db.commit()
+        now = datetime.now(timezone.utc)
+        job = agent_maintenance_job(
+            test_db,
+            agent,
+            "check",
+            operation.id,
+            repository=repository,
+            created_at=now,
+            updated_at=now,
+        )
+        job.payload = {**job.payload, LOCK_CONTENTION_DEFERS_KEY: True}
+        test_db.commit()
+        test_db.refresh(job)
+        return job, operation, _agent_headers(registered["agent_token"])
+
+    def test_a_lock_failure_leaves_the_operation_row_and_sends_no_notification(
+        self, test_client, test_db, admin_headers
+    ):
+        job, operation, headers = self._flagged_check_job(
+            test_client, test_db, admin_headers
+        )
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            response = test_client.post(
+                f"/api/agents/jobs/{job.id}/fail",
+                json={
+                    "error_message": "repository.check exited with code 73",
+                    "return_code": 73,
+                    "stderr_tail": "Failed to create/acquire the lock /r (timeout).",
+                    "failure_kind": "lock_contention",
+                },
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        test_db.refresh(job)
+        test_db.refresh(operation)
+        assert job.status == "failed"
+        assert job.result == {
+            "return_code": 73,
+            "stderr_tail": "Failed to create/acquire the lock /r (timeout).",
+            "failure_kind": "lock_contention",
+            "deferred": True,
+        }
+        # the runner's wait raises this failure as a deferral and runs the
+        # operation again on this row
+        assert operation.status == "running"
+        assert operation.completed_at is None
+        assert operation.error_message is None
+        notifier.send_check_completion.assert_not_awaited()
+
+    def test_a_deferred_attempts_late_log_lines_stay_out_of_the_operation_log(
+        self, test_client, test_db, admin_headers, tmp_path, monkeypatch
+    ):
+        """The row goes on to another attempt, whose transcript the operation
+        log holds; a line of the deferred attempt that lands late must not
+        be appended to it or rewrite it."""
+        monkeypatch.setattr(app_config.settings, "data_dir", str(tmp_path))
+        job, operation, headers = self._flagged_check_job(
+            test_client, test_db, admin_headers
+        )
+        log_path = tmp_path / "operation.log"
+        log_path.write_text("the next attempt's transcript", encoding="utf-8")
+        operation.log_file_path = str(log_path)
+        test_db.commit()
+
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/fail",
+            json={
+                "error_message": "repository.check exited with code 73",
+                "return_code": 73,
+                "stderr_tail": "Failed to create/acquire the lock /r (timeout).",
+                "failure_kind": "lock_contention",
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200
+        # the runner has moved on meanwhile: the next attempt spent the budget
+        from app.services.operations.runner import MAX_DEFERRALS
+
+        test_db.refresh(job)
+        assert job.result["deferred"] is True
+        operation.params = {**(operation.params or {}), "deferrals": MAX_DEFERRALS}
+        test_db.commit()
+        for sequence in (3, 1):
+            response = test_client.post(
+                f"/api/agents/jobs/{job.id}/logs",
+                json={"sequence": sequence, "stream": "stderr", "message": "late"},
+                headers=headers,
+            )
+            assert response.status_code == 200, response.text
+
+        assert log_path.read_text(encoding="utf-8") == "the next attempt's transcript"
+
+    def test_a_lock_failure_past_the_deferral_budget_is_recorded_and_notified(
+        self, test_client, test_db, admin_headers
+    ):
+        """The runner records the attempt after the last deferral as the
+        failure; the report finishes the row for it, so the check's failure
+        notification goes out with Borg's reason."""
+        from app.services.operations.runner import MAX_DEFERRALS
+
+        job, operation, headers = self._flagged_check_job(
+            test_client, test_db, admin_headers
+        )
+        operation.params = {**(operation.params or {}), "deferrals": MAX_DEFERRALS}
+        test_db.commit()
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            response = test_client.post(
+                f"/api/agents/jobs/{job.id}/fail",
+                json={
+                    "error_message": "repository.check exited with code 73",
+                    "return_code": 73,
+                    "stderr_tail": "Failed to create/acquire the lock /r (timeout).",
+                    "failure_kind": "lock_contention",
+                },
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        test_db.refresh(job)
+        test_db.refresh(operation)
+        assert "deferred" not in job.result
+        assert operation.status == "failed"
+        notifier.send_check_completion.assert_awaited_once()
+        kwargs = notifier.send_check_completion.await_args.kwargs
+        assert kwargs["status"] == "failed"
+        assert kwargs["error_message"] == (
+            "repository.check exited with code 73: "
+            "Failed to create/acquire the lock /r (timeout)."
+        )
+
+    def test_an_old_agents_lost_lock_is_recorded_not_deferred(
+        self, test_client, test_db, admin_headers
+    ):
+        """An agent before 0.1.10 reports exit code 73 without a kind; the
+        log row that says Borg lost its own lock (already there) rules the
+        deferral out, and the failure is recorded."""
+        job, operation, headers = self._flagged_check_job(
+            test_client, test_db, admin_headers
+        )
+        test_db.add(
+            AgentJobLog(
+                agent_job_id=job.id,
+                sequence=2,
+                stream="stderr",
+                message="Failed to create/acquire the lock /r (timeout). "
+                "Our lock was killed by another borg - there is no safe way "
+                "to continue.",
+                created_at=datetime.utcnow(),
+            )
+        )
+        test_db.commit()
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            response = test_client.post(
+                f"/api/agents/jobs/{job.id}/fail",
+                json={
+                    "error_message": "repository.check exited with code 73",
+                    "return_code": 73,
+                },
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        test_db.refresh(job)
+        test_db.refresh(operation)
+        assert "deferred" not in job.result
+        assert operation.status == "failed"
+        notifier.send_check_completion.assert_awaited_once()
+
+    def test_any_other_failure_of_the_flagged_job_is_recorded(
+        self, test_client, test_db, admin_headers
+    ):
+        job, operation, headers = self._flagged_check_job(
+            test_client, test_db, admin_headers
+        )
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            response = test_client.post(
+                f"/api/agents/jobs/{job.id}/fail",
+                json={
+                    "error_message": "repository.check exited with code 2",
+                    "return_code": 2,
+                    "stderr_tail": "Repository /r does not exist.",
+                    "failure_kind": "other",
+                },
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        test_db.refresh(job)
+        test_db.refresh(operation)
+        assert operation.status == "failed"
+        # the row and its notification carry Borg's reason from the report;
+        # the agent job keeps the message as the agent sent it
+        assert operation.error_message == (
+            "repository.check exited with code 2: Repository /r does not exist."
+        )
+        assert job.error_message == "repository.check exited with code 2"
+        notifier.send_check_completion.assert_awaited_once()
+        assert notifier.send_check_completion.await_args.kwargs["error_message"] == (
+            "repository.check exited with code 2: Repository /r does not exist."
+        )
+
+    def test_credentials_in_the_tail_are_redacted_before_they_are_kept(
+        self, test_client, test_db, admin_headers
+    ):
+        """Borg names the repository in its messages; a location with
+        credentials must not reach the row's message or a notification."""
+        job, operation, headers = self._flagged_check_job(
+            test_client, test_db, admin_headers
+        )
+
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            response = test_client.post(
+                f"/api/agents/jobs/{job.id}/fail",
+                json={
+                    "error_message": "repository.check exited with code 2",
+                    "return_code": 2,
+                    "stderr_tail": (
+                        "Repository ssh://user:s3cret@host/repo does not exist."
+                    ),
+                    "failure_kind": "other",
+                },
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        test_db.refresh(job)
+        test_db.refresh(operation)
+        assert "s3cret" not in job.result["stderr_tail"]
+        assert "s3cret" not in operation.error_message
+        # redacted before the bound: a location cut in the middle would
+        # otherwise keep its credential
+        from app.services.repository_executor import (
+            FAILURE_TAIL_MAX_CHARS,
+            agent_failure_result,
+        )
+
+        crossing = "a" * (FAILURE_TAIL_MAX_CHARS - 10) + " ssh://user:s3cret@host/repo"
+        assert (
+            "s3cret" not in agent_failure_result(2, stderr_tail=crossing)["stderr_tail"]
+        )
+        assert (
+            "s3cret"
+            not in (notifier.send_check_completion.await_args.kwargs["error_message"])
+        )
+        assert "ssh://user:***@host/repo" in operation.error_message
+
+    def test_an_unknown_failure_kind_and_a_long_tail_are_normalized(
+        self, test_client, test_db, admin_headers
+    ):
+        from app.services.repository_executor import FAILURE_TAIL_MAX_CHARS
+
+        job, operation, headers = self._flagged_check_job(
+            test_client, test_db, admin_headers
+        )
+
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/fail",
+            json={
+                "error_message": "repository.check exited with code 2",
+                "return_code": 2,
+                "stderr_tail": "x" * (FAILURE_TAIL_MAX_CHARS + 10) + "end",
+                "failure_kind": "something_newer",
+            },
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        test_db.refresh(job)
+        assert job.result["failure_kind"] == "other"
+        assert len(job.result["stderr_tail"]) == FAILURE_TAIL_MAX_CHARS
+        assert job.result["stderr_tail"].endswith("end")
+
+    @pytest.mark.asyncio
+    async def test_the_session_transport_carries_the_report(
+        self, test_client, test_db, admin_headers
+    ):
+        job, operation, headers = self._flagged_check_job(
+            test_client, test_db, admin_headers
+        )
+        with patch(NOTIFIER_PATCH_TARGET, new_callable=AsyncMock) as notifier:
+            await _handle_agent_session_message(
+                test_db,
+                job.agent_machine_id,
+                {
+                    "type": "command_error",
+                    "job_id": job.id,
+                    "error": {
+                        "message": "repository.check exited with code 73",
+                        "return_code": 73,
+                        "stderr_tail": "Failed to create/acquire the lock /r (timeout).",
+                        "failure_kind": "lock_contention",
+                    },
+                },
+            )
+
+        test_db.refresh(job)
+        test_db.refresh(operation)
+        assert job.status == "failed"
+        assert job.result["failure_kind"] == "lock_contention"
+        assert job.result["stderr_tail"] == (
+            "Failed to create/acquire the lock /r (timeout)."
+        )
+        assert operation.status == "running"
+        notifier.send_check_completion.assert_not_awaited()

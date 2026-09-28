@@ -17,13 +17,79 @@ from urllib.parse import urlparse
 import structlog
 from sqlalchemy.orm import Session
 
-from app.database.models import BackupJob, Repository, SSHConnection, SSHKey
+from app.database.models import Repository, SSHConnection, SSHKey
+from app.utils.borg_env import effective_repository_remote_path
 from app.database.database import SessionLocal
 from app.config import settings
+from app.core.borg_errors import is_borg_warning_exit_code
+from app.services.log_policy import get_log_save_policy, job_has_logs_by_policy
+from app.services.operations.backup_facade import resolve_backup_job
 from app.services.notification_service import notification_service
-from app.utils.ssh_utils import ssh_key_auth_args, write_ssh_key_to_tempfile
+from app.utils.ssh_host_keys import host_key_ssh_opts
+from app.utils.ssh_utils import (
+    resolve_repository_ssh_connection,
+    ssh_key_auth_args,
+    write_ssh_key_to_tempfile,
+)
 
 logger = structlog.get_logger()
+
+# BORG_PASSPHRASE=<value> as _build_remote_command emits it: shlex.quote yields
+# either a bare word or a single-quoted string with '"'"' for embedded quotes.
+# The unquoted branch refuses our own mask, which makes redaction IDEMPOTENT:
+# output is redacted at capture and again at transcript assembly, and without
+# the lookahead the second pass would re-match `***` and eat what follows it
+# (e.g. the colon in "BORG_PASSPHRASE=***: command not found"). A real value
+# can never look like the mask here - shlex.quote single-quotes anything
+# containing `*`, so it lands in the quoted branch.
+_PASSPHRASE_ASSIGNMENT = re.compile(
+    r"""BORG_PASSPHRASE=(?:'(?:[^']|'"'"')*'|(?!\*\*\*)[^\s']+)"""
+)
+
+
+def _redact_command(text: str) -> str:
+    """Mask passphrase assignments wherever they appear in text bound for logs.
+
+    Applied to the built command, and defensively to borg's output and the
+    error message too - a shell that chokes on the command line echoes it.
+    Idempotent, so capture-time and assembly-time redaction can overlap.
+    """
+    return _PASSPHRASE_ASSIGNMENT.sub("BORG_PASSPHRASE=***", text)
+
+
+def _collapse_carriage_returns(line: str) -> str:
+    """Keep what a terminal would show of a \\r-overwritten line.
+
+    borg's --progress writes its updates to stderr terminated by \\r, so a
+    single readline() yields the whole progress history up to the next real
+    line. Only the final state is worth keeping.
+    """
+    segments = [segment for segment in line.split("\r") if segment.strip()]
+    return segments[-1].strip() if segments else ""
+
+
+def _parse_created_archive_name(stdout) -> str | None:
+    """Extract the resolved archive name from ``borg create --json`` stdout.
+
+    borg expands placeholders such as ``{hostname}-{now}`` when it creates the
+    archive and reports the resolved name as ``archive.name`` in the JSON
+    result document. Returns None when the output is absent or unparseable so
+    the caller can fall back to the requested (template) name.
+    """
+    if not stdout or not stdout.strip():
+        return None
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    archive = data.get("archive")
+    if isinstance(archive, dict):
+        name = archive.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
 
 
 class RemoteBackupService:
@@ -58,7 +124,7 @@ class RemoteBackupService:
         db = SessionLocal()
         try:
             # Update job status
-            job = db.query(BackupJob).filter(BackupJob.id == job_id).first()
+            job = resolve_backup_job(db, job_id)
             if not job:
                 raise Exception(f"Backup job {job_id} not found")
 
@@ -82,11 +148,6 @@ class RemoteBackupService:
             if not ssh_connection:
                 raise Exception(f"SSH connection {source_ssh_connection_id} not found")
 
-            if not ssh_connection.is_backup_source:
-                raise Exception(
-                    f"SSH connection {source_ssh_connection_id} is not enabled as backup source"
-                )
-
             # Load repository
             repository = (
                 db.query(Repository).filter(Repository.id == repository_id).first()
@@ -94,11 +155,16 @@ class RemoteBackupService:
             if not repository:
                 raise Exception(f"Repository {repository_id} not found")
 
-            # Verify repository is SSH type (Phase 1 limitation)
-            if not repository.connection_id:
+            repository_connection = resolve_repository_ssh_connection(repository, db)
+            if not repository_connection:
                 raise Exception(
                     "Remote backups currently only support SSH repositories. "
                     "Local repositories will be supported in a future update."
+                )
+            if repository_connection.id != ssh_connection.id:
+                raise Exception(
+                    "Remote direct backups require the source and repository "
+                    "to use the same SSH connection"
                 )
 
             # Store remote hostname for reference
@@ -116,14 +182,14 @@ class RemoteBackupService:
                 compression=compression,
                 custom_flags=custom_flags,
                 upload_ratelimit_kib=upload_ratelimit_kib,
-                borg_binary_path=ssh_connection.borg_binary_path,
+                borg_binary_path=ssh_connection.borg_binary_path or "borg",
                 use_sudo=ssh_connection.use_sudo,
             )
 
             logger.info(
                 "Built borg command for remote execution",
                 job_id=job_id,
-                command_preview=borg_command[:200],
+                command=_redact_command(borg_command),
             )
 
             # Execute command on remote host
@@ -134,21 +200,57 @@ class RemoteBackupService:
                 db=db,
             )
 
+            # borg expanded the {hostname}-{now} placeholders on the remote
+            # host and reports the resolved name in its --json result document.
+            resolved_name = _parse_created_archive_name(result.get("stdout"))
+
+            # A warning exit code only counts as a warning when borg proves it
+            # wrote an archive (the result document above). An exit in the
+            # warning range without it is the remote shell speaking - 127 for
+            # a missing borg binary, 126 for a non-executable one - and means
+            # the backup never ran.
+            warning = (
+                is_borg_warning_exit_code(result.get("returncode"))
+                and resolved_name is not None
+            )
+            if warning:
+                result = {**result, "success": True, "warning": True, "error": None}
+
             # Update final job status
-            job = db.query(BackupJob).filter(BackupJob.id == job_id).first()
+            job = resolve_backup_job(db, job_id)
             if result["success"]:
-                job.status = "completed"
+                if resolved_name:
+                    archive_name = resolved_name
+                job.archive_name = archive_name
                 job.progress = 100
                 job.progress_percent = 100.0
-                logger.info("Remote backup completed successfully", job_id=job_id)
+                if warning:
+                    job.status = "completed_with_warnings"
+                    job.error_message = json.dumps(
+                        {
+                            "key": "backend.errors.service.backupCompletedWithWarning",
+                            "params": {"exitCode": result["returncode"]},
+                        }
+                    )
+                    logger.warning(
+                        "Remote backup completed with warnings",
+                        job_id=job_id,
+                        exit_code=result["returncode"],
+                    )
+                else:
+                    job.status = "completed"
+                    logger.info("Remote backup completed successfully", job_id=job_id)
             else:
                 job.status = "failed"
-                job.error_message = result.get("error", "Remote backup failed")
+                job.error_message = _redact_command(
+                    result.get("error") or "Remote backup failed"
+                )
                 logger.error(
-                    "Remote backup failed", job_id=job_id, error=result.get("error")
+                    "Remote backup failed", job_id=job_id, error=job.error_message
                 )
 
             job.completed_at = datetime.utcnow()
+            self._store_job_logs(db, job, borg_command, result)
             db.commit()
 
             await self._send_completion_notification(
@@ -169,7 +271,7 @@ class RemoteBackupService:
             )
 
             # Update job status
-            job = db.query(BackupJob).filter(BackupJob.id == job_id).first()
+            job = resolve_backup_job(db, job_id)
             if job:
                 job.status = "failed"
                 job.error_message = str(e)
@@ -180,24 +282,77 @@ class RemoteBackupService:
         finally:
             db.close()
 
+    def _store_job_logs(self, db: Session, job, command: str, result: dict) -> None:
+        """Keep the remote borg output the way the local path keeps its own.
+
+        The transcript is the redacted command, borg's stderr and its --json
+        result. Per the log save policy it goes to a per-job file (so the
+        Activity view can stream it) or, when the policy says not to keep a
+        file, into the job row like local backups do.
+        """
+        parts = [f"$ {command}"]
+        for stream in ("stderr", "stdout"):
+            text = (result.get(stream) or "").strip()
+            if text:
+                parts.append(text)
+        transcript = _redact_command("\n".join(parts))
+
+        try:
+            should_save = job_has_logs_by_policy(
+                job,
+                get_log_save_policy(db),
+                output_text=transcript,
+                status=job.status,
+                exit_code=result.get("returncode"),
+            )
+            if should_save:
+                log_file = (
+                    self.log_dir
+                    / f"backup_job_{job.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+                )
+                log_file.write_text(transcript + "\n")
+                job.log_file_path = str(log_file)
+                job.logs = f"Logs saved to: {log_file.name}"
+            else:
+                job.logs = transcript
+        except Exception as e:
+            job.logs = transcript
+            logger.warning(
+                "Failed to save remote backup log file, kept transcript in DB",
+                job_id=job.id,
+                error=str(e),
+            )
+
     async def _send_completion_notification(
         self,
         db: Session,
-        job: BackupJob,
+        job,
         repository: Repository,
         archive_name: str,
     ) -> None:
         try:
+            stats = {
+                "original_size": job.original_size,
+                "compressed_size": job.compressed_size,
+                "deduplicated_size": job.deduplicated_size,
+            }
             if job.status == "completed":
                 await notification_service.send_backup_success(
                     db,
                     repository.name,
                     archive_name,
-                    stats={
-                        "original_size": job.original_size,
-                        "compressed_size": job.compressed_size,
-                        "deduplicated_size": job.deduplicated_size,
-                    },
+                    stats=stats,
+                    completion_time=job.completed_at,
+                    started_at=job.started_at,
+                    nfiles=job.nfiles,
+                )
+            elif job.status == "completed_with_warnings":
+                await notification_service.send_backup_warning(
+                    db,
+                    repository.name,
+                    archive_name,
+                    job.error_message,
+                    stats=stats,
                     completion_time=job.completed_at,
                     started_at=job.started_at,
                     nfiles=job.nfiles,
@@ -240,6 +395,10 @@ class RemoteBackupService:
           --compression lz4 \
           ssh://user@repo-host:/path::{hostname}-{now} \
           /data /etc
+
+        With use_sudo, the sudoers ``env_keep`` allowlist preserves the Borg
+        variables required by the command without granting arbitrary environment
+        control through ``SETENV``.
         """
         # Get DB session for connection lookup
         db = SessionLocal()
@@ -247,11 +406,20 @@ class RemoteBackupService:
             repo_url = self._get_repository_url(
                 repository, db, source_ssh_connection=source_ssh_connection
             )
+            remote_path = effective_repository_remote_path(repository, db)
         finally:
             db.close()
 
-        # Build borg command parts
-        cmd_parts = [
+        # Environment for borg, as shell assignments in front of the command.
+        # No BORG_EXIT_CODES here, unlike every environment we build for a borg
+        # we run ourselves: with use_sudo these pass through the sudoers
+        # env_keep allowlist, which the operator maintains on the remote host
+        # and which docs/ssh-keys.md documents as exactly four variables. A
+        # fifth would be dropped by sudo until every remote host is edited, so
+        # a sudo backup would keep the legacy codes while a non-sudo one moved
+        # to the modern set. Remote-direct stays on legacy until that
+        # allowlist can change with it.
+        env_assignments = [
             "BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes",
             "BORG_RELOCATED_REPO_ACCESS_IS_OK=yes",
         ]
@@ -264,16 +432,37 @@ class RemoteBackupService:
         ):
             # Use shlex.quote to safely escape the passphrase
             escaped_passphrase = shlex.quote(repository.passphrase)
-            cmd_parts.append(f"BORG_PASSPHRASE={escaped_passphrase}")
+            env_assignments.append(f"BORG_PASSPHRASE={escaped_passphrase}")
 
-        # Add remote path if configured
-        if repository.remote_path:
-            cmd_parts.append(f"BORG_REMOTE_PATH={shlex.quote(repository.remote_path)}")
+        # The effective path applies the repository connection's sudo policy.
+        # For remote-direct backups this makes Borg use the same privileged
+        # identity when it contacts the repository as other repository actions.
+        if remote_path:
+            env_assignments.append(f"BORG_REMOTE_PATH={shlex.quote(remote_path)}")
+
+        cmd_parts = list(env_assignments)
 
         # Borg binary path (optionally prefixed with sudo)
+        borg_command = shlex.quote(borg_binary_path)
         if use_sudo:
-            cmd_parts.append("sudo")
-        cmd_parts.append(shlex.quote(borg_binary_path))
+            # sudoers preserves only the documented Borg variables through its
+            # env_keep allowlist. -n fails fast instead of waiting for a password
+            # and -H keeps Borg's root cache out of the SSH user's home.
+            if borg_binary_path == "borg":
+                # Resolve Borg with the SSH user's PATH before sudo applies its
+                # secure_path. The documented sudoers env_keep allowlist keeps
+                # the required Borg variables while NOSETENV prevents arbitrary
+                # environment changes.
+                cmd_parts = [
+                    "export",
+                    *env_assignments,
+                    "&&",
+                    "borg_path=$(command -v borg)",
+                    "&&",
+                ]
+                borg_command = '"$borg_path"'
+            cmd_parts.extend(["sudo", "-n", "-H"])
+        cmd_parts.append(borg_command)
 
         # Create command
         cmd_parts.append("create")
@@ -329,10 +518,11 @@ class RemoteBackupService:
         Examples:
         - SSH repo: ssh://backup@repo-host:22/path
         """
-        if repository.connection_id:
+        connection = resolve_repository_ssh_connection(repository, db)
+        if connection:
             if (
                 source_ssh_connection is not None
-                and repository.connection_id == source_ssh_connection.id
+                and connection.id == source_ssh_connection.id
             ):
                 return self._extract_remote_repository_path(repository.path)
 
@@ -342,13 +532,6 @@ class RemoteBackupService:
                 return repository.path
 
             # Get SSH connection details
-            connection = (
-                db.query(SSHConnection)
-                .filter(SSHConnection.id == repository.connection_id)
-                .first()
-            )
-            if not connection:
-                raise ValueError(f"SSH connection {repository.connection_id} not found")
             return f"ssh://{connection.username}@{connection.host}:{connection.port}{repository.path}"
         else:
             raise NotImplementedError(
@@ -379,10 +562,7 @@ class RemoteBackupService:
                 ssh_cmd = [
                     "ssh",
                     *ssh_key_auth_args(key_file_path),
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "UserKnownHostsFile=/dev/null",
+                    *host_key_ssh_opts(ssh_connection, db),
                     "-o",
                     "ServerAliveInterval=60",
                     "-o",
@@ -394,10 +574,7 @@ class RemoteBackupService:
                 ]
 
                 logger.info(
-                    "Executing SSH command",
-                    job_id=job_id,
-                    host=ssh_connection.host,
-                    command_preview=command[:200],
+                    "Executing SSH command", job_id=job_id, host=ssh_connection.host
                 )
 
                 # Execute command
@@ -410,7 +587,7 @@ class RemoteBackupService:
                 self.running_processes[job_id] = process
 
                 # Track PID on remote host (if possible to extract from output)
-                job = db.query(BackupJob).filter(BackupJob.id == job_id).first()
+                job = resolve_backup_job(db, job_id)
                 if job and process.pid:
                     job.remote_process_pid = process.pid
                     db.commit()
@@ -424,7 +601,15 @@ class RemoteBackupService:
                         line = await process.stdout.readline()
                         if not line:
                             break
-                        line_str = line.decode("utf-8", errors="replace").strip()
+                        # Redact at capture, like stderr below: a remote shell
+                        # error can echo the whole command line — with its
+                        # BORG_PASSPHRASE assignment — on either stream, and
+                        # stdout_lines is returned and stored. Redaction never
+                        # alters borg's own JSON, so progress parsing still
+                        # sees the line unchanged.
+                        line_str = _redact_command(
+                            line.decode("utf-8", errors="replace").strip()
+                        )
                         stdout_lines.append(line_str)
 
                         # Try to parse Borg JSON progress
@@ -442,7 +627,17 @@ class RemoteBackupService:
                         line = await process.stderr.readline()
                         if not line:
                             break
-                        line_str = line.decode("utf-8", errors="replace").strip()
+                        # Redact at capture: a remote shell can echo the
+                        # BORG_PASSPHRASE assignment back on stderr, and every
+                        # downstream path (debug log, transcript, result) reads
+                        # from stderr_lines.
+                        line_str = _redact_command(
+                            _collapse_carriage_returns(
+                                line.decode("utf-8", errors="replace")
+                            )
+                        )
+                        if not line_str:
+                            continue
                         stderr_lines.append(line_str)
                         logger.debug(
                             "Remote backup stderr", job_id=job_id, line=line_str
@@ -457,16 +652,27 @@ class RemoteBackupService:
                 # Clean up
                 del self.running_processes[job_id]
 
-                # Return result
+                # Return transport facts only; whether a non-zero exit is a
+                # borg warning or a failure is decided by the caller, which
+                # knows what command ran and what output to expect. On failure,
+                # borg's last line on stderr names the cause; surface it next
+                # to the exit code. stderr_lines is already redacted at
+                # capture, and redaction must precede this truncation (a
+                # cut-off quoted assignment would no longer match the
+                # redaction pattern).
                 success = returncode == 0
+                error = None
+                if not success:
+                    error = f"Remote backup failed with exit code {returncode}"
+                    if stderr_lines:
+                        cause = stderr_lines[-1][:300]
+                        error = f"{error}: {cause}"
                 return {
                     "success": success,
                     "returncode": returncode,
                     "stdout": "\n".join(stdout_lines),
                     "stderr": "\n".join(stderr_lines),
-                    "error": None
-                    if success
-                    else f"Remote backup failed with exit code {returncode}",
+                    "error": error,
                 }
 
             finally:
@@ -498,7 +704,7 @@ class RemoteBackupService:
     async def _update_progress_from_json(self, job_id: int, data: dict, db: Session):
         """Update job progress from Borg JSON output"""
         try:
-            job = db.query(BackupJob).filter(BackupJob.id == job_id).first()
+            job = resolve_backup_job(db, job_id)
             if not job:
                 return
 
@@ -554,20 +760,27 @@ class RemoteBackupService:
 
             try:
                 # Try to find borg binary
-                borg_path = ssh_connection.borg_binary_path or "/usr/bin/borg"
+                borg_path = ssh_connection.borg_binary_path or "borg"
+
+                if ssh_connection.use_sudo and borg_path == "borg":
+                    remote_command = (
+                        "borg_path=$(command -v borg) && "
+                        'exec sudo -n -H "$borg_path" --version'
+                    )
+                elif ssh_connection.use_sudo:
+                    remote_command = f"sudo -n -H {shlex.quote(borg_path)} --version"
+                else:
+                    remote_command = f"{shlex.quote(borg_path)} --version"
 
                 # Build SSH command to check borg
                 ssh_cmd = [
                     "ssh",
                     *ssh_key_auth_args(key_file_path),
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "UserKnownHostsFile=/dev/null",
+                    *host_key_ssh_opts(ssh_connection, db),
                     "-p",
                     str(ssh_connection.port),
                     f"{ssh_connection.username}@{ssh_connection.host}",
-                    f"{borg_path} --version",
+                    remote_command,
                 ]
 
                 logger.info(
@@ -602,16 +815,22 @@ class RemoteBackupService:
 
                     return {"installed": True, "version": version, "path": borg_path}
                 else:
+                    # No passphrase is involved in a --version probe, but the
+                    # stream is redacted anyway: every stderr that leaves this
+                    # service is, so no future caller has to re-check.
+                    stderr_text = _redact_command(
+                        stderr.decode("utf-8", errors="replace")
+                    )
                     logger.warning(
                         "Borg not found on remote host",
                         connection_id=ssh_connection_id,
-                        stderr=stderr.decode("utf-8", errors="replace"),
+                        stderr=stderr_text,
                     )
                     return {
                         "installed": False,
                         "version": None,
                         "path": None,
-                        "error": stderr.decode("utf-8", errors="replace"),
+                        "error": stderr_text,
                     }
 
             finally:
@@ -658,7 +877,7 @@ class RemoteBackupService:
                 # Update job status
                 db = SessionLocal()
                 try:
-                    job = db.query(BackupJob).filter(BackupJob.id == job_id).first()
+                    job = resolve_backup_job(db, job_id)
                     if job:
                         job.status = "failed"
                         job.error_message = "Backup cancelled by user"

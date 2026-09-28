@@ -516,10 +516,21 @@ const Schedule: React.FC = () => {
         }}
       >
         <Box>
-          <Typography variant="h4" fontWeight={600} gutterBottom>
+          <Typography
+            variant="h4"
+            gutterBottom
+            sx={{
+              fontWeight: 600,
+            }}
+          >
             {t('schedule.title')}
           </Typography>
-          <Typography variant="body2" color="text.secondary">
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+            }}
+          >
             {t('schedule.subtitle')}
           </Typography>
         </Box>
@@ -540,7 +551,7 @@ const Schedule: React.FC = () => {
               sx={{ width: { xs: '100%', sm: 'auto' } }}
             >
               {t('schedule.createLegacySchedule', {
-                defaultValue: 'Create legacy schedule',
+                defaultValue: 'Create backup automation',
               })}
             </Button>
             <Button

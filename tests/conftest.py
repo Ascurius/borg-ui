@@ -55,6 +55,10 @@ os.environ["BORG_KEYS_DIR"] = _borg_keys_dir
 # Add parent directory to path so we can import from app/
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# tests/manual holds live-server scripts driven by the smoke runners and by
+# hand; a bare `pytest` must not collect them. An explicit path still runs.
+collect_ignore = ["manual"]
+
 # Import fixtures from fixtures directory
 pytest_plugins = [
     "tests.fixtures.database",
@@ -116,6 +120,28 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "requires_ui: Tests that require Borg UI to be running"
     )
+
+    _create_process_wide_schema()
+
+
+def _create_process_wide_schema():
+    """Give the process-wide engine its tables.
+
+    Most tests get a per-test database through the ``test_db`` fixture, but
+    application code that opens its own session (anything calling
+    ``SessionLocal`` directly, because it is handed a path or an id rather than
+    a session) goes to the engine built from DATABASE_URL at import time. That
+    database had no tables at all, so those lookups raised OperationalError,
+    and code under test saw a database failure that cannot happen in
+    production, where the schema is always present.
+
+    The tables are left empty: a lookup finds nothing, which is a real answer,
+    rather than blowing up.
+    """
+    from app.database.database import Base, engine
+    import app.database.models  # noqa: F401 - registers the tables on Base
+
+    Base.metadata.create_all(bind=engine)
 
 
 @pytest.fixture(scope="session")

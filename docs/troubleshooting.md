@@ -19,6 +19,12 @@ the SSH repository connection are the same. Different SSH source/repository
 pairs still run on the Borg UI server and may see warnings when active files
 change during backup.
 
+Pull mode mounts the remote filesystem inside the container and therefore
+needs FUSE access (`/dev/fuse`, `SYS_ADMIN`, AppArmor exception). A job that
+fails at once with `failedPrepareSourcePaths` and `fuse: device not found` is
+missing that - see
+[Remote Machines](ssh-keys#sshfs-mount-fails-with-fuse-device-not-found).
+
 ### Slow first backup after a pull or restart
 
 `docker compose pull` and container recreates do not remove Docker volumes or
@@ -86,6 +92,37 @@ from inside the container can modify user data on the host and can fail for
 read-only mounts. Fix access with host permissions, runtime UID/GID mapping, or
 the rootless Podman `PUID=0` / `PGID=0` mode above.
 
+### Group-readable source paths in Docker
+
+`PUID` and `PGID` set the Borg UI container process's primary user and group;
+they do not grant it access to every supplementary group on the host. This can
+matter when a mounted source directory is readable by a group other than the
+configured `PGID` (for example, a directory owned by `otheruser:photos` with
+mode `2770`).
+
+Add the host group's **numeric GID** to the Borg UI service with `group_add`:
+
+```yaml
+services:
+  app:
+    environment:
+      - PUID=1008
+      - PGID=1008
+    group_add:
+      - "3001" # Host group with read access to the mounted source
+```
+
+Recreate the container after changing Compose. To confirm the running Borg UI
+process has the expected supplementary group, run:
+
+```bash
+docker exec borg-web-ui sh -c "cat /proc/1/status | grep -E 'Uid|Gid|Groups'"
+```
+
+Use the GID of the group that owns or can read the source directory, not a Borg
+UI web-login user. Prefer granting access only to the mounted data Borg UI
+needs rather than running the container as root.
+
 ### Path not found
 
 Check the Docker volume mapping and use the container path, not the host path.
@@ -103,6 +140,25 @@ Do not break locks blindly. First confirm no backup, restore, check, prune,
 compact, mount, or external Borg process is using the repository.
 
 Break the lock only when you are certain the previous Borg process is gone.
+
+### Borg 2 repository unreadable after an upgrade
+
+Borg operations on an existing Borg 2 repository fail with
+`repository version 3 is not supported by this borg version`.
+
+This exact error means a Borg 2.0.0b22 (or later) client is reading a
+repository written by an earlier Borg 2 beta: that release changed the
+repository format (packs) and cannot open the old one. With this error — and
+only with this error — the storage, the passphrase and the key are fine; the
+format alone is the problem, and there is no in-place conversion. To keep
+using the repository, go back to the image you upgraded from. To move on,
+move the repository aside and let a fresh one be created — and delete the old
+one only once the new one holds backups you have verified. Borg 1
+repositories are not affected.
+
+A repository that became inaccessible after an image pull but reports a
+different error is an ordinary access problem — check the job log for the
+actual message and start from storage, network and credentials.
 
 ### Slow archive browsing
 

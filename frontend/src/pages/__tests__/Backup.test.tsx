@@ -42,8 +42,8 @@ let backupPlansPayload: Array<Record<string, unknown>> = []
 let backupPlanRunsPayload: Array<Record<string, unknown>> = []
 let backupQueryClients: QueryClient[] = []
 
-async function openLegacyBackupTab(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(await screen.findByRole('tab', { name: /legacy backup/i }))
+async function openBackupAutomationsTab(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole('tab', { name: /backup automations/i }))
 }
 
 async function selectBackupPlan(user: ReturnType<typeof userEvent.setup>, name: RegExp | string) {
@@ -279,7 +279,7 @@ describe('Backup page', () => {
     backupPlansRetryRunMock.mockImplementation(() => Promise.resolve({ data: {} }))
   })
 
-  it('defaults to the backup plans tab and keeps legacy backup separate', async () => {
+  it('defaults to the backup plans tab and keeps backup automations separate', async () => {
     const user = userEvent.setup()
 
     renderBackup()
@@ -291,9 +291,9 @@ describe('Backup page', () => {
     expect(await screen.findByRole('button', { name: /create backup plan/i })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /choose primary repo/i })).not.toBeInTheDocument()
 
-    await openLegacyBackupTab(user)
+    await openBackupAutomationsTab(user)
 
-    expect(screen.getByRole('tab', { name: /legacy backup/i })).toHaveAttribute(
+    expect(screen.getByRole('tab', { name: /backup automations/i })).toHaveAttribute(
       'aria-selected',
       'true'
     )
@@ -307,7 +307,7 @@ describe('Backup page', () => {
 
     renderBackup()
 
-    expect(await screen.findByRole('tab', { name: /legacy backup/i })).toHaveAttribute(
+    expect(await screen.findByRole('tab', { name: /backup automations/i })).toHaveAttribute(
       'aria-selected',
       'true'
     )
@@ -358,7 +358,7 @@ describe('Backup page', () => {
     const user = userEvent.setup()
 
     renderBackup()
-    await openLegacyBackupTab(user)
+    await openBackupAutomationsTab(user)
 
     expect(await screen.findByText('choose Primary Repo')).toBeInTheDocument()
     expect(screen.queryByText('choose Observe Repo')).not.toBeInTheDocument()
@@ -617,7 +617,7 @@ describe('Backup page', () => {
       expect(getManualJobsMock).not.toHaveBeenCalled()
     })
 
-    await openLegacyBackupTab(user)
+    await openBackupAutomationsTab(user)
     await user.click(await screen.findByRole('button', { name: /choose primary repo/i }))
 
     await waitFor(() => {
@@ -645,7 +645,7 @@ describe('Backup page', () => {
 
     renderBackup()
 
-    await openLegacyBackupTab(user)
+    await openBackupAutomationsTab(user)
     await user.click(await screen.findByRole('button', { name: /choose primary repo/i }))
 
     await waitFor(() => {
@@ -678,7 +678,7 @@ describe('Backup page', () => {
     const user = userEvent.setup()
 
     renderBackup()
-    await openLegacyBackupTab(user)
+    await openBackupAutomationsTab(user)
 
     expect(await screen.findByText('Recent Manual Jobs')).toBeInTheDocument()
     expect(
@@ -690,7 +690,7 @@ describe('Backup page', () => {
     const user = userEvent.setup()
     const { unmount } = renderBackup()
 
-    await openLegacyBackupTab(user)
+    await openBackupAutomationsTab(user)
     await user.click(await screen.findByRole('button', { name: /choose primary repo/i }))
 
     expect(trackBackup).toHaveBeenCalledWith(
@@ -702,13 +702,31 @@ describe('Backup page', () => {
       })
     )
 
+    // Without backup permission no repository qualifies for a manual run, so
+    // the tab has nothing behind it and goes rather than standing there empty
+    // with a disabled button.
     canDoBackup = false
     unmount()
     renderBackup()
-    await openLegacyBackupTab(user)
 
+    expect(await screen.findByRole('tab', { name: /backup plans/i })).toBeInTheDocument()
+    await waitFor(() =>
+      expect(screen.queryByRole('tab', { name: /backup automations/i })).not.toBeInTheDocument()
+    )
     expect(screen.queryByRole('button', { name: /choose primary repo/i })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /start backup/i })).toBeDisabled()
+  })
+
+  it('drops the automations tab when no repository carries source paths', async () => {
+    repositoriesPayload = repositoriesPayload.map((repo) => ({
+      ...repo,
+      source_directories: [],
+    }))
+    renderBackup()
+
+    expect(await screen.findByRole('tab', { name: /backup plans/i })).toBeInTheDocument()
+    await waitFor(() =>
+      expect(screen.queryByRole('tab', { name: /backup automations/i })).not.toBeInTheDocument()
+    )
   })
 
   it('shows the generated borg command preview for the selected repository', async () => {
@@ -716,7 +734,7 @@ describe('Backup page', () => {
 
     renderBackup()
 
-    await openLegacyBackupTab(user)
+    await openBackupAutomationsTab(user)
     await user.click(await screen.findByRole('button', { name: /choose primary repo/i }))
 
     expect(await screen.findByText(/borg create/i)).toBeInTheDocument()

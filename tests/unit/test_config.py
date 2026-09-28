@@ -9,7 +9,9 @@ import os
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from app.config import Settings
+from sqlalchemy.engine import make_url
+
+from app.config import Settings, resolve_database_url
 
 
 @pytest.mark.unit
@@ -38,7 +40,7 @@ def test_settings_environment():
     settings = Settings()
 
     assert settings.environment is not None
-    assert settings.app_name == "Borg Web UI"
+    assert settings.app_name == "Borg UI"
 
 
 @pytest.mark.unit
@@ -76,3 +78,138 @@ def test_rclone_settings_env_roots_override_data_dir(monkeypatch):
 
     assert settings.rclone_config_root == "/custom/rclone-config"
     assert settings.rclone_cache_root == "/custom/rclone-cache"
+
+
+@pytest.mark.unit
+class TestResolveDatabaseUrl:
+    """Which database the application runs on, and how that is decided."""
+
+    def test_no_configuration_keeps_the_sqlite_file(self):
+        assert resolve_database_url({}, "/data") == "sqlite:////data/borg.db"
+
+    def test_database_url_wins_over_everything(self):
+        env = {
+            "DATABASE_URL": "postgresql+psycopg://u:p@elsewhere/db",
+            "DB_HOST": "ignored",
+            "DB_USER": "ignored",
+            "DB_PASSWORD": "ignored",
+        }
+        assert (
+            resolve_database_url(env, "/data")
+            == "postgresql+psycopg://u:p@elsewhere/db"
+        )
+
+    def test_db_host_assembles_a_postgres_url(self):
+        env = {
+            "DB_HOST": "db.example",
+            "DB_USER": "borg_writer_user",
+            "DB_PASSWORD": "secret",
+            "DB_PORT": "6432",
+            "DB_NAME": "borgdb",
+        }
+        assert resolve_database_url(env, "/data") == (
+            "postgresql+psycopg://borg_writer_user:secret@db.example:6432/borgdb"
+        )
+
+    def test_port_and_name_have_defaults(self):
+        env = {"DB_HOST": "db.example", "DB_USER": "u", "DB_PASSWORD": "p"}
+        assert resolve_database_url(env, "/data") == (
+            "postgresql+psycopg://u:p@db.example:5432/borg"
+        )
+
+    def test_a_password_with_url_characters_survives(self):
+        """Generated passwords contain these. Unquoted, "/" ends the host and
+        "@" starts a new one, and the failure looks like a wrong host."""
+        env = {
+            "DB_HOST": "db.example",
+            "DB_USER": "user@corp",
+            "DB_PASSWORD": "p@ss/w:rd%21+x",
+        }
+
+        url = resolve_database_url(env, "/data")
+
+        assert url == (
+            "postgresql+psycopg://user%40corp:p%40ss%2Fw%3Ard%2521%2Bx@db.example:5432/borg"
+        )
+        # The real check: it still parses back to the credentials we put in.
+        parsed = make_url(url)
+        assert parsed.host == "db.example"
+        assert parsed.username == "user@corp"
+        assert parsed.password == "p@ss/w:rd%21+x"
+        assert parsed.database == "borg"
+
+    @pytest.mark.parametrize(
+        "env,missing",
+        [
+            ({"DB_HOST": "db.example", "DB_PASSWORD": "p"}, "DB_USER"),
+            ({"DB_HOST": "db.example", "DB_USER": "u"}, "DB_PASSWORD"),
+            ({"DB_HOST": "db.example"}, "DB_USER and DB_PASSWORD"),
+        ],
+    )
+    def test_incomplete_credentials_fail_loudly_instead_of_using_sqlite(
+        self, env, missing
+    ):
+        """A missing secret must not silently start the app on a local file
+        while the real database sits unused."""
+        with pytest.raises(RuntimeError, match=missing):
+            resolve_database_url(env, "/data")
+
+
+@pytest.mark.unit
+def test_index_history_max_rows_default():
+    assert Settings().index_history_max_rows == 200000
+
+
+@pytest.mark.unit
+def test_resolve_ssh_home_dir_defaults_to_ssh_keys_dir():
+    """Native installs (LXC) deploy keys next to the rest of the data."""
+    from app.config import resolve_ssh_home_dir
+
+    assert (
+        resolve_ssh_home_dir({}, "/opt/borg-ui/data/ssh_keys")
+        == "/opt/borg-ui/data/ssh_keys"
+    )
+    assert (
+        resolve_ssh_home_dir({"SSH_HOME_DIR": ""}, "/data/ssh_keys") == "/data/ssh_keys"
+    )
+
+
+@pytest.mark.unit
+def test_resolve_ssh_home_dir_honours_env_override():
+    """Docker exports SSH_HOME_DIR=/home/borg/.ssh from the entrypoint."""
+    from app.config import resolve_ssh_home_dir
+
+    assert (
+        resolve_ssh_home_dir({"SSH_HOME_DIR": "/home/borg/.ssh"}, "/data/ssh_keys")
+        == "/home/borg/.ssh"
+    )
+
+
+@pytest.mark.unit
+def test_resolve_secret_key_file_lives_under_data_dir():
+    from pathlib import Path
+
+    from app.config import resolve_secret_key_file
+
+    assert resolve_secret_key_file("/data") == Path("/data/.secret_key")
+    assert resolve_secret_key_file("/opt/borg-ui/data") == Path(
+        "/opt/borg-ui/data/.secret_key"
+    )
+
+
+@pytest.mark.unit
+def test_module_settings_ssh_home_dir_derives_from_ssh_keys_dir():
+    """With no SSH_HOME_DIR in the environment the two settings are the same dir.
+
+    Exercised through derive_ssh_dirs on a fresh Settings. Reloading app.config
+    instead would rebuild the module-level `settings` object and re-run its
+    side effects underneath every module that already imported it.
+    """
+    from app.config import derive_ssh_dirs
+
+    settings = Settings()
+    settings.data_dir = "/opt/borg-ui/data"
+    derive_ssh_dirs(settings, {})
+
+    assert settings.ssh_keys_dir == "/opt/borg-ui/data/ssh_keys"
+    assert settings.ssh_home_dir == settings.ssh_keys_dir

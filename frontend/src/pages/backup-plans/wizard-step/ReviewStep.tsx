@@ -1,4 +1,4 @@
-import { Alert, Box, Stack, Typography } from '@mui/material'
+import { Alert, Box, Chip, Stack, Typography, useTheme } from '@mui/material'
 import {
   CalendarClock,
   Code,
@@ -26,10 +26,6 @@ import { buildRoutePreviews, routeExecutorLabelKey } from '../routePreview'
 import { formatSshConnectionLabel, getPathBasename } from './helpers'
 import type { BackupPlanWizardStepProps } from './types'
 
-const REVIEW_BLUE = '#3b82f6'
-const REVIEW_VIOLET = '#8b5cf6'
-const REVIEW_EMERALD = '#10b981'
-
 type ReviewStepProps = Pick<
   BackupPlanWizardStepProps,
   'wizardState' | 'repositories' | 'agentMachines' | 'selectedSourceConnection' | 'scripts' | 't'
@@ -43,6 +39,7 @@ export function ReviewStep({
   scripts,
   t,
 }: ReviewStepProps) {
+  const theme = useTheme()
   const sourceLocationLabel =
     wizardState.sourceType === 'agent'
       ? t('backupPlans.sourceChooser.managedAgent')
@@ -134,7 +131,7 @@ export function ReviewStep({
         <ReviewSectionCard
           icon={<ListChecks size={14} />}
           label={t('backupPlans.wizard.review.plan')}
-          accentColor={REVIEW_BLUE}
+          accentColor={theme.palette.primary.main}
         >
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25 }}>
             <Typography
@@ -164,13 +161,13 @@ export function ReviewStep({
           </Box>
 
           <ReviewAttrRow label={t('backupPlans.wizard.review.sourceLocation')}>
-            <Stack direction="row" spacing={0.5} alignItems="center" sx={{ minWidth: 0 }}>
+            <Stack direction="row" spacing={0.5} sx={{ minWidth: 0, alignItems: 'center' }}>
               {wizardState.sourceType === 'remote' || wizardState.sourceType === 'mixed' ? (
                 <Laptop size={12} style={{ opacity: 0.6, flexShrink: 0 }} />
               ) : (
                 <HardDrive size={12} style={{ opacity: 0.6, flexShrink: 0 }} />
               )}
-              <Typography variant="body2" fontSize="0.75rem" noWrap>
+              <Typography variant="body2" noWrap sx={{ fontSize: '0.75rem' }}>
                 {sourceLocationLabel}
               </Typography>
             </Stack>
@@ -178,7 +175,7 @@ export function ReviewStep({
 
           {wizardState.sourceType === 'remote' && (
             <ReviewAttrRow label={t('backupPlans.wizard.review.sourceConnection')}>
-              <Typography variant="body2" fontSize="0.75rem" fontWeight={500} noWrap>
+              <Typography variant="body2" noWrap sx={{ fontSize: '0.75rem', fontWeight: 500 }}>
                 {sourceConnectionLabel}
               </Typography>
             </ReviewAttrRow>
@@ -323,7 +320,7 @@ export function ReviewStep({
         <ReviewSectionCard
           icon={<Database size={14} />}
           label={t('backupPlans.wizard.review.repositories')}
-          accentColor={REVIEW_BLUE}
+          accentColor={theme.palette.primary.main}
           trailing={
             wizardState.repositoryIds.length > 1 ? (
               <ReviewCount>{wizardState.repositoryIds.length}</ReviewCount>
@@ -340,6 +337,7 @@ export function ReviewStep({
           >
             {selectedRepositories.map((repository) => {
               const routePreview = routePreviewByRepositoryId.get(repository.id)
+              const skipped = (wizardState.disabledRepositoryIds || []).includes(repository.id)
               return (
                 <Box
                   key={repository.id}
@@ -364,6 +362,22 @@ export function ReviewStep({
                     title={repository.name}
                   >
                     {repository.name}
+                    {skipped && (
+                      <Chip
+                        component="span"
+                        size="small"
+                        label={t('multiRepositorySelector.skipped')}
+                        color="warning"
+                        variant="outlined"
+                        sx={{
+                          ml: 0.75,
+                          height: 18,
+                          fontSize: '0.62rem',
+                          verticalAlign: 'middle',
+                          '& .MuiChip-label': { px: 0.6 },
+                        }}
+                      />
+                    )}
                   </Typography>
                   <Typography
                     variant="caption"
@@ -382,9 +396,42 @@ export function ReviewStep({
                   </Typography>
                   {routePreview &&
                     (routePreview.supported ? (
-                      <Typography variant="caption" color="text.secondary">
-                        {t(routeExecutorLabelKey(routePreview.executor))}
-                      </Typography>
+                      <>
+                        <Typography variant="caption" color="text.secondary">
+                          {t(routeExecutorLabelKey(routePreview.executor))}
+                        </Typography>
+                        {routePreview.strategy === 'remote_direct' && (
+                          <Box
+                            sx={{
+                              display: 'flex',
+                              gap: 0.75,
+                              alignItems: 'flex-start',
+                              mt: 0.5,
+                              p: 0.75,
+                              borderRadius: 1,
+                              bgcolor: 'action.hover',
+                            }}
+                          >
+                            <Box sx={{ color: 'info.main', display: 'flex', mt: '1px' }}>
+                              <Laptop size={14} />
+                            </Box>
+                            <Box>
+                              <Typography
+                                variant="caption"
+                                sx={{ display: 'block', fontWeight: 700 }}
+                              >
+                                {t('backupPlans.routePreview.directOnSourceTitle')}
+                              </Typography>
+                              <Typography
+                                variant="caption"
+                                sx={{ display: 'block', lineHeight: 1.4 }}
+                              >
+                                {t('backupPlans.routePreview.directOnSourceDescription')}
+                              </Typography>
+                            </Box>
+                          </Box>
+                        )}
+                      </>
                     ) : (
                       <Alert severity="warning" sx={{ py: 0, px: 1 }}>
                         {t(routePreview.messageKey || '', routePreview.messageParams)}
@@ -399,7 +446,7 @@ export function ReviewStep({
         <ReviewSectionCard
           icon={<Settings size={14} />}
           label={t('backupPlans.wizard.steps.settings')}
-          accentColor={REVIEW_VIOLET}
+          accentColor={theme.palette.secondary.main}
         >
           <ReviewAttrRow label={t('backupPlans.wizard.fields.archiveNameTemplate')}>
             <ReviewCodePill maxChars={28}>{wizardState.archiveNameTemplate}</ReviewCodePill>
@@ -485,14 +532,13 @@ export function ReviewStep({
         <ReviewSectionCard
           icon={<Code size={14} />}
           label={t('backupPlans.wizard.steps.scripts')}
-          accentColor={REVIEW_VIOLET}
+          accentColor={theme.palette.secondary.main}
         >
           <ReviewAttrRow label={t('backupPlans.wizard.review.planPreScript')}>
             <Typography
               variant="body2"
-              fontSize="0.75rem"
-              fontWeight={prePlanScripts.length > 0 ? 600 : 400}
               color={prePlanScripts.length > 0 ? 'text.primary' : 'text.disabled'}
+              sx={{ fontSize: '0.75rem', fontWeight: prePlanScripts.length > 0 ? 600 : 400 }}
             >
               {prePlanScripts.length > 0
                 ? prePlanScripts.map((hook) => hookLabel(hook)).join(', ')
@@ -502,9 +548,8 @@ export function ReviewStep({
           <ReviewAttrRow label={t('backupPlans.wizard.review.planPostScript')}>
             <Typography
               variant="body2"
-              fontSize="0.75rem"
-              fontWeight={postPlanScripts.length > 0 ? 600 : 400}
               color={postPlanScripts.length > 0 ? 'text.primary' : 'text.disabled'}
+              sx={{ fontSize: '0.75rem', fontWeight: postPlanScripts.length > 0 ? 600 : 400 }}
             >
               {postPlanScripts.length > 0
                 ? postPlanScripts.map((hook) => hookLabel(hook)).join(', ')
@@ -522,7 +567,7 @@ export function ReviewStep({
         <ReviewSectionCard
           icon={<CalendarClock size={14} />}
           label={t('backupPlans.wizard.steps.schedule')}
-          accentColor={REVIEW_EMERALD}
+          accentColor={theme.palette.success.main}
           trailing={
             <ReviewStatus
               enabled={wizardState.scheduleEnabled}
@@ -535,14 +580,42 @@ export function ReviewStep({
           }
         >
           {wizardState.scheduleEnabled ? (
-            <>
-              <ReviewAttrRow label={t('backupPlans.wizard.fields.cronExpression')}>
-                <ReviewCodePill>{wizardState.cronExpression}</ReviewCodePill>
-              </ReviewAttrRow>
-              <ReviewAttrRow label={t('backupPlans.wizard.fields.timezone')}>
-                <ReviewCodePill maxChars={20}>{wizardState.timezone}</ReviewCodePill>
-              </ReviewAttrRow>
-            </>
+            wizardState.scheduleMode === 'availability' ? (
+              <>
+                <ReviewAttrRow label={t('schedule.trigger.label', { defaultValue: 'Run trigger' })}>
+                  <Typography variant="body2" sx={{ fontSize: '0.75rem', fontWeight: 600 }}>
+                    {t('schedule.trigger.whenAvailable', {
+                      defaultValue: 'When source is available',
+                    })}
+                  </Typography>
+                </ReviewAttrRow>
+                <ReviewAttrRow
+                  label={t('schedule.trigger.checkInterval', {
+                    defaultValue: 'Check every (minutes)',
+                  })}
+                >
+                  <ReviewCodePill>
+                    {wizardState.availabilityCheckIntervalMinutes} min
+                  </ReviewCodePill>
+                </ReviewAttrRow>
+                <ReviewAttrRow
+                  label={t('schedule.trigger.minimumInterval', {
+                    defaultValue: 'Minimum interval after a successful run (hours)',
+                  })}
+                >
+                  <ReviewCodePill>{wizardState.minimumSuccessIntervalHours} h</ReviewCodePill>
+                </ReviewAttrRow>
+              </>
+            ) : (
+              <>
+                <ReviewAttrRow label={t('backupPlans.wizard.fields.cronExpression')}>
+                  <ReviewCodePill>{wizardState.cronExpression}</ReviewCodePill>
+                </ReviewAttrRow>
+                <ReviewAttrRow label={t('backupPlans.wizard.fields.timezone')}>
+                  <ReviewCodePill maxChars={20}>{wizardState.timezone}</ReviewCodePill>
+                </ReviewAttrRow>
+              </>
+            )
           ) : (
             <Typography
               variant="caption"
@@ -562,7 +635,7 @@ export function ReviewStep({
         <ReviewSectionCard
           icon={<Wrench size={14} />}
           label={t('backupPlans.wizard.maintenance.title')}
-          accentColor={REVIEW_EMERALD}
+          accentColor={theme.palette.success.main}
         >
           <ReviewAttrRow label={t('backupPlans.wizard.review.prune')}>
             <ReviewStatus
@@ -683,7 +756,7 @@ function ContainerSourceReviewItem({
         py: 0.85,
       }}
     >
-      <Stack direction="row" spacing={0.75} alignItems="center" sx={{ minWidth: 0 }}>
+      <Stack direction="row" spacing={0.75} sx={{ minWidth: 0, alignItems: 'center' }}>
         <ContainerIcon size={12} style={{ opacity: 0.7, flexShrink: 0 }} />
         <Typography
           variant="caption"

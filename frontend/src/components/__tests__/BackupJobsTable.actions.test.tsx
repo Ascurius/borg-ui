@@ -142,15 +142,20 @@ vi.mock('../DeleteJobDialog', () => ({
 vi.mock('../ArchiveContentsDialog', () => ({
   default: ({
     open,
+    archive,
     onDownloadFile,
   }: {
     open: boolean
+    archive: { id: string; name: string } | null
     onDownloadFile?: (archiveName: string, filePath: string) => void
   }) =>
     open ? (
-      <button onClick={() => onDownloadFile?.('archive-77', '/srv/notes.txt')}>
-        Download File
-      </button>
+      <div>
+        <span data-testid="archive-id">{archive?.id}</span>
+        <button onClick={() => onDownloadFile?.('archive-77', '/srv/notes.txt')}>
+          Download File
+        </button>
+      </div>
     ) : null,
 }))
 
@@ -185,6 +190,12 @@ describe('BackupJobsTable action internals', () => {
             name: 'Repo 77',
             path: '/backup/repo77',
             borg_version: 2,
+          },
+          {
+            id: 78,
+            name: 'Repo 78',
+            path: '/backup/repo78',
+            borg_version: 1,
           },
         ],
       },
@@ -253,6 +264,7 @@ describe('BackupJobsTable action internals', () => {
             status: 'completed',
             started_at: '2026-04-01T10:00:00Z',
             archive_name: 'archive-77',
+            archive_borg_id: 'aaaa7777aaaa7777',
           },
         ]}
         actions={{ viewArchive: true }}
@@ -264,8 +276,112 @@ describe('BackupJobsTable action internals', () => {
 
     await waitFor(() => expect(downloadArchiveFileMock).toHaveBeenCalled())
     const downloadCall = downloadArchiveFileMock.mock.calls[0]
-    expect(downloadCall[1]).toBe('archive-77')
+    expect(downloadCall[1]).toBe('aaaa7777aaaa7777')
     expect(downloadCall[2]).toBe('/srv/notes.txt')
+  })
+
+  it('opens the archive by its borg id, not its name', async () => {
+    // A Borg 2 series repeats names, so the client addresses the archive by
+    // id (aid:<id>); the name is never a valid id.
+    const user = userEvent.setup()
+
+    renderWithProviders(
+      <BackupJobsTable
+        jobs={[
+          {
+            id: 13,
+            repository: '/backup/repo77',
+            repository_path: '/backup/repo77',
+            type: 'backup',
+            status: 'completed',
+            started_at: '2026-04-01T10:00:00Z',
+            archive_name: 'daily',
+            archive_borg_id: 'bbbb2222bbbb2222',
+          },
+        ]}
+        actions={{ viewArchive: true }}
+      />
+    )
+
+    await user.click(await screen.findByRole('button', { name: /view archive/i }))
+    expect(await screen.findByTestId('archive-id')).toHaveTextContent('bbbb2222bbbb2222')
+  })
+
+  it('downloads from a Borg 2 archive by its borg id', async () => {
+    const user = userEvent.setup()
+
+    renderWithProviders(
+      <BackupJobsTable
+        jobs={[
+          {
+            id: 15,
+            repository: '/backup/repo77',
+            repository_path: '/backup/repo77',
+            type: 'backup',
+            status: 'completed',
+            started_at: '2026-04-01T10:00:00Z',
+            archive_name: 'daily',
+            archive_borg_id: 'bbbb2222bbbb2222',
+          },
+        ]}
+        actions={{ viewArchive: true }}
+      />
+    )
+
+    await user.click(await screen.findByRole('button', { name: /view archive/i }))
+    await user.click(await screen.findByRole('button', { name: /download file/i }))
+
+    await waitFor(() => expect(downloadArchiveFileMock).toHaveBeenCalled())
+    expect(downloadArchiveFileMock.mock.calls[0][1]).toBe('bbbb2222bbbb2222')
+  })
+
+  it('disables the shortcut for a Borg 2 backup whose archive is not indexed yet', async () => {
+    renderWithProviders(
+      <BackupJobsTable
+        jobs={[
+          {
+            id: 14,
+            repository: '/backup/repo77',
+            repository_path: '/backup/repo77',
+            type: 'backup',
+            status: 'completed',
+            started_at: '2026-04-01T10:00:00Z',
+            archive_name: 'daily',
+          },
+        ]}
+        actions={{ viewArchive: true }}
+      />
+    )
+
+    const button = await screen.findByRole('button', { name: /view archive/i })
+    await waitFor(() => expect(button).toBeDisabled())
+    expect(button).toHaveAttribute('title', expect.stringMatching(/not indexed yet/i))
+    expect(button).toBeDisabled()
+    expect(screen.queryByTestId('archive-id')).not.toBeInTheDocument()
+  })
+
+  it('opens a Borg 1 archive by name when there is no stored row', async () => {
+    const user = userEvent.setup()
+
+    renderWithProviders(
+      <BackupJobsTable
+        jobs={[
+          {
+            id: 16,
+            repository: '/backup/repo78',
+            repository_path: '/backup/repo78',
+            type: 'backup',
+            status: 'completed',
+            started_at: '2026-04-01T10:00:00Z',
+            archive_name: 'nightly',
+          },
+        ]}
+        actions={{ viewArchive: true }}
+      />
+    )
+
+    await user.click(await screen.findByRole('button', { name: /view archive/i }))
+    expect(await screen.findByTestId('archive-id')).toHaveTextContent('')
   })
 
   it('confirms and calls retry for failed manual backup jobs', async () => {
@@ -511,6 +627,98 @@ describe('BackupJobsTable action internals', () => {
     })
     expect(queryClient.getQueryData(['backup-status-manual'])).toEqual(initialManualJobs)
     expect(queryClient.getQueryData(['activity'])).toEqual(initialActivityData)
+  })
+
+  it('keeps a row from being deleted twice while its delete is out', async () => {
+    const user = userEvent.setup()
+    let failDelete: (error: Error) => void = () => {}
+    deleteJobMock.mockReturnValueOnce(
+      new Promise((_, reject) => {
+        failDelete = reject
+      })
+    )
+    const jobs = [
+      {
+        id: 40,
+        repository: '/backup/repo40',
+        repository_path: '/backup/repo40',
+        type: 'backup',
+        status: 'completed',
+        started_at: '2026-04-01T10:00:00Z',
+      },
+      {
+        id: 40,
+        repository: '/backup/repo40',
+        repository_path: '/backup/repo40',
+        type: 'check',
+        status: 'completed',
+        started_at: '2026-04-01T10:05:00Z',
+      },
+    ]
+
+    renderWithProviders(
+      <BackupJobsTable jobs={jobs} canDeleteJobs={true} actions={{ delete: true }} />
+    )
+
+    const [backupDelete, checkDelete] = screen.getAllByRole('button', { name: /^delete$/i })
+    await user.click(backupDelete)
+    await user.click(screen.getByRole('button', { name: /confirm delete/i }))
+
+    // The row is still listed (a poll can bring it back while the request
+    // is out); its Delete waits, another type's row with the same id does not.
+    await waitFor(() => expect(backupDelete).toBeDisabled())
+    expect(backupDelete).toHaveAttribute('title', 'Deleting...')
+    expect(checkDelete).toBeEnabled()
+    await user.click(backupDelete)
+    expect(screen.queryByRole('button', { name: /confirm delete/i })).not.toBeInTheDocument()
+    expect(deleteJobMock).toHaveBeenCalledTimes(1)
+
+    failDelete(new Error('Delete failed from API'))
+    await waitFor(() => expect(backupDelete).toBeEnabled())
+    expect(backupDelete).toHaveAttribute('title', 'Delete')
+  })
+
+  it('shares a pending delete with every table on the same query client', async () => {
+    // Two pages in turn, or a page left and opened again while the delete is
+    // out: each mounts its own table, all of them share one cache.
+    const user = userEvent.setup()
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    })
+    let failDelete: (error: Error) => void = () => {}
+    deleteJobMock.mockReturnValueOnce(
+      new Promise((_, reject) => {
+        failDelete = reject
+      })
+    )
+    const job = {
+      id: 40,
+      repository: '/backup/repo40',
+      repository_path: '/backup/repo40',
+      type: 'backup',
+      status: 'completed',
+      started_at: '2026-04-01T10:00:00Z',
+    }
+
+    renderWithProviders(
+      <>
+        <BackupJobsTable jobs={[job]} canDeleteJobs={true} actions={{ delete: true }} />
+        <BackupJobsTable jobs={[job]} canDeleteJobs={true} actions={{ delete: true }} />
+      </>,
+      { queryClient }
+    )
+
+    const [first, second] = screen.getAllByRole('button', { name: /^delete$/i })
+    await user.click(first)
+    await user.click(screen.getByRole('button', { name: /confirm delete/i }))
+
+    await waitFor(() => expect(second).toBeDisabled())
+    expect(first).toBeDisabled()
+    expect(deleteJobMock).toHaveBeenCalledTimes(1)
+
+    failDelete(new Error('Delete failed from API'))
+    await waitFor(() => expect(second).toBeEnabled())
+    expect(first).toBeEnabled()
   })
 
   it('resolves break-lock repository details from the fetched repository list', async () => {

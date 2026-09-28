@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { Box, Typography, Button, IconButton, Tooltip, Chip, useTheme, alpha } from '@mui/material'
 import { format, isTomorrow, isToday, isThisYear } from 'date-fns'
@@ -7,6 +8,7 @@ import {
   ShieldCheck,
   Package2,
   Scissors,
+  Eye,
   FolderOpen,
   Play,
   Trash2,
@@ -26,17 +28,24 @@ import {
   CalendarClock,
   ListChecks,
   Unlock,
+  History,
 } from 'lucide-react'
 import { useMaintenanceJobs } from '../hooks/useMaintenanceJobs'
 import BorgVersionChip from './BorgVersionChip'
 import { getRepoCapabilities } from '../utils/repoCapabilities'
-import { formatDateShort, formatDateTimeFull, formatElapsedTime } from '../utils/dateUtils'
+import {
+  formatDateShort,
+  formatDateTimeFull,
+  formatElapsedTime,
+  parseBackendDate,
+} from '../utils/dateUtils'
 import { formatUploadRatelimit } from '../utils/uploadRatelimit'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAnalytics } from '../hooks/useAnalytics'
 import { Repository } from '../types'
 import type { RepoAction } from '../hooks/usePermissions'
 import OperationalCard from './OperationalCard'
+import { archivesMayArrive, repositoryStatItems, stateText } from '../utils/repositoryStats'
 
 interface RepositoryCardProps {
   repository: Repository
@@ -45,6 +54,7 @@ interface RepositoryCardProps {
   onCheck: () => void
   onCompact: () => void
   onPrune: () => void
+  onPrunePreview: () => void
   onWipeContents: () => void
   onBreakLock: () => void
   onEdit: () => void
@@ -83,6 +93,7 @@ export default function RepositoryCard({
   onCheck,
   onCompact,
   onPrune,
+  onPrunePreview,
   onWipeContents,
   onBreakLock,
   onEdit,
@@ -105,6 +116,7 @@ export default function RepositoryCard({
   const isDark = theme.palette.mode === 'dark'
   const queryClient = useQueryClient()
   const { t } = useTranslation()
+  const navigate = useNavigate()
   const { trackRepository, trackBackup, trackArchive, EventAction } = useAnalytics()
 
   const capabilities = getRepoCapabilities(repository)
@@ -158,6 +170,25 @@ export default function RepositoryCard({
   const hasSeparatedRepositoryActions = canBreakLock || canShowDestructiveActions
   const uploadRatelimitLabel = formatUploadRatelimit(repository.upload_ratelimit_kib)
 
+  // Neither value can move while background work is off: `Last index` has
+  // nothing running, and `Last prune` is read from archive listings that no
+  // longer refresh (spec 6.8, 10.2), so "Never" would be a wrong answer
+  // rather than an empty one. The tooltip says where the setting lives; the
+  // metadata row renders plain values, so it is not a link.
+  const backgroundOff = repository.index_mode === 'off'
+  const lastRunValue = (value?: string | null) =>
+    backgroundOff
+      ? t('repositoryCard.backgroundWorkOff')
+      : value
+        ? formatDateShort(value)
+        : t('common.never')
+  const lastRunTooltip = (value?: string | null) =>
+    backgroundOff
+      ? t('repositoryCard.backgroundWorkOffHint')
+      : value
+        ? formatDateTimeFull(value)
+        : ''
+
   const [elapsedTime, setElapsedTime] = useState('')
 
   useEffect(() => {
@@ -199,21 +230,57 @@ export default function RepositoryCard({
     }
   }, [hasRunningJobs, isInJobsSet, repository.id, onJobCompleted, queryClient])
 
+  // The stored size figures, read the way the archive header and the info
+  // dialog read them (#981), and the post-import "indexing" state (#1063)
+  // for a count or a size the chain has not produced yet.
+  const statItems = repositoryStatItems(t, {
+    storage: repository.storage,
+    // a response without `storage` (an older server) counted a missing
+    // column as 0, as the card always did
+    archiveCount: repository.archive_count ?? (repository.storage === undefined ? 0 : null),
+    indexPendingKinds: repository.index_pending_kinds,
+  })
+  const archivesStat = statItems.find((item) => item.key === 'archives')!
+  const sizeStat = statItems.find((item) => item.key === 'usedOnDisk')!
+  const lastBackupIndexing =
+    !repository.last_backup &&
+    archivesMayArrive(repository.storage, new Set(repository.index_pending_kinds ?? []))
+  // A response without `storage` (a server older than the payload) keeps
+  // the formatted string the card always showed, without a hint that
+  // would call that string "not measured".
+  const legacySize =
+    repository.storage === undefined && sizeStat.state === 'unknown'
+      ? repository.total_size || null
+      : null
+  const sizeValue = legacySize ?? stateText(t, sizeStat)
+
   const keyStats = [
     {
       label: t('repositoryCard.archives'),
-      value: String(repository.archive_count ?? 0),
-      tooltip: '',
+      value: stateText(t, archivesStat),
+      tooltip: archivesStat.hint ?? '',
     },
     {
+      // the card keeps its label; where and when the size was read is
+      // the tooltip's, as the dialog's subtitle says it
       label: t('repositoryCard.totalSize'),
-      value: repository.total_size || 'N/A',
-      tooltip: '',
+      value: sizeValue,
+      tooltip: legacySize
+        ? ''
+        : [sizeStat.subtitle, sizeStat.hint].filter(Boolean).join('. ') || '',
     },
     {
       label: t('repositoryCard.lastBackup'),
-      value: repository.last_backup ? formatDateShort(repository.last_backup) : t('common.never'),
-      tooltip: repository.last_backup ? formatDateTimeFull(repository.last_backup) : '',
+      value: repository.last_backup
+        ? formatDateShort(repository.last_backup)
+        : lastBackupIndexing
+          ? t('repositoryStats.indexing')
+          : t('common.never'),
+      tooltip: repository.last_backup
+        ? formatDateTimeFull(repository.last_backup)
+        : lastBackupIndexing
+          ? t('repositoryStats.indexingArchivesHint')
+          : '',
     },
     {
       label: t('repositoryCard.lastCheck'),
@@ -242,6 +309,26 @@ export default function RepositoryCard({
       value: repository.last_compact ? formatDateShort(repository.last_compact) : t('common.never'),
       tooltip: repository.last_compact ? formatDateTimeFull(repository.last_compact) : '',
     },
+    // A backend that predates these fields sends nothing (not null): show no
+    // entry then, rather than claiming "Never" for a repository pruned nightly.
+    ...(repository.last_prune !== undefined
+      ? [
+          {
+            label: t('repositoryCard.lastPrune'),
+            value: lastRunValue(repository.last_prune),
+            tooltip: lastRunTooltip(repository.last_prune),
+          },
+        ]
+      : []),
+    ...(repository.last_index !== undefined
+      ? [
+          {
+            label: t('repositoryCard.lastIndex'),
+            value: lastRunValue(repository.last_index),
+            tooltip: lastRunTooltip(repository.last_index),
+          },
+        ]
+      : []),
     ...(repository.source_directories?.length
       ? [
           {
@@ -380,7 +467,7 @@ export default function RepositoryCard({
       }
     }
 
-    const nextRunDate = new Date(rcloneStorage.next_scheduled_sync_at)
+    const nextRunDate = parseBackendDate(rcloneStorage.next_scheduled_sync_at)
     if (Number.isNaN(nextRunDate.getTime())) {
       return {
         label: t('repositoryCard.rcloneScheduled'),
@@ -463,7 +550,7 @@ export default function RepositoryCard({
 
     if (!repository.next_run) return null
 
-    const nextRunDate = new Date(repository.next_run)
+    const nextRunDate = parseBackendDate(repository.next_run)
     let whenLabel = format(
       nextRunDate,
       isThisYear(nextRunDate) ? 'MMM d · h:mm a' : 'MMM d, yyyy · h:mm a'
@@ -516,7 +603,7 @@ export default function RepositoryCard({
     const color = (theme.palette[colorKey] as { main: string }).main
     return {
       ...iconBtnSx,
-      color: alpha(color, isDark ? 0.65 : 0.55),
+      color: alpha(color, 0.75),
       '&:hover': {
         bgcolor: alpha(color, isDark ? 0.12 : 0.09),
         color: color,
@@ -567,7 +654,14 @@ export default function RepositoryCard({
           >
             <Box sx={{ minWidth: 0, flex: 1 }}>
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
-                <Typography variant="subtitle1" fontWeight={700} noWrap sx={{ lineHeight: 1.3 }}>
+                <Typography
+                  variant="subtitle1"
+                  noWrap
+                  sx={{
+                    fontWeight: 700,
+                    lineHeight: 1.3,
+                  }}
+                >
                   {repository.name}
                 </Typography>
                 {repository.mode === 'observe' && (
@@ -813,7 +907,7 @@ export default function RepositoryCard({
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 0.35 }}>
                     <Box
                       sx={{
-                        color: alpha(statColor, 0.7),
+                        color: alpha(statColor, 0.75),
                         display: 'flex',
                         alignItems: 'center',
                       }}
@@ -826,7 +920,7 @@ export default function RepositoryCard({
                         fontWeight: 700,
                         textTransform: 'uppercase',
                         letterSpacing: '0.07em',
-                        color: alpha(statColor, 0.7),
+                        color: statColor,
                         lineHeight: 1,
                       }}
                     >
@@ -835,9 +929,12 @@ export default function RepositoryCard({
                   </Box>
                   <Typography
                     variant="body2"
-                    fontWeight={600}
                     noWrap
-                    sx={{ fontVariantNumeric: 'tabular-nums', fontSize: '0.85rem' }}
+                    sx={{
+                      fontWeight: 600,
+                      fontVariantNumeric: 'tabular-nums',
+                      fontSize: '0.85rem',
+                    }}
                   >
                     {stat.value}
                   </Typography>
@@ -903,10 +1000,22 @@ export default function RepositoryCard({
             }}
           >
             <Box sx={{ minWidth: 0 }}>
-              <Typography variant="caption" fontWeight={700} color="primary.main">
+              <Typography
+                variant="caption"
+                sx={{
+                  fontWeight: 700,
+                  color: 'primary.main',
+                }}
+              >
                 {t('repositoryCard.legacySources.title')}
               </Typography>
-              <Typography variant="caption" color="text.secondary" display="block">
+              <Typography
+                variant="caption"
+                sx={{
+                  color: 'text.secondary',
+                  display: 'block',
+                }}
+              >
                 {t('repositoryCard.legacySources.description')}
               </Typography>
             </Box>
@@ -1017,6 +1126,22 @@ export default function RepositoryCard({
               </Tooltip>
             )}
 
+            {canDo('maintenance') && capabilities.canPrune && (
+              <Tooltip title={t('repositoryCard.buttons.prunePreview')} arrow>
+                <span>
+                  <IconButton
+                    size="small"
+                    onClick={onPrunePreview}
+                    disabled={isMaintenanceRunning}
+                    aria-label={t('repositoryCard.buttons.prunePreview')}
+                    sx={coloredIconBtnSx('warning')}
+                  >
+                    <Eye size={16} />
+                  </IconButton>
+                </span>
+              </Tooltip>
+            )}
+
             {canDo('view') && (
               <Tooltip title={t('repositoryCard.buttons.viewArchives')} arrow>
                 <span>
@@ -1052,6 +1177,26 @@ export default function RepositoryCard({
                     sx={coloredIconBtnSx('primary')}
                   >
                     <ListChecks size={16} />
+                  </IconButton>
+                </span>
+              </Tooltip>
+            )}
+
+            {canDo('view') && (
+              <Tooltip title={t('repositoryCard.buttons.operations')} arrow>
+                <span>
+                  <IconButton
+                    size="small"
+                    onClick={() => {
+                      trackRepository(EventAction.VIEW, repository, {
+                        destination: 'operations',
+                      })
+                      navigate(`/activity?repository_id=${repository.id}`)
+                    }}
+                    aria-label={t('repositoryCard.buttons.operations')}
+                    sx={coloredIconBtnSx('secondary')}
+                  >
+                    <History size={16} />
                   </IconButton>
                 </span>
               </Tooltip>
@@ -1129,7 +1274,7 @@ export default function RepositoryCard({
                         disabled={isMaintenanceRunning}
                         sx={{
                           ...iconBtnSx,
-                          color: alpha(theme.palette.error.main, 0.56),
+                          color: alpha(theme.palette.error.main, 0.75),
                           '&:hover': {
                             color: theme.palette.error.main,
                             bgcolor: alpha(theme.palette.error.main, 0.09),
@@ -1146,7 +1291,7 @@ export default function RepositoryCard({
                         aria-label={t('repositoryCard.buttons.delete')}
                         sx={{
                           ...iconBtnSx,
-                          color: alpha(theme.palette.error.main, 0.6),
+                          color: alpha(theme.palette.error.main, 0.75),
                           '&:hover': {
                             color: theme.palette.error.main,
                             bgcolor: alpha(theme.palette.error.main, 0.1),
@@ -1165,7 +1310,7 @@ export default function RepositoryCard({
                           disabled={isMaintenanceRunning}
                           sx={{
                             ...iconBtnSx,
-                            color: alpha(theme.palette.error.main, 0.72),
+                            color: alpha(theme.palette.error.main, 0.75),
                             '&:hover': {
                               color: theme.palette.error.dark,
                               bgcolor: alpha(theme.palette.error.main, 0.13),
@@ -1317,8 +1462,11 @@ export default function RepositoryCard({
             {elapsedTime && (
               <Typography
                 variant="caption"
-                color="text.secondary"
-                sx={{ display: 'block', mt: 0.25 }}
+                sx={{
+                  color: 'text.secondary',
+                  display: 'block',
+                  mt: 0.25,
+                }}
               >
                 {elapsedTime}
               </Typography>

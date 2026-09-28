@@ -42,6 +42,7 @@ describe('ArchiveContentsDialog', () => {
   const mockHandlers = {
     onClose: vi.fn(),
     onDownloadFile: vi.fn(),
+    onDownloadFolder: vi.fn(),
   }
 
   let mockGetArchiveContents: ReturnType<typeof vi.fn>
@@ -150,6 +151,35 @@ describe('ArchiveContentsDialog', () => {
       { timeout: 3000 }
     )
     expect(screen.queryByText(/takes a little longer/i)).not.toBeInTheDocument()
+  })
+
+  it('shows the error and retries when the listing fails', async () => {
+    mockGetArchiveContents
+      .mockRejectedValueOnce({
+        response: { data: { detail: 'Archive daily not found' } },
+      })
+      .mockResolvedValue({
+        status: 200,
+        data: { items: [{ name: 'file.txt', path: 'file.txt', type: 'file', size: 5 }] },
+      } as AxiosResponse)
+
+    renderWithProviders(
+      <ArchiveContentsDialog
+        open={true}
+        archive={mockArchive}
+        repository={mockRepository}
+        {...mockHandlers}
+      />
+    )
+
+    expect(await screen.findByText(/Archive daily not found/)).toBeInTheDocument()
+    expect(screen.queryByText('No archive information available')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }))
+
+    expect(await screen.findByText('file.txt')).toBeInTheDocument()
+    expect(mockGetArchiveContents).toHaveBeenCalledTimes(2)
+    expect(screen.queryByText(/Archive daily not found/)).not.toBeInTheDocument()
   })
 
   it('displays empty archive message when no items', async () => {
@@ -454,6 +484,50 @@ describe('ArchiveContentsDialog', () => {
     await waitFor(() =>
       expect(mockHandlers.onDownloadFile).toHaveBeenCalledWith(mockArchive.name, '/file.txt', 512)
     )
+  })
+
+  it('calls onDownloadFolder from the normal archive viewer', async () => {
+    mockGetArchiveContents.mockResolvedValue({
+      data: { items: [{ name: 'Documents', path: '/Documents', type: 'directory' }] },
+    } as AxiosResponse)
+
+    renderWithProviders(
+      <ArchiveContentsDialog
+        open
+        archive={mockArchive}
+        repository={mockRepository}
+        {...mockHandlers}
+      />
+    )
+
+    await waitFor(() => expect(screen.getByText('Documents')).toBeInTheDocument())
+    fireEvent.click(screen.getByTitle('Download folder'))
+    await waitFor(() =>
+      expect(mockHandlers.onDownloadFolder).toHaveBeenCalledWith(mockArchive.name, '/Documents')
+    )
+  })
+
+  it('re-enables folder download after a rejected handler', async () => {
+    mockGetArchiveContents.mockResolvedValue({
+      data: { items: [{ name: 'Documents', path: '/Documents', type: 'directory' }] },
+    } as AxiosResponse)
+    mockHandlers.onDownloadFolder.mockRejectedValueOnce(new Error('download failed'))
+
+    renderWithProviders(
+      <ArchiveContentsDialog
+        open
+        archive={mockArchive}
+        repository={mockRepository}
+        {...mockHandlers}
+      />
+    )
+
+    await waitFor(() => expect(screen.getByText('Documents')).toBeInTheDocument())
+    const downloadButton = screen.getByTitle('Download folder')
+    fireEvent.click(downloadButton)
+
+    await waitFor(() => expect(mockHandlers.onDownloadFolder).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(downloadButton).toBeEnabled())
   })
 
   it('calls onClose when Close button is clicked', async () => {

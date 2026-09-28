@@ -66,7 +66,7 @@ Common options:
 | SFTP deployment mode | Key deployment needs SFTP mode, for example Hetzner Storage Box |
 | SSH path prefix | SSH commands need a prefix that SFTP browsing does not, for example some NAS paths |
 | Logical mount point | You want a friendly name for the remote machine in path pickers |
-| Use sudo | SSHFS access needs the remote SFTP server to run through sudo |
+| Use sudo | Remote source files or a remote repository need root access; see the sudo requirements below |
 
 SFTP deployment mode can break some older SSH servers or NAS devices. Disable it when key deployment fails on those systems.
 
@@ -137,6 +137,29 @@ for Borg UI's Borg-over-SSH repository setup. See
 [Provider Guides](provider-guides) for BorgBase, Hetzner Storage Box, Synology,
 Unraid, and other hosted or NAS examples.
 
+## Remote Source Backups
+
+A backup plan can use a Remote Machine as its *source*. Borg UI runs that
+backup in one of two ways:
+
+- **SSHFS pull mode** (when Remote Direct Backup does not apply): the container mounts the remote
+  filesystem with SSHFS and runs `borg create` itself. This needs FUSE access
+  from the Docker host - `/dev/fuse`, the `SYS_ADMIN` capability and an
+  AppArmor exception - which the Compose examples in
+  [Installation](installation) do not grant. See
+  [Optional FUSE Access](installation#optional-fuse-access) for the exact
+  lines; `privileged: true`, as the repository's own `docker-compose.yml`
+  uses, is the broader way to get the same access - use one or the other,
+  not both. Without either the job fails before it reads a single file (see
+  [Troubleshooting](#sshfs-mount-fails-with-fuse-device-not-found)).
+- **Remote Direct Backup**: `borg create` runs on the remote machine itself,
+  see below. It needs no FUSE access and no extra container privileges.
+
+`SYS_ADMIN` plus `apparmor:unconfined` is a real widening of the container's
+privileges, and `privileged: true` more so. If you would rather not grant
+either, put source and repository on the same SSH connection and use Remote
+Direct Backup mode instead.
+
 ## Remote Direct Backups
 
 When a backup plan uses an SSH source and an SSH repository on the same SSH
@@ -149,6 +172,70 @@ Use the connection's Borg binary path when the source host needs a wrapper
 script, for example to pause Docker containers before Borg starts and resume
 them after Borg exits. The repository `remote_path` setting is different: it is
 passed to Borg as the repository-side remote Borg path.
+
+When **Use sudo** is enabled on the repository connection, Borg UI runs the
+remote Borg server with `sudo -n -H` for every repository operation. Do not
+grant sudo directly to the Borg binary. On Borg 1, a user who can choose Borg
+arguments could use `--rsh` to run another command as root.
+
+Instead, set the repository `remote_path` to a root-owned wrapper that accepts
+only Borg's `serve` operation and restricts it to the exact repository path.
+For example, create `/usr/local/sbin/borg-serve` with this content, replacing
+both paths for your host:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" != "serve" ]]; then
+    echo "Only borg serve is permitted" >&2
+    exit 64
+fi
+
+shift
+for argument in "$@"; do
+    case "$argument" in
+        --verbose|--info|--debug|--error|--critical|--log-json|--show-version|--help|\
+        --umask=077|--lock-wait=*|--debug-topic=*|--log-level=*|--storage-quota=*) ;;
+        *)
+            echo "Unsupported borg serve argument: $argument" >&2
+            exit 64
+            ;;
+    esac
+done
+
+exec /usr/bin/borg serve --umask=077 --restrict-to-repository /srv/borg "$@"
+```
+
+Make the wrapper, `/srv`, `/srv/borg`, and every parent directory in both paths
+owned by root and not writable by the SSH user. Borg resolves the repository
+path before serving it, so a writable path component could otherwise be
+replaced. Then configure passwordless sudo with `NOSETENV` and an exact
+`env_keep` allowlist. Borg UI uses only
+`BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK`,
+`BORG_RELOCATED_REPO_ACCESS_IS_OK`, `BORG_PASSPHRASE`, and `BORG_REMOTE_PATH`
+for a remote-direct backup. Add a root-owned file with `visudo`:
+
+```sudoers
+Defaults:<ssh-user> env_keep += "BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK BORG_RELOCATED_REPO_ACCESS_IS_OK BORG_PASSPHRASE BORG_REMOTE_PATH"
+<ssh-user> ALL=(root) NOPASSWD: NOSETENV: /usr/local/sbin/borg-serve
+```
+
+Do not add `BORG_PASSCOMMAND` to this allowlist. Borg executes that helper, so
+a user-controlled helper must never run as root. If your setup needs a helper,
+use a fixed root-owned wrapper that supplies only the required values. Keep the
+connection's Borg binary path for source-side backups. The sudo wrapper above
+belongs in the repository `remote_path` setting.
+
+Before creating a plan, verify that the restricted sudo command works on the
+remote host:
+
+```bash
+sudo -n -H /usr/local/sbin/borg-serve serve --help
+```
+
+`-H` keeps root's Borg cache and configuration under `/root` instead of the SSH
+user's home.
 
 ## Synology and NAS Path Prefixes
 
@@ -202,13 +289,39 @@ Passphrase-protected keys are not suitable for unattended scheduled backups unle
 
 ## Restrict Remote Access
 
-For backup-only remote users, consider restricting the public key in `authorized_keys`:
+For backup-only remote users, restrict the public key in `authorized_keys` so
+it can only run Borg:
 
 ```text
 command="borg serve --restrict-to-path /backups",restrict ssh-ed25519 AAAA... borg-ui
 ```
 
-Adjust the path for your server.
+Adjust the path for your server. Borg UI detects such keys: the connection
+test reports "SSH connection works, remote shell restricted" and stays green,
+because the key authenticated even though the probe command was refused.
+Everything that needs a shell on the repository host is unavailable with a
+restricted key and degrades without failing the connection:
+
+| Feature | Remote command | With a restricted key |
+|---|---|---|
+| Connection test, diagnostics latency | `pwd` | connected (restricted) |
+| Storage information | `df -k <path>` | hidden |
+| Path browsing, repository detection | `ls`, `stat`, SFTP | enter paths manually |
+| Mount connection | SFTP subsystem | unavailable |
+| Borg operations | `<remote_path> serve …` | work |
+
+Do not widen the key's allowlist to make those features work; a backup key
+should stay Borg-only.
+
+If you use a wrapper script instead of a fixed `borg serve` command, match
+`$SSH_ORIGINAL_COMMAND` against what Borg UI actually sends: the repository's
+**Remote Borg path** (default `borg`) followed by `serve` and flags, for example
+`borg serve --umask=077 --info`. With **Use sudo** enabled it is
+`sudo -n -H <remote_path> serve …`. The repository wizard's command preview
+shows the exact remote command for your settings. Match on the prefix rather
+than the full string, since Borg adds flags such as `--info` or `--debug`.
+Note that for a subsystem request `SSH_ORIGINAL_COMMAND` arrives with one
+trailing ASCII space; shell-quoted it is `'/usr/lib/openssh/sftp-server '`.
 
 ## Troubleshooting
 
@@ -226,3 +339,20 @@ The remote user needs read access to source paths and write access to repository
 ### Host key changed
 
 Verify the host change first. Then update known-hosts through the UI or by reconnecting as appropriate.
+
+### SSHFS mount fails with `fuse: device not found`
+
+A remote-source backup in SSHFS pull mode fails immediately with
+`backend.errors.service.failedPrepareSourcePaths`, and the container log shows
+`SSHFS mount failed: fuse: device not found, try 'modprobe fuse' first` or
+`fusermount3: mount failed: Operation not permitted`.
+
+The container has no FUSE access. Add `/dev/fuse`, `SYS_ADMIN` and the AppArmor
+exception from [Optional FUSE Access](installation#optional-fuse-access) to the
+Borg UI service (or run it with `privileged: true`, which includes all three),
+make sure `/dev/fuse` exists on the host (`ls -l /dev/fuse`; if it is missing,
+`modprobe fuse`), and recreate the container.
+On Ubuntu the AppArmor line is the one that matters: the `docker-default`
+profile denies `fusermount3` even when the device and capability are present.
+If you would rather not widen the container's privileges, use
+[Remote Direct Backup](#remote-direct-backups) mode, which needs none of this.

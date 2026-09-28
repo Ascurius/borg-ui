@@ -16,10 +16,15 @@ import structlog
 
 from app.database.database import get_db
 from app.database.models import User, Repository, SSHConnection, SystemSettings
-from app.core.security import get_current_user
+from app.core.security import check_repo_access, get_current_user
 from app.core.features import require_feature
-from app.core.borg2 import borg2, BORG2_ENCRYPTION_MODES
-from app.core.borg_errors import is_lock_error
+from app.core.borg2 import (
+    borg2,
+    BORG2_ENCRYPTION_MODES,
+    normalize_repo_info_encryption,
+)
+from app.core.borg_errors import is_lock_error, is_repository_exists_failure
+from app.services.repository_info_sync import sync_archive_stats_from_info
 from app.services.agent_job_dispatcher import dispatch_agent_job_best_effort
 from app.services.repository_command_lock import run_serialized_repository_command
 from app.services.repository_executor import (
@@ -28,8 +33,7 @@ from app.services.repository_executor import (
     wait_for_agent_repository_operation_job,
 )
 from app.services.v2.repository_service import repository_v2_service
-from app.utils.fs import calculate_path_size_bytes
-from app.utils.borg_env import repository_borg_env
+from app.utils.borg_env import effective_repository_remote_path, repository_borg_env
 from app.utils.archive_job_metadata import enrich_archives_with_backup_metadata
 from app.utils.repository_paths import build_ssh_repository_path
 from app.utils.source_locations import legacy_source_fields, normalize_source_locations
@@ -232,7 +236,7 @@ async def _rcreate(
         remote_path=remote_path,
         init_timeout=init_timeout,
     )
-    result["already_existed"] = result.get("return_code") == 2
+    result["already_existed"] = is_repository_exists_failure(result)
     return result
 
 
@@ -539,6 +543,7 @@ async def get_repository_info(
             raise HTTPException(
                 status_code=404, detail={"key": "backend.errors.repo.notFound"}
             )
+        check_repo_access(db, current_user, repo, "viewer")
 
         info_timeout = _get_info_timeout(db)
 
@@ -565,37 +570,27 @@ async def get_repository_info(
                 info_data["repository"] = rinfo_data["repository"]
             if rinfo_data.get("encryption") and not info_data.get("encryption"):
                 info_data["encryption"] = rinfo_data["encryption"]
-            return {"info": info_data, "borg_version": 2}
+            sync_archive_stats_from_info(repo, info_data, db)
+            return {
+                "info": normalize_repo_info_encryption(info_data),
+                "borg_version": 2,
+            }
 
         bypass_lock = _resolve_bypass_lock(repo, db, "bypass_lock_on_info")
         with repository_borg_env(repo, db) as env:
             result = await borg2.info_repo(
                 repository=repo.path,
                 passphrase=repo.passphrase,
-                remote_path=repo.remote_path,
+                remote_path=effective_repository_remote_path(repo),
                 bypass_lock=bypass_lock,
                 timeout=info_timeout,
                 env=env,
             )
-        if (
-            not result["success"]
-            and not bypass_lock
-            and _is_borg2_lock_like_failure(result)
-        ):
-            logger.warning(
-                "Retrying borg2 info_repo with bypass lock after lock-like failure",
-                repo_id=repo.id,
-                path=repo.path,
-            )
-            with repository_borg_env(repo, db) as env:
-                result = await borg2.info_repo(
-                    repository=repo.path,
-                    passphrase=repo.passphrase,
-                    remote_path=repo.remote_path,
-                    bypass_lock=True,
-                    timeout=info_timeout,
-                    env=env,
-                )
+        # No lock-error retry here. It used to re-run the command with
+        # bypass_lock=True, which only ever meant "--bypass-lock" — a flag Borg 2
+        # does not have. With that gone the retry would issue the identical
+        # command and double the wait on every lock error, so the lock error is
+        # reported as one.
         if not result["success"]:
             raise HTTPException(
                 status_code=500,
@@ -607,14 +602,15 @@ async def get_repository_info(
         except json.JSONDecodeError:
             info_data = {"raw": result["stdout"]}
 
-        # borg2 info --json has per-archive original_size but no repo-level disk usage.
-        # borg2 repo-info --json has cache.path only — no cache.stats like borg1.
-        # Pull repository/encryption metadata from rinfo, then compute disk usage separately.
+        # borg2 info --json has per-archive original_size but no repo-level disk
+        # usage, and repo-info --json has cache.path only, no cache.stats like
+        # borg1. Pull repository/encryption metadata from rinfo; the size is the
+        # stored one (`storage` on the repository response), not a live du.
         with repository_borg_env(repo, db) as env:
             rinfo_result = await borg2.rinfo(
                 repository=repo.path,
                 passphrase=repo.passphrase,
-                remote_path=repo.remote_path,
+                remote_path=effective_repository_remote_path(repo),
                 env=env,
             )
         if rinfo_result["success"]:
@@ -627,32 +623,32 @@ async def get_repository_info(
             except json.JSONDecodeError:
                 pass
 
-        # For local repos compute actual on-disk size via du (borg2 has no JSON equivalent).
-        # Remote repos (SSH/SFTP) get no rinfo_stats — frontend treats missing as unavailable.
-        is_local = repo.path.startswith("/") and not repo.host
-        if is_local:
-            try:
-                disk_bytes = await calculate_path_size_bytes([repo.path], timeout=30)
-                if disk_bytes > 0:
-                    info_data["rinfo_stats"] = {
-                        "unique_csize": disk_bytes,
-                        "unique_size": disk_bytes,
-                    }
-            except Exception:
-                pass
+        # The card renders the stored columns; sync them from the list just
+        # fetched, or the dialog shows a count the card contradicts.
+        sync_archive_stats_from_info(repo, info_data, db)
 
-        return {"info": info_data, "borg_version": 2}
+        # Normalised on the way out, not at either parse site: both `info --json`
+        # and `repo-info --json` carry the block, and the merge above only fires
+        # when info_data has none of its own — so normalising a source would miss
+        # the case where borg2 info already supplied one.
+        return {"info": normalize_repo_info_encryption(info_data), "borg_version": 2}
 
     return await run_serialized_repository_command(repo_id, _operation)
 
 
 @router.get("/{repo_id}/archives")
+@router.get("/{repo_id}/archives/live")
 async def list_archives(
     repo_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """List all archives in a Borg 2 repository."""
+    """List all archives in a Borg 2 repository, straight from borg.
+
+    Served at `/archives/live` as well, so one client method reaches the
+    live listing on both borg versions: on the v1 router that path is what
+    the persisted archive index left free (see `app/api/archive_index.py`).
+    """
 
     async def _operation():
         repo = (
@@ -664,6 +660,7 @@ async def list_archives(
             raise HTTPException(
                 status_code=404, detail={"key": "backend.errors.repo.notFound"}
             )
+        check_repo_access(db, current_user, repo, "viewer")
 
         from app.database.models import SystemSettings
 
@@ -692,7 +689,7 @@ async def list_archives(
                 result = await borg2.list_archives(
                     repo.path,
                     passphrase=repo.passphrase,
-                    remote_path=repo.remote_path,
+                    remote_path=effective_repository_remote_path(repo),
                     bypass_lock=bypass_lock,
                     env=env,
                 )
@@ -731,6 +728,7 @@ async def get_repository_stats(
         raise HTTPException(
             status_code=404, detail={"key": "backend.errors.repo.notFound"}
         )
+    check_repo_access(db, current_user, repo, "viewer")
 
     info_timeout = _get_info_timeout(db)
     if is_agent_executor(repo):
@@ -742,7 +740,7 @@ async def get_repository_stats(
             result = await borg2.rinfo(
                 repository=repo.path,
                 passphrase=repo.passphrase,
-                remote_path=repo.remote_path,
+                remote_path=effective_repository_remote_path(repo),
                 bypass_lock=_resolve_bypass_lock(repo, db, "bypass_lock_on_info"),
                 timeout=info_timeout,
                 env=env,
@@ -758,4 +756,4 @@ async def get_repository_stats(
     except json.JSONDecodeError:
         stats_data = {}
 
-    return {"stats": stats_data, "borg_version": 2}
+    return {"stats": normalize_repo_info_encryption(stats_data), "borg_version": 2}

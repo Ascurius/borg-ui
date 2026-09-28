@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type JSX } from 'react'
 import type { TFunction } from 'i18next'
 import type { Meta, StoryObj } from '@storybook/react-vite'
 import { Box } from '@mui/material'
@@ -75,6 +75,19 @@ export const PresetIconColors: Story = {
       default_path: '/home',
       ssh_path_prefix: '',
       mount_point: 'hetzner-storage-box',
+    },
+  },
+}
+
+export const RsyncNetDefaults: Story = {
+  args: {
+    initialForm: {
+      ...createConnectionForm(),
+      port: 22,
+      use_sftp_mode: true,
+      default_path: '/',
+      ssh_path_prefix: '',
+      mount_point: 'rsync-net',
     },
   },
 }

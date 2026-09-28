@@ -14,13 +14,21 @@ from urllib.parse import urlparse, urlunparse
 
 from agent.borg_ui_agent import __version__
 from agent.borg_ui_agent.borg import detect_borg_binaries, detect_platform
+from agent.borg_ui_agent.cancel import SELF_CANCELLING_JOB_KINDS
 from agent.borg_ui_agent.client import AGENT_AUTH_HEADER, AgentClient
 from agent.borg_ui_agent.config import AgentConfig
 from agent.borg_ui_agent.filesystem import FilesystemBrowseError, browse_filesystem
 from agent.borg_ui_agent.runtime import get_capabilities, get_job_handler
 from agent.borg_ui_agent.scripts import list_allowed_scripts
+from agent.borg_ui_agent.self_upgrade import check_self_upgrade
 
 logger = logging.getLogger(__name__)
+
+# How long an upgrade owns the session after it is requested. Matches
+# AGENT_UPGRADE_TIMEOUT_SECONDS on the server, so an endpoint whose reinstall
+# never happened starts taking jobs again no earlier than the moment the
+# server marks that upgrade failed.
+UPGRADE_CLAIM_SECONDS = 600
 
 try:
     from websocket import WebSocketTimeoutException
@@ -136,13 +144,19 @@ class SessionCommandClient:
                 "sequence": sequence,
                 "stream": stream,
                 "message": message,
-            }
+            },
+            lambda c: c.send_log(
+                job_id, sequence=sequence, stream=stream, message=message
+            ),
         )
         return {"accepted": True}
 
     def send_progress(self, job_id: int, progress: dict[str, Any]) -> dict[str, Any]:
         self._ensure_started(job_id)
-        self._send({"type": "progress", "job_id": job_id, **progress})
+        self._send(
+            {"type": "progress", "job_id": job_id, **progress},
+            lambda c: c.send_progress(job_id, progress),
+        )
         return {"id": job_id, "status": "running"}
 
     def complete_job(self, job_id: int, *, result: dict[str, Any]) -> dict[str, Any]:
@@ -155,17 +169,31 @@ class SessionCommandClient:
         return {"id": job_id, "status": "completed"}
 
     def fail_job(
-        self, job_id: int, *, error_message: str, return_code: Optional[int] = None
+        self,
+        job_id: int,
+        *,
+        error_message: str,
+        return_code: Optional[int] = None,
+        stderr_tail: Optional[str] = None,
+        failure_kind: Optional[str] = None,
     ) -> dict[str, Any]:
         self._ensure_started(job_id)
         self.finished = True
         error: dict[str, Any] = {"message": error_message}
         if return_code is not None:
             error["return_code"] = return_code
+        if stderr_tail is not None:
+            error["stderr_tail"] = stderr_tail
+        if failure_kind is not None:
+            error["failure_kind"] = failure_kind
         self._deliver_terminal(
             {"type": "command_error", "job_id": job_id, "error": error},
             lambda c: c.fail_job(
-                job_id, error_message=error_message, return_code=return_code
+                job_id,
+                error_message=error_message,
+                return_code=return_code,
+                stderr_tail=stderr_tail,
+                failure_kind=failure_kind,
             ),
         )
         return {"id": job_id, "status": "failed"}
@@ -240,10 +268,31 @@ class SessionCommandClient:
             return
         self.enqueue(ws_payload)
 
-    def _send(self, payload: dict[str, Any]) -> None:
-        """Best-effort telemetry send (job_started/progress/log/cancel). Losing
-        one is harmless; terminal results go through _deliver_terminal instead."""
-        self.enqueue(payload)
+    def _send(
+        self,
+        payload: dict[str, Any],
+        http_call: Optional[Callable[[AgentClient], Any]] = None,
+    ) -> None:
+        """Best-effort telemetry send (job_started/progress/log). Losing one
+        is harmless; terminal results go through _deliver_terminal instead.
+        Once the session is closing nothing queued here is delivered, but the
+        worker runs on and its keepalive must still reach the server (the
+        reaper fails a job without activity), so a frame the outbox refuses
+        goes over REST when `http_call` names its request."""
+        if self.enqueue(payload) or http_call is None:
+            return
+        if self.job_id is None or self._http_client is None:
+            return
+        with self._http_lock:
+            try:
+                http_call(self._http_client)
+            except Exception:  # noqa: BLE001 - best effort, the next one is due
+                logger.debug(
+                    "Dropped a %s frame for job %s after the session closed",
+                    payload.get("type"),
+                    self.job_id,
+                    exc_info=True,
+                )
 
     def enqueue(self, payload: dict[str, Any]) -> bool:
         """Hand one frame to the session thread, which owns the socket.
@@ -297,6 +346,15 @@ class AgentSessionRuntime:
         self._registry_lock = threading.Lock()
         self._cancel_events: dict[int, threading.Event] = {}
         self._pending_cancels: set[int] = set()
+        # Jobs whose worker ends its process on cancel and reports `canceled`
+        # itself (SELF_CANCELLING_JOB_KINDS); see the cancel command.
+        self._self_cancelling_jobs: set[int] = set()
+        # Deadline (monotonic) while an upgrade is being requested, held
+        # through the restart it causes so a job dispatched after the busy
+        # check cannot start under an agent that is about to die. Guarded by
+        # _registry_lock, the same lock the cancel registry uses, so the check
+        # and the reservation are one atomic step.
+        self._upgrading_until: Optional[float] = None
 
     def run_forever(
         self,
@@ -372,12 +430,35 @@ class AgentSessionRuntime:
                     continue
                 message = json.loads(raw_message)
                 if isinstance(message, dict) and message.get("type") == "command":
-                    worker = threading.Thread(
-                        target=self._handle_command,
-                        args=(outbox, message, closing),
-                        daemon=True,
+                    # Register before the worker thread exists: a session that
+                    # drops before _handle_command registers leaves the worker
+                    # unsignalable and absent from hello, and the server
+                    # redispatches a job still running here. See
+                    # _job_id_for_dispatch for why only some messages register.
+                    job_id = self._job_id_for_dispatch(message)
+                    cancel_event = (
+                        self._register_cancel(
+                            job_id, command=str(message.get("command") or "")
+                        )
+                        if job_id is not None
+                        else None
                     )
-                    worker.start()
+                    try:
+                        worker = threading.Thread(
+                            target=self._handle_command,
+                            args=(outbox, message, closing),
+                            kwargs={"cancel_event": cancel_event},
+                            daemon=True,
+                        )
+                        worker.start()
+                    except Exception:
+                        # The thread never ran, so nothing will ever reach
+                        # _handle_command's finally to unregister this id --
+                        # do it here or it leaks in _cancel_events (and hello)
+                        # permanently.
+                        if job_id is not None:
+                            self._unregister_cancel(job_id)
+                        raise
                     workers.append(worker)
                     workers = [w for w in workers if w.is_alive()]
                 handled += 1
@@ -393,14 +474,14 @@ class AgentSessionRuntime:
                 except Exception:
                     pass
             else:
-                # The session dropped. Suppress any further frames, signal
-                # cancellation, and return *without* joining -- so run_forever
-                # reconnects right away instead of blocking on a possibly-slow
-                # job. The cancelled daemon workers wind down on their own.
+                # The session dropped. Suppress any further frames and return
+                # *without* joining -- so run_forever reconnects right away
+                # instead of blocking on a possibly-slow job. The workers keep
+                # running: a dropped socket is not a cancel, their verdicts go
+                # over REST, and the next hello reports them as running. Setting
+                # their cancel events here would make the cancel poller end a
+                # silent Borg (a long check) on every proxy hiccup.
                 closing.set()
-                with self._registry_lock:
-                    for event in self._cancel_events.values():
-                        event.set()
             try:
                 socket.close()
             except Exception:
@@ -468,24 +549,87 @@ class AgentSessionRuntime:
                 "agent_id": self.config.agent_id,
                 "hostname": machine["hostname"],
                 "agent_version": __version__,
+                "timezone": machine.get("timezone"),
                 "borg_versions": borg_versions,
                 "capabilities": get_capabilities(),
-                "running_job_ids": [],
+                # The server treats this as authoritative: on this path it
+                # requeues-and-redispatches any "claimed"/undelivered job absent
+                # from the list, regardless of age (see
+                # ignore_age_for_undelivered in app/api/agents.py). _cancel_events
+                # lives on this instance, not the session, so a worker whose
+                # cancellation is still cooperative-pending survives a dropped
+                # socket and keeps running here. Reporting an empty list on
+                # reconnect would tell the server "I have nothing," and it would
+                # requeue and redispatch a job this agent is still executing —
+                # double-running a durable operation.
+                "running_job_ids": self._running_job_ids(),
             }
         )
         with self._writing(socket):
             socket.send(message)
+
+    def _running_job_ids(self) -> list[int]:
+        """Snapshot of job ids with a live worker on this agent instance right
+        now (registered in _register_cancel, cleared in _unregister_cancel's
+        finally). Taken under _registry_lock; the lock is released before this
+        returns so hello's I/O never runs while holding it."""
+        with self._registry_lock:
+            return sorted(self._cancel_events.keys())
+
+    @staticmethod
+    def _job_id_for_dispatch(message: dict[str, Any]) -> Optional[int]:
+        """Return the job id if, and only if, this message will reach a job
+        handler in _handle_command below -- i.e. it survives every one of
+        that method's early returns. Used by the session loop to register the
+        cancel event before the worker thread starts (see the register-before-
+        start comment in run_session); kept in lockstep with _handle_command's
+        own dispatch conditions on purpose, since a mismatch would either miss
+        the registration (the race this exists to close) or register an id
+        that nothing ever unregisters (a permanent phantom in hello)."""
+        command = str(message.get("command") or "")
+        if command in (
+            "filesystem.browse",
+            "diagnostics.run",
+            "agent.repository_defaults",
+            "agent.list_scripts",
+            "agent.upgrade",
+            "cancel",
+        ):
+            return None
+        raw_job_id = message.get("job_id")
+        # Cast defensively: this runs on the session thread, so an unparseable
+        # job_id raised here would unwind the whole session. Inside
+        # _handle_command -- a daemon worker -- the same bad value only kills
+        # that one command. Returning None keeps it out of the registry and
+        # leaves _handle_command to fail it exactly as it did before.
+        # OverflowError is not hypothetical: json.loads turns 1e400 into
+        # float("inf"), and int(inf) raises it rather than ValueError.
+        try:
+            job_id = int(raw_job_id) if raw_job_id is not None else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if job_id is None or get_job_handler(command) is None:
+            return None
+        return job_id
 
     def _handle_command(
         self,
         outbox: "queue.Queue[str]",
         message: dict[str, Any],
         closing: Optional[threading.Event] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> None:
         """Handle one server command (runs in a worker thread): ack it, then run
         the matching handler with cooperative cancellation wired in. Outgoing
         frames go to ``outbox`` for the session thread to write; ``closing``
-        suppresses them once the owning session has been torn down."""
+        suppresses them once the owning session has been torn down.
+
+        ``cancel_event`` is the event the session loop already registered for
+        this job via _job_id_for_dispatch/_register_cancel, closing the
+        register-before-start race (see run_session). It defaults to None so
+        direct callers (tests, or any future caller that predates this) keep
+        working: this method then falls back to registering it itself, same
+        as before this fix."""
         command_id = str(message.get("command_id") or "")
         command = str(message.get("command") or "")
         raw_job_id = message.get("job_id")
@@ -521,16 +665,21 @@ class AgentSessionRuntime:
             self._handle_list_scripts(client, payload)
             return
 
+        if command == "agent.upgrade":
+            self._handle_upgrade(client)
+            return
+
         if command == "cancel":
-            # Signal the worker running this job so it actually stops; it emits
-            # its own job_canceled as it unwinds. Also record the cancel here via
-            # the cancel path (idempotent /cancel) so the outcome is captured even
-            # if no worker is running. NOT send_result — that routes through
-            # complete_job and would wrongly finalize the target job as completed,
-            # racing the worker's cancel. The server dispatches cancel
+            # Signal the worker running this job so it actually stops. A worker
+            # of a kind that ends its process on cancel emits its own
+            # job_canceled once the process has ended, which is when the
+            # server may release the repository to other work. For any other
+            # job, or when no worker runs it, the cancel is recorded here via
+            # the cancel path (idempotent /cancel) so the outcome is captured. NOT
+            # send_result — that routes through complete_job and would wrongly
+            # finalize the target job as completed. The server dispatches cancel
             # fire-and-forget (wait_for_result=False), so no response is expected.
-            if job_id is not None:
-                self._signal_cancel(job_id)
+            if job_id is not None and not self._signal_cancel(job_id):
                 client.cancel_job(job_id)
             return
 
@@ -542,7 +691,27 @@ class AgentSessionRuntime:
             )
             return
 
-        cancel_event = self._register_cancel(job_id)
+        if self._upgrade_claimed():
+            # Refusing is what makes the upgrade's busy check hold: this
+            # process is about to be restarted, so a job started here would be
+            # orphaned by it. Failing now lets the server retry the job against
+            # the upgraded agent instead of waiting for the reaper.
+            #
+            # The session loop registered this id before starting the worker,
+            # and the unregister below is in a finally this return skips, so
+            # drop it here or hello reports a job that is not running.
+            self._unregister_cancel(job_id)
+            client.send_error(
+                "Agent is upgrading and cannot start new jobs",
+                code="upgrade_in_progress",
+            )
+            return
+
+        # Normally already registered by the session loop before this thread
+        # even started (see _job_id_for_dispatch); only register here when a
+        # caller invoked this method directly without doing that (e.g. a test).
+        if cancel_event is None:
+            cancel_event = self._register_cancel(job_id, command=command)
         try:
             result = handler(
                 {"id": job_id, "type": command, "payload": payload},
@@ -572,32 +741,86 @@ class AgentSessionRuntime:
                 return_code=return_code,
             )
 
-    def _register_cancel(self, job_id: int) -> threading.Event:
+    def _upgrade_claimed(self) -> bool:
+        """Whether an upgrade currently owns this session."""
+        with self._registry_lock:
+            return (
+                self._upgrading_until is not None
+                and time.monotonic() < self._upgrading_until
+            )
+
+    def _reserve_for_upgrade(self) -> list[int]:
+        """Claim this session for an upgrade, or report what is running.
+
+        The check and the claim happen under one lock hold, so a job that
+        registers concurrently either lands before the claim (and is reported
+        here, refusing the upgrade) or after it (and is refused by the
+        dispatch guard in _handle_command). Nothing slips between them.
+
+        Returns the running job ids when the upgrade must be refused, and an
+        empty list when the claim succeeded. A second upgrade request arriving
+        while one is already claimed is refused too, with an empty id list.
+
+        The claim carries a deadline because the reinstall is not guaranteed
+        to happen: the root helper refuses a non-https server, a checksum that
+        does not match, or a config that names a different server, and in each
+        case it aborts with this process still running. A claim without an
+        expiry would leave such an endpoint refusing every job until someone
+        restarted it by hand, which is worse than the orphaned job the claim
+        exists to prevent. The deadline matches the server's own upgrade
+        timeout, so the agent starts accepting work again no earlier than the
+        moment the server gives up on the upgrade.
+        """
+        with self._registry_lock:
+            running = sorted(self._cancel_events.keys())
+            if running:
+                return running
+            if (
+                self._upgrading_until is not None
+                and time.monotonic() < self._upgrading_until
+            ):
+                return [-1]
+            self._upgrading_until = time.monotonic() + UPGRADE_CLAIM_SECONDS
+            return []
+
+    def _release_upgrade(self) -> None:
+        """Undo the claim when the upgrade never actually starts. On success it
+        is left to expire: the restart normally gets there first."""
+        with self._registry_lock:
+            self._upgrading_until = None
+
+    def _register_cancel(self, job_id: int, *, command: str = "") -> threading.Event:
         """Register a cancel Event for ``job_id`` — already set if a cancel for it
-        arrived before the worker thread got here (start-up race)."""
+        arrived before the worker thread got here (start-up race). ``command``
+        is the job kind; see _signal_cancel."""
         event = threading.Event()
         with self._registry_lock:
             if job_id in self._pending_cancels:
                 self._pending_cancels.discard(job_id)
                 event.set()
             self._cancel_events[job_id] = event
+            if command in SELF_CANCELLING_JOB_KINDS:
+                self._self_cancelling_jobs.add(job_id)
         return event
 
-    def _signal_cancel(self, job_id: int) -> None:
+    def _signal_cancel(self, job_id: int) -> bool:
         """Request cancellation of ``job_id``; if its worker hasn't registered
-        yet, remember the request so it isn't lost."""
+        yet, remember the request so it isn't lost. True when a registered
+        worker was signalled that reports the cancel itself."""
         with self._registry_lock:
             event = self._cancel_events.get(job_id)
             if event is not None:
                 event.set()
-            else:
-                self._pending_cancels.add(job_id)
+                return job_id in self._self_cancelling_jobs
+            self._pending_cancels.add(job_id)
+            return False
 
     def _unregister_cancel(self, job_id: int) -> None:
         """Drop the cancel Event (and any pending flag) for a finished job."""
         with self._registry_lock:
             self._cancel_events.pop(job_id, None)
             self._pending_cancels.discard(job_id)
+            self._self_cancelling_jobs.discard(job_id)
 
     def _handle_repository_defaults(
         self, client: SessionCommandClient, payload: dict[str, Any]
@@ -649,6 +872,49 @@ class AgentSessionRuntime:
             client.send_error(f"Listing agent scripts failed: {exc}")
             return
         client.send_result({"scripts": scripts})
+
+    def _handle_upgrade(self, client: SessionCommandClient) -> None:
+        """Ask this endpoint to reinstall itself.
+
+        The whole action is creating one empty file that nothing reads: a
+        systemd .path unit watches it and starts the root helper, which takes
+        no arguments and reads every parameter from a root-owned config. The
+        agent therefore names no version and passes no argv.
+
+        Readiness is re-checked rather than trusted. The capability was
+        reported at connect time and the endpoint may have been changed since.
+        """
+        # Claiming rather than sampling: an upgrade restarts this process, and
+        # a job dispatched between a bare check and that restart would be
+        # orphaned by it. The claim closes the window, and is held through the
+        # restart on purpose.
+        running = self._reserve_for_upgrade()
+        if running:
+            # An upgrade restarts this process, which would orphan whatever
+            # job is running under it.
+            client.send_error(f"Agent is running jobs {running}", code="upgrade_busy")
+            return
+
+        readiness = check_self_upgrade()
+        if not readiness.supported or readiness.trigger is None:
+            self._release_upgrade()
+            client.send_error(
+                f"Endpoint cannot upgrade itself: {readiness.reason}",
+                code="upgrade_unsupported",
+            )
+            return
+
+        try:
+            readiness.trigger.touch()
+        except OSError as exc:
+            self._release_upgrade()
+            client.send_error(
+                f"Could not request upgrade: {exc}", code="upgrade_failed"
+            )
+            return
+
+        logger.info("Upgrade requested via %s", readiness.trigger)
+        client.send_result({"success": True, "trigger": str(readiness.trigger)})
 
     def _handle_diagnostics(
         self, client: SessionCommandClient, payload: dict[str, Any]

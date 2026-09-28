@@ -202,6 +202,15 @@ class _FakeQuery:
     def first(self):
         return self._result
 
+    def update(self, values, synchronize_session=False):
+        # the conditional transition of the timeout handler, applied to the
+        # one fake row (its status is the expected one in these tests)
+        if self._result is None:
+            return 0
+        for column, value in values.items():
+            setattr(self._result, column.key, value)
+        return 1
+
 
 class _FakeDB:
     def __init__(self, restore_job, agent_job):
@@ -214,8 +223,6 @@ class _FakeDB:
 
     def query(self, model):
         name = getattr(model, "__name__", "")
-        if name == "RestoreJob":
-            return _FakeQuery(self._restore_job)
         if name == "AgentJob":
             return _FakeQuery(self._agent_job)
         return _FakeQuery(None)
@@ -245,6 +252,7 @@ async def test_await_agent_restore_fails_when_never_claimed(monkeypatch):
         status="queued",
         progress_percent=None,
         current_file=None,
+        updated_at=None,
         nfiles=None,
         original_size=None,
         id=5,
@@ -261,6 +269,14 @@ async def test_await_agent_restore_fails_when_never_claimed(monkeypatch):
         restore_service_module,
         "time",
         SimpleNamespace(monotonic=lambda: next(clock)),
+    )
+
+    # The restore is resolved through the facade; this test drives the wait
+    # loop, so the resolution is stubbed to the fake row it writes to.
+    monkeypatch.setattr(
+        restore_service_module,
+        "resolve_restore_job",
+        lambda session, job_id: restore_job,
     )
 
     service = RestoreService()

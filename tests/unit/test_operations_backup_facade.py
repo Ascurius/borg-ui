@@ -1,0 +1,416 @@
+"""Phase 8: an `operations` row wearing the legacy backup-job surface."""
+
+from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from sqlalchemy.exc import OperationalError
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
+
+from app.database.models import (
+    BackupPlan,
+    BackupPlanRun,
+    Base,
+    Operation,
+    Repository,
+)
+from app.services.operations.backup_facade import (
+    BackupJobFacade,
+    backup_jobs_for_archive_names,
+    backup_jobs_started_since,
+    create_backup_operation,
+    latest_backup_jobs_by_repository,
+    list_backup_jobs,
+    newest_backup_job,
+    resolve_backup_job,
+    wait_for_backup_operation,
+    wait_out_backup_operation,
+)
+
+
+@pytest.fixture()
+def db():
+    engine = create_engine("sqlite:///:memory:")
+
+    @event.listens_for(engine, "connect")
+    def _fk_on(dbapi_conn, record):
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+@pytest.fixture()
+def repository(db):
+    repo = Repository(
+        name="nas", path="/repo/nas", borg_version=1, repository_type="local"
+    )
+    db.add(repo)
+    db.commit()
+    return repo
+
+
+@pytest.fixture()
+def log_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.config.settings.data_dir", str(tmp_path))
+    return tmp_path / "logs"
+
+
+def _backup_operation(db, repository, status="queued", trigger="manual", **kw):
+    op = Operation(
+        repository_id=repository.id if repository is not None else None,
+        kind="backup",
+        category="backup",
+        status=status,
+        trigger=trigger,
+        priority=0,
+        run_id="run-1",
+        params={"executor": "server"},
+        **kw,
+    )
+    db.add(op)
+    db.commit()
+    return op
+
+
+def test_facade_maps_status_words_and_progress(db, repository):
+    op = _backup_operation(db, repository)
+    job = BackupJobFacade(db, op)
+
+    assert job.status == "pending"
+    assert job.repository == "/repo/nas"
+    assert job.execution_mode == "local"
+    assert job.triggered_by == "manual"
+    assert job.retry_attempt == 1
+
+    job.status = "running"
+    job.progress = 42
+    job.progress_percent = 42.5
+    job.current_file = "/home/k/docs"
+    job.execution_mode = "local"
+    db.commit()
+
+    assert op.status == "running"
+    assert op.progress_percent == 42.5
+    assert job.progress == 42
+    assert op.progress_message == "/home/k/docs"
+    assert op.execution_mode == "server"
+
+
+def test_detail_columns_land_on_the_details_row(db, repository):
+    op = _backup_operation(db, repository)
+    job = BackupJobFacade(db, op)
+    job.archive_name = "nas-2026-09-09"
+    job.original_size = 5
+    job.maintenance_status = "running_prune"
+    job.remote_hostname = "box"
+    db.commit()
+
+    again = BackupJobFacade(db, db.get(Operation, op.id))
+    assert again.archive_name == "nas-2026-09-09"
+    assert again.original_size == 5
+    assert again.maintenance_status == "running_prune"
+    assert again.remote_hostname == "box"
+    with pytest.raises(AttributeError):
+        again.no_such_column
+
+
+def test_backup_plan_id_is_derived_from_the_run(db, repository):
+    plan = BackupPlan(name="nightly", source_directories='["/data"]')
+    db.add(plan)
+    db.flush()
+    run = BackupPlanRun(backup_plan_id=plan.id, trigger="manual", status="running")
+    db.add(run)
+    db.flush()
+    op = _backup_operation(db, repository, trigger="plan", backup_plan_run_id=run.id)
+    job = BackupJobFacade(db, op)
+
+    assert job.backup_plan_id == plan.id
+    assert job.triggered_by == "backup_plan"
+
+
+def test_logs_go_to_the_operation_log_file(db, repository, log_dir):
+    op = _backup_operation(db, repository)
+    job = BackupJobFacade(db, op)
+
+    job.logs = "line one\nline two"
+    db.commit()
+
+    assert op.log_file_path == str(log_dir / f"operation_{op.id}.log")
+    assert job.logs == "line one\nline two"
+
+    job.logs = "Logs saved to: something.log"
+    assert job.logs == "line one\nline two"
+
+
+def test_resolve_returns_none_for_an_unknown_id(db, repository):
+    op = _backup_operation(db, repository)
+
+    assert isinstance(resolve_backup_job(db, op.id), BackupJobFacade)
+    assert resolve_backup_job(db, op.id + 1000) is None
+
+
+def test_create_backup_operation_records_route_and_params(db, repository):
+    repository.source_ssh_connection_id = None
+    job = create_backup_operation(
+        db,
+        repository,
+        trigger="schedule",
+        executor="server",
+        params={"archive_name": "nas-{now}", "skip_hooks": None},
+        scheduled_job_id=None,
+    )
+
+    op = db.get(Operation, job.id)
+    assert op.kind == "backup"
+    assert op.trigger == "schedule"
+    assert op.priority == 5
+    assert op.params == {"archive_name": "nas-{now}", "executor": "server"}
+    assert op.execution_mode == "server"
+    assert job.route_strategy is not None
+
+
+def test_create_backup_operation_without_a_repository_keeps_the_path(db):
+    job = create_backup_operation(
+        db,
+        None,
+        trigger="manual",
+        executor="server",
+        repository_path="/nowhere",
+        commit=False,
+    )
+    job.status = "failed"
+    db.commit()
+
+    assert job.repository == "/nowhere"
+    assert job.repository_id is None
+    assert db.get(Operation, job.id).status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_backup_operation_holds_no_transaction_while_it_sleeps(
+    db, repository
+):
+    """A poll ends its read transaction before the sleep, so a waiter pins no
+    connection for the length of a backup."""
+    op = _backup_operation(db, repository, status="running")
+    sleeps = []
+
+    async def sleep_then_finish(seconds):
+        sleeps.append(db.in_transaction())
+        op.status = "completed"
+        db.commit()
+
+    with patch(
+        "app.services.operations.backup_facade.asyncio.sleep", new=sleep_then_finish
+    ):
+        assert await wait_for_backup_operation(db, op.id) == "completed"
+
+    assert sleeps == [False]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_backup_operation_returns_the_legacy_word(db, repository):
+    op = _backup_operation(db, repository, status="running")
+
+    async def _finish():
+        op.status = "completed_with_warnings"
+        db.commit()
+
+    import asyncio
+
+    asyncio.get_running_loop().call_later(
+        0.05, lambda: asyncio.ensure_future(_finish())
+    )
+    assert (
+        await wait_for_backup_operation(db, op.id, poll_interval_seconds=0.01)
+        == "completed_with_warnings"
+    )
+
+
+@pytest.mark.asyncio
+async def test_wait_for_backup_operation_waits_for_the_runner_task(db, repository):
+    """#1216: the server backup commits `completed` as soon as `borg create`
+    exits, then runs `borg info`, the rclone mirror and the post-backup
+    hooks. A waiter that stops there starts the plan's prune against a
+    repository `borg info` still has locked. The row is done when the
+    runner's task is, whose terminal write also carries a late failure."""
+    import asyncio
+
+    from app.services.operations.runner import operation_runner
+
+    op = _backup_operation(db, repository, status="completed")
+    task = asyncio.get_running_loop().create_future()
+    operation_runner.running_tasks[op.id] = task
+
+    def _finish():
+        op.status = "failed"
+        db.commit()
+        operation_runner.running_tasks.pop(op.id, None)
+        task.set_result(None)
+
+    asyncio.get_running_loop().call_later(0.05, _finish)
+    try:
+        assert (
+            await wait_for_backup_operation(db, op.id, poll_interval_seconds=0.01)
+            == "failed"
+        )
+    finally:
+        operation_runner.running_tasks.pop(op.id, None)
+
+
+def _locked_database() -> OperationalError:
+    """The error SQLAlchemy raises for a locked SQLite database."""
+    return OperationalError("SELECT operations.id", {}, Exception("database is locked"))
+
+
+@pytest.mark.asyncio
+async def test_wait_out_backup_operation_waits_again_after_a_failed_read(db):
+    """A database error is waited out with a doubling, capped sleep; each
+    wait polls on a session of its own, closed when it ends, and each one
+    still gets the caller's cancel callback."""
+    sessions = []
+    callbacks = []
+    is_cancelled = lambda: False  # noqa: E731
+
+    async def flaky_wait(session, operation_id, **kwargs):
+        sessions.append(session)
+        callbacks.append(kwargs["is_cancelled"])
+        # A real poll begins a transaction; the helper must end it.
+        session.get(Operation, operation_id)
+        assert session.in_transaction()
+        if len(sessions) < 7:
+            raise _locked_database()
+        return "completed"
+
+    with (
+        patch("app.database.database.SessionLocal", sessionmaker(bind=db.get_bind())),
+        patch(
+            "app.services.operations.backup_facade.wait_for_backup_operation",
+            new=flaky_wait,
+        ),
+        patch(
+            "app.services.operations.backup_facade.asyncio.sleep", new=AsyncMock()
+        ) as sleep,
+    ):
+        assert (
+            await wait_out_backup_operation(7, is_cancelled=is_cancelled) == "completed"
+        )
+
+    assert [call.args for call in sleep.await_args_list] == [
+        (2.0,),
+        (4.0,),
+        (8.0,),
+        (16.0,),
+        (30.0,),
+        (30.0,),
+    ]
+    assert len({id(session) for session in sessions}) == 7
+    assert all(not session.in_transaction() for session in sessions)
+    assert callbacks == [is_cancelled] * 7
+
+
+@pytest.mark.asyncio
+async def test_wait_out_backup_operation_lets_any_other_error_through(db):
+    """Waiting cures no programming error; it reaches the caller at once."""
+
+    sessions = []
+
+    async def broken_wait(session, operation_id, **kwargs):
+        sessions.append(session)
+        session.get(Operation, operation_id)
+        raise RuntimeError("lost the runner")
+
+    with (
+        patch("app.database.database.SessionLocal", sessionmaker(bind=db.get_bind())),
+        patch(
+            "app.services.operations.backup_facade.wait_for_backup_operation",
+            new=broken_wait,
+        ),
+        patch(
+            "app.services.operations.backup_facade.asyncio.sleep", new=AsyncMock()
+        ) as sleep,
+        pytest.raises(RuntimeError, match="lost the runner"),
+    ):
+        await wait_out_backup_operation(7)
+
+    sleep.assert_not_awaited()
+    assert not sessions[0].in_transaction()
+
+
+def test_list_backup_jobs_newest_first(db, repository):
+    old = _backup_operation(db, repository, status="completed")
+    old.created_at = datetime(2026, 9, 1)
+    db.commit()
+    op = _backup_operation(db, repository, status="completed")
+    op.created_at = datetime(2026, 9, 9)
+    db.commit()
+
+    jobs = list_backup_jobs(db, 10)
+    assert [j.id for j in jobs] == [op.id, old.id]
+    assert list_backup_jobs(db, 10, manual_only=True)[0].id == op.id
+    assert list_backup_jobs(db, 10, scheduled_only=True) == []
+    assert list_backup_jobs(db, 10, repository_path="/other") == []
+
+
+def test_started_since_archive_names_and_per_repository_helpers(db, repository):
+    now = datetime.utcnow()
+    legacy = _backup_operation(db, repository, status="completed")
+    legacy.started_at = now - timedelta(days=3)
+    legacy.created_at = now - timedelta(days=3)
+    legacy.completed_at = now - timedelta(days=3)
+    BackupJobFacade(db, legacy).archive_name = "nas-old"
+    db.commit()
+    op = _backup_operation(db, repository, status="running")
+    op.started_at = now - timedelta(hours=1)
+    job = BackupJobFacade(db, op)
+    job.archive_name = "nas-new"
+    db.commit()
+
+    recent = backup_jobs_started_since(db, now - timedelta(days=7))
+    assert [j.id for j in recent] == [op.id, legacy.id]
+    assert backup_jobs_started_since(db, now - timedelta(days=1))[0].id == op.id
+
+    by_name = backup_jobs_for_archive_names(db, repository, {"nas-old", "nas-new"})
+    assert {j.archive_name for j in by_name} == {"nas-old", "nas-new"}
+
+    latest = latest_backup_jobs_by_repository(db)
+    assert latest["/repo/nas"].id == op.id
+    assert latest_backup_jobs_by_repository(db, running=True)["/repo/nas"].id == op.id
+    assert newest_backup_job(db, running=True).id == op.id
+    assert newest_backup_job(db, terminal=True).id == legacy.id
+
+
+def test_a_list_loads_its_details_rows_in_one_statement(db, repository):
+    """A facade constructor reads the details row; a list of facades used to
+    read one row per statement (#1082). The list preloads them instead."""
+    now = datetime.utcnow()
+    for i in range(6):
+        op = _backup_operation(
+            db, repository, status="completed", started_at=now - timedelta(hours=i)
+        )
+        BackupJobFacade(db, op).archive_name = f"nas-{i}"
+    db.commit()
+    # forget the rows, so that the list has to load them again
+    db.expunge_all()
+
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(db.get_bind(), "before_cursor_execute", record)
+    try:
+        jobs = backup_jobs_started_since(db, now - timedelta(days=1))
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", record)
+
+    assert len(jobs) == 6
+    assert len(statements) == 2
+    assert "operation_backup_details" in statements[1]
+    assert sorted(job.archive_name for job in jobs) == [f"nas-{i}" for i in range(6)]

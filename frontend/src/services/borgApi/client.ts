@@ -21,7 +21,7 @@ import {
   clearAccessToken,
   type BackendTargetRequestConfig,
 } from '../authHeaders'
-import type { AxiosProgressEvent, InternalAxiosRequestConfig } from 'axios'
+import type { AxiosProgressEvent, AxiosResponse, InternalAxiosRequestConfig } from 'axios'
 
 export const httpClient = axios.create({
   baseURL: import.meta.env.VITE_API_URL || `${BASE_PATH}/api`,
@@ -142,7 +142,10 @@ export class BorgApiClient {
   // ── Archives ─────────────────────────────────────────────────────────────
 
   listArchives() {
-    return httpClient.get(`${this.repoBase}/archives`)
+    // `/archives` is the persisted archive index, whose rows carry database ids
+    // and no borg archive name; the live borg listing is `/archives/live` on
+    // both routers.
+    return httpClient.get(`${this.repoBase}/archives/live`)
   }
 
   getArchiveInfo(archiveId: string, includeFiles = false, fileLimit = 1000) {
@@ -199,9 +202,26 @@ export class BorgApiClient {
     })
   }
 
+  /** Fetch one archived directory as a streamed tar file. */
+  fetchArchiveFolder(
+    archiveId: string,
+    directoryPath: string,
+    options?: { onDownloadProgress?: (event: AxiosProgressEvent) => void }
+  ) {
+    return httpClient.get(`${this.v}/archives/download-folder`, {
+      params: {
+        repository: this.repoId,
+        archive: archiveId,
+        directory_path: directoryPath,
+      },
+      responseType: 'blob',
+      onDownloadProgress: options?.onDownloadProgress,
+    })
+  }
+
   // ── Backup operations ────────────────────────────────────────────────────
 
-  runBackup(options: BackupOptions = {}) {
+  runBackup(options: BackupOptions = {}): Promise<AxiosResponse> {
     if (this.v === '/v2') {
       return httpClient.post('/v2/backup/run', {
         repository_id: this.repoId,

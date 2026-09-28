@@ -1,16 +1,48 @@
 import asyncio
+import json
 from datetime import datetime
 from pathlib import Path
 import structlog
 from sqlalchemy.orm import Session
-from app.database.models import PruneJob, Repository
+from app.database.models import Repository
+from app.services.job_history_retention import (
+    archive_names_from_prune_output,
+    mark_jobs_of_pruned_archives,
+)
 from app.database.database import SessionLocal
 from app.config import settings
 from app.core.borg import borg
+from app.core.borg_errors import is_borg_warning_exit_code
 from app.utils.db_retries import commit_with_retry
-from app.utils.borg_env import build_repository_borg_env, cleanup_temp_key_file
+from app.utils.borg_env import (
+    build_repository_borg_env,
+    cleanup_temp_key_file,
+    effective_repository_remote_path,
+    with_lock_wait,
+)
+from app.services.operations.job_facade import refresh_job, resolve_maintenance_job
+
+from app.services.process_cancel import (
+    terminate_process,
+    terminate_tracked_process,
+)
 
 logger = structlog.get_logger()
+
+
+def _log_message(line: str) -> str:
+    """The text of a Borg `--log-json` record, or the line itself.
+
+    Archive names are matched against the record's `message`: in the raw
+    line a name containing `"` or `\\` is JSON-escaped and would not match."""
+    if line.startswith("{"):
+        try:
+            message = json.loads(line).get("message")
+        except (ValueError, AttributeError):
+            return line
+        if isinstance(message, str):
+            return message
+    return line
 
 
 class PruneService:
@@ -23,28 +55,7 @@ class PruneService:
 
     async def cancel_prune(self, job_id: int) -> bool:
         """Cancel a running prune job by terminating its tracked process."""
-        if job_id not in self.running_processes:
-            logger.warning("No running prune process found for job", job_id=job_id)
-            return False
-
-        process = self.running_processes[job_id]
-        try:
-            process.terminate()
-            logger.info("Sent SIGTERM to prune process", job_id=job_id, pid=process.pid)
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                process.kill()
-                logger.warning(
-                    "Force killed prune process (SIGKILL)",
-                    job_id=job_id,
-                    pid=process.pid,
-                )
-                await process.wait()
-            return True
-        except Exception as e:
-            logger.error("Failed to cancel prune process", job_id=job_id, error=str(e))
-            return False
+        return await terminate_tracked_process(self.running_processes, job_id, "prune")
 
     async def execute_prune(
         self,
@@ -68,7 +79,7 @@ class PruneService:
 
         try:
             # Get job
-            job = db.query(PruneJob).filter(PruneJob.id == job_id).first()
+            job = resolve_maintenance_job(db, job_id, "prune")
             if not job:
                 logger.error("Prune job not found", job_id=job_id)
                 return
@@ -159,8 +170,8 @@ class PruneService:
                 cmd.append(f"--keep-within={keep_within.strip()}")
 
             # Add remote path if specified
-            if repository.remote_path:
-                cmd.extend(["--remote-path", repository.remote_path])
+            if remote_path := effective_repository_remote_path(repository):
+                cmd.extend(["--remote-path", remote_path])
 
             cmd.append(repository.path)
 
@@ -174,7 +185,7 @@ class PruneService:
 
             # Execute command
             process = await asyncio.create_subprocess_exec(
-                *cmd,
+                *with_lock_wait(cmd, env),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
@@ -189,27 +200,23 @@ class PruneService:
             # In-memory log buffer
             log_buffer = []
             MAX_BUFFER_SIZE = 1000
+            # Collected while streaming: the buffer above is capped, and a
+            # large prune's early "Pruning archive:" lines would fall out of
+            # it before they are parsed.
+            pruned_archive_names: set[str] = set()
 
             async def check_cancellation():
                 """Periodic heartbeat to check for cancellation"""
                 nonlocal cancelled
                 while not cancelled and process.returncode is None:
                     await asyncio.sleep(3)
-                    db.refresh(job)
+                    refresh_job(db, job)
                     if job.status == "cancelled":
                         logger.info(
                             "Prune job cancelled, terminating process", job_id=job_id
                         )
                         cancelled = True
-                        process.terminate()
-                        try:
-                            await asyncio.wait_for(process.wait(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "Process didn't terminate, killing it", job_id=job_id
-                            )
-                            process.kill()
-                            await process.wait()
+                        await terminate_process(process, job_id, "prune")
                         break
 
             async def stream_logs():
@@ -227,7 +234,19 @@ class PruneService:
                                 ).strip()
                                 if line_str:
                                     log_buffer.append(f"[{name}] {line_str}")
-                                    if len(log_buffer) > MAX_BUFFER_SIZE:
+                                    pruned_archive_names.update(
+                                        archive_names_from_prune_output(
+                                            _log_message(line_str)
+                                        )
+                                    )
+                                    # A dry run's output is one verdict line per
+                                    # archive and the preview (spec 4.4) reads
+                                    # every one of them; only a real prune's
+                                    # chatter is capped.
+                                    if (
+                                        not dry_run
+                                        and len(log_buffer) > MAX_BUFFER_SIZE
+                                    ):
                                         log_buffer.pop(0)
                         except asyncio.CancelledError:
                             pass
@@ -250,8 +269,7 @@ class PruneService:
             except asyncio.CancelledError:
                 logger.info("Prune task cancelled", job_id=job_id)
                 cancelled = True
-                process.terminate()
-                await process.wait()
+                await terminate_process(process, job_id, "prune")
                 raise
 
             # Wait for process to complete
@@ -268,7 +286,7 @@ class PruneService:
                 logger.info(
                     "Prune completed successfully", job_id=job_id, dry_run=dry_run
                 )
-            elif process.returncode == 1 or (100 <= process.returncode <= 127):
+            elif is_borg_warning_exit_code(process.returncode):
                 # Warning (legacy exit code 1 or modern exit codes 100-127)
                 job.status = "completed_with_warnings"
                 job.error_message = (
@@ -289,18 +307,15 @@ class PruneService:
                     "Prune failed", job_id=job_id, exit_code=process.returncode
                 )
 
-            # Archives that no longer exist take their job records with them:
-            # parse the pruned names from the --list output and cascade.
+            # Archives that no longer exist are recorded on their backup jobs:
+            # the names were collected from the --list output while it streamed.
             if not dry_run and job.status in ("completed", "completed_with_warnings"):
-                from app.services.job_history_retention import (
-                    archive_names_from_prune_output,
-                    purge_jobs_for_pruned_archives,
-                )
-
-                purge_jobs_for_pruned_archives(
+                mark_jobs_of_pruned_archives(
                     db,
                     repository_id,
-                    archive_names_from_prune_output("\n".join(log_buffer)),
+                    pruned_archive_names,
+                    created_before=job.started_at,
+                    pruned_at=job.completed_at,
                 )
 
             # Save logs for all completed/failed/cancelled/warning jobs
@@ -376,9 +391,11 @@ class PruneService:
             try:
                 completed_at = datetime.utcnow()
 
+                error_message = str(e)
+
                 def persist_failure_state():
                     job.status = "failed"
-                    job.error_message = str(e)
+                    job.error_message = error_message
                     job.completed_at = completed_at
 
                 await commit_with_retry(

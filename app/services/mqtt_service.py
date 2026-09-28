@@ -1,5 +1,5 @@
 """
-MQTT service for Borg Web UI.
+MQTT service for Borg UI.
 
 Home Assistant sensor state is always published from database state so that:
 - state can be fully reconstructed from DB records
@@ -12,13 +12,17 @@ import json
 from typing import Any, Dict, List, Optional, Set
 
 import structlog
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config import get_runtime_app_version
 from app.database.database import SessionLocal
-from app.database.models import BackupJob, MQTTSyncState, Repository
+from app.database.models import MQTTSyncState, Repository
+from app.services.operations.backup_facade import (
+    latest_backup_jobs_by_repository,
+    newest_backup_job,
+)
 from app.utils.datetime_utils import serialize_datetime
+from app.services.storage_usage import stored_size_bytes
 
 import paho.mqtt.client as mqtt
 
@@ -186,28 +190,6 @@ class MQTTSyncStateStore:
 class BackupJobQueryService:
     """Read-model queries for per-repository backup jobs."""
 
-    @staticmethod
-    def _latest_jobs_subquery(
-        db: Session,
-        *,
-        status_filter: Optional[str] = None,
-        order_field: Any = BackupJob.created_at,
-    ):
-        query = db.query(
-            BackupJob.id.label("job_id"),
-            BackupJob.repository.label("repository"),
-            BackupJob.status.label("status"),
-            func.row_number()
-            .over(
-                partition_by=BackupJob.repository,
-                order_by=(order_field.desc(), BackupJob.id.desc()),
-            )
-            .label("row_num"),
-        ).filter(BackupJob.repository.isnot(None))
-        if status_filter:
-            query = query.filter(BackupJob.status == status_filter)
-        return query.subquery()
-
     def fetch_failed_repositories(
         self,
         db: Session,
@@ -217,63 +199,22 @@ class BackupJobQueryService:
         if not path_to_id:
             return set()
 
-        latest_jobs = self._latest_jobs_subquery(db)
-        latest_rows = (
-            db.query(
-                latest_jobs.c.repository,
-                latest_jobs.c.status,
-            )
-            .filter(
-                latest_jobs.c.row_num == 1,
-                latest_jobs.c.repository.in_(list(path_to_id.keys())),
-            )
-            .all()
-        )
-
         failed_ids: Set[int] = set()
-        for repository_path, status in latest_rows:
-            if status != "failed":
+        for repository_path, job in latest_backup_jobs_by_repository(db).items():
+            if job.status != "failed":
                 continue
             repo_id = path_to_id.get(repository_path)
             if repo_id:
                 failed_ids.add(repo_id)
         return failed_ids
 
-    def fetch_latest_backup_jobs_by_repository(
-        self,
-        db: Session,
-    ) -> Dict[str, BackupJob]:
-        """
-        Return latest backup job row per repository path.
+    def fetch_latest_backup_jobs_by_repository(self, db: Session) -> Dict[str, Any]:
+        """Latest backup per repository path, across both tables (phase 8)."""
+        return latest_backup_jobs_by_repository(db)
 
-        Uses a window function so only one row per repository is materialized.
-        """
-        latest_jobs = self._latest_jobs_subquery(db)
-        rows = (
-            db.query(BackupJob)
-            .join(latest_jobs, BackupJob.id == latest_jobs.c.job_id)
-            .filter(latest_jobs.c.row_num == 1)
-            .all()
-        )
-        return {job.repository: job for job in rows if job.repository}
-
-    def fetch_running_backup_jobs_by_repository(
-        self,
-        db: Session,
-    ) -> Dict[str, BackupJob]:
-        """Return latest running backup job row per repository path."""
-        latest_running_jobs = self._latest_jobs_subquery(
-            db,
-            status_filter="running",
-            order_field=func.coalesce(BackupJob.started_at, BackupJob.created_at),
-        )
-        rows = (
-            db.query(BackupJob)
-            .join(latest_running_jobs, BackupJob.id == latest_running_jobs.c.job_id)
-            .filter(latest_running_jobs.c.row_num == 1)
-            .all()
-        )
-        return {job.repository: job for job in rows if job.repository}
+    def fetch_running_backup_jobs_by_repository(self, db: Session) -> Dict[str, Any]:
+        """Latest running backup per repository path, across both tables."""
+        return latest_backup_jobs_by_repository(db, running=True)
 
 
 class HomeAssistantDiscoveryPublisher:
@@ -515,22 +456,10 @@ class ServerStatePublisher:
 
     def publish_server_state_from_db(self, db: Session) -> bool:
         """Publish server-level sensor topics from backup_jobs table."""
-        running_job = (
-            db.query(BackupJob)
-            .filter(BackupJob.status == "running")
-            .order_by(BackupJob.started_at.desc(), BackupJob.id.desc())
-            .first()
-        )
-        latest_job = (
-            db.query(BackupJob)
-            .order_by(BackupJob.created_at.desc(), BackupJob.id.desc())
-            .first()
-        )
-        latest_terminal_job = (
-            db.query(BackupJob)
-            .filter(BackupJob.status.in_(TERMINAL_JOB_STATUSES))
-            .order_by(BackupJob.completed_at.desc(), BackupJob.id.desc())
-            .first()
+        running_job = newest_backup_job(db, running=True)
+        latest_job = newest_backup_job(db)
+        latest_terminal_job = newest_backup_job(
+            db, terminal=True, terminal_statuses=TERMINAL_JOB_STATUSES
         )
 
         running_timestamp = (
@@ -649,13 +578,13 @@ class RepositoryStatePublisher:
         self,
         repository: Repository,
         failed_repository_ids: Set[int],
-        latest_jobs_by_repository: Dict[str, BackupJob],
-        running_jobs_by_repository: Dict[str, BackupJob],
+        latest_jobs_by_repository: Dict[str, Any],
+        running_jobs_by_repository: Dict[str, Any],
     ) -> bool:
         """Publish all per-repository state topics from repository table."""
         try:
             success = True
-            size_bytes = self.parse_size_to_bytes(repository.total_size or "0")
+            size_bytes = stored_size_bytes(repository)
             if not self._mqtt_service.publish_repository_size(
                 repository.id,
                 size_bytes,
@@ -781,35 +710,6 @@ class RepositoryStatePublisher:
                 exc_info=True,
             )
             return False
-
-    @staticmethod
-    def parse_size_to_bytes(size_str: str) -> int:
-        """Parse human-readable size string to bytes."""
-        if not size_str:
-            return 0
-
-        normalized = size_str.strip().upper().replace(" ", "")
-        multipliers = [
-            ("PB", 1024**5),
-            ("TB", 1024**4),
-            ("GB", 1024**3),
-            ("MB", 1024**2),
-            ("KB", 1024),
-            ("B", 1),
-        ]
-
-        for unit, multiplier in multipliers:
-            if normalized.endswith(unit):
-                try:
-                    number = float(normalized[: -len(unit)])
-                    return int(number * multiplier)
-                except ValueError:
-                    return 0
-
-        try:
-            return int(float(normalized))
-        except ValueError:
-            return 0
 
     @staticmethod
     def get_repository_status(
@@ -1218,7 +1118,7 @@ class MQTTService:
             payload["archive"] = archive
         return self.publish(f"repositories/{repository_id}/status", payload, qos=1)
 
-    def publish_repository_size(self, repository_id: int, total: int):
+    def publish_repository_size(self, repository_id: int, total: Optional[int]):
         if not self.config["enabled"]:
             return False
         return self.publish(
@@ -1496,8 +1396,8 @@ class MQTTService:
         self,
         repository: Repository,
         failed_repository_ids: Set[int],
-        latest_jobs_by_repository: Dict[str, BackupJob],
-        running_jobs_by_repository: Dict[str, BackupJob],
+        latest_jobs_by_repository: Dict[str, Any],
+        running_jobs_by_repository: Dict[str, Any],
     ) -> bool:
         """Publish all per-repository state topics from repository table."""
         return self._repository_state_publisher.publish_repository_data(
@@ -1513,21 +1413,13 @@ class MQTTService:
         """Return repository IDs whose latest backup job failed."""
         return self._job_query_service.fetch_failed_repositories(db, path_to_id)
 
-    def _fetch_latest_backup_jobs_by_repository(
-        self, db: Session
-    ) -> Dict[str, BackupJob]:
+    def _fetch_latest_backup_jobs_by_repository(self, db: Session) -> Dict[str, Any]:
         """Return latest backup job row per repository path."""
         return self._job_query_service.fetch_latest_backup_jobs_by_repository(db)
 
-    def _fetch_running_backup_jobs_by_repository(
-        self, db: Session
-    ) -> Dict[str, BackupJob]:
+    def _fetch_running_backup_jobs_by_repository(self, db: Session) -> Dict[str, Any]:
         """Return latest running backup job row per repository path."""
         return self._job_query_service.fetch_running_backup_jobs_by_repository(db)
-
-    def _parse_size_to_bytes(self, size_str: str) -> int:
-        """Parse human-readable size string to bytes."""
-        return self._repository_state_publisher.parse_size_to_bytes(size_str)
 
     def _get_repository_status(
         self,

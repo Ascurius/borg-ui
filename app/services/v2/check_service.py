@@ -2,7 +2,7 @@
 
 Mirrors check_service.py but uses the borg2 binary with --progress --log-json
 flags required for parseable progress output.  Progress is stored in the shared
-CheckJob table so the existing frontend polling endpoints work unchanged.
+operations row, so the existing frontend polling endpoints work unchanged.
 """
 
 import asyncio
@@ -12,12 +12,26 @@ from datetime import datetime
 from pathlib import Path
 import structlog
 
-from app.database.models import CheckJob, Repository
+from app.database.models import Repository
 from app.database.database import SessionLocal
+from app.services.operations.job_facade import (
+    claim_running,
+    refresh_job,
+    resolve_maintenance_job,
+)
+from app.services.process_cancel import (
+    terminate_process,
+    terminate_tracked_process,
+)
 from app.core.borg2 import _get_borg2_binary
+from app.core.borg_errors import is_borg_warning_exit_code
 from app.config import settings
 from app.utils.db_retries import commit_with_retry
-from app.utils.borg_env import build_repository_borg_env, cleanup_temp_key_file
+from app.utils.borg_env import (
+    build_repository_borg_env,
+    cleanup_temp_key_file,
+    effective_repository_remote_path,
+)
 from app.utils.ssh_utils import (
     resolve_repo_ssh_key_file,  # noqa: F401
 )  # Backward-compatible patch target for tests
@@ -37,20 +51,26 @@ def _get_process_start_time(pid: int) -> int:
 
 
 class CheckV2Service:
-    """Run borg2 check with real-time progress tracking via CheckJob records."""
+    """Run borg2 check with real-time progress tracking via operation rows."""
 
     def __init__(self):
         self.log_dir = Path(settings.data_dir) / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.running_processes: dict = {}
 
+    async def cancel_check(self, job_id: int) -> bool:
+        """Cancel a running borg2 check job by terminating its tracked process."""
+        return await terminate_tracked_process(
+            self.running_processes, job_id, "borg2 check"
+        )
+
     async def execute_check(self, job_id: int, repository_id: int, _db=None):
-        """Execute borg2 check with progress streaming into a CheckJob record."""
+        """Execute borg2 check with progress streaming into an operation row."""
         db = SessionLocal()
         temp_key_file = None
 
         try:
-            job = db.query(CheckJob).filter(CheckJob.id == job_id).first()
+            job = resolve_maintenance_job(db, job_id, "check")
             if not job:
                 logger.error("Borg2 check job not found", job_id=job_id)
                 return
@@ -75,9 +95,9 @@ class CheckV2Service:
                 )
                 return
 
-            # Job is pre-set to running by the endpoint; refresh to ensure we have latest state.
-            # If the job was somehow already completed/cancelled (race), bail out.
-            db.refresh(job)
+            # Refresh to ensure we have the latest state. If the job was
+            # somehow already completed/cancelled (race), bail out.
+            refresh_job(db, job)
             if job.status not in ("running", "pending"):
                 logger.warning(
                     "Check job already in terminal state, skipping",
@@ -85,6 +105,34 @@ class CheckV2Service:
                     status=job.status,
                 )
                 return
+
+            # The manual endpoint pre-sets the job to running, but scheduler
+            # jobs arrive as pending. Record the actual execution start either
+            # way so started_at is never left NULL (job history and the
+            # dashboard activity feed both filter on it). The status predicate
+            # keeps a concurrent cancellation from being overwritten.
+            started_at = datetime.utcnow()
+            claimed = 0
+
+            def persist_start_state():
+                nonlocal claimed
+                claimed = claim_running(db, job_id, "check", started_at)
+
+            await commit_with_retry(
+                db,
+                prepare=persist_start_state,
+                logger=logger,
+                action="borg2_check_start",
+                job_id=job_id,
+                repository_id=repository_id,
+            )
+            if not claimed:
+                logger.warning(
+                    "Check job reached a terminal state before start, skipping",
+                    job_id=job_id,
+                )
+                return
+            refresh_job(db, job)
 
             env, temp_key_file = build_repository_borg_env(
                 repo,
@@ -126,8 +174,8 @@ class CheckV2Service:
                         extra_flags=extra_flags,
                         error=str(exc),
                     )
-            if repo.remote_path:
-                cmd.extend(["--remote-path", repo.remote_path])
+            if remote_path := effective_repository_remote_path(repo):
+                cmd.extend(["--remote-path", remote_path])
 
             logger.info(
                 "Starting borg2 check",
@@ -172,16 +220,11 @@ class CheckV2Service:
                 nonlocal cancelled
                 while not cancelled and process.returncode is None:
                     await asyncio.sleep(3)
-                    db.refresh(job)
+                    refresh_job(db, job)
                     if job.status == "cancelled":
                         logger.info("Borg2 check cancelled, terminating", job_id=job_id)
                         cancelled = True
-                        process.terminate()
-                        try:
-                            await asyncio.wait_for(process.wait(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            process.kill()
-                            await process.wait()
+                        await terminate_process(process, job_id, "borg2 check")
                         break
 
             async def stream_logs():
@@ -279,8 +322,7 @@ class CheckV2Service:
                 )
             except asyncio.CancelledError:
                 cancelled = True
-                process.terminate()
-                await process.wait()
+                await terminate_process(process, job_id, "borg2 check")
                 raise
 
             if process.returncode is None:
@@ -300,7 +342,7 @@ class CheckV2Service:
                 job.completed_at = datetime.utcnow()
                 repo.last_check = datetime.utcnow()
                 logger.info("Borg2 check completed", job_id=job_id)
-            elif process.returncode == 1 or (100 <= process.returncode <= 127):
+            elif is_borg_warning_exit_code(process.returncode):
                 job.status = "completed_with_warnings"
                 job.progress = 100
                 job.progress_message = (
@@ -372,9 +414,11 @@ class CheckV2Service:
             try:
                 completed_at = datetime.utcnow()
 
+                error_message = str(e)
+
                 def persist_failure_state():
                     job.status = "failed"
-                    job.error_message = str(e)
+                    job.error_message = error_message
                     job.completed_at = completed_at
 
                 await commit_with_retry(

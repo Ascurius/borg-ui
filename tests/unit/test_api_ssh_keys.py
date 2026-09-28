@@ -217,6 +217,136 @@ class TestSSHKeysEndpoints:
         )
         assert listed_connection["error_message"] == error_message
 
+    def test_connection_test_restricted_shell_counts_as_connected(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """A forced-command key refuses `pwd` but authenticated: that is connected."""
+        from app.core.security import encrypt_secret
+
+        fake_private_key = "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----\n"
+        ssh_key = SSHKey(
+            name="Restricted key",
+            public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest test@test",
+            private_key=encrypt_secret(fake_private_key),
+            is_active=True,
+        )
+        test_db.add(ssh_key)
+        test_db.commit()
+        test_db.refresh(ssh_key)
+
+        seen_kwargs: dict = {}
+
+        async def mock_subprocess(*cmd, **kwargs):
+            seen_kwargs.update(kwargs)
+            mock_process = AsyncMock()
+            mock_process.communicate = AsyncMock(
+                return_value=(b"", b"Only borg serve is permitted\n")
+            )
+            mock_process.returncode = 64
+            return mock_process
+
+        with patch(
+            "app.api.ssh_keys.asyncio.create_subprocess_exec",
+            side_effect=mock_subprocess,
+        ):
+            response = test_client.post(
+                f"/api/ssh-keys/{ssh_key.id}/test-connection",
+                json={"host": "repo.example", "username": "borg", "port": 22},
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["message"] == "backend.success.ssh.connectionTestSuccessRestricted"
+        assert data["connection"]["status"] == "connected"
+        assert data["connection"]["error_message"] is None
+        assert data["connection"]["shell_restricted"] is True
+        # borg serve would block on an open stdin
+        assert seen_kwargs["stdin"] == asyncio.subprocess.DEVNULL
+
+        stored = (
+            test_db.query(SSHConnection)
+            .filter(SSHConnection.id == data["connection"]["id"])
+            .one()
+        )
+        assert stored.shell_restricted is True
+
+        listed = test_client.get("/api/ssh-keys/connections", headers=admin_headers)
+        assert listed.status_code == 200
+        assert (
+            next(c for c in listed.json()["connections"] if c["id"] == stored.id)[
+                "shell_restricted"
+            ]
+            is True
+        )
+
+    def test_connection_diagnostics_latency_marks_restricted_shell(
+        self, test_client: TestClient, admin_headers, test_db, monkeypatch
+    ):
+        _, connection = self._create_diagnostics_connection(test_db)
+
+        async def fake_run_ssh_process(cmd, timeout_seconds):
+            if "-W" in cmd:
+                return 0, b"", b""
+            if cmd[-1].startswith("dd if=/dev/zero"):
+                return 0, b"x" * 131072, b""
+            return 1, b"", b"Only borg serve is permitted\n"
+
+        monkeypatch.setattr(
+            ssh_keys_api, "_run_ssh_process", fake_run_ssh_process, raising=False
+        )
+        self._patch_monotonic(monkeypatch, [10.0, 10.0, 10.0, 10.025])
+
+        response = test_client.post(
+            f"/api/ssh-keys/connections/{connection.id}/diagnostics",
+            json={"timeout_seconds": 4},
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["session"]["status"] == "success"
+        assert data["session"]["restricted"] is True
+
+    def test_restricted_result_clears_cached_storage(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """Storage numbers collected before the key was locked down cannot be
+        refreshed any more, so a restricted result drops them."""
+        _, connection = self._create_diagnostics_connection(test_db)
+        connection.storage_total = 1000
+        connection.storage_used = 400
+        connection.storage_available = 600
+        connection.storage_percent_used = 40.0
+        connection.last_storage_check = datetime.utcnow()
+        test_db.commit()
+
+        async def mock_subprocess(*cmd, **kwargs):
+            mock_process = AsyncMock()
+            mock_process.communicate = AsyncMock(return_value=(b"", b"denied\n"))
+            mock_process.returncode = 1
+            return mock_process
+
+        with patch(
+            "app.api.ssh_keys.asyncio.create_subprocess_exec",
+            side_effect=mock_subprocess,
+        ):
+            response = test_client.post(
+                f"/api/ssh-keys/connections/{connection.id}/test",
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        test_db.refresh(connection)
+        assert connection.shell_restricted is True
+        assert connection.storage_total is None
+        assert connection.storage_used is None
+        assert connection.storage_available is None
+        assert connection.storage_percent_used is None
+        assert connection.last_storage_check is None
+
     def _create_diagnostics_connection(self, test_db):
         fake_private_key = "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----\n"
         ssh_key = SSHKey(
@@ -1182,14 +1312,13 @@ class TestSSHConnectionDelete:
         self, test_client: TestClient, test_db, admin_headers
     ):
         """Deleting an SSH connection must succeed even when backup_jobs,
-        restore_jobs, repositories, and scheduled_jobs still reference it.
+        operation details rows, repositories, and scheduled_jobs still
+        reference it.
         All FK columns must be NULLed before the DELETE so no constraint fires.
         """
         from app.database.models import (
             SSHConnection,
             Repository,
-            BackupJob,
-            RestoreJob,
             ScheduledJob,
         )
 
@@ -1208,22 +1337,6 @@ class TestSSHConnectionDelete:
         )
         test_db.add(repo)
 
-        backup_job = BackupJob(
-            repository="/tmp/ssh-repo",
-            status="completed",
-            source_ssh_connection_id=conn_id,
-        )
-        test_db.add(backup_job)
-
-        restore_job = RestoreJob(
-            repository="/tmp/ssh-repo",
-            archive="test-archive",
-            destination="/tmp/restore",
-            status="completed",
-            destination_connection_id=conn_id,
-        )
-        test_db.add(restore_job)
-
         scheduled_job = ScheduledJob(
             name="test-schedule",
             cron_expression="0 2 * * *",
@@ -1232,9 +1345,42 @@ class TestSSHConnectionDelete:
         test_db.add(scheduled_job)
         test_db.commit()
 
+        from app.database.models import (
+            Operation,
+            OperationBackupDetails,
+            OperationRestoreDetails,
+        )
+        from app.services.operations.details import backup_details, restore_details
+
+        backup_op = Operation(
+            repository_id=repo.id,
+            kind="backup",
+            category="backup",
+            status="completed",
+            trigger="manual",
+            priority=0,
+            run_id="run-ssh-delete-backup",
+        )
+        test_db.add(backup_op)
+        test_db.flush()
+        backup_details(test_db, backup_op).source_ssh_connection_id = conn_id
+        restore_op = Operation(
+            repository_id=repo.id,
+            kind="restore",
+            category="restore",
+            status="completed",
+            trigger="manual",
+            priority=0,
+            run_id="run-ssh-delete",
+        )
+        test_db.add(restore_op)
+        test_db.flush()
+        restore_details(test_db, restore_op).destination_connection_id = conn_id
+        test_db.commit()
+
         repo_id = repo.id
-        backup_job_id = backup_job.id
-        restore_job_id = restore_job.id
+        backup_op_id = backup_op.id
+        restore_op_id = restore_op.id
         scheduled_job_id = scheduled_job.id
 
         response = test_client.delete(
@@ -1256,17 +1402,13 @@ class TestSSHConnectionDelete:
         assert repo_after.connection_id is None
         assert repo_after.source_ssh_connection_id is None
 
-        backup_after = (
-            test_db.query(BackupJob).filter(BackupJob.id == backup_job_id).first()
-        )
+        backup_after = test_db.get(OperationBackupDetails, backup_op_id)
         assert backup_after is not None
         assert backup_after.source_ssh_connection_id is None
 
-        restore_after = (
-            test_db.query(RestoreJob).filter(RestoreJob.id == restore_job_id).first()
-        )
-        assert restore_after is not None
-        assert restore_after.destination_connection_id is None
+        details_after = test_db.get(OperationRestoreDetails, restore_op_id)
+        assert details_after is not None
+        assert details_after.destination_connection_id is None
 
         scheduled_after = (
             test_db.query(ScheduledJob)
@@ -1430,3 +1572,278 @@ class TestSSHKeyStorageAndHelpers:
 
         assert response.status_code == 404
         assert response.json()["detail"]["key"] == "backend.errors.ssh.noSystemKeyFound"
+
+
+@pytest.mark.unit
+class TestSSHConnectionHostKeyEndpoints:
+    """Host-key trust flow: inspect, confirm, forget."""
+
+    ED25519 = (
+        "keys.example.com ssh-ed25519 "
+        "AAAAC3NzaC1lZDI1NTE5AAAAIBERERERERERERERERERERERERERERERERERERERERER"
+    )
+    ROTATED = (
+        "keys.example.com ssh-ed25519 "
+        "AAAAC3NzaC1lZDI1NTE5AAAAIBEREREREREREREREREREREREREREREREREREREREREQ"
+    )
+
+    def _connection(self, test_db, **overrides):
+        connection = SSHConnection(
+            host="keys.example.com",
+            username="borg",
+            port=2222,
+            status="connected",
+            **overrides,
+        )
+        test_db.add(connection)
+        test_db.commit()
+        test_db.refresh(connection)
+        return connection
+
+    def test_reports_an_unpinned_connection_as_unknown(
+        self, test_client: TestClient, admin_headers, test_db, monkeypatch
+    ):
+        connection = self._connection(test_db)
+        monkeypatch.setattr(
+            ssh_keys_api,
+            "scan_host_key_async",
+            AsyncMock(return_value=self.ED25519),
+        )
+
+        response = test_client.get(
+            f"/api/ssh-keys/connections/{connection.id}/host-key",
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "unknown"
+        assert body["trusted_fingerprint"] is None
+        assert body["observed_fingerprint"].startswith("SHA256:")
+
+    def test_reports_a_changed_key(
+        self, test_client: TestClient, admin_headers, test_db, monkeypatch
+    ):
+        connection = self._connection(test_db, known_host_key=self.ED25519)
+        monkeypatch.setattr(
+            ssh_keys_api,
+            "scan_host_key_async",
+            AsyncMock(return_value=self.ROTATED),
+        )
+
+        response = test_client.get(
+            f"/api/ssh-keys/connections/{connection.id}/host-key",
+            headers=admin_headers,
+        )
+
+        assert response.json()["status"] == "changed"
+
+    def test_reports_an_unreachable_host(
+        self, test_client: TestClient, admin_headers, test_db, monkeypatch
+    ):
+        connection = self._connection(test_db, known_host_key=self.ED25519)
+        monkeypatch.setattr(
+            ssh_keys_api,
+            "scan_host_key_async",
+            AsyncMock(side_effect=ssh_keys_api.HostKeyScanError("timed out")),
+        )
+
+        response = test_client.get(
+            f"/api/ssh-keys/connections/{connection.id}/host-key",
+            headers=admin_headers,
+        )
+
+        assert response.json()["status"] == "unreachable"
+
+    def test_trusting_pins_the_confirmed_key(
+        self, test_client: TestClient, admin_headers, test_db, monkeypatch
+    ):
+        connection = self._connection(test_db)
+        monkeypatch.setattr(
+            ssh_keys_api,
+            "scan_host_key_async",
+            AsyncMock(return_value=self.ED25519),
+        )
+
+        response = test_client.post(
+            f"/api/ssh-keys/connections/{connection.id}/host-key/trust",
+            headers=admin_headers,
+            json={"key": self.ED25519},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "trusted"
+        test_db.refresh(connection)
+        assert connection.known_host_key == self.ED25519
+
+    def test_trusting_survives_a_rescan_in_a_different_order(
+        self, test_client: TestClient, admin_headers, test_db, monkeypatch
+    ):
+        """A host offering several key types is the normal case.
+
+        ssh-keyscan prints them in whatever order they answer, so the confirmed
+        blob and the fresh scan describe the same keys in a different order.
+        Refusing that made trusting impossible against every real multi-key
+        host, which is nearly all of them.
+        """
+        connection = self._connection(test_db)
+        rsa = "keys.example.com ssh-rsa AAAAB3NzaC1yc2EiIiIiIiIiIiIiIiIiIiIi"
+        monkeypatch.setattr(
+            ssh_keys_api,
+            "scan_host_key_async",
+            AsyncMock(return_value=f"{rsa}\n{self.ED25519}"),
+        )
+
+        response = test_client.post(
+            f"/api/ssh-keys/connections/{connection.id}/host-key/trust",
+            headers=admin_headers,
+            json={"key": f"{self.ED25519}\n{rsa}"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "trusted"
+        test_db.refresh(connection)
+        assert self.ED25519 in connection.known_host_key
+        assert rsa in connection.known_host_key
+
+    def test_refuses_to_pin_a_key_that_changed_while_confirming(
+        self, test_client: TestClient, admin_headers, test_db, monkeypatch
+    ):
+        connection = self._connection(test_db)
+        monkeypatch.setattr(
+            ssh_keys_api,
+            "scan_host_key_async",
+            AsyncMock(return_value=self.ROTATED),
+        )
+
+        response = test_client.post(
+            f"/api/ssh-keys/connections/{connection.id}/host-key/trust",
+            headers=admin_headers,
+            json={"key": self.ED25519},
+        )
+
+        assert response.status_code == 409
+        test_db.refresh(connection)
+        assert connection.known_host_key is None
+
+    def test_reports_a_host_that_cannot_be_read_when_trusting(
+        self, test_client: TestClient, admin_headers, test_db, monkeypatch
+    ):
+        connection = self._connection(test_db)
+        monkeypatch.setattr(
+            ssh_keys_api,
+            "scan_host_key_async",
+            AsyncMock(side_effect=ssh_keys_api.HostKeyScanError("refused")),
+        )
+
+        response = test_client.post(
+            f"/api/ssh-keys/connections/{connection.id}/host-key/trust",
+            headers=admin_headers,
+            json={"key": self.ED25519},
+        )
+
+        assert response.status_code == 502
+        assert response.json()["detail"]["key"] == (
+            "backend.errors.ssh.failedReadHostKey"
+        )
+
+    def test_refuses_to_trust_without_a_confirmed_key(
+        self, test_client: TestClient, admin_headers, test_db, monkeypatch
+    ):
+        """An empty body must not mean "pin whatever answers right now"."""
+        connection = self._connection(test_db)
+        scan = AsyncMock(return_value=self.ED25519)
+        monkeypatch.setattr(ssh_keys_api, "scan_host_key_async", scan)
+
+        for body in ({}, {"key": ""}, {"key": None}):
+            response = test_client.post(
+                f"/api/ssh-keys/connections/{connection.id}/host-key/trust",
+                headers=admin_headers,
+                json=body,
+            )
+            assert response.status_code == 422
+
+        scan.assert_not_awaited()
+        test_db.refresh(connection)
+        assert connection.known_host_key is None
+
+    def test_reports_a_key_that_could_not_be_stored(
+        self, test_client: TestClient, admin_headers, test_db, monkeypatch
+    ):
+        """A failed write must not be reported to the user as verified."""
+        connection = self._connection(test_db)
+        monkeypatch.setattr(
+            ssh_keys_api,
+            "scan_host_key_async",
+            AsyncMock(return_value=self.ED25519),
+        )
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(ssh_keys_api, "pin_host_key", fail)
+
+        response = test_client.post(
+            f"/api/ssh-keys/connections/{connection.id}/host-key/trust",
+            headers=admin_headers,
+            json={"key": self.ED25519},
+        )
+
+        assert response.status_code == 500
+        assert response.json()["detail"]["key"] == (
+            "backend.errors.ssh.failedStoreHostKey"
+        )
+
+    def test_forgetting_also_stops_silent_pinning(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """A connection old enough to pin silently must stop doing so."""
+        connection = self._connection(
+            test_db,
+            known_host_key=self.ED25519,
+            host_key_trust_on_first_use=True,
+        )
+
+        test_client.delete(
+            f"/api/ssh-keys/connections/{connection.id}/host-key",
+            headers=admin_headers,
+        )
+
+        test_db.refresh(connection)
+        assert connection.known_host_key is None
+        assert connection.host_key_trust_on_first_use is False
+
+    def test_forgetting_clears_the_pin(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        connection = self._connection(test_db, known_host_key=self.ED25519)
+
+        response = test_client.delete(
+            f"/api/ssh-keys/connections/{connection.id}/host-key",
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "unknown"
+        test_db.refresh(connection)
+        assert connection.known_host_key is None
+
+    def test_the_connection_list_reports_host_key_state(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        self._connection(test_db, known_host_key=self.ED25519)
+
+        response = test_client.get("/api/ssh-keys/connections", headers=admin_headers)
+
+        connection = response.json()["connections"][0]
+        assert connection["host_key_verified"] is True
+        assert connection["host_key_fingerprint"].startswith("SHA256:")
+
+    def test_missing_connection_returns_404(
+        self, test_client: TestClient, admin_headers
+    ):
+        response = test_client.get(
+            "/api/ssh-keys/connections/424242/host-key", headers=admin_headers
+        )
+
+        assert response.status_code == 404

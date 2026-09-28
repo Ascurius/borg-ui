@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/karanhudia/borg-ui/main/assets/logo-dark.png" />
     <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/karanhudia/borg-ui/main/assets/logo-light.png" />
-    <img alt="Borg UI Logo v2" src="https://raw.githubusercontent.com/karanhudia/borg-ui/main/assets/logo-light.png" width="360" />
+    <img alt="Borg UI Logo v2" src="https://raw.githubusercontent.com/karanhudia/borg-ui/main/assets/logo-light.png" width="270" />
   </picture>
 </div>
 
@@ -115,7 +115,17 @@ docker run -d \
 
 Access the app at `http://localhost:8081` with `admin` / `admin123`.
 
-For setup details, see the [installation guide](https://docs.borgui.com/installation).
+No Docker? Install straight onto a Debian or Ubuntu host, whether that is bare
+metal, a VM, or an LXC container:
+
+```bash
+curl -fsSLO https://github.com/karanhudia/borg-ui/releases/latest/download/install.sh
+curl -fsSL https://github.com/karanhudia/borg-ui/releases/latest/download/install.sh.sha256 | sha256sum -c - \
+  && sudo bash install.sh
+```
+
+For setup details and the native install options, see the
+[installation guide](https://docs.borgui.com/installation).
 
 ## Documentation
 
@@ -140,11 +150,11 @@ For teams that need commercial support, larger rollouts, or an enterprise conver
 
 <div align="center">
 
-<a href="https://star-history.com/#karanhudia/borg-ui&Date">
+<a href="https://star-history.dera.page/#karanhudia/borg-ui&type=Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=karanhudia/borg-ui&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=karanhudia/borg-ui&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=karanhudia/borg-ui&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=karanhudia/borg-ui&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=karanhudia/borg-ui&type=Date" />
+    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=karanhudia/borg-ui&type=Date" />
   </picture>
 </a>
 

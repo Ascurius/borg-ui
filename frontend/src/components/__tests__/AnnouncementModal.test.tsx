@@ -50,7 +50,7 @@ describe('AnnouncementModal', () => {
           dismissible: true,
           highlights: ['First improvement', 'Second improvement'],
           cta_label: 'View release notes',
-          cta_url: 'javascript:void(0)',
+          cta_url: 'https://example.com/release-notes',
         }}
         open
         onAcknowledge={onAcknowledge}
@@ -64,7 +64,7 @@ describe('AnnouncementModal', () => {
     expect(screen.getByText('Latest release')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /view release notes/i })).toHaveAttribute(
       'href',
-      'javascript:void(0)'
+      'https://example.com/release-notes'
     )
 
     await user.click(screen.getByRole('button', { name: 'Remind me later' }))
@@ -74,6 +74,27 @@ describe('AnnouncementModal', () => {
     expect(onSnooze).toHaveBeenCalledTimes(1)
     expect(onAcknowledge).toHaveBeenCalledTimes(1)
     expect(onCtaClick).toHaveBeenCalledTimes(1)
+  })
+
+  it('scrolls a long highlights list while keeping the actions outside it', () => {
+    renderWithProviders(
+      <AnnouncementModal
+        announcement={{
+          ...baseAnnouncement,
+          dismissible: true,
+          highlights: Array.from({ length: 13 }, (_, i) => `Improvement ${i + 1}`),
+        }}
+        open
+        onAcknowledge={vi.fn()}
+        onSnooze={vi.fn()}
+      />
+    )
+
+    const highlights = screen.getByTestId('announcement-highlights')
+    expect(getComputedStyle(highlights).overflowY).toBe('auto')
+    expect(highlights).toHaveTextContent('Improvement 13')
+    expect(highlights).not.toContainElement(screen.getByRole('button', { name: 'Got it' }))
+    expect(highlights).not.toContainElement(screen.getByRole('button', { name: 'Remind me later' }))
   })
 
   it('uses the close button for dismissible notices', async () => {

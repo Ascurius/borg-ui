@@ -211,12 +211,12 @@ const CacheManagementTab: React.FC = () => {
   const formatTtl = (minutes: number) => {
     if (minutes >= 1440) {
       const days = Math.floor(minutes / 1440)
-      return `${days} day${days > 1 ? 's' : ''}`
+      return t('cache.durationDays', { count: days })
     } else if (minutes >= 60) {
       const hours = Math.floor(minutes / 60)
-      return `${hours} hour${hours > 1 ? 's' : ''}`
+      return t('cache.durationHours', { count: hours })
     } else {
-      return `${minutes} minute${minutes > 1 ? 's' : ''}`
+      return t('cache.durationMinutes', { count: minutes })
     }
   }
 
@@ -243,10 +243,20 @@ const CacheManagementTab: React.FC = () => {
           }}
         >
           <Box>
-            <Typography variant="h6" fontWeight={600}>
+            <Typography
+              variant="h6"
+              sx={{
+                fontWeight: 600,
+              }}
+            >
               {t('cacheManagement.title')}
             </Typography>
-            <Typography variant="body2" color="text.secondary">
+            <Typography
+              variant="body2"
+              sx={{
+                color: 'text.secondary',
+              }}
+            >
               {t('cache.subtitle')}
             </Typography>
           </Box>
@@ -275,7 +285,7 @@ const CacheManagementTab: React.FC = () => {
               </Box>
               {stats && (
                 <Chip
-                  label={stats.backend === 'redis' ? 'Redis' : 'In-Memory'}
+                  label={stats.backend === 'redis' ? t('cache.redis') : t('cache.inMemory')}
                   color={stats.backend === 'redis' ? 'success' : 'warning'}
                   size="small"
                   icon={stats.backend === 'redis' ? <Database size={16} /> : <Zap size={16} />}
@@ -287,9 +297,9 @@ const CacheManagementTab: React.FC = () => {
             {stats && stats.connection_info && (
               <Alert severity="info" sx={{ py: 0.5 }}>
                 <Typography variant="caption">
-                  <strong>Connection:</strong> {stats.connection_info}
-                  {stats.connection_type === 'external_url' && ' (External Redis)'}
-                  {stats.connection_type === 'local' && ' (Local Docker)'}
+                  <strong>{t('cache.connection')}:</strong> {stats.connection_info}
+                  {stats.connection_type === 'external_url' && ` (${t('cache.externalRedis')})`}
+                  {stats.connection_type === 'local' && ` (${t('cache.localDocker')})`}
                 </Typography>
               </Alert>
             )}
@@ -308,7 +318,12 @@ const CacheManagementTab: React.FC = () => {
                 <Typography variant="h4" color="primary">
                   {stats?.entry_count || 0}
                 </Typography>
-                <Typography variant="body2" color="text.secondary">
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('cache.cachedArchives')}
                 </Typography>
               </Box>
@@ -317,7 +332,12 @@ const CacheManagementTab: React.FC = () => {
                 <Typography variant="h4" color="primary">
                   {sizeMb.toFixed(1)} MB
                 </Typography>
-                <Typography variant="body2" color="text.secondary">
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('cache.memoryUsed')}
                 </Typography>
               </Box>
@@ -326,19 +346,36 @@ const CacheManagementTab: React.FC = () => {
                 <Typography variant="h4" color="primary">
                   {hitRate.toFixed(1)}%
                 </Typography>
-                <Typography variant="body2" color="text.secondary">
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('cache.hitRate')}
                 </Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('cache.totalRequests', { count: totalRequests })}
                 </Typography>
               </Box>
 
               <Box sx={{ textAlign: 'center', p: 2, bgcolor: 'action.hover', borderRadius: 1 }}>
                 <Typography variant="h4" color="primary">
-                  {stats ? formatTtl(stats.cache_ttl_minutes) : '2 hours'}
+                  {stats
+                    ? formatTtl(stats.cache_ttl_minutes)
+                    : t('cache.durationHours', { count: 2 })}
                 </Typography>
-                <Typography variant="body2" color="text.secondary">
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('cache.cacheTtl')}
                 </Typography>
               </Box>
@@ -355,10 +392,20 @@ const CacheManagementTab: React.FC = () => {
                   mb: 1,
                 }}
               >
-                <Typography variant="body2" color="text.secondary">
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('cache.cacheUsage')}
                 </Typography>
-                <Typography variant="body2" color="text.secondary">
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
                   {t('cache.cacheUsageDetail', {
                     used: sizeMb.toFixed(1),
                     max: maxSizeFromStats,
@@ -422,8 +469,10 @@ const CacheManagementTab: React.FC = () => {
                 fullWidth
                 value={ttlMinutes}
                 onChange={(e) => setTtlMinutes(Number(e.target.value))}
-                inputProps={{ min: 1, max: 10080 }}
                 helperText={t('cache.ttlHelperText', { current: formatTtl(ttlMinutes) })}
+                slotProps={{
+                  htmlInput: { min: 1, max: 10080 },
+                }}
               />
 
               <TextField
@@ -432,14 +481,22 @@ const CacheManagementTab: React.FC = () => {
                 fullWidth
                 value={maxSizeMb}
                 onChange={(e) => setMaxSizeMb(Number(e.target.value))}
-                inputProps={{ min: 100, max: 10240 }}
                 helperText={t('cache.maxSizeHelperText', {
                   current: (maxSizeMb / 1024).toFixed(2),
                 })}
+                slotProps={{
+                  htmlInput: { min: 100, max: 10240 },
+                }}
               />
             </Box>
 
-            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} alignItems="flex-start">
+            <Stack
+              direction={{ xs: 'column', sm: 'row' }}
+              spacing={2}
+              sx={{
+                alignItems: 'flex-start',
+              }}
+            >
               <TextField
                 label={t('cache.redisUrlLabel')}
                 fullWidth

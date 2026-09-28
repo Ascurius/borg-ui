@@ -8,6 +8,8 @@ import {
   useTheme,
   alpha,
 } from '@mui/material'
+import type { Theme } from '@mui/material/styles'
+import { toneColor, type Tone } from './shared/tones'
 import {
   CheckCircle,
   XCircle,
@@ -19,6 +21,9 @@ import {
   HardDrive,
   Network,
   Key,
+  ShieldCheck,
+  ShieldAlert,
+  Lock,
 } from 'lucide-react'
 
 interface StorageInfo {
@@ -44,10 +49,13 @@ interface RemoteMachine {
   default_path?: string
   mount_point?: string
   status: string
+  shell_restricted?: boolean
   last_test?: string
   last_success?: string
   error_message?: string
   storage?: StorageInfo | null
+  host_key_verified?: boolean
+  host_key_fingerprint?: string | null
   created_at: string
 }
 
@@ -59,16 +67,20 @@ interface RemoteMachineCardProps {
   onTestConnection: (machine: RemoteMachine) => void
   onDeployKey: (machine: RemoteMachine) => void
   onRunDiagnostics?: (machine: RemoteMachine) => void
+  onVerifyHostKey?: (machine: RemoteMachine) => void
   canManageConnections?: boolean
 }
 
-const STATUS_ACCENT: Record<string, string> = {
-  connected: '#059669',
-  failed: '#ef4444',
-  testing: '#f59e0b',
+// Palette tones, not hex: the accent is also the status label's text
+// colour, and the theme's shades are the ones that stay readable.
+const STATUS_ACCENT: Record<string, Tone> = {
+  connected: 'success',
+  failed: 'error',
+  testing: 'warning',
 }
 
-const getStatusAccent = (status: string) => STATUS_ACCENT[status] ?? '#6b7280'
+const getStatusAccent = (status: string, theme: Theme) =>
+  toneColor(theme, STATUS_ACCENT[status] ?? 'neutral')
 
 const getStatusIcon = (status: string) => {
   switch (status) {
@@ -96,12 +108,18 @@ export default function RemoteMachineCard({
   onTestConnection,
   onDeployKey,
   onRunDiagnostics,
+  onVerifyHostKey,
   canManageConnections = true,
 }: RemoteMachineCardProps) {
   const { t } = useTranslation()
   const theme = useTheme()
   const isDark = theme.palette.mode === 'dark'
-  const accent = getStatusAccent(machine.status)
+  const accent = getStatusAccent(machine.status, theme)
+  // df cannot run on a Borg-only key, so storage refresh is a dead end there.
+  const isRestricted = Boolean(machine.shell_restricted)
+  const refreshStorageTooltip = isRestricted
+    ? t('remoteMachineCard.restricted.tooltip')
+    : t('remoteMachine.refreshStorage')
 
   const iconBtnSx = {
     width: { xs: 40, sm: 34 },
@@ -119,7 +137,7 @@ export default function RemoteMachineCard({
     const color = theme.palette[colorKey].main
     return {
       ...iconBtnSx,
-      color: alpha(color, isDark ? 0.65 : 0.55),
+      color: alpha(color, 0.75),
       '&:hover': {
         bgcolor: alpha(color, isDark ? 0.12 : 0.09),
         color,
@@ -176,7 +194,7 @@ export default function RemoteMachineCard({
                   fontWeight: 700,
                   textTransform: 'uppercase',
                   letterSpacing: '0.08em',
-                  color: alpha(accent, 0.9),
+                  color: accent,
                   lineHeight: 1,
                 }}
               >
@@ -203,10 +221,13 @@ export default function RemoteMachineCard({
           {/* Machine name — full width, no competing badge */}
           <Typography
             variant="subtitle1"
-            fontWeight={700}
             noWrap
             title={machine.mount_point || machine.host}
-            sx={{ lineHeight: 1.3, mb: 0.25 }}
+            sx={{
+              fontWeight: 700,
+              lineHeight: 1.3,
+              mb: 0.25,
+            }}
           >
             {machine.mount_point || machine.host}
           </Typography>
@@ -223,6 +244,61 @@ export default function RemoteMachineCard({
           >
             {machine.username}@{machine.host}:{machine.port}
           </Typography>
+
+          {/* Host-key trust. The remote host is only authenticated once its key
+              is pinned, so a connection without one says so plainly. */}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 0.5 }}>
+            <Box
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                color: machine.host_key_verified
+                  ? theme.palette.success.main
+                  : theme.palette.warning.main,
+              }}
+            >
+              {machine.host_key_verified ? <ShieldCheck size={12} /> : <ShieldAlert size={12} />}
+            </Box>
+            <Typography
+              noWrap
+              title={machine.host_key_fingerprint || undefined}
+              sx={{ fontSize: '0.62rem', color: 'text.disabled', minWidth: 0 }}
+            >
+              {machine.host_key_verified
+                ? t('remoteMachineCard.hostKey.verified')
+                : t('remoteMachineCard.hostKey.unverified')}
+            </Typography>
+            {isRestricted && (
+              <Tooltip title={t('remoteMachineCard.restricted.tooltip')} arrow>
+                <Box
+                  component="span"
+                  tabIndex={0}
+                  aria-label={t('remoteMachineCard.restricted.tooltip')}
+                  sx={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 0.5,
+                    ml: 0.75,
+                    pl: 0.75,
+                    borderLeft: '1px solid',
+                    borderColor: 'divider',
+                    color: 'text.disabled',
+                    fontSize: '0.62rem',
+                    whiteSpace: 'nowrap',
+                    cursor: 'default',
+                    borderRadius: 0.5,
+                    '&:focus-visible': {
+                      outline: `2px solid ${theme.palette.primary.main}`,
+                      outlineOffset: 2,
+                    },
+                  }}
+                >
+                  <Lock size={11} aria-hidden />
+                  {t('remoteMachineCard.restricted.label')}
+                </Box>
+              </Tooltip>
+            )}
+          </Box>
         </Box>
 
         {/* ── Storage Stats Band ── */}
@@ -268,7 +344,7 @@ export default function RemoteMachineCard({
                       fontWeight: 700,
                       textTransform: 'uppercase',
                       letterSpacing: '0.06em',
-                      color: alpha(col.color, 0.75),
+                      color: col.color,
                       lineHeight: 1,
                       mb: 0.5,
                     }}
@@ -357,22 +433,28 @@ export default function RemoteMachineCard({
           >
             <HardDrive size={14} style={{ opacity: 0.4, flexShrink: 0 }} />
             <Typography noWrap sx={{ fontSize: '0.75rem', color: 'text.disabled', flex: 1 }}>
-              {t('remoteMachine.noStorageInfo')}
+              {isRestricted
+                ? t('remoteMachineCard.restricted.storage')
+                : t('remoteMachine.noStorageInfo')}
             </Typography>
-            <Tooltip title={t('remoteMachine.refreshStorage')} arrow>
-              <IconButton
-                aria-label={t('remoteMachine.refreshStorage')}
-                onClick={() => onRefreshStorage(machine)}
-                sx={{
-                  width: { xs: 36, sm: 30 },
-                  height: { xs: 36, sm: 30 },
-                  flexShrink: 0,
-                  color: 'text.disabled',
-                  '&:hover': { color: 'text.secondary' },
-                }}
-              >
-                <RefreshCw size={14} />
-              </IconButton>
+            <Tooltip title={refreshStorageTooltip} arrow>
+              {/* span keeps the tooltip reachable while the button is disabled */}
+              <span>
+                <IconButton
+                  aria-label={t('remoteMachine.refreshStorage')}
+                  onClick={() => onRefreshStorage(machine)}
+                  disabled={isRestricted}
+                  sx={{
+                    width: { xs: 36, sm: 30 },
+                    height: { xs: 36, sm: 30 },
+                    flexShrink: 0,
+                    color: 'text.disabled',
+                    '&:hover': { color: 'text.secondary' },
+                  }}
+                >
+                  <RefreshCw size={14} />
+                </IconButton>
+              </span>
             </Tooltip>
           </Box>
         )}
@@ -485,16 +567,35 @@ export default function RemoteMachineCard({
                 <Network size={16} />
               </IconButton>
             </Tooltip>
-            <Tooltip title={t('remoteMachine.actions.refreshStorage')} arrow>
-              <IconButton
-                size="small"
-                aria-label={t('remoteMachine.actions.refreshStorage')}
-                onClick={() => onRefreshStorage(machine)}
-                sx={coloredIconBtnSx('info')}
-              >
-                <RefreshCw size={16} />
-              </IconButton>
+            <Tooltip title={refreshStorageTooltip} arrow>
+              <span>
+                <IconButton
+                  size="small"
+                  aria-label={t('remoteMachine.actions.refreshStorage')}
+                  onClick={() => onRefreshStorage(machine)}
+                  disabled={isRestricted}
+                  sx={coloredIconBtnSx('info')}
+                >
+                  <RefreshCw size={16} />
+                </IconButton>
+              </span>
             </Tooltip>
+            {onVerifyHostKey && (
+              <Tooltip title={t('remoteMachineCard.hostKey.action')} arrow>
+                <IconButton
+                  size="small"
+                  aria-label={t('remoteMachineCard.hostKey.action')}
+                  onClick={() => onVerifyHostKey(machine)}
+                  sx={coloredIconBtnSx(machine.host_key_verified ? 'success' : 'warning')}
+                >
+                  {machine.host_key_verified ? (
+                    <ShieldCheck size={16} />
+                  ) : (
+                    <ShieldAlert size={16} />
+                  )}
+                </IconButton>
+              </Tooltip>
+            )}
             {onRunDiagnostics && (
               <Tooltip title={t('remoteMachine.actions.runDiagnostics')} arrow>
                 <IconButton
@@ -550,7 +651,7 @@ export default function RemoteMachineCard({
                   onClick={() => onDelete(machine)}
                   sx={{
                     ...iconBtnSx,
-                    color: alpha(theme.palette.error.main, 0.6),
+                    color: alpha(theme.palette.error.main, 0.75),
                     '&:hover': {
                       color: theme.palette.error.main,
                       bgcolor: alpha(theme.palette.error.main, isDark ? 0.15 : 0.1),

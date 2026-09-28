@@ -1,0 +1,773 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import {
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+  Link as RouterLink,
+} from 'react-router-dom'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'react-hot-toast'
+import {
+  Alert,
+  Box,
+  Breadcrumbs,
+  Button,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Divider,
+  Link,
+  Paper,
+  Skeleton,
+  Stack,
+  Typography,
+  alpha,
+  useTheme,
+} from '@mui/material'
+import { Scissors } from 'lucide-react'
+import { formatRelativeTime } from '../utils/dateUtils'
+import { operationsAPI, repositoriesAPI } from '../services/api'
+import { useAuth } from '../hooks/useAuth'
+import ArchiveSeriesHeatmap from '../components/archives/ArchiveSeriesHeatmap'
+import PruneRetentionFields from '../components/prune/PruneRetentionFields'
+import { DEFAULT_RETENTION } from '../components/prune/defaultRetention'
+import PrunePreviewNumbers from '../components/prune/PrunePreviewNumbers'
+import PruneCandidatesRanked from '../components/prune/PruneCandidatesRanked'
+import PruneLostFilesPanel from '../components/prune/PruneLostFilesPanel'
+import { PruneComparedPolicies } from '../components/prune/PruneComparedPolicies'
+import { retentionKey, sameRetention } from '../components/prune/formatRetention'
+import { tintChipSx } from '../components/shared/tones'
+import { dayVerdict, previewToHeatmap, sizeIntensity } from '../components/prune/previewHeatmap'
+import type { PruneRetention, PrunePreviewResponse, PruneComparisonRow } from '../types/archives'
+
+const toForm = (r: PruneComparisonRow['retention']): PruneRetention | null =>
+  r ? { ...r, keep_within: r.keep_within ?? '' } : null
+
+interface LocationState {
+  retention?: PruneRetention
+}
+
+export default function PrunePreview() {
+  const { t } = useTranslation()
+  const { hasGlobalPermission } = useAuth()
+  const theme = useTheme()
+  const navigate = useNavigate()
+  const location = useLocation()
+  const { repositoryId: repositoryIdParam } = useParams()
+  const repositoryId = Number(repositoryIdParam)
+
+  const stateRetention = (location.state as LocationState | null)?.retention
+
+  const { data: repositoriesData } = useQuery({
+    queryKey: ['repositories'],
+    queryFn: repositoriesAPI.getRepositories,
+  })
+  const repository = useMemo(
+    () => repositoriesData?.data?.repositories?.find((r: { id: number }) => r.id === repositoryId),
+    [repositoriesData, repositoryId]
+  )
+
+  const {
+    data: defaultsData,
+    isError: defaultsFailed,
+    refetch: refetchDefaults,
+  } = useQuery({
+    queryKey: ['prune-retention-defaults', repositoryId],
+    queryFn: () => repositoriesAPI.pruneRetentionDefaults(repositoryId).then((res) => res.data),
+    enabled: !stateRetention && Number.isFinite(repositoryId),
+  })
+  const defaultRetention = useMemo<PruneRetention | null>(
+    () =>
+      defaultsData
+        ? {
+            keep_hourly: defaultsData.keep_hourly,
+            keep_daily: defaultsData.keep_daily,
+            keep_weekly: defaultsData.keep_weekly,
+            keep_monthly: defaultsData.keep_monthly,
+            keep_quarterly: defaultsData.keep_quarterly,
+            keep_yearly: defaultsData.keep_yearly,
+            keep_within: defaultsData.keep_within ?? '',
+          }
+        : null,
+    [defaultsData]
+  )
+  const source = stateRetention || !defaultsData ? null : defaultsData
+
+  const [searchParams] = useSearchParams()
+  const candidateKey = searchParams.get('candidate')
+  const queryClient = useQueryClient()
+  // The refresh's operation id; polled until the operation ends, whatever
+  // way it ends, so a skipped or failed comparison does not leave the page
+  // "Comparing" for good.
+  // Keyed by repository: the route keeps this component instance across
+  // repositories, and a refresh that lands after a switch belongs to the
+  // old one.
+  const [pendingOp, setPendingOp] = useState<{ id: number; repositoryId: number } | null>(null)
+  const pendingOpId = pendingOp?.repositoryId === repositoryId ? pendingOp.id : null
+  const comparisonQuery = useQuery({
+    queryKey: ['prune-comparison', repositoryId],
+    queryFn: () => repositoriesAPI.pruneComparison(repositoryId).then((res) => res.data),
+    enabled: Number.isFinite(repositoryId),
+  })
+  const comparison = comparisonQuery.data ?? null
+  // automatic prune previews are off and nothing will refresh this one
+  const autoOff = comparison?.auto === false && comparison.stale
+  const pendingOpQuery = useQuery({
+    queryKey: ['operation', pendingOpId],
+    queryFn: () => operationsAPI.get(pendingOpId as number).then((res) => res.data),
+    enabled: pendingOpId !== null,
+    refetchInterval: 3000,
+  })
+  const pendingStatus = pendingOpQuery.data?.status
+  useEffect(() => {
+    if (pendingOpId === null) return
+    const ended = pendingStatus !== undefined && !['queued', 'running'].includes(pendingStatus)
+    if (ended || pendingOpQuery.isError) {
+      setPendingOp(null)
+      queryClient.invalidateQueries({ queryKey: ['prune-comparison', repositoryId] })
+    }
+  }, [pendingOpId, pendingStatus, pendingOpQuery.isError, queryClient, repositoryId])
+  const refreshMutation = useMutation({
+    mutationFn: ({ id, auto }: { id: number; auto: boolean }) =>
+      repositoriesAPI.pruneComparisonRefresh(id, auto),
+    onSuccess: (res, { id }) => setPendingOp({ id: res.data.operation_id, repositoryId: id }),
+    // The automatic one is the page doing its job, not something the reader
+    // asked for: a comparison already running (409), or a reader without the
+    // rights to start one (403), is not an error to shout about.
+    onError: (_err, { auto }) => {
+      if (!auto) toast.error(t('prunePreview.compare.refreshFailed'))
+    },
+  })
+  const candidateRetention = useMemo(
+    () =>
+      candidateKey && comparison
+        ? toForm(comparison.candidates.find((c) => c.key === candidateKey)?.retention ?? null)
+        : null,
+    [candidateKey, comparison]
+  )
+
+  const [retention, setRetention] = useState<PruneRetention>(stateRetention ?? DEFAULT_RETENTION)
+  // The retention the shown preview was computed with. "Run prune now"
+  // posts this, never the form, so an edit without a refresh cannot prune
+  // with rules nobody previewed.
+  const [previewedRetention, setPreviewedRetention] = useState<PruneRetention | null>(null)
+  const [preview, setPreview] = useState<PrunePreviewResponse | null>(null)
+  const [error, setError] = useState<{ status: number; key: string; log?: string } | null>(null)
+  const [refreshedAt, setRefreshedAt] = useState<Date | null>(null)
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [logOpen, setLogOpen] = useState(false)
+
+  // Previews already run in this visit, by retention. Clicking back and
+  // forth across the compared policies is reading, not re-measuring: each
+  // dry run is a real borg call and shows up in the activity timeline.
+  // Cleared per repository; "Refresh preview" goes around it.
+  const previewCache = useRef(new Map<string, { preview: PrunePreviewResponse; at: Date }>())
+  const cacheKey = (form: PruneRetention) => retentionKey(form)
+  // Every dry run of this visit belongs to one run, so the timeline shows
+  // the policies tried as steps under a single "Prune preview" instead of a
+  // loose row each.
+  const previewRunId = useRef(crypto.randomUUID())
+
+  // Which selection the page is showing. Clicking through the table starts
+  // requests that finish out of order, and a slow dry run for a row left
+  // behind must not land on top of the row now on screen.
+  // The route keeps this component across repositories, so a request also
+  // carries the repository it was made for: an answer for the one just left
+  // must not land under the one now on screen.
+  const selectionSeq = useRef(0)
+  const current = (seq: number, repo: number) =>
+    seq === selectionSeq.current && repo === repositoryId
+  const nextSeq = () => ++selectionSeq.current
+
+  const previewMutation = useMutation({
+    mutationFn: ({ form, repo }: { form: PruneRetention; seq: number; repo: number }) =>
+      repositoriesAPI.prunePreview(repo, form, previewRunId.current),
+    onSuccess: (res, { form, seq, repo }) => {
+      if (!current(seq, repo)) return
+      previewCache.current.set(cacheKey(form), { preview: res.data, at: new Date() })
+      setPreview(res.data)
+      setPreviewedRetention(form)
+      setError(null)
+      setRefreshedAt(new Date())
+    },
+    onError: (err: unknown, { seq, repo }) => {
+      if (!current(seq, repo)) return
+      const e = err as {
+        response?: {
+          status: number
+          data?: { detail?: { key: string; params?: { log?: string } } }
+        }
+      }
+      const status = e.response?.status ?? 500
+      const key = e.response?.data?.detail?.key ?? 'prunePreview.dryRunFailed'
+      const log = e.response?.data?.detail?.params?.log
+      setError({ status, key, log })
+    },
+  })
+
+  // A compared policy the comparison kept verdicts for opens as a read:
+  // the server joins them to the index again, no dry run, nothing new in
+  // the timeline. Only a retention nobody compared still costs a dry run.
+  const storedMutation = useMutation({
+    mutationFn: ({ row, repo }: { row: PruneComparisonRow; seq: number; repo: number }) =>
+      repositoriesAPI.pruneCandidatePreview(repo, row.key),
+    onSuccess: (res, { row, seq, repo }) => {
+      if (!current(seq, repo)) return
+      const form = toForm(row.retention)
+      if (form) previewCache.current.set(cacheKey(form), { preview: res.data, at: new Date() })
+      setPreview(res.data)
+      if (form) setPreviewedRetention(form)
+      setError(null)
+      setRefreshedAt(new Date())
+    },
+    // A stored row that has gone (a comparison replaced underneath) falls
+    // back to the dry run rather than leaving the reader with nothing.
+    onError: (_err, { row, seq, repo }) => {
+      if (!current(seq, repo)) return
+      const form = toForm(row.retention)
+      if (form) previewMutation.mutate({ form, seq, repo })
+    },
+  })
+
+  // Show a candidate: from this visit's cache, else from the stored
+  // comparison, else by running its dry run.
+  const showCandidate = (row: PruneComparisonRow) => {
+    const form = toForm(row.retention)
+    if (!form) return
+    // a choice made here outranks the row the page was waiting for
+    setWantedKey(null)
+    // every selection, cache hit included, retires whatever is in flight
+    const seq = nextSeq()
+    setRetention(form)
+    const cached = previewCache.current.get(cacheKey(form))
+    if (cached) {
+      setPreview(cached.preview)
+      setPreviewedRetention(form)
+      setError(null)
+      setRefreshedAt(cached.at)
+      return
+    }
+    if (row.readable) storedMutation.mutate({ row, seq, repo: repositoryId })
+    else previewMutation.mutate({ form, seq, repo: repositoryId })
+  }
+
+  const runPruneMutation = useMutation({
+    mutationFn: (form: PruneRetention) =>
+      repositoriesAPI.pruneRepository(repositoryId, { ...form, dry_run: false }),
+    onSuccess: () => {
+      toast.success(t('repositories.toasts.pruneStarted'))
+      navigate(`/activity?repository_id=${repositoryId}`)
+    },
+    onError: () => {
+      toast.error(t('repositories.toasts.pruneFailed'))
+    },
+  })
+
+  // Switching repository empties the page at once: the route keeps this
+  // component, and the previous repository's numbers must not sit under the
+  // new one's name while its own are still on their way. Declared before the
+  // first-preview effect so it runs first on the render that changed the
+  // route: the other way round, the new repository's preview starts and is
+  // then thrown away by this reset, with nothing left to start it again.
+  const shownRepoRef = useRef(repositoryId)
+  useEffect(() => {
+    if (shownRepoRef.current === repositoryId) return
+    shownRepoRef.current = repositoryId
+    nextSeq()
+    previewCache.current.clear()
+    setPreview(null)
+    setPreviewedRetention(null)
+    setError(null)
+    setRefreshedAt(null)
+    setWantedKey(null)
+  }, [repositoryId])
+
+  // First preview, once per repository, with the retention the form is
+  // prefilled with: the dialog's form when it sent us here, else the
+  // loaded defaults. Reading the form state here would see the value from
+  // before the defaults landed.
+  const ranForRepoRef = useRef<number | null>(null)
+  useEffect(() => {
+    if (ranForRepoRef.current === repositoryId) return
+    if (!Number.isFinite(repositoryId)) return
+    if (candidateKey && !candidateRetention && comparisonQuery.isFetching) return
+    // Nothing is decided until the comparison is known: deciding early means
+    // not finding the candidate that covers the prefill, and running a dry
+    // run the comparison is about to run anyway.
+    if (!comparisonQuery.isFetched && !comparisonQuery.isError) return
+    const initial = stateRetention ?? candidateRetention ?? defaultRetention
+    if (!initial) return
+    ranForRepoRef.current = repositoryId
+    previewCache.current.clear()
+    previewRunId.current = crypto.randomUUID()
+    setRetention(initial)
+    // The comparison has usually already run this exact policy; reading its
+    // stored verdicts beats running Borg again just to open the page. When
+    // it has not run it yet but is about to, wait for it rather than racing
+    // it with a dry run of the same policy.
+    // A stale comparison nothing will refresh (automatic previews off) is
+    // not one to read the page's numbers from: run the policy itself.
+    const match = autoOff
+      ? undefined
+      : comparison?.candidates.find((c) => sameRetention(c.retention, initial))
+    const seq = nextSeq()
+    if (match?.readable) storedMutation.mutate({ row: match, seq, repo: repositoryId })
+    else if (match) {
+      // A compared policy that cannot be read back yet is one the comparison
+      // is about to run: wait for it. Whether the payload in hand calls
+      // itself stale does not decide this, since it may be a cached one from
+      // an earlier visit.
+      setWantedKey(match.key)
+      comparisonQuery.refetch()
+    } else previewMutation.mutate({ form: initial, seq, repo: repositoryId })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    defaultRetention,
+    stateRetention,
+    repositoryId,
+    candidateRetention,
+    comparisonQuery.isFetching,
+    comparisonQuery.isFetched,
+    comparisonQuery.isError,
+    candidateKey,
+    comparison,
+  ])
+
+  // Opening the page is what asks for the comparison: with none stored, or
+  // one the archive set or the day has moved past, run it now and let the
+  // stored numbers stand until the new ones land. Once per repository per
+  // visit, so a refusal does not turn into a loop.
+  const askedForRepoRef = useRef<number | null>(null)
+  useEffect(() => {
+    if (askedForRepoRef.current === repositoryId) return
+    if (!Number.isFinite(repositoryId)) return
+    if (!comparison || comparisonQuery.isFetching) return
+    if (pendingOpId !== null) return
+    if (!comparison.stale || autoOff) return
+    askedForRepoRef.current = repositoryId
+    refreshMutation.mutate({ id: repositoryId, auto: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [comparison, comparisonQuery.isFetching, pendingOpId, repositoryId])
+
+  // The candidate the page is waiting on a running comparison for. Nothing
+  // is on screen until it lands, and if the comparison never produces it
+  // (too few archives, maintenance pending) the dry run takes over.
+  const [wantedKey, setWantedKey] = useState<string | null>(null)
+  useEffect(() => {
+    if (wantedKey === null || !comparison) return
+    const row = comparison.candidates.find((c) => c.key === wantedKey)
+    if (row?.readable) {
+      setWantedKey(null)
+      showCandidate(row)
+      return
+    }
+    // Nothing more is coming: the comparison is not running, and either it
+    // does not call itself stale, the server refused to run it (no rights,
+    // or one already running we are not watching), or automatic previews
+    // are off and nothing will. Run the policy's own dry
+    // run rather than leave the page on skeletons for good.
+    if (
+      pendingOpId === null &&
+      !comparisonQuery.isFetching &&
+      !refreshMutation.isPending &&
+      (!comparison.stale || refreshMutation.isError || autoOff)
+    ) {
+      setWantedKey(null)
+      previewMutation.mutate({ form: retention, seq: nextSeq(), repo: repositoryId })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    wantedKey,
+    comparison,
+    pendingOpId,
+    comparisonQuery.isFetching,
+    refreshMutation.isPending,
+    refreshMutation.isError,
+    autoOff,
+  ])
+
+  // A finished comparison replaced every row: re-read the one on screen so
+  // the numbers under it match the table above it.
+  const shownComputedAt = useRef<string | null>(null)
+  useEffect(() => {
+    if (!comparison?.computed_at || pendingOpId !== null) return
+    if (shownComputedAt.current === comparison.computed_at) return
+    shownComputedAt.current = comparison.computed_at
+    if (!previewedRetention) return
+    const row = comparison.candidates.find(
+      (c) => c.readable && sameRetention(c.retention, previewedRetention)
+    )
+    if (!row) return
+    previewCache.current.delete(cacheKey(previewedRetention))
+    storedMutation.mutate({ row, seq: nextSeq(), repo: repositoryId })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [comparison, pendingOpId])
+
+  // Until the prefill is known the form shows placeholder values that
+  // nothing should preview or prune with.
+  const ready = Boolean(stateRetention ?? defaultRetention)
+  // Field by field: a form that lists the same numbers in another key order
+  // is not an edit, and must not block "Run prune now".
+  const dirty = previewedRetention !== null && !sameRetention(retention, previewedRetention)
+
+  // A preview is on its way whether it is running, being read back, or
+  // waiting on the comparison that will produce it.
+  const loadingPreview = previewMutation.isPending || storedMutation.isPending || wantedKey !== null
+
+  const archives = useMemo(() => preview?.archives ?? [], [preview])
+  const heatmapData = useMemo(() => previewToHeatmap(archives), [archives])
+  const verdictOf = useMemo(() => dayVerdict(archives), [archives])
+  const intensityOf = useMemo(() => sizeIntensity(archives), [archives])
+  const byId = useMemo(() => new Map(archives.map((a) => [a.id, a])), [archives])
+
+  const deletedCount = preview?.deleted_count ?? 0
+  const keptCount = preview?.kept_count ?? 0
+
+  const selectedKey = useMemo(() => {
+    if (!previewedRetention || !comparison) return null
+    return (
+      comparison.candidates.find((c) => sameRetention(c.retention, previewedRetention))?.key ?? null
+    )
+  }, [comparison, previewedRetention])
+  // The ceiling only holds while the index is complete: an unindexed
+  // archive on either side can move the total up or down.
+  const lostSize =
+    preview && preview.lost_files.available && !preview.lost_files.incomplete
+      ? (preview.lost_files.total_size ?? 0)
+      : null
+  const editing =
+    preview && previewedRetention && selectedKey === null
+      ? {
+          retention: previewedRetention,
+          kept_count: preview.kept_count,
+          deleted_count: preview.deleted_count,
+          freed_at_least: preview.freed_at_least,
+          lost_size: lostSize,
+        }
+      : null
+
+  return (
+    <Box>
+      <Breadcrumbs sx={{ mb: 2 }}>
+        <Link component={RouterLink} to="/repositories" underline="hover">
+          {t('prunePreview.crumbRepositories')}
+        </Link>
+        <Typography color="text.secondary">{repository?.name ?? repositoryId}</Typography>
+        <Typography color="text.primary">{t('prunePreview.title')}</Typography>
+      </Breadcrumbs>
+
+      <Box sx={{ display: 'flex', flexDirection: { xs: 'column', md: 'row' }, gap: 3 }}>
+        <Paper
+          variant="outlined"
+          sx={{ p: 2, width: { xs: '100%', md: 300 }, flexShrink: 0, alignSelf: 'flex-start' }}
+        >
+          <Stack direction="row" sx={{ alignItems: 'center', gap: 1.25, mb: 1 }}>
+            <Box
+              sx={{
+                width: 32,
+                height: 32,
+                borderRadius: 1.5,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: 'primary.main',
+                bgcolor: alpha(
+                  theme.palette.primary.main,
+                  theme.palette.mode === 'dark' ? 0.16 : 0.1
+                ),
+              }}
+            >
+              <Scissors size={18} />
+            </Box>
+            <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+              {t('prunePreview.retention')}
+            </Typography>
+          </Stack>
+          {source && (
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+              {source.source === 'plan'
+                ? t('prunePreview.prefilledPlan', { name: source.plan_name })
+                : source.source === 'last_prune'
+                  ? t('prunePreview.prefilledLastPrune')
+                  : t('prunePreview.prefilledDefault')}
+            </Typography>
+          )}
+          {defaultsFailed && !stateRetention && (
+            <Alert
+              severity="error"
+              sx={{ mb: 1 }}
+              action={
+                <Button size="small" color="inherit" onClick={() => refetchDefaults()}>
+                  {t('prunePreview.retry')}
+                </Button>
+              }
+            >
+              {t('prunePreview.defaultsFailed')}
+            </Alert>
+          )}
+          <PruneRetentionFields
+            value={retention}
+            onChange={setRetention}
+            disabled={!ready || previewMutation.isPending}
+          />
+          {error?.key === 'backend.errors.prune.noKeepRule' && (
+            <Alert severity="error" sx={{ mt: 1 }}>
+              {t('prunePreview.noKeepRule')}
+            </Alert>
+          )}
+          <Stack direction="row" spacing={1} sx={{ mt: 2 }}>
+            <Button
+              size="small"
+              disabled={!ready}
+              onClick={() => setRetention(stateRetention ?? defaultRetention ?? DEFAULT_RETENTION)}
+            >
+              {t('prunePreview.reset')}
+            </Button>
+            <Button
+              size="small"
+              variant="contained"
+              disabled={!ready || previewMutation.isPending}
+              onClick={() =>
+                previewMutation.mutate({ form: retention, seq: nextSeq(), repo: repositoryId })
+              }
+            >
+              {t('prunePreview.refresh')}
+            </Button>
+          </Stack>
+          {refreshedAt && (
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+              {t('prunePreview.refreshedAt', {
+                when: formatRelativeTime(refreshedAt.toISOString()),
+              })}
+            </Typography>
+          )}
+        </Paper>
+
+        <Stack spacing={3} sx={{ flex: 1, minWidth: 0 }}>
+          {error && error.key !== 'backend.errors.prune.noKeepRule' && (
+            <Alert severity="error">
+              {error.status === 502
+                ? t('prunePreview.dryRunFailed')
+                : t('prunePreview.previewFailed', { status: error.status })}
+              {error.log && (
+                <Box component="pre" sx={{ mt: 1, fontSize: '0.75rem', overflowX: 'auto' }}>
+                  {error.log}
+                </Box>
+              )}
+            </Alert>
+          )}
+
+          <PruneComparedPolicies
+            comparison={comparison}
+            editing={editing}
+            selectedKey={selectedKey}
+            pending={pendingOpId !== null}
+            refreshDisabled={!ready || previewMutation.isPending || refreshMutation.isPending}
+            canManageSettings={hasGlobalPermission('settings.system.manage')}
+            onSelect={showCandidate}
+            onRefresh={() => refreshMutation.mutate({ id: repositoryId, auto: false })}
+          />
+
+          {loadingPreview && !preview ? (
+            <Stack spacing={1.5}>
+              <Skeleton variant="rounded" height={100} />
+              <Skeleton variant="rounded" height={200} />
+            </Stack>
+          ) : preview ? (
+            <Box sx={{ opacity: loadingPreview ? 0.6 : 1 }}>
+              <PrunePreviewNumbers
+                deletedCount={deletedCount}
+                keptCount={keptCount}
+                freedAtLeast={preview.freed_at_least}
+                footprintBefore={preview.footprint_before}
+                footprintAfterAtMost={preview.footprint_after_at_most}
+              />
+
+              <Paper variant="outlined" sx={{ p: 2, mt: 3 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight: 600, mb: 1.5 }}>
+                  {t('prunePreview.heatmapTitle')}
+                </Typography>
+                <ArchiveSeriesHeatmap
+                  data={heatmapData}
+                  // These days are prune verdicts, not backup runs: the
+                  // outlier and missed-run rows describe nothing here.
+                  showFlagLegend={false}
+                  onSelectDay={(day) => {
+                    const id = day.archive_ids[0]
+                    if (id != null) navigate(`/archives/${repositoryId}/${id}`)
+                  }}
+                  onSelectArchive={(id) => navigate(`/archives/${repositoryId}/${id}`)}
+                  cellColor={(day) => {
+                    const v = verdictOf(day)
+                    const intensity = intensityOf(day)
+                    if (v === 'kept') return alpha(theme.palette.success.main, intensity)
+                    if (v === 'deleted') return alpha(theme.palette.error.main, intensity)
+                    if (v === 'mixed') return theme.palette.warning.main
+                    return undefined
+                  }}
+                  cellLabel={(day) => {
+                    const names = day.archive_ids
+                      .map((id) => byId.get(id))
+                      .filter(Boolean)
+                      .map((a) =>
+                        a!.verdict === 'kept'
+                          ? t('prunePreview.cellKept', { name: a!.name, rule: a!.rule })
+                          : t('prunePreview.cellDeleted', { name: a!.name })
+                      )
+                    return names.join(', ') || undefined
+                  }}
+                />
+                <Stack direction="row" spacing={1} sx={{ mt: 1.5 }}>
+                  <Chip
+                    size="small"
+                    label={t('prunePreview.legendKept')}
+                    sx={tintChipSx(theme, 'success')}
+                  />
+                  <Chip
+                    size="small"
+                    label={t('prunePreview.legendDeleted')}
+                    sx={tintChipSx(theme, 'error')}
+                  />
+                  <Chip
+                    size="small"
+                    label={t('prunePreview.legendMixed')}
+                    sx={tintChipSx(theme, 'warning')}
+                  />
+                </Stack>
+              </Paper>
+
+              <Paper variant="outlined" sx={{ p: 2, mt: 3 }}>
+                <PruneCandidatesRanked
+                  archives={archives}
+                  partialMeasure={preview.partial_measure}
+                  onOpen={(id) => navigate(`/archives/${repositoryId}/${id}`)}
+                />
+              </Paper>
+
+              {/* No PlanGate: the count of files losing their last copy is a
+                  warning in front of an irreversible delete, so it shows on
+                  every plan. The panel locks its own file list. */}
+              <Paper variant="outlined" sx={{ p: 2, mt: 3 }}>
+                <PruneLostFilesPanel repositoryId={repositoryId} lost={preview.lost_files} />
+              </Paper>
+
+              <Stack spacing={1} sx={{ mt: 3 }}>
+                {preview.lost_files.incomplete && (
+                  <Alert severity="warning">
+                    {t('prunePreview.warnIncomplete', {
+                      count: preview.lost_files.unindexed_archive_ids?.length ?? 0,
+                    })}
+                  </Alert>
+                )}
+                <Alert severity="info">{t('prunePreview.warnLowerBound')}</Alert>
+                {preview.partial_measure && (
+                  <Alert severity="warning">
+                    {t('prunePreview.remeasuredPartial', { cap: 50, count: deletedCount })}
+                  </Alert>
+                )}
+              </Stack>
+
+              <Divider sx={{ my: 2 }} />
+
+              <Button size="small" onClick={() => setLogOpen((v) => !v)}>
+                {t('prunePreview.showLog', { deleted: deletedCount, kept: keptCount })}
+              </Button>
+              {logOpen && (
+                <Box
+                  component="pre"
+                  sx={{
+                    mt: 1,
+                    p: 1.5,
+                    bgcolor: 'action.hover',
+                    borderRadius: 1,
+                    fontSize: '0.75rem',
+                    overflowX: 'auto',
+                  }}
+                >
+                  {preview.log}
+                </Box>
+              )}
+
+              {/* The decision travels with the reader: what goes, what stays,
+                  what is lost, and the button, pinned above the fold's end. */}
+              <Paper
+                elevation={0}
+                data-testid="prune-preview-action-bar"
+                sx={{
+                  position: 'sticky',
+                  bottom: 16,
+                  mt: 3,
+                  p: 1.5,
+                  borderRadius: 2,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 1,
+                  flexWrap: 'wrap',
+                  bgcolor: alpha(theme.palette.background.paper, 0.85),
+                  backdropFilter: 'blur(8px)',
+                  boxShadow: `0 0 0 1px ${alpha(
+                    theme.palette.mode === 'dark' ? '#fff' : '#000',
+                    0.1
+                  )}, 0 8px 24px ${alpha('#000', theme.palette.mode === 'dark' ? 0.4 : 0.12)}`,
+                }}
+              >
+                <Chip
+                  size="small"
+                  label={t('prunePreview.deletedCount', { count: deletedCount })}
+                  sx={tintChipSx(theme, 'error')}
+                />
+                <Chip
+                  size="small"
+                  label={t('prunePreview.kept', { count: keptCount })}
+                  sx={tintChipSx(theme, 'success')}
+                />
+                {preview.lost_files.available && (preview.lost_files.total_count ?? 0) > 0 && (
+                  <Chip
+                    size="small"
+                    label={t('prunePreview.lostShort', { count: preview.lost_files.total_count })}
+                    sx={tintChipSx(theme, 'warning')}
+                  />
+                )}
+                <Box sx={{ flex: 1 }} />
+                <Button onClick={() => navigate(-1)}>{t('prunePreview.cancel')}</Button>
+                <Button
+                  variant="contained"
+                  color="error"
+                  onClick={() => setConfirmOpen(true)}
+                  disabled={deletedCount === 0 || dirty || loadingPreview || error !== null}
+                >
+                  {t('prunePreview.runNow', { count: deletedCount })}
+                </Button>
+              </Paper>
+            </Box>
+          ) : null}
+        </Stack>
+      </Box>
+
+      <Dialog open={confirmOpen} onClose={() => setConfirmOpen(false)}>
+        <DialogTitle>{t('prunePreview.confirmTitle', { count: deletedCount })}</DialogTitle>
+        <DialogContent>
+          <DialogContentText>{t('prunePreview.confirmBody')}</DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setConfirmOpen(false)}>{t('prunePreview.cancel')}</Button>
+          <Button
+            variant="contained"
+            color="error"
+            onClick={() => {
+              setConfirmOpen(false)
+              if (previewedRetention) runPruneMutation.mutate(previewedRetention)
+            }}
+          >
+            {t('prunePreview.confirm')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  )
+}

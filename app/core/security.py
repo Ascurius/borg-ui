@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Annotated, Optional
 import jwt
 from jwt.exceptions import PyJWTError as JWTError
 import bcrypt
+from pydantic import AfterValidator
 import hashlib
 from fastapi import HTTPException, status, Depends, Request
 from fastapi.security import HTTPBearer
@@ -76,6 +77,26 @@ def verify_password(plain_password: str, hashed_password: Optional[str]) -> bool
 def get_password_hash(password: str) -> str:
     """Hash a password"""
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+# bcrypt hashes at most 72 bytes of input; bcrypt 5 raises ValueError on longer
+# input rather than truncating it. Left unchecked that surfaces as a 500 when a
+# user sets a long (or multibyte) password. Validating at the request boundary
+# turns it into a clean 422 on registration, password change, and reset.
+BCRYPT_MAX_PASSWORD_BYTES = 72
+
+
+def enforce_bcrypt_password_length(password: str) -> str:
+    if len(password.encode("utf-8")) > BCRYPT_MAX_PASSWORD_BYTES:
+        raise ValueError(
+            f"Password must not exceed {BCRYPT_MAX_PASSWORD_BYTES} bytes when "
+            "UTF-8 encoded"
+        )
+    return password
+
+
+# Use on request-model password fields that are hashed with get_password_hash.
+BcryptPassword = Annotated[str, AfterValidator(enforce_bcrypt_password_length)]
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
@@ -590,25 +611,34 @@ def check_repo_access(db: Session, user: User, repo, required_role: str) -> None
     if user.role == "admin":
         return
 
-    effective_role = getattr(user, "all_repositories_role", None)
     perm = (
         db.query(UserRepositoryPermission)
         .filter_by(user_id=user.id, repository_id=repo.id)
         .first()
     )
-    if perm and (
-        effective_role is None
-        or REPO_ROLE_RANK.get(perm.role, 0) > REPO_ROLE_RANK.get(effective_role, 0)
-    ):
-        effective_role = perm.role
-
-    if effective_role is None or REPO_ROLE_RANK.get(
-        effective_role, 0
-    ) < REPO_ROLE_RANK.get(required_role, 0):
+    if not repository_role_allows(user, perm.role if perm else None, required_role):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"key": "backend.errors.auth.notEnoughPermissions"},
         )
+
+
+def repository_role_allows(
+    user: User, permission_role: Optional[str], required_role: str
+) -> bool:
+    """`check_repo_access`'s rule on a permission row already read: the
+    user's role on all repositories, raised by a grant on this one that
+    outranks it, must reach `required_role`. Admin is decided before this."""
+    effective_role = getattr(user, "all_repositories_role", None)
+    if permission_role and (
+        effective_role is None
+        or REPO_ROLE_RANK.get(permission_role, 0)
+        > REPO_ROLE_RANK.get(effective_role, 0)
+    ):
+        effective_role = permission_role
+    return effective_role is not None and REPO_ROLE_RANK.get(
+        effective_role, 0
+    ) >= REPO_ROLE_RANK.get(required_role, 0)
 
 
 def get_repository_by_path_or_404(
@@ -680,10 +710,23 @@ async def create_first_user():
         user_count = db.query(User).count()
         if user_count == 0:
             # Create default admin user
-            # Use environment variable if set, otherwise use default
+            # Use environment variable if set, otherwise use default. A
+            # template with a blank password field (the Unraid template, a
+            # Compose file with `${INITIAL_ADMIN_PASSWORD:-}`) sets the
+            # variable to an empty string; that must not create an admin with
+            # an empty password, so empty or whitespace-only reads as unset.
+            # Surrounding whitespace is dropped from a real value too (an env
+            # file's trailing space would otherwise lock the operator out of
+            # an admin nobody can reset without a user), and said so.
             import os
 
-            default_password = os.getenv("INITIAL_ADMIN_PASSWORD", "admin123")
+            configured = os.getenv("INITIAL_ADMIN_PASSWORD", "")
+            default_password = configured.strip() or "admin123"
+            if configured.strip() and configured != configured.strip():
+                logger.warning(
+                    "Surrounding whitespace dropped from INITIAL_ADMIN_PASSWORD",
+                    username="admin",
+                )
             hashed_password = get_password_hash(default_password)
 
             admin_user = User(

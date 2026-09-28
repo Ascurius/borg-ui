@@ -12,6 +12,9 @@ interface WizardStepScheduleReviewProps {
     repositoryIds: number[]
     cronExpression: string
     timezone?: string
+    scheduleMode?: 'cron' | 'availability'
+    availabilityCheckIntervalMinutes?: number
+    minimumSuccessIntervalHours?: number
     archiveNameTemplate: string
     preBackupScriptId: number | null
     postBackupScriptId: number | null
@@ -29,11 +32,6 @@ interface WizardStepScheduleReviewProps {
   repositories: Repository[]
   scripts: Script[]
 }
-
-const BLUE = '#3b82f6'
-const VIOLET = '#8b5cf6'
-const EMERALD = '#10b981'
-const AMBER = '#f59e0b'
 
 function IconBadge({ icon, accentColor }: { icon: React.ReactNode; accentColor: string }) {
   const theme = useTheme()
@@ -170,6 +168,7 @@ const WizardStepScheduleReview: React.FC<WizardStepScheduleReviewProps> = ({
   scripts,
 }) => {
   const { t } = useTranslation()
+  const theme = useTheme()
 
   const selectedRepos = repositories.filter((r) => data.repositoryIds.includes(r.id))
   const preScript = scripts.find((s) => s.id === data.preBackupScriptId)
@@ -209,17 +208,17 @@ const WizardStepScheduleReview: React.FC<WizardStepScheduleReviewProps> = ({
         <Tooltip title={t('wizard.scheduleWizard.review.readyToCreate')} placement="top" arrow>
           <Chip
             icon={<Rocket size={11} />}
-            label="Ready"
+            label={t('wizard.scheduleWizard.review.ready')}
             size="small"
             sx={{
               height: 20,
               fontSize: '0.65rem',
               fontWeight: 600,
-              bgcolor: alpha(EMERALD, 0.1),
-              color: EMERALD,
-              border: `1px solid ${alpha(EMERALD, 0.25)}`,
+              bgcolor: alpha(theme.palette.success.main, 0.1),
+              color: theme.palette.success.main,
+              border: `1px solid ${alpha(theme.palette.success.main, 0.25)}`,
               cursor: 'help',
-              '& .MuiChip-icon': { color: EMERALD, ml: '6px' },
+              '& .MuiChip-icon': { color: theme.palette.success.main, ml: '6px' },
               '& .MuiChip-label': { px: '8px' },
             }}
           />
@@ -227,7 +226,12 @@ const WizardStepScheduleReview: React.FC<WizardStepScheduleReviewProps> = ({
       </Box>
 
       <Alert severity="success">
-        <Typography variant="body2" fontWeight={700}>
+        <Typography
+          variant="body2"
+          sx={{
+            fontWeight: 700,
+          }}
+        >
           {t('wizard.scheduleWizard.review.readyToCreate')}
         </Typography>
         <Typography variant="body2">
@@ -249,10 +253,16 @@ const WizardStepScheduleReview: React.FC<WizardStepScheduleReviewProps> = ({
         <SectionCard
           icon={<Calendar size={14} />}
           label={t('wizard.scheduleWizard.review.jobSummary')}
-          accentColor={BLUE}
+          accentColor={theme.palette.primary.main}
         >
           <AttrRow label={t('wizard.scheduleWizard.review.name')}>
-            <Typography variant="body2" fontWeight={700} fontSize="0.8rem">
+            <Typography
+              variant="body2"
+              sx={{
+                fontWeight: 700,
+                fontSize: '0.8rem',
+              }}
+            >
               {data.name}
             </Typography>
           </AttrRow>
@@ -260,20 +270,46 @@ const WizardStepScheduleReview: React.FC<WizardStepScheduleReviewProps> = ({
             <AttrRow label={t('wizard.scheduleWizard.basicInfo.descriptionLabel')}>
               <Typography
                 variant="body2"
-                fontSize="0.75rem"
-                color="text.secondary"
-                sx={{ textAlign: 'right' }}
+                sx={{
+                  fontSize: '0.75rem',
+                  color: 'text.secondary',
+                  textAlign: 'right',
+                }}
               >
                 {data.description}
               </Typography>
             </AttrRow>
           )}
-          <AttrRow label={t('wizard.scheduleWizard.review.schedule')}>
-            <CodePill>{data.cronExpression}</CodePill>
-          </AttrRow>
-          <AttrRow label={t('wizard.scheduleWizard.review.timezone', { defaultValue: 'Timezone' })}>
-            <CodePill>{data.timezone || 'UTC'}</CodePill>
-          </AttrRow>
+          {data.scheduleMode === 'availability' ? (
+            <>
+              <AttrRow label={t('schedule.trigger.label')}>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    fontSize: '0.75rem',
+                    fontWeight: 600,
+                  }}
+                >
+                  {t('schedule.trigger.whenAvailable')}
+                </Typography>
+              </AttrRow>
+              <AttrRow label={t('schedule.trigger.checkInterval')}>
+                <CodePill>{data.availabilityCheckIntervalMinutes ?? 30} min</CodePill>
+              </AttrRow>
+              <AttrRow label={t('schedule.trigger.minimumInterval')}>
+                <CodePill>{data.minimumSuccessIntervalHours ?? 20} h</CodePill>
+              </AttrRow>
+            </>
+          ) : (
+            <>
+              <AttrRow label={t('wizard.scheduleWizard.review.schedule')}>
+                <CodePill>{data.cronExpression}</CodePill>
+              </AttrRow>
+              <AttrRow label={t('wizard.scheduleWizard.review.timezone')}>
+                <CodePill>{data.timezone || 'UTC'}</CodePill>
+              </AttrRow>
+            </>
+          )}
           <AttrRow label={t('wizard.scheduleWizard.review.archiveNameTemplate')}>
             <CodePill>{data.archiveNameTemplate}</CodePill>
           </AttrRow>
@@ -283,10 +319,16 @@ const WizardStepScheduleReview: React.FC<WizardStepScheduleReviewProps> = ({
         <SectionCard
           icon={<Database size={14} />}
           label={t('wizard.scheduleWizard.review.repositories', { count: selectedRepos.length })}
-          accentColor={AMBER}
+          accentColor={theme.palette.warning.main}
         >
           {selectedRepos.length === 0 ? (
-            <Typography variant="body2" fontSize="0.75rem" color="text.secondary">
+            <Typography
+              variant="body2"
+              sx={{
+                fontSize: '0.75rem',
+                color: 'text.secondary',
+              }}
+            >
               {t('wizard.scheduleWizard.review.none')}
             </Typography>
           ) : (
@@ -307,26 +349,50 @@ const WizardStepScheduleReview: React.FC<WizardStepScheduleReviewProps> = ({
         <SectionCard
           icon={<Code size={14} />}
           label={t('wizard.scheduleWizard.review.scriptsConfiguration')}
-          accentColor={VIOLET}
+          accentColor={theme.palette.secondary.main}
         >
           <AttrRow label={t('wizard.scheduleWizard.review.preBackupScript')}>
             {preScript ? (
-              <Typography variant="body2" fontSize="0.75rem" fontWeight={500}>
+              <Typography
+                variant="body2"
+                sx={{
+                  fontSize: '0.75rem',
+                  fontWeight: 500,
+                }}
+              >
                 {preScript.name}
               </Typography>
             ) : (
-              <Typography variant="body2" fontSize="0.75rem" color="text.disabled">
+              <Typography
+                variant="body2"
+                sx={{
+                  fontSize: '0.75rem',
+                  color: 'text.disabled',
+                }}
+              >
                 {t('wizard.scheduleWizard.review.none')}
               </Typography>
             )}
           </AttrRow>
           <AttrRow label={t('wizard.scheduleWizard.review.postBackupScript')}>
             {postScript ? (
-              <Typography variant="body2" fontSize="0.75rem" fontWeight={500}>
+              <Typography
+                variant="body2"
+                sx={{
+                  fontSize: '0.75rem',
+                  fontWeight: 500,
+                }}
+              >
                 {postScript.name}
               </Typography>
             ) : (
-              <Typography variant="body2" fontSize="0.75rem" color="text.disabled">
+              <Typography
+                variant="body2"
+                sx={{
+                  fontSize: '0.75rem',
+                  color: 'text.disabled',
+                }}
+              >
                 {t('wizard.scheduleWizard.review.none')}
               </Typography>
             )}
@@ -349,7 +415,7 @@ const WizardStepScheduleReview: React.FC<WizardStepScheduleReviewProps> = ({
         <SectionCard
           icon={<Wrench size={14} />}
           label={t('wizard.scheduleWizard.review.maintenanceSettings')}
-          accentColor={EMERALD}
+          accentColor={theme.palette.success.main}
         >
           <AttrRow label={t('wizard.scheduleWizard.review.pruneAfterBackup')}>
             <Chip
@@ -364,7 +430,7 @@ const WizardStepScheduleReview: React.FC<WizardStepScheduleReviewProps> = ({
             />
           </AttrRow>
           {data.runPruneAfter && (
-            <AttrRow label="Keep:">
+            <AttrRow label={t('wizard.scheduleWizard.review.keep')}>
               <CodePill>{pruneKeeps}</CodePill>
             </AttrRow>
           )}

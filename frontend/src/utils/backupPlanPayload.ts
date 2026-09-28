@@ -26,6 +26,8 @@ export interface BackupPlanPayloadState {
   sourceLocations?: SourceLocation[]
   excludePatterns: string[]
   repositoryIds: number[]
+  // Repositories kept on the plan but skipped during runs (issue #879).
+  disabledRepositoryIds?: number[]
   compression: string
   archiveNameTemplate: string
   customFlags: string
@@ -35,8 +37,11 @@ export interface BackupPlanPayloadState {
   maxParallelRepositories: number
   failureBehavior: 'continue' | 'stop'
   scheduleEnabled: boolean
+  scheduleMode?: 'cron' | 'availability'
   cronExpression: string
   timezone: string
+  availabilityCheckIntervalMinutes?: number
+  minimumSuccessIntervalHours?: number
   preBackupScriptId: number | null
   postBackupScriptId: number | null
   preBackupScriptParameters: Record<string, string>
@@ -362,6 +367,7 @@ export function buildBackupPlanPayload(
   state: BackupPlanPayloadState,
   clearLegacySourceRepositoryIds: number[] = []
 ): BackupPlanData {
+  const scheduleMode = state.scheduleMode || 'cron'
   const sourceLocations = normalizeSourceLocations(state)
   const sourceDirectories = sourceLocations.length
     ? sourceLocations.flatMap((location) => location.paths)
@@ -397,8 +403,15 @@ export function buildBackupPlanPayload(
       state.repositoryRunMode === 'parallel' ? state.maxParallelRepositories : 1,
     failure_behavior: state.failureBehavior,
     schedule_enabled: state.scheduleEnabled,
-    cron_expression: state.scheduleEnabled ? state.cronExpression : null,
+    schedule_mode: scheduleMode,
+    cron_expression: state.scheduleEnabled && scheduleMode === 'cron' ? state.cronExpression : null,
     timezone: state.timezone,
+    ...(scheduleMode === 'availability'
+      ? {
+          availability_check_interval_minutes: state.availabilityCheckIntervalMinutes ?? 30,
+          min_success_interval_minutes: Math.round((state.minimumSuccessIntervalHours ?? 20) * 60),
+        }
+      : {}),
     pre_backup_script_id: firstPreHook?.script_id ?? state.preBackupScriptId,
     post_backup_script_id: firstPostHook?.script_id ?? state.postBackupScriptId,
     pre_backup_script_parameters:
@@ -421,7 +434,7 @@ export function buildBackupPlanPayload(
     prune_keep_within: normalizeOptionalString(state.pruneKeepWithin),
     repositories: state.repositoryIds.map((repositoryId, index) => ({
       repository_id: repositoryId,
-      enabled: true,
+      enabled: !(state.disabledRepositoryIds || []).includes(repositoryId),
       execution_order: index + 1,
       compression_source: 'plan',
       compression_override: null,

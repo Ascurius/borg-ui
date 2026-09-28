@@ -1,3 +1,4 @@
+import type { StoredPruneRetention } from './archives'
 /**
  * Type definitions for jobs and repositories used across the application
  *
@@ -7,6 +8,8 @@
  * Most fields are optional as different contexts provide different subsets of data.
  */
 
+import type { OperationCategory, OperationTrigger } from './operations'
+
 export interface Job {
   id: string | number
   repository_id?: number | null
@@ -15,11 +18,15 @@ export interface Job {
   type?: string
   status: string
   progress?: number
-  progress_message?: string
+  progress_message?: string | null
   started_at?: string | null
   completed_at?: string | null
   error_message?: string | null
+  skip_reason?: 'minimum_interval_not_elapsed' | 'source_unavailable' | null
   archive_name?: string | null
+  // The stored archive's borg id; the Borg 2 client addresses archives by it.
+  archive_borg_id?: string | null
+  archive_pruned_at?: string | null
   package_name?: string | null
   has_logs?: boolean
   triggered_by?: string
@@ -42,6 +49,17 @@ export interface Job {
   retry_requested_by_user_id?: number | null
   retry_requested_at?: string | null
   progress_details?: unknown
+  kind?: string | null
+  category?: OperationCategory | null
+  trigger?: OperationTrigger | null
+  depends_on_id?: number | null
+  hook_type?: string | null
+  // A prune dry run (the preview page, or the retention comparison).
+  dry_run?: boolean
+  prune_retention?: StoredPruneRetention | null
+  progress_current?: number | null
+  progress_total?: number | null
+  followups?: Job[]
 }
 
 export interface Repository {

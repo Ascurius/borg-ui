@@ -73,6 +73,12 @@ Successful responses use this shape:
 }
 ```
 
+The `job_id` is an operations id. The same number addresses `GET
+/api/operations/{id}` and the Activity log routes with job type `backup`. A
+job stays `pending` while another exclusive operation holds the repository,
+and `POST /api/backup/cancel/{id}` cancels a pending job as well as a
+running one.
+
 The JSON body uses the `repository` string accepted by Borg UI's manual backup
 flow. For the current `/api/backup/start` and `/api/backup/run` endpoints, pass
 the repository path shown in Borg UI. Older clients may still submit requests
@@ -163,3 +169,135 @@ curl -sS "$BASE_URL/api/backup/logs/$JOB_ID/download" \
   -H "X-Borg-Authorization: Bearer $TOKEN" \
   -o "backup_job_${JOB_ID}_logs.txt"
 ```
+
+## Maintenance jobs (check, prune, compact, restore check, archive delete)
+
+The start routes (`POST /api/repositories/{id}/check`, `/prune`, `/compact`,
+`/restore-check`, and `DELETE /api/archives/{archive_id}`) return
+`{"job_id", "status", "message"}`, where `job_id` is an `operations` row id:
+the work is queued behind the repository's other exclusive operations (a
+running backup, for example) instead of being rejected with a conflict, so
+`status` is usually `pending` rather than `running`. A prune's dry run is the
+exception: it runs and answers inline, so its payload carries the
+`prune_result` shape instead of a `job_id` to poll.
+
+The corresponding status and list routes are `GET .../check-jobs/{id}`,
+`/prune-jobs/{id}`, `/compact-jobs/{id}`, `/restore-check-jobs/{id}`,
+`/api/archives/delete-jobs/{id}`, and their per-repository list forms.
+
+## Repository wipe, cloud mirror, and package install jobs
+
+These three kinds are `operations` rows too, and every response body and
+status word is unchanged.
+
+`POST /api/repositories/{id}/wipe` still answers
+`{"id", "status", "phase", ...}` with `status: "pending"`, but the wipe is now
+queued behind the repository's other exclusive work rather than started
+immediately, and `GET /api/repositories/{id}/wipe-jobs/{job_id}` polls it as
+before. The preview from `POST .../wipe-preview` keeps its own id space in
+`repository_wipe_jobs`, the one table that still holds previews; both id
+spaces resolve on the status and cancel routes. The statuses `completed_compaction_failed` and `failed_partial` are
+still returned, reconstructed from the operation's wipe details.
+
+The cloud mirror `latest_sync_job` block on the repository payload keeps its
+shape, including `triggered_by: "initial"` for the sync queued when a cloud
+repository is created, and `operation: "sync" | "hydrate"`. Activity still
+reports the two as types `rclone_sync` and `rclone_hydrate`.
+
+`POST /api/packages/{id}/install` and `GET /api/packages/jobs/{job_id}` keep
+their bodies, including `stdout`, `stderr`, and `exit_code`: the two streams
+now live in the operation's log file and are parsed back for the response. The
+install is queued and started by the runner, so a fresh job answers `pending`
+before it answers `installing`.
+
+## Restore jobs
+
+A restore is an `operations` row as well. `POST /api/restore/start` answers
+`{"job_id", "status": "pending", "message"}`, where the id is an operations row
+id. `GET /api/restore/jobs`, `GET /api/restore/status/{id}`, and
+`POST /api/restore/cancel/{id}` keep their bodies and status words.
+`progress_details.estimated_time_remaining` is
+computed from the sizes and the speed rather than stored. The restore's
+logs are its operation log file, readable through
+`GET /api/activity/restore/{id}/logs` as before.
+
+## Operations
+
+Every job is an `operations` row, and these routes read and steer them
+directly. Each `job_id` the job routes return is an operation id usable here.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/operations/` | List operations, filtered by `repository_id`, `category[]`, `kind[]`, `status[]`, `trigger[]`, `run_id`, `since`, with `limit` and a `cursor` for paging |
+| `GET /api/operations/queue` | What is running and waiting right now, with the concurrency limits in force |
+| `GET /api/operations/repositories` | One row per repository the user may see, with the state of its derived data |
+| `GET /api/operations/repositories/{id}` | The archives behind a row's failed and truncated counts, newest first |
+| `POST /api/operations/reconcile` | Run the reconcile tick now instead of waiting for the interval |
+| `POST /api/operations/pause` | Stop dispatching follow-up and reconcile work |
+| `POST /api/operations/resume` | Dispatch it again |
+| `PUT /api/operations/limits` | Change the concurrency limits |
+| `GET /api/operations/{id}` | One operation with its kind-specific detail |
+| `POST /api/operations/{id}/cancel` | Ask the runner to cancel it |
+| `GET /api/operations/{id}/logs` | Paginated log lines |
+| `GET /api/operations/{id}/logs/download` | The log file as a download |
+
+## Activity
+
+`GET /api/activity/recent` is the unified history. Parameters: `limit`,
+`job_type`, `status`, `category[]`, `trigger[]`, `repository_id`, and
+`collapse_runs` (on by default, which nests a run's index follow-ups under
+their parent).
+
+Each item carries `activity_key`, `type`, `category`, `trigger`, `followups`,
+and the fields the job views have always read: `id`, `status`, `started_at`,
+`completed_at`, `error_message`, `repository`, `repository_path`,
+`log_file_path`, `triggered_by`, `schedule_id`, `archive_name`,
+`package_name`, and `has_logs`.
+
+Three routes serve one item by type and id: `GET /api/activity/{job_type}/{id}/logs`,
+`GET /api/activity/{job_type}/{id}/logs/download`, and
+`DELETE /api/activity/{job_type}/{id}`. The `job_type` values are the Activity
+type words (`backup`, `restore`, `check`, `restore_check`, `compact`, `prune`,
+`package`, `rclone_sync`, `rclone_hydrate`, `script_execution`).
+
+## Archive index and history
+
+Database-backed archive routes under `/api/repositories/{id}`. Routes
+marked Pro require the `archive_history` feature and return the standard
+plan 403 payload otherwise.
+
+| Method | Route | Plan | Purpose |
+| --- | --- | --- | --- |
+| GET | `/archives` | Community | Archives from the index with `series`, `since`, `until` filters and `sync_state` |
+| GET | `/archives/live` | Community | The previous live `borg list` route, kept for the Archives page until it switches to the index. Also served by the v2 router at `/api/v2/repositories/{id}/archives/live`, so one client reaches the live listing on both borg versions |
+| GET | `/archives/heatmap` | Community | Per day counts and sizes for the whole repository and per series; `missed_run` days; outlier flags on Pro |
+| GET | `/archives/{archive_id}` | Community | One archive with history state and neighbours |
+| GET | `/status` | Community | Per-category status from repository evidence (newest archive, detected removals, job rows); overdue flags on Pro. The repositories list payload carries `last_prune` and `last_index` from the same evidence for the card |
+| POST | `/rebuild` | Community (`history` stage is Pro) | Body `{"from": "stats" \| "archives" \| "history"}` |
+| POST | `/resync` | Community | Brings the stored archive list back in line after work that removed archives |
+| GET | `/archives/{archive_id}/changes` | Pro | Changes against the predecessor or `compare_to`. `incomplete` and `unindexed_archive_ids` flag a fold whose window contains an archive that was never indexed |
+| GET | `/history?path=` | Pro | Every archive that touched a path, with present ranges |
+| GET | `/search?q=` | Pro | Filename search across all archives |
+
+`GET /api/archives/list` is deprecated and sends `Deprecation: true` with a
+`Link` header pointing at the index route.
+
+`since` and `until` accept an offset (`2026-01-01T00:00:00Z`); the value is
+converted to UTC before it reaches the index, which stores naive UTC.
+
+### Index mode
+
+Every repository payload carries `index_mode`, one of `full` (the default),
+`archives` or `off`. It says how much derived data the repository keeps
+refreshed: `full` indexes everything, `archives` keeps the archive list and
+the size current but builds no file history, and `off` refreshes nothing.
+
+`PUT /api/repositories/{id}` accepts `index_mode`; any other value is a 422.
+Changing it away from `full` cancels the repository's queued index work (a
+running index is left to finish), and changing it back to `full` enqueues
+one catch-up run.
+
+Manual work is not blocked by the mode. `/rebuild` and `/resync` run once
+for a repository in any mode, and neither builds file history for a mode
+that excludes it. `repositories.history_index_excludes`,
+the glob patterns file history skips, is accepted on the same route.

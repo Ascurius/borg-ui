@@ -1,4 +1,6 @@
 import React from 'react'
+import { useId } from 'react'
+import { useTranslation } from 'react-i18next'
 import {
   FormControl,
   InputLabel,
@@ -43,9 +45,9 @@ export default function RepoSelect({
   onChange,
   loading = false,
   valueKey = 'path',
-  label = 'Repository',
-  loadingLabel = 'Loading…',
-  placeholderLabel = 'Select a repository',
+  label,
+  loadingLabel,
+  placeholderLabel,
   fallbackDisplayValue,
   maintenanceLabel,
   size = 'medium',
@@ -55,7 +57,12 @@ export default function RepoSelect({
   fullWidth = true,
   sx,
 }: RepoSelectProps) {
+  const { t } = useTranslation()
   const theme = useTheme()
+  const resolvedLabel = label ?? t('repoSelect.label')
+  const labelId = useId()
+  const resolvedLoadingLabel = loadingLabel ?? t('common.loading')
+  const resolvedPlaceholderLabel = placeholderLabel ?? t('repoSelect.placeholder')
 
   // Find selected repo for rich renderValue
   const selectedRepo =
@@ -87,32 +94,49 @@ export default function RepoSelect({
       size={size}
       sx={{ minWidth: { xs: '100%', sm: 300 }, ...sx }}
     >
-      {label && <InputLabel>{label}</InputLabel>}
+      {resolvedLabel && <InputLabel id={labelId}>{resolvedLabel}</InputLabel>}
       <Select
+        labelId={resolvedLabel ? labelId : undefined}
         value={value}
         onChange={(e) => onChange(e.target.value as number | string)}
-        label={label || undefined}
+        label={resolvedLabel || undefined}
         disabled={disabled || loading}
         sx={selectSx}
         renderValue={(val) => {
           if (loading) {
             return (
-              <Typography variant="body2" color="text.secondary">
-                {loadingLabel}
+              <Typography
+                variant="body2"
+                sx={{
+                  color: 'text.secondary',
+                }}
+              >
+                {resolvedLoadingLabel}
               </Typography>
             )
           }
           if (!val || val === '' || !selectedRepo) {
             if (val && val !== '' && fallbackDisplayValue) {
               return (
-                <Typography variant="body2" color="text.secondary" sx={{ fontWeight: 600 }}>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: 'text.secondary',
+                    fontWeight: 600,
+                  }}
+                >
                   {fallbackDisplayValue}
                 </Typography>
               )
             }
             return (
-              <Typography variant="body2" color="text.disabled">
-                {placeholderLabel}
+              <Typography
+                variant="body2"
+                sx={{
+                  color: 'text.disabled',
+                }}
+              >
+                {resolvedPlaceholderLabel}
               </Typography>
             )
           }
@@ -120,9 +144,21 @@ export default function RepoSelect({
           if (size === 'small') {
             // Compact: icon + name only
             return (
-              <Stack direction="row" spacing={0.75} alignItems="center">
+              <Stack
+                direction="row"
+                spacing={0.75}
+                sx={{
+                  alignItems: 'center',
+                }}
+              >
                 <Database size={13} />
-                <Typography variant="body2" fontWeight={500} noWrap>
+                <Typography
+                  variant="body2"
+                  noWrap
+                  sx={{
+                    fontWeight: 500,
+                  }}
+                >
                   {selectedRepo.name}
                 </Typography>
                 <BorgVersionChip borgVersion={selectedRepo.borg_version} compact />
@@ -135,13 +171,30 @@ export default function RepoSelect({
             <Stack
               direction="row"
               spacing={1}
-              alignItems="center"
-              sx={{ minWidth: 0, flex: 1, overflow: 'hidden' }}
+              sx={{
+                alignItems: 'center',
+                minWidth: 0,
+                flex: 1,
+                overflow: 'hidden',
+              }}
             >
               <Database size={16} style={{ flexShrink: 0 }} />
               <Box sx={{ minWidth: 0, flex: 1 }}>
-                <Stack direction="row" spacing={0.5} alignItems="center">
-                  <Typography variant="body2" fontWeight={600} noWrap sx={{ lineHeight: 1.3 }}>
+                <Stack
+                  direction="row"
+                  spacing={0.5}
+                  sx={{
+                    alignItems: 'center',
+                  }}
+                >
+                  <Typography
+                    variant="body2"
+                    noWrap
+                    sx={{
+                      fontWeight: 600,
+                      lineHeight: 1.3,
+                    }}
+                  >
                     {selectedRepo.name}
                   </Typography>
                   <BorgVersionChip borgVersion={selectedRepo.borg_version} compact />
@@ -168,7 +221,7 @@ export default function RepoSelect({
         {prefixItems}
         {!prefixItems && (
           <MenuItem value="" disabled>
-            {loading ? loadingLabel : placeholderLabel}
+            {loading ? resolvedLoadingLabel : resolvedPlaceholderLabel}
           </MenuItem>
         )}
         {repositories.map((repo) => (

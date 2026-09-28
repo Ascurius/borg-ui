@@ -2,13 +2,22 @@
 
 from contextlib import contextmanager
 import os
+import shlex
 from pathlib import Path
 from typing import Iterator, Optional
 
+from sqlalchemy.orm import object_session
+
 from app.config import settings
+from app.utils.ssh_host_keys import (
+    host_key_ssh_opts,
+    host_key_ssh_opts_for_connection_id,
+)
 from app.utils.ssh_utils import (
+    find_ssh_connection_for_path,
     public_key_only_ssh_args,
     resolve_repo_ssh_key_file,
+    resolve_repository_ssh_connection,
     resolve_ssh_key_file_by_id,
 )
 
@@ -17,8 +26,19 @@ def get_standard_ssh_opts(
     include_key_path: Optional[str] = None,
     *,
     keepalive: bool = False,
+    connection=None,
+    db=None,
+    connection_id=None,
 ) -> list[str]:
-    """Return standard SSH options for Borg operations."""
+    """Return standard SSH options for Borg operations.
+
+    ``connection`` is the SSH connection the command runs against; its pinned
+    host key verifies the remote host. A caller that knows only the id passes
+    ``connection_id`` and the row is loaded here, so a repository attached to a
+    pinned connection is never reduced to recording the key on first use just
+    because the caller had no session. With neither there is no row to verify
+    against, and the key is recorded on first use in a shared known_hosts file.
+    """
     opts: list[str] = []
 
     if include_key_path:
@@ -26,16 +46,11 @@ def get_standard_ssh_opts(
 
     opts.extend(public_key_only_ssh_args(identities_only=bool(include_key_path)))
 
-    opts.extend(
-        [
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "LogLevel=ERROR",
-        ]
-    )
+    if connection is None and connection_id is not None:
+        opts.extend(host_key_ssh_opts_for_connection_id(connection_id))
+    else:
+        opts.extend(host_key_ssh_opts(connection, db))
+    opts.extend(["-o", "LogLevel=ERROR"])
 
     if keepalive:
         opts.extend(
@@ -61,6 +76,12 @@ def get_standard_ssh_opts(
     return opts
 
 
+# Lock wait for Borg commands run inside an HTTP request. Background jobs keep
+# setup_borg_env's 180s; a request should report "repository locked" long
+# before a reverse proxy's read timeout (commonly 60s) cuts it off.
+REQUEST_LOCK_WAIT = "20"
+
+
 def setup_borg_env(
     *,
     base_env=None,
@@ -79,6 +100,22 @@ def setup_borg_env(
     env["BORG_RELOCATED_REPO_ACCESS_IS_OK"] = "yes"
     env["BORG_LOCK_WAIT"] = lock_wait
     env["BORG_HOSTNAME_IS_UNIQUE"] = "yes"
+    # Borg's modern exit codes: 0 success, 2-99 specific errors, 100-127
+    # specific warnings, instead of the legacy 0/1/2. Borg 2 uses them by
+    # default; Borg 1.4 needs this variable, and without it the same failure
+    # reports "Insufficient free space" from a backup and a bare "Error" from
+    # a prune. `is_borg_warning_exit_code` and BORG_EXIT_CODES already read
+    # both schemes, so the messages get better and nothing else changes.
+    # setdefault, like the cache flags below: an operator can pin "legacy".
+    env.setdefault("BORG_EXIT_CODES", "modern")
+    # Borg 2.0.0b23's pack cache: borgstore serves archive metadata as
+    # whole-pack loads, so on remote repositories every listing re-transfers
+    # packs. The writethrough cache under borg's own cache directory
+    # downloads each pack once. setdefault: the
+    # container environment can resize it or disable it (BORG_STORE_CACHE="").
+    # Borg 1 ignores both variables.
+    env.setdefault("BORG_STORE_CACHE", "1")
+    env.setdefault("BORG_PACK_CACHE_SIZE", str(2 * 1024**3))
     # Borg 2 starts an rclone RC process for direct rclone repositories. The
     # same managed config must be available to that process as to repository
     # create/import commands, otherwise it falls back to an empty default config.
@@ -93,9 +130,55 @@ def setup_borg_env(
     return env
 
 
+def with_lock_wait(cmd, env=None) -> list[str]:
+    """Pass the environment's BORG_LOCK_WAIT to a Borg 1 command line.
+
+    Borg 2 reads BORG_LOCK_WAIT itself. Borg 1.4 never does: its --lock-wait
+    defaults to 1 second, so without the flag every Borg 1 command gives up
+    on a held lock almost at once (#1216). Borg 1 takes common options before
+    the subcommand, and a --lock-wait the caller put after it still wins.
+    `env=None` means the inherited environment, as for subprocess.
+    """
+    cmd = list(cmd)
+    lock_wait = (os.environ if env is None else env).get("BORG_LOCK_WAIT")
+    if not lock_wait or os.path.basename(cmd[0]) != "borg" or "--lock-wait" in cmd:
+        return cmd
+    return [cmd[0], "--lock-wait", lock_wait, *cmd[1:]]
+
+
 def cleanup_temp_key_file(temp_key_file: Optional[str]) -> None:
     if temp_key_file and os.path.exists(temp_key_file):
         os.unlink(temp_key_file)
+
+
+def effective_repository_remote_path(repository, db=None) -> Optional[str]:
+    """Return the Borg command used by an SSH repository's remote server.
+
+    Borg runs its remote side as the SSH user by default. A repository attached
+    to a connection with ``use_sudo`` needs that remote server to run as root
+    instead, otherwise it cannot access data written by a remote-direct backup
+    that ran as root. ``-n`` prevents an unattended command from hanging for a
+    password and ``-H`` keeps root's Borg state out of the SSH user's home.
+    """
+    configured_path = getattr(repository, "remote_path", None)
+    connection = getattr(repository, "repository_connection", None)
+    if getattr(connection, "use_sudo", None) is not True:
+        session = db
+        if session is None:
+            try:
+                session = object_session(repository)
+            except Exception:
+                session = None
+        if session is not None:
+            connection = resolve_repository_ssh_connection(repository, session)
+
+    if not connection or getattr(connection, "use_sudo", False) is not True:
+        return configured_path
+
+    borg_path = (
+        getattr(connection, "borg_binary_path", None) or configured_path or "borg"
+    )
+    return f"sudo -n -H {shlex.quote(borg_path)}"
 
 
 def build_repository_borg_env(
@@ -109,8 +192,12 @@ def build_repository_borg_env(
 ):
     """Build Borg env for a stored repository and return env + temp key path."""
     temp_key_file = resolve_repo_ssh_key_file(repository, db)
+    connection = resolve_repository_ssh_connection(repository, db) if db else None
     ssh_opts = get_standard_ssh_opts(
-        include_key_path=temp_key_file, keepalive=keepalive
+        include_key_path=temp_key_file,
+        keepalive=keepalive,
+        connection=connection,
+        db=db,
     )
     env = setup_borg_env(
         base_env=base_env,
@@ -119,6 +206,9 @@ def build_repository_borg_env(
         lock_wait=lock_wait,
         show_progress=show_progress,
     )
+    remote_path = effective_repository_remote_path(repository, db)
+    if remote_path:
+        env["BORG_REMOTE_PATH"] = remote_path
     return env, temp_key_file
 
 
@@ -135,11 +225,17 @@ def build_ssh_key_borg_env(
 ):
     """Build Borg env for an arbitrary Borg path plus optional SSH key ID."""
     temp_key_file = None
+    connection = None
     if ssh_key_id and path.startswith("ssh://"):
         temp_key_file = resolve_ssh_key_file_by_id(ssh_key_id, db=db)
+    if db is not None and path.startswith("ssh://"):
+        connection = find_ssh_connection_for_path(path, db)
 
     ssh_opts = get_standard_ssh_opts(
-        include_key_path=temp_key_file, keepalive=keepalive
+        include_key_path=temp_key_file,
+        keepalive=keepalive,
+        connection=connection,
+        db=db,
     )
     env = setup_borg_env(
         base_env=base_env,

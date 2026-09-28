@@ -15,6 +15,7 @@ import type { SystemStyleObject } from '@mui/system'
 import { Search } from 'lucide-react'
 import type { KeyboardEvent, MouseEvent, ReactNode } from 'react'
 import { useId, useMemo, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import RichSelectRow from './RichSelectRow'
 
 export interface RichSelectOption {
@@ -42,6 +43,7 @@ interface RichSelectProps {
   searchEnabled?: boolean
   searchPlaceholder?: string
   noResultsText?: string
+  size?: 'small' | 'medium'
   sx?: SxProps<Theme>
   selectSx?: SxProps<Theme>
   menuPaperSx?: SxProps<Theme>
@@ -58,18 +60,23 @@ export default function RichSelect({
   required,
   placeholder,
   searchEnabled = false,
-  searchPlaceholder = 'Search',
-  noResultsText = 'No results found',
+  searchPlaceholder,
+  noResultsText,
+  size = 'medium',
   sx,
   selectSx,
   menuPaperSx,
 }: RichSelectProps) {
+  const { t } = useTranslation()
   const generatedId = useId()
   const resolvedLabelId = labelId ?? `${generatedId}-label`
   const rootRef = useRef<HTMLDivElement | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
   const [menuWidth, setMenuWidth] = useState<number | null>(null)
   const [search, setSearch] = useState('')
+  const resolvedSearchPlaceholder = searchPlaceholder ?? t('common.search')
+  const resolvedNoResultsText = noResultsText ?? t('common.noResults')
+  const height = size === 'small' ? 40 : 56
   const selectSxList = toSxArray(selectSx)
   const menuPaperSxList = toSxArray(menuPaperSx)
 
@@ -118,7 +125,14 @@ export default function RichSelect({
   }
 
   return (
-    <FormControl fullWidth disabled={disabled} required={required} sx={sx} ref={rootRef}>
+    <FormControl
+      fullWidth
+      size={size}
+      disabled={disabled}
+      required={required}
+      sx={sx}
+      ref={rootRef}
+    >
       <InputLabel id={resolvedLabelId} shrink={Boolean(placeholder) || undefined}>
         {label}
       </InputLabel>
@@ -138,7 +152,13 @@ export default function RichSelect({
         renderValue={(selected) => {
           if (selected === '' && placeholder) {
             return (
-              <Typography variant="body2" color="text.secondary" noWrap>
+              <Typography
+                variant="body2"
+                noWrap
+                sx={{
+                  color: 'text.secondary',
+                }}
+              >
                 {placeholder}
               </Typography>
             )
@@ -151,32 +171,34 @@ export default function RichSelect({
         }}
         MenuProps={{
           autoFocus: !searchEnabled,
-          MenuListProps: {
-            autoFocusItem: !searchEnabled,
-            sx: {
-              width: '100%',
-              py: 0.5,
-            },
-          },
-          PaperProps: {
-            sx: [
-              {
-                mt: 0.5,
-                width: menuWidth ?? undefined,
-                minWidth: menuWidth ?? undefined,
-                maxWidth: menuWidth ?? undefined,
-                maxHeight: 430,
-                overflowX: 'hidden',
+          slotProps: {
+            list: {
+              autoFocusItem: !searchEnabled,
+              sx: {
+                width: '100%',
+                py: 0.5,
               },
-              ...menuPaperSxList,
-            ],
+            },
+            paper: {
+              sx: [
+                {
+                  mt: 0.5,
+                  width: menuWidth ?? undefined,
+                  minWidth: menuWidth ?? undefined,
+                  maxWidth: menuWidth ?? undefined,
+                  maxHeight: 430,
+                  overflowX: 'hidden',
+                },
+                ...menuPaperSxList,
+              ],
+            },
           },
         }}
         sx={[
           {
-            height: 56,
+            height,
             '& .MuiSelect-select': {
-              height: 56,
+              height,
               boxSizing: 'border-box',
               display: 'flex',
               alignItems: 'center',
@@ -204,24 +226,32 @@ export default function RichSelect({
               fullWidth
               size="small"
               value={search}
-              placeholder={searchPlaceholder}
+              placeholder={resolvedSearchPlaceholder}
               onChange={(event) => setSearch(event.target.value)}
               onClick={handleSearchClick}
               onMouseDown={handleSearchClick}
               onKeyDown={handleSearchKeyDown}
-              InputProps={{
-                startAdornment: (
-                  <InputAdornment position="start">
-                    <Search size={14} />
-                  </InputAdornment>
-                ),
+              slotProps={{
+                input: {
+                  startAdornment: (
+                    <InputAdornment position="start">
+                      <Search size={14} />
+                    </InputAdornment>
+                  ),
+                },
               }}
             />
           </ListSubheader>
         )}
         {placeholder && (
           <MenuItem disabled value="" sx={menuItemSx}>
-            <Typography variant="body2" color="text.secondary" noWrap>
+            <Typography
+              variant="body2"
+              noWrap
+              sx={{
+                color: 'text.secondary',
+              }}
+            >
               {placeholder}
             </Typography>
           </MenuItem>
@@ -258,8 +288,14 @@ export default function RichSelect({
           ])
         ) : (
           <MenuItem disabled sx={menuItemSx}>
-            <Typography variant="body2" color="text.secondary" noWrap>
-              {noResultsText}
+            <Typography
+              variant="body2"
+              noWrap
+              sx={{
+                color: 'text.secondary',
+              }}
+            >
+              {resolvedNoResultsText}
             </Typography>
           </MenuItem>
         )}
@@ -289,9 +325,7 @@ const menuItemSx = {
 }
 
 type RichSelectSxItem =
-  | boolean
-  | SystemStyleObject<Theme>
-  | ((theme: Theme) => SystemStyleObject<Theme>)
+  boolean | SystemStyleObject<Theme> | ((theme: Theme) => SystemStyleObject<Theme>)
 
 function toSxArray(sx?: SxProps<Theme>): RichSelectSxItem[] {
   if (!sx) return []

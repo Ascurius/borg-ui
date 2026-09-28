@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Box, Typography, Chip, IconButton, Tooltip, alpha } from '@mui/material'
+import { Box, Typography, Chip, IconButton, Tooltip, alpha, useTheme } from '@mui/material'
 import {
   FolderOpen,
   Shield,
@@ -34,6 +34,7 @@ interface SSHConnection {
   ssh_key_id: number
   default_path?: string
   ssh_path_prefix?: string
+  use_sudo?: boolean
 }
 
 interface AgentMachine {
@@ -136,6 +137,7 @@ export default function WizardStepReview({
     return { host: '', username: '', port: 22 }
   }
 
+  const theme = useTheme()
   const repoDetails = getRepoConnectionDetails()
   const selectedAgent =
     executionTarget === 'agent' && data.agentMachineId
@@ -152,12 +154,6 @@ export default function WizardStepReview({
   const cloudMirrorTarget = data.rcloneRemoteName
     ? `${data.rcloneRemoteName}:${data.rcloneRemotePath || ''}`
     : data.rcloneRemotePath || t('wizard.review.notSet')
-
-  const EMERALD = '#10b981'
-  const BLUE = '#3b82f6'
-  const AMBER = '#f59e0b'
-  const VIOLET = '#8b5cf6'
-  const ERROR = '#ef4444'
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -191,6 +187,7 @@ export default function WizardStepReview({
             sourceDirs={data.sourceDirs}
             customFlags={data.customFlags}
             remotePath={data.remotePath}
+            useSudo={getRepoSshConnection()?.use_sudo}
             repositoryMode={data.repositoryMode}
             dataSource={data.dataSource}
             sourceSshConnection={getSourceSshConnection()}
@@ -205,17 +202,17 @@ export default function WizardStepReview({
           <Tooltip title={t('wizard.review.repositoryInitialized')} placement="top" arrow>
             <Chip
               icon={<Rocket size={11} />}
-              label="Ready to Initialize"
+              label={t('wizard.review.readyToInitialize')}
               size="small"
               sx={{
                 height: 20,
                 fontSize: '0.65rem',
                 fontWeight: 600,
-                bgcolor: alpha(EMERALD, 0.1),
-                color: EMERALD,
-                border: `1px solid ${alpha(EMERALD, 0.25)}`,
+                bgcolor: alpha(theme.palette.success.main, 0.1),
+                color: theme.palette.success.main,
+                border: `1px solid ${alpha(theme.palette.success.main, 0.25)}`,
                 cursor: 'help',
-                '& .MuiChip-icon': { color: EMERALD, ml: '6px' },
+                '& .MuiChip-icon': { color: theme.palette.success.main, ml: '6px' },
                 '& .MuiChip-label': { px: '8px' },
               }}
             />
@@ -226,7 +223,12 @@ export default function WizardStepReview({
       {mode === 'create' && data.repositoryMode === 'full' && (
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
           <Info size={14} style={{ opacity: 0.45, flexShrink: 0 }} />
-          <Typography variant="body2" color="text.secondary">
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+            }}
+          >
             {t('wizard.review.repositoryInitialized')}
           </Typography>
         </Box>
@@ -238,10 +240,16 @@ export default function WizardStepReview({
         <ReviewSectionCard
           icon={<FolderOpen size={14} />}
           label={t('wizard.review.repository')}
-          accentColor={BLUE}
+          accentColor={theme.palette.primary.main}
         >
           <ReviewAttrRow label={t('wizard.review.name')}>
-            <Typography variant="body2" fontWeight={700} fontSize="0.8rem">
+            <Typography
+              variant="body2"
+              sx={{
+                fontWeight: 700,
+                fontSize: '0.8rem',
+              }}
+            >
               {data.name}
             </Typography>
           </ReviewAttrRow>
@@ -266,7 +274,12 @@ export default function WizardStepReview({
               ) : (
                 <Cloud size={12} style={{ opacity: 0.6 }} />
               )}
-              <Typography variant="body2" fontSize="0.75rem">
+              <Typography
+                variant="body2"
+                sx={{
+                  fontSize: '0.75rem',
+                }}
+              >
                 {executionTarget === 'agent'
                   ? t('wizard.review.repositoryPathOnSelectedAgent')
                   : data.repositoryLocation === 'local'
@@ -287,7 +300,12 @@ export default function WizardStepReview({
               ) : (
                 <Server size={12} style={{ opacity: 0.6 }} />
               )}
-              <Typography variant="body2" fontSize="0.75rem">
+              <Typography
+                variant="body2"
+                sx={{
+                  fontSize: '0.75rem',
+                }}
+              >
                 {executionTarget === 'agent'
                   ? t('wizard.review.managedAgent')
                   : t('wizard.review.borgUiServer')}
@@ -297,7 +315,13 @@ export default function WizardStepReview({
 
           {executionTarget === 'agent' && (
             <ReviewAttrRow label={t('wizard.review.agent')}>
-              <Typography variant="body2" fontSize="0.75rem" fontWeight={500}>
+              <Typography
+                variant="body2"
+                sx={{
+                  fontSize: '0.75rem',
+                  fontWeight: 500,
+                }}
+              >
                 {selectedAgent?.hostname || selectedAgent?.name || t('wizard.review.notSet')}
               </Typography>
             </ReviewAttrRow>
@@ -310,12 +334,22 @@ export default function WizardStepReview({
           {isDirectRclone && (
             <>
               <ReviewAttrRow label={t('wizard.review.rcloneRoute')}>
-                <Typography variant="body2" fontSize="0.75rem">
+                <Typography
+                  variant="body2"
+                  sx={{
+                    fontSize: '0.75rem',
+                  }}
+                >
                   {t('wizard.location.directRcloneRoutePreview')}
                 </Typography>
               </ReviewAttrRow>
               <ReviewAttrRow label={t('wizard.review.directRcloneTradeoffsLabel')}>
-                <Typography variant="body2" fontSize="0.75rem">
+                <Typography
+                  variant="body2"
+                  sx={{
+                    fontSize: '0.75rem',
+                  }}
+                >
                   {t('wizard.review.directRcloneTradeoffs')}
                 </Typography>
               </ReviewAttrRow>
@@ -336,10 +370,15 @@ export default function WizardStepReview({
           <ReviewSectionCard
             icon={<Cloud size={14} />}
             label={t('wizard.review.cloudMirror')}
-            accentColor={VIOLET}
+            accentColor={theme.palette.secondary.main}
           >
             <ReviewAttrRow label={t('wizard.review.rcloneRoute')}>
-              <Typography variant="body2" fontSize="0.75rem">
+              <Typography
+                variant="body2"
+                sx={{
+                  fontSize: '0.75rem',
+                }}
+              >
                 {t('wizard.cloudMirror.routePreview')}
               </Typography>
             </ReviewAttrRow>
@@ -347,7 +386,12 @@ export default function WizardStepReview({
               <ReviewCodePill>{cloudMirrorTarget}</ReviewCodePill>
             </ReviewAttrRow>
             <ReviewAttrRow label={t('wizard.review.rcloneSyncPolicy')}>
-              <Typography variant="body2" fontSize="0.75rem">
+              <Typography
+                variant="body2"
+                sx={{
+                  fontSize: '0.75rem',
+                }}
+              >
                 {getRcloneSyncPolicyLabel()}
               </Typography>
             </ReviewAttrRow>
@@ -367,15 +411,15 @@ export default function WizardStepReview({
         <ReviewSectionCard
           icon={<Shield size={14} />}
           label={t('wizard.review.security')}
-          accentColor={isEncrypted ? EMERALD : ERROR}
+          accentColor={isEncrypted ? theme.palette.success.main : theme.palette.error.main}
         >
           {mode === 'create' && (
             <ReviewAttrRow label={t('wizard.review.encryption')}>
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.4 }}>
                 {isEncrypted ? (
-                  <Lock size={11} color={EMERALD} />
+                  <Lock size={11} color={theme.palette.success.main} />
                 ) : (
-                  <Unlock size={11} color={ERROR} />
+                  <Unlock size={11} color={theme.palette.error.main} />
                 )}
                 <Chip
                   label={t(getEncryptionLabelKey(data.encryption))}
@@ -392,15 +436,27 @@ export default function WizardStepReview({
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.4 }}>
                 <Typography
                   variant="body2"
-                  fontFamily={showPassphrase ? 'inherit' : 'monospace'}
-                  fontSize="0.75rem"
-                  letterSpacing={showPassphrase ? 'normal' : '0.1em'}
+                  sx={{
+                    fontFamily: showPassphrase ? 'inherit' : 'monospace',
+                    fontSize: '0.75rem',
+                    letterSpacing: showPassphrase ? 'normal' : '0.1em',
+                  }}
                 >
                   {showPassphrase ? data.passphrase : '••••••••'}
                 </Typography>
-                <Tooltip title={showPassphrase ? 'Hide passphrase' : 'Show passphrase'}>
+                <Tooltip
+                  title={
+                    showPassphrase
+                      ? t('wizard.review.hidePassphrase')
+                      : t('wizard.review.showPassphrase')
+                  }
+                >
                   <IconButton
-                    aria-label={showPassphrase ? 'Hide passphrase' : 'Show passphrase'}
+                    aria-label={
+                      showPassphrase
+                        ? t('wizard.review.hidePassphrase')
+                        : t('wizard.review.showPassphrase')
+                    }
                     onClick={() => setShowPassphrase((v) => !v)}
                     size="small"
                     sx={{ p: 0.2 }}
@@ -410,7 +466,13 @@ export default function WizardStepReview({
                 </Tooltip>
               </Box>
             ) : (
-              <Typography variant="body2" fontSize="0.75rem" color="text.secondary">
+              <Typography
+                variant="body2"
+                sx={{
+                  fontSize: '0.75rem',
+                  color: 'text.secondary',
+                }}
+              >
                 {t('wizard.review.passphraseNotSet')}
               </Typography>
             )}
@@ -422,14 +484,26 @@ export default function WizardStepReview({
           <ReviewSectionCard
             icon={<Info size={14} />}
             label={t('wizard.review.planOwnedSources')}
-            accentColor={AMBER}
+            accentColor={theme.palette.warning.main}
           >
             <ReviewAttrRow label={t('wizard.review.source')}>
-              <Typography variant="body2" fontSize="0.75rem" fontWeight={500}>
+              <Typography
+                variant="body2"
+                sx={{
+                  fontSize: '0.75rem',
+                  fontWeight: 500,
+                }}
+              >
                 {t('wizard.review.backupPlans')}
               </Typography>
             </ReviewAttrRow>
-            <Typography variant="body2" color="text.secondary" fontSize="0.75rem">
+            <Typography
+              variant="body2"
+              sx={{
+                color: 'text.secondary',
+                fontSize: '0.75rem',
+              }}
+            >
               {t('wizard.review.planOwnedSourcesDetail')}
             </Typography>
           </ReviewSectionCard>
@@ -439,10 +513,16 @@ export default function WizardStepReview({
           <ReviewSectionCard
             icon={data.dataSource === 'local' ? <HardDrive size={14} /> : <Laptop size={14} />}
             label={t('wizard.review.dataSource')}
-            accentColor={AMBER}
+            accentColor={theme.palette.warning.main}
           >
             <ReviewAttrRow label={t('wizard.review.source')}>
-              <Typography variant="body2" fontSize="0.75rem" fontWeight={500}>
+              <Typography
+                variant="body2"
+                sx={{
+                  fontSize: '0.75rem',
+                  fontWeight: 500,
+                }}
+              >
                 {executionTarget === 'agent'
                   ? t('wizard.review.managedAgent')
                   : data.dataSource === 'local'
@@ -454,13 +534,23 @@ export default function WizardStepReview({
             {data.dataSource === 'local' && (
               <>
                 <ReviewAttrRow label={t('wizard.review.directories')}>
-                  <Typography variant="body2" fontSize="0.75rem">
+                  <Typography
+                    variant="body2"
+                    sx={{
+                      fontSize: '0.75rem',
+                    }}
+                  >
                     {t('wizard.review.directoriesCount', { count: data.sourceDirs.length })}
                   </Typography>
                 </ReviewAttrRow>
 
                 <ReviewAttrRow label={t('wizard.review.excludePatterns')}>
-                  <Typography variant="body2" fontSize="0.75rem">
+                  <Typography
+                    variant="body2"
+                    sx={{
+                      fontSize: '0.75rem',
+                    }}
+                  >
                     {t('wizard.review.directoriesCount', { count: data.excludePatterns.length })}
                   </Typography>
                 </ReviewAttrRow>
@@ -474,7 +564,7 @@ export default function WizardStepReview({
           <ReviewSectionCard
             icon={<Settings size={14} />}
             label={t('wizard.review.backupConfiguration')}
-            accentColor={VIOLET}
+            accentColor={theme.palette.secondary.main}
           >
             <ReviewAttrRow label={t('wizard.review.compression')}>
               <ReviewCodePill>{data.compression}</ReviewCodePill>
@@ -493,7 +583,12 @@ export default function WizardStepReview({
       {mode === 'import' && (
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
           <Info size={14} style={{ opacity: 0.45, flexShrink: 0 }} />
-          <Typography variant="body2" color="text.secondary">
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+            }}
+          >
             {t('wizard.review.repositoryImportNote')}
           </Typography>
         </Box>
@@ -502,7 +597,12 @@ export default function WizardStepReview({
       {mode === 'edit' && (
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
           <Info size={14} style={{ opacity: 0.45, flexShrink: 0 }} />
-          <Typography variant="body2" color="text.secondary">
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+            }}
+          >
             {t('wizard.review.repositoryEditNote')}
           </Typography>
         </Box>

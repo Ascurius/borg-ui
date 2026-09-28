@@ -15,6 +15,7 @@ from app.api import (
     backup,
     backup_plans,
     archives,
+    archive_index,
     restore,
     schedule,
     settings as settings_api,
@@ -29,6 +30,7 @@ from app.api import (
     scripts,
     packages,
     activity,
+    operations,
     scripts_library,
     mounts,
     metrics,
@@ -42,8 +44,6 @@ from app.api import (
 )
 from app.api.v2 import router as v2_router
 from app.routers import config
-from app.database.database import engine
-from app.database.models import Base
 from app.config import get_runtime_app_version, settings
 from app.core.proxy_auth import inspect_proxy_auth_config
 from app.core.security import create_first_user
@@ -162,12 +162,9 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
-
 # Create FastAPI app
 app = FastAPI(
-    title="Borg Web UI",
+    title="Borg UI",
     description="A lightweight web interface for Borg backup management",
     version=get_runtime_app_version(),
     docs_url="/api/docs",
@@ -209,6 +206,9 @@ app.include_router(events.router, prefix="/api/events", tags=["Events"])
 app.include_router(
     repositories.router, prefix="/api/repositories", tags=["Repositories"]
 )
+app.include_router(
+    archive_index.router, prefix="/api/repositories", tags=["Archive index"]
+)
 app.include_router(rclone.public_router, prefix="/api/rclone", tags=["Rclone"])
 app.include_router(rclone.router, prefix="/api/rclone", tags=["Rclone"])
 app.include_router(ssh_keys.router, prefix="/api/ssh-keys", tags=["SSH Keys"])
@@ -223,6 +223,7 @@ app.include_router(
 app.include_router(packages.router, prefix="/api/packages", tags=["Packages"])
 app.include_router(notifications.router)
 app.include_router(activity.router)
+app.include_router(operations.router, prefix="/api/operations", tags=["Operations"])
 app.include_router(config.router, prefix="/api")
 app.include_router(mounts.router)  # Mount management API
 
@@ -246,19 +247,19 @@ app.include_router(v2_router, prefix="/api/v2")  # Borg 2 versioned API
 @app.on_event("startup")
 async def startup_event():
     """Initialize application on startup"""
-    logger.info("Starting Borg Web UI")
+    logger.info("Starting Borg UI")
     _log_insecure_no_auth_warning()
     _log_proxy_auth_security_warnings()
+
+    # Before anything touches the database. The container entrypoint also
+    # prepares the schema, but the app is not always started through it —
+    # `uvicorn app.main:app` has to work too, and without this it comes up
+    # against an empty database and fails every request that reads from it.
+    from app.database.db_upgrade import ensure_schema
+
+    ensure_schema()
+
     from app.database.database import SessionLocal
-
-    # Run database migrations
-    from app.database.migrations import run_migrations
-
-    try:
-        run_migrations()
-    except Exception as e:
-        logger.error("Failed to run migrations", error=str(e))
-        # Don't fail startup, just log the error
 
     app_version = get_runtime_app_version()
 
@@ -290,8 +291,13 @@ async def startup_event():
             except Exception as e:
                 logger.warning("Background licensing refresh failed", error=str(e))
 
+    # The same setting has to gate this loop, not just the startup call above.
+    # Spawning it unconditionally meant ENABLE_STARTUP_LICENSE_SYNC=false only
+    # delayed contact with the activation service by an hour instead of
+    # preventing it, so an instance could never actually be kept offline.
     global licensing_refresh_task
-    licensing_refresh_task = _spawn_background_task(licensing_refresh_loop())
+    if settings.enable_startup_license_sync:
+        licensing_refresh_task = _spawn_background_task(licensing_refresh_loop())
 
     # Create first user if no users exist
     await create_first_user()
@@ -354,16 +360,7 @@ async def startup_event():
     except Exception as e:
         logger.warning("Failed to rotate logs", error=str(e))
 
-    # Cleanup orphaned jobs from container restarts
-    from app.utils.process_utils import cleanup_orphaned_jobs, cleanup_orphaned_mounts
-
-    try:
-        db = SessionLocal()
-        cleanup_orphaned_jobs(db)
-        db.close()
-        logger.info("Orphaned job cleanup completed")
-    except Exception as e:
-        logger.error("Failed to cleanup orphaned jobs", error=str(e))
+    from app.utils.process_utils import cleanup_orphaned_mounts
 
     # Cleanup orphaned mounts from container restarts
     try:
@@ -371,18 +368,6 @@ async def startup_event():
         logger.info("Orphaned mount cleanup completed")
     except Exception as e:
         logger.error("Failed to cleanup orphaned mounts", error=str(e))
-
-    try:
-        resumed_cloud_syncs = (
-            repositories.resume_pending_initial_cloud_mirror_sync_jobs()
-        )
-        if resumed_cloud_syncs:
-            logger.info(
-                "Resumed pending initial cloud mirror sync jobs",
-                count=resumed_cloud_syncs,
-            )
-    except Exception as e:
-        logger.error("Failed to resume pending cloud mirror sync jobs", error=str(e))
 
     # Note: Package auto-installation now handled by entrypoint.sh startup script
     # This runs asynchronously via /app/app/scripts/startup_packages.py
@@ -398,12 +383,35 @@ async def startup_event():
     app.state.background_tasks.append(task1)
     logger.info("Scheduled job checker started")
 
-    # Start stats refresh scheduler (background task)
-    from app.services.stats_refresh_scheduler import stats_refresh_scheduler
+    # Operations runner: register executors, start the loop (which recovers
+    # interrupted rows), then start the reconcile scheduler that replaces the old
+    # stats refresh loop (spec sections 7.1, 7.5, 7.6).
+    from app.database.database import SessionLocal
+    from app.services.operations.executors import load_default_executors
+    from app.services.operations.reconcile import reconcile_scheduler
+    from app.services.operations.runner import operation_runner
 
-    task2 = asyncio.create_task(stats_refresh_scheduler.start())
+    load_default_executors()
+    # `start()` recovers interrupted rows once it holds the runner lease,
+    # not before: a process being replaced may still be running them.
+    task2 = asyncio.create_task(
+        operation_runner.start(before_recovery=_recover_interrupted_work)
+    )
     app.state.background_tasks.append(task2)
-    logger.info("Stats refresh scheduler started")
+    task2b = asyncio.create_task(reconcile_scheduler.start())
+    app.state.background_tasks.append(task2b)
+    logger.info("Operations runner and reconcile scheduler started")
+
+    try:
+        db = SessionLocal()
+        try:
+            from app.services.operations.reconcile import bootstrap_history_once
+
+            bootstrap_history_once(db)
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error("History bootstrap failed", error=str(e))
 
     # Initialize MQTT service from database settings (using new implementation)
     from app.services.mqtt_service import mqtt_service, build_mqtt_runtime_config
@@ -464,13 +472,46 @@ async def startup_event():
     app.state.background_tasks.append(task6)
     logger.info("Job history retention scheduler started")
 
-    logger.info("Borg Web UI started successfully")
+    logger.info("Borg UI started successfully")
+
+
+def _recover_interrupted_work() -> None:
+    """Startup sweeps of rows a restart left behind that the runner's own
+    recovery does not cover. Called by the runner once it holds its lease, so
+    a process being replaced keeps its work."""
+    from app.database.database import SessionLocal
+    from app.utils.process_utils import cleanup_orphaned_jobs
+
+    try:
+        db = SessionLocal()
+        try:
+            cleanup_orphaned_jobs(db)
+        finally:
+            db.close()
+        logger.info("Orphaned job cleanup completed")
+    except Exception as e:
+        logger.error("Failed to cleanup orphaned jobs", error=str(e))
+
+    # Must run before OperationRunner.recover_on_startup: spec 7.6 would
+    # mark an interrupted mirror sync failed, and an rclone sync is a
+    # reconciliation that is safe to re-run, so it is requeued instead.
+    try:
+        resumed_cloud_syncs = (
+            repositories.resume_pending_initial_cloud_mirror_sync_operations()
+        )
+        if resumed_cloud_syncs:
+            logger.info(
+                "Resumed pending initial cloud mirror sync jobs",
+                count=resumed_cloud_syncs,
+            )
+    except Exception as e:
+        logger.error("Failed to resume pending cloud mirror sync jobs", error=str(e))
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on application shutdown"""
-    logger.info("Shutting down Borg Web UI")
+    logger.info("Shutting down Borg UI")
 
     global licensing_refresh_task
     if licensing_refresh_task:
@@ -480,6 +521,19 @@ async def shutdown_event():
         except asyncio.CancelledError:
             pass
         licensing_refresh_task = None
+
+    # Stop the operations runner and reconcile loop before cancelling tasks
+    from app.services.operations.reconcile import reconcile_scheduler
+    from app.services.operations.runner import operation_runner
+
+    operation_runner.stop()
+    operation_runner.wake()  # end the loop now, not at its next poll
+    reconcile_scheduler.stop()
+    # gunicorn's --graceful-timeout (30s) also covers uvicorn's wait for open
+    # connections before this (app/gunicorn_worker.py, 5s); a drain cut off by
+    # the kill never releases the runner lease, and a replacement waits for it
+    # to expire.
+    await operation_runner.drain(timeout=20.0)
 
     # Cancel background tasks
     tasks = getattr(app.state, "background_tasks", [])
@@ -511,7 +565,7 @@ async def root():
     if _cached_index_html is not None:
         return HTMLResponse(content=_cached_index_html)
     return HTMLResponse(
-        content="<h1>Borg Web UI</h1><p>Frontend not built yet. Please run the build process.</p>"
+        content="<h1>Borg UI</h1><p>Frontend not built yet. Please run the build process.</p>"
     )
 
 
@@ -537,7 +591,7 @@ async def catch_all(full_path: str):
     if _cached_index_html is not None:
         return HTMLResponse(content=_cached_index_html)
     return HTMLResponse(
-        content="<h1>Borg Web UI</h1><p>Frontend not built yet. Please run the build process.</p>"
+        content="<h1>Borg UI</h1><p>Frontend not built yet. Please run the build process.</p>"
     )
 
 
@@ -551,7 +605,7 @@ async def health_check():
 async def api_info():
     """API information endpoint"""
     return {
-        "name": "Borg Web UI API",
+        "name": "Borg UI API",
         "version": get_runtime_app_version(),
         "docs": "/api/docs",
         "status": "running",

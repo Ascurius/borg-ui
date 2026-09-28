@@ -20,10 +20,14 @@ Most configuration is available in the UI under Settings. Use environment variab
 | `DATA_DIR` | `/data` | App database, logs, SSH material, generated secret |
 | `BORG_CACHE_DIR` | `/home/borg/.cache/borg` | Borg files/chunks cache directory. Keep the matching volume persistent for backup performance |
 | `SECRET_KEY` | generated | JWT/session signing key. Auto-generated into `/data/.secret_key` if omitted |
-| `INITIAL_ADMIN_PASSWORD` | `admin123` | Password for the first `admin` user |
+| `INITIAL_ADMIN_PASSWORD` | `admin123` | Password for the first `admin` user, used on first start only. Empty or whitespace-only counts as unset; surrounding whitespace is dropped |
 | `LOG_LEVEL` | `INFO` | Backend log level |
 | `LOCAL_MOUNT_POINTS` | `/local` | Comma-separated container paths shown as local mounts in the file browser |
 | `BASE_PATH` | empty | Sub-path deployment, for example `/borg-ui` |
+
+`PUID` and `PGID` set the Borg UI process's primary identity. If a source is
+readable through an additional host group, add that group's numeric GID with
+Docker Compose `group_add`; see [Permission denied](troubleshooting#permission-denied).
 
 ## Volumes
 
@@ -147,6 +151,18 @@ Priority for UI-managed timeout settings:
 1. saved UI value, when changed from the default or environment value
 2. environment variable
 3. built-in default
+
+## Operations Index
+
+| Variable | Default | Used for |
+| --- | --- | --- |
+| `INDEX_ARCHIVE_INFO_PER_RUN` | `20` | Per-archive `borg info` calls one archive listing run may make for newly seen archives; the rest are picked up by later runs |
+| `INDEX_HISTORY_MAX_ROWS` | `200000` | Change rows stored per archive by the history index; changes past the cap collapse into per-subtree summary rows and the archive is marked truncated |
+| `INDEX_HISTORY_SECONDS_PER_RUN` | `900` | Wall-clock budget for one history index run; archives past it stay pending for the next run, so a long backfill cannot hold an index worker. `0` disables the budget |
+
+The reconcile interval (`stats_refresh_interval_minutes`) and the
+`index_workers` and `paused_stages` (the stages paused on the Background work tab) runner controls are system settings
+managed in the UI and through `/api/operations`, not environment variables.
 
 ## Archive Browsing Limits
 
@@ -302,9 +318,9 @@ requirements.
 | --- | --- | --- |
 | `ACTIVATION_SERVICE_URL` | `https://license.borgui.com` | License activation endpoint |
 | `ACTIVATION_TIMEOUT_SECONDS` | `10` | Activation request timeout |
-| `ENABLE_STARTUP_LICENSE_SYNC` | `true` in production | Sync license/full-access state at startup |
+| `ENABLE_STARTUP_LICENSE_SYNC` | `true` in production | Sync license/full-access state at startup and hourly |
 
-Set `ENABLE_STARTUP_LICENSE_SYNC=false` to prevent startup contact with the activation service.
+Set `ENABLE_STARTUP_LICENSE_SYNC=false` to stop all automatic contact with the activation service, both at startup and on the hourly refresh. Admin-initiated activation, deactivation, and refresh from Settings still contact it.
 
 ## Reverse Proxy Sub-Path
 

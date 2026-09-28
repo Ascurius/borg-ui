@@ -8,12 +8,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 import structlog
 
-from app.database.models import DeleteArchiveJob, Repository
+from app.database.models import Repository
 from app.database.database import SessionLocal
 from app.core.borg2 import borg2
 from app.config import settings
+from app.services.operations.job_facade import claim_running, resolve_maintenance_job
+from app.services.process_cancel import terminate_tracked_process
 from app.utils.db_retries import commit_with_retry
-from app.utils.borg_env import build_repository_borg_env, cleanup_temp_key_file
+from app.utils.borg_env import (
+    build_repository_borg_env,
+    cleanup_temp_key_file,
+    effective_repository_remote_path,
+)
 
 logger = structlog.get_logger()
 
@@ -22,6 +28,19 @@ class DeleteArchiveV2Service:
     def __init__(self):
         self.log_dir = Path(settings.data_dir) / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.running_processes: dict = {}
+
+    async def cancel_delete(self, job_id: int) -> bool:
+        """Cancel a running borg2 delete by terminating its tracked process.
+
+        Whichever of the two steps is in flight - the delete itself or the
+        mandatory compact that follows it - is the one tracked, so a cancel
+        during either releases the repository lock instead of leaving Borg
+        holding it while the row says cancelled.
+        """
+        return await terminate_tracked_process(
+            self.running_processes, job_id, "borg2 delete_archive"
+        )
 
     async def execute_delete(
         self, job_id: int, repository_id: int, archive_name: str, _db=None
@@ -30,9 +49,7 @@ class DeleteArchiveV2Service:
         db = SessionLocal()
         temp_key_file = None
         try:
-            job = (
-                db.query(DeleteArchiveJob).filter(DeleteArchiveJob.id == job_id).first()
-            )
+            job = resolve_maintenance_job(db, job_id, "delete_archive")
             if not job:
                 logger.error("Borg2 delete job not found", job_id=job_id)
                 return
@@ -55,12 +72,11 @@ class DeleteArchiveV2Service:
                 return
 
             started_at = datetime.now(timezone.utc)
+            claimed = 0
 
             def persist_start_state():
-                job.status = "running"
-                job.started_at = started_at
-                job.progress = 10
-                job.progress_message = "Deleting archive..."
+                nonlocal claimed
+                claimed = claim_running(db, job_id, "delete_archive", started_at)
 
             await commit_with_retry(
                 db,
@@ -70,16 +86,39 @@ class DeleteArchiveV2Service:
                 job_id=job_id,
                 repository_id=repository_id,
             )
+            if not claimed:
+                logger.warning(
+                    "Delete job reached a terminal state before start, skipping",
+                    job_id=job_id,
+                )
+                return
+
+            def persist_progress_state():
+                job.progress = 10
+                job.progress_message = "Deleting archive..."
+
+            await commit_with_retry(
+                db,
+                prepare=persist_progress_state,
+                logger=logger,
+                action="borg2_delete_progress",
+                job_id=job_id,
+                repository_id=repository_id,
+            )
 
             env, temp_key_file = build_repository_borg_env(repo, db, keepalive=True)
+
+            def track(process):
+                self.running_processes[job_id] = process
 
             # Step 1: delete the archive
             delete_result = await borg2.delete_archive(
                 repository=repo.path,
                 archive=archive_name,
                 passphrase=repo.passphrase,
-                remote_path=repo.remote_path,
+                remote_path=effective_repository_remote_path(repo),
                 env=env,
+                on_process=track,
             )
 
             if not delete_result["success"]:
@@ -122,8 +161,9 @@ class DeleteArchiveV2Service:
             compact_result = await borg2.compact(
                 repository=repo.path,
                 passphrase=repo.passphrase,
-                remote_path=repo.remote_path,
+                remote_path=effective_repository_remote_path(repo),
                 env=env,
+                on_process=track,
             )
 
             if not compact_result["success"]:
@@ -162,17 +202,15 @@ class DeleteArchiveV2Service:
                 "Borg2 delete archive service error", job_id=job_id, error=str(e)
             )
             try:
-                job = (
-                    db.query(DeleteArchiveJob)
-                    .filter(DeleteArchiveJob.id == job_id)
-                    .first()
-                )
+                job = resolve_maintenance_job(db, job_id, "delete_archive")
                 if job:
                     completed_at = datetime.now(timezone.utc)
 
+                    error_message = str(e)
+
                     def persist_failure_state():
                         job.status = "failed"
-                        job.error_message = str(e)
+                        job.error_message = error_message
                         job.completed_at = completed_at
 
                     await commit_with_retry(
@@ -186,6 +224,7 @@ class DeleteArchiveV2Service:
             except Exception:
                 pass
         finally:
+            self.running_processes.pop(job_id, None)
             cleanup_temp_key_file(temp_key_file)
             db.close()
 

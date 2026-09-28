@@ -1,8 +1,12 @@
 import asyncio
 import json
+import math
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import (
     APIRouter,
@@ -25,6 +29,8 @@ from app.core.agent_auth import (
     resolve_agent_from_token,
 )
 from app.core.agent_constants import DEFAULT_AGENT_POLL_INTERVAL_SECONDS
+from app.core.agent_versions import borg_pin_satisfied
+from app.core.borg_errors import is_borg_warning_exit_code
 from app.core.security import get_password_hash, verify_password
 from app.database.database import get_db
 from app.database.models import (
@@ -32,14 +38,19 @@ from app.database.models import (
     AgentJob,
     AgentJobLog,
     AgentMachine,
-    BackupJob,
-    CheckJob,
-    CompactJob,
-    DeleteArchiveJob,
-    PruneJob,
+    Operation,
     Repository,
 )
-from app.services.agent_artifact_relay import agent_artifact_relay
+from app.services.operations.backup_facade import (
+    BackupJobFacade,
+    is_backup_operation,
+)
+from app.services.operations.job_facade import resolve_agent_maintenance_job
+from app.services.repository_executor import lock_failure_was_deferred
+from app.services.agent_artifact_relay import (
+    CLOSE_ACK_TIMEOUT_SECONDS,
+    agent_artifact_relay,
+)
 from app.services.agent_connection_manager import (
     AgentConnection,
     agent_connection_manager,
@@ -48,7 +59,24 @@ from app.services.agent_job_dispatcher import (
     agent_job_kind as live_agent_job_kind,
     dispatch_agent_job_best_effort,
 )
-from app.utils.datetime_utils import serialize_datetime
+from app.services.agent_job_notifications import (
+    notify_backup_job_finished,
+    notify_backup_job_started,
+    notify_check_job_finished,
+    orm_identity_id,
+)
+from app.services.borg2_compact_stats import (
+    MAX_COUNT,
+    PRECISION_EXACT,
+    PRECISION_ROUNDED,
+    TAIL_LINES,
+    parse_compact_stats,
+)
+from app.services.maintenance_state import apply_compact_stats
+from app.services.operations.followups import (
+    enqueue_backup_followups,
+)
+from app.utils.datetime_utils import serialize_datetime, utc_now
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/api/agents", tags=["agents"])
@@ -62,25 +90,54 @@ FINAL_AGENT_JOB_STATUSES = {
 }
 
 
-def _is_borg_warning_return_code(return_code: Any) -> bool:
-    """Borg's warning exit codes: legacy rc 1, modern range 100-127.
-
-    Same classification the server-side services apply to their own borg
-    processes - the agent path finally speaks it too instead of collapsing
-    every non-zero exit into "failed".
-    """
-    return isinstance(return_code, int) and (
-        return_code == 1 or 100 <= return_code <= 127
-    )
-
-
-STALE_AGENT_JOB_REQUEUE_AFTER = timedelta(minutes=15)
-REPOSITORY_OPERATION_JOB_MODELS = {
-    "check": CheckJob,
-    "compact": CompactJob,
-    "prune": PruneJob,
-    "delete_archive": DeleteArchiveJob,
-}
+# MUST STAY BELOW agent_job_reaper.AGENT_JOB_REAP_AFTER.
+#
+# A job claimed just before an agent's socket drops is never delivered: it
+# sits "claimed" with started_at NULL until something recovers it.
+# _requeue_stale_agent_jobs runs on the REST /heartbeat path (polling agents)
+# and on the WebSocket session's hello (session agents reconnecting), but the
+# two paths now lean on this window differently.
+#
+# On /heartbeat this window is still the whole story: a polling agent's own
+# claim→start gap is real work in progress, not a dropped delivery, so a job
+# only requeues once it has sat idle longer than this.
+#
+# At hello it is not needed for the case it was originally sized for. A
+# session agent that just said hello cannot have a delivery in flight that
+# predates its own hello — so an undelivered claimed job (started_at NULL)
+# the agent does not list in running_job_ids is requeued regardless of age
+# on that path. This window still applies to every other job seen at hello
+# (running jobs, and claimed jobs still reported as running). Without this
+# split, a reconnect inside the window found the stranded job "too fresh"
+# and had no further chance to recover it until the next disconnect or the
+# reaper — session heartbeats are WS messages that never call this function,
+# so hello was the only opportunity.
+#
+# Two minutes gives a polling agent room to reclaim its own work well before
+# the reaper acts. It is safe to be this short because the requeue already
+# skips any job the agent reports in running_job_ids and any job whose own
+# activity is newer than the cutoff, so a genuinely running operation is
+# never requeued however long it takes.
+STALE_AGENT_JOB_REQUEUE_AFTER = timedelta(minutes=2)
+# A queued job this old on an agent's heartbeat missed its immediate dispatch:
+# the creator pushes a job the instant it commits, so one still queued after
+# the grace was created where no session for the agent existed (a server
+# process in its shutdown window, whose sessions were already closed while
+# it still ran the operations runner). Only the session start re-dispatched
+# until now, so such a job waited for the next reconnect and held the
+# repository through admission meanwhile. The grace keeps the heartbeat off a
+# job whose creator is dispatching it right now; the conditional claim in the
+# dispatcher rules out a double send either way.
+UNDELIVERED_AGENT_JOB_REDISPATCH_AFTER = timedelta(seconds=10)
+# The maintenance kinds an agent can run. These live in the `operations`
+# table, and `resolve_agent_maintenance_job` hands back the operation-backed
+# facade the callbacks below drive.
+REPOSITORY_OPERATION_JOB_KINDS = (
+    "check",
+    "compact",
+    "prune",
+    "delete_archive",
+)
 
 
 def _now_utc() -> datetime:
@@ -91,6 +148,55 @@ def _as_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def resolve_agent_upgrade(agent: AgentMachine) -> None:
+    """Clear a requested upgrade when the endpoint comes back on its target.
+
+    The agent is killed by the thing it is reporting on, so the server owns the
+    outcome. An endpoint that comes back on the old version is left in
+    `requested`: the reinstall may still be mid flight, and only the timeout
+    resolves it.
+
+    An endpoint already marked `failed` is cleared too when it turns up on the
+    target version. The agent can be killed before its acknowledgement reaches
+    the server, and the timeout is a guess by construction, so the version the
+    endpoint actually reports outranks either.
+
+    The target has two halves once an endpoint carries a Borg pin. A Borg only
+    change leaves `agent_version` alone, so matching on it would resolve such
+    an upgrade on the endpoint's next heartbeat, before the reinstall had done
+    anything. The caller must therefore have already stored this heartbeat's
+    `borg_versions`, or the pin is read against the previous report.
+    """
+    if agent.upgrade_state not in ("requested", "failed"):
+        return
+    if (
+        agent.upgrade_target_version
+        and agent.agent_version == agent.upgrade_target_version
+        and borg_pin_satisfied(
+            desired=agent.desired_borg_version, reported=agent.borg_versions
+        )
+    ):
+        agent.upgrade_state = "idle"
+        agent.upgrade_error = None
+        agent.upgrade_requested_at = None
+
+
+def _validated_timezone(value: Optional[str]) -> Optional[str]:
+    """The value if it names a real IANA zone, else None.
+
+    The zone interprets borg's local-time archive timestamps from this agent,
+    so an unknown name must not be stored - the parser would silently fall
+    back anyway, and a validated column keeps that fallback rare.
+    """
+    if not value:
+        return None
+    try:
+        ZoneInfo(value)
+    except Exception:
+        return None
+    return value
 
 
 def _invalid_enrollment_token() -> HTTPException:
@@ -107,6 +213,7 @@ class AgentRegisterRequest(BaseModel):
     os: Optional[str] = None
     arch: Optional[str] = None
     agent_version: Optional[str] = None
+    timezone: Optional[str] = None
     borg_versions: list[dict[str, Any]] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
     labels: dict[str, Any] = Field(default_factory=dict)
@@ -126,6 +233,7 @@ class AgentHeartbeatRequest(BaseModel):
     agent_id: str
     hostname: Optional[str] = None
     agent_version: Optional[str] = None
+    timezone: Optional[str] = None
     borg_versions: list[dict[str, Any]] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
     running_job_ids: list[int] = Field(default_factory=list)
@@ -146,6 +254,7 @@ class AgentSessionHello(BaseModel):
     agent_id: str
     hostname: Optional[str] = None
     agent_version: Optional[str] = None
+    timezone: Optional[str] = None
     borg_versions: list[dict[str, Any]] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
     running_job_ids: list[int] = Field(default_factory=list)
@@ -208,6 +317,10 @@ class AgentJobFailRequest(BaseModel):
     completed_at: Optional[datetime] = None
     error_message: str
     return_code: Optional[int] = None
+    # Since agent 0.1.10: the last lines Borg wrote and the failure's kind
+    # (`lock_contention` or `other`); see `agent_failure_result`.
+    stderr_tail: Optional[str] = None
+    failure_kind: Optional[str] = None
 
 
 class AgentJobCanceledRequest(BaseModel):
@@ -292,18 +405,48 @@ def _is_terminal_backup_status(status_value: Optional[str]) -> bool:
 # one on reconnect re-runs it for nobody (and, for an extract, re-breaks the agent
 # session). Everything NOT listed here is treated as durable and retried:
 # backups, maintenance ops (check/prune/compact), and rclone_sync (which owns a
-# persistent RcloneSyncJob record and also runs automatically after backups).
+# persistent mirror operation and also runs automatically after backups).
 # Allowlist, not blocklist, so an unknown/new job kind defaults to the safe side
 # (retry) rather than being silently dropped.
 REQUEST_SCOPED_REPOSITORY_JOB_KINDS = frozenset(
     {
         "repository.extract_archive_file",
+        "repository.export_archive_tar",
         "repository.list_archive_contents",
         "repository.list_archives",
         "repository.info",
         "repository.init",
+        # The consumer is the history index run that registered the relay
+        # channel; once it stopped waiting, a rerun streams a whole diff
+        # into the drain for nobody and holds the repository meanwhile.
+        "repository.diff",
     }
 )
+
+
+# Kinds whose upload is worthless unless a consumer takes it (the agent fails
+# the job on a refusal); the others are downloads whose consumer may leave.
+DELIVERY_REQUIRED_REPOSITORY_JOB_KINDS = frozenset({"repository.diff"})
+
+
+def _is_delivery_required_job(job: AgentJob) -> bool:
+    if job.job_type != "repository":
+        return False
+    payload = job.payload if isinstance(job.payload, dict) else {}
+    return payload.get("job_kind") in DELIVERY_REQUIRED_REPOSITORY_JOB_KINDS
+
+
+async def _cancel_unconsumed_delivery(db: Session, job: AgentJob) -> None:
+    """Cancel a delivery-required job whose upload found no consumer, so the
+    agent ends borg instead of finishing a listing for nobody."""
+    from app.services.agent_job_dispatcher import dispatch_agent_cancel_if_connected
+    from app.services.repository_executor import (
+        abandon_agent_repository_operation_job,
+    )
+
+    cancelled = abandon_agent_repository_operation_job(db, job.id)
+    if cancelled is not None and cancelled.status == "cancel_requested":
+        await dispatch_agent_cancel_if_connected(cancelled)
 
 
 def _is_request_scoped_repository_job(job: AgentJob) -> bool:
@@ -314,12 +457,59 @@ def _is_request_scoped_repository_job(job: AgentJob) -> bool:
     return payload.get("job_kind") in REQUEST_SCOPED_REPOSITORY_JOB_KINDS
 
 
+def _claim_transition_from_read_status(
+    job: AgentJob, db: Session, values: dict[Any, Any]
+) -> bool:
+    """Apply `values` only while the job still has the status it was read with.
+
+    A cancel request or a verdict committed after the read is newer than the
+    decision made from it; the WHERE guard lets it stand instead of writing
+    over it. On success the ORM object is refreshed with the values written.
+    """
+    moved = (
+        db.query(AgentJob)
+        .filter(AgentJob.id == job.id, AgentJob.status == job.status)
+        .update(values, synchronize_session=False)
+    )
+    if not moved:
+        db.expire(job)
+        return False
+    db.refresh(job)
+    return True
+
+
+def _cancel_if_requested_meanwhile(
+    job: AgentJob,
+    db: Session,
+    *,
+    completed_at: datetime,
+    stale_cutoff: datetime,
+    ignore_age: bool,
+) -> None:
+    """Settle a cancel request that won against the requeue, by the rule the
+    loop applies to a job read as cancel_requested.
+
+    Left alone, the row would hold the repository until the reaper: the
+    cancel's own dispatch can miss a session that is only being set up, and
+    session heartbeats never come back here. On /heartbeat the age check
+    still applies to the refreshed row: a polling agent may have started the
+    job after its report was taken, and closing it here would take the
+    cancel away from a job that is running.
+    """
+    if job.status != "cancel_requested":
+        return
+    if not ignore_age and _job_activity_at(job) > stale_cutoff:
+        return
+    _cancel_agent_job(job, db, completed_at=completed_at)
+
+
 def _requeue_stale_agent_jobs(
     db: Session,
     current_agent: AgentMachine,
     *,
     now: datetime,
     running_job_ids: list[int],
+    ignore_age_for_undelivered: bool = False,
 ) -> None:
     running_ids = set(running_job_ids)
     stale_cutoff = now - STALE_AGENT_JOB_REQUEUE_AFTER
@@ -334,25 +524,69 @@ def _requeue_stale_agent_jobs(
     for job in jobs:
         if job.id in running_ids:
             continue
-        if _job_activity_at(job) > stale_cutoff:
+
+        undelivered = job.status == "claimed" and job.started_at is None
+        # A hello's running_job_ids is authoritative for a job the agent was
+        # asked to cancel too: absent from it, the cancel is done, and the
+        # row must not hold the repository until the reaper.
+        skip_age_check = ignore_age_for_undelivered and (
+            undelivered or job.status == "cancel_requested"
+        )
+        if not skip_age_check and _job_activity_at(job) > stale_cutoff:
+            continue
+
+        if job.status == "cancel_requested":
+            # Someone asked this job to stop and the agent no longer runs
+            # it: the cancel is done, the backup or operation it carries
+            # included. Queueing it again would run the work (a prune, an
+            # archive delete) after it was cancelled.
+            _cancel_agent_job(job, db, completed_at=now)
             continue
 
         if _is_request_scoped_repository_job(job):
             # No client is waiting for the result any more — fail terminally
             # instead of restarting a job whose receiver is gone.
-            job.status = "failed"
-            job.completed_at = now
-            job.updated_at = now
-            job.error_message = (
-                "Agent session lost before delivery; request-scoped repository "
-                "operation failed (no client is waiting for the result)."
-            )
+            if not _claim_transition_from_read_status(
+                job,
+                db,
+                {
+                    AgentJob.status: "failed",
+                    AgentJob.completed_at: now,
+                    AgentJob.updated_at: now,
+                    AgentJob.error_message: (
+                        "Agent session lost before delivery; request-scoped "
+                        "repository operation failed (no client is waiting "
+                        "for the result)."
+                    ),
+                },
+            ):
+                _cancel_if_requested_meanwhile(
+                    job,
+                    db,
+                    completed_at=now,
+                    stale_cutoff=stale_cutoff,
+                    ignore_age=ignore_age_for_undelivered,
+                )
             continue
 
-        job.status = "queued"
-        job.claimed_at = None
-        job.started_at = None
-        job.updated_at = now
+        if not _claim_transition_from_read_status(
+            job,
+            db,
+            {
+                AgentJob.status: "queued",
+                AgentJob.claimed_at: None,
+                AgentJob.started_at: None,
+                AgentJob.updated_at: now,
+            },
+        ):
+            _cancel_if_requested_meanwhile(
+                job,
+                db,
+                completed_at=now,
+                stale_cutoff=stale_cutoff,
+                ignore_age=ignore_age_for_undelivered,
+            )
+            continue
 
         backup_job = _get_linked_backup_job(job, db)
         if backup_job and not _is_terminal_backup_status(backup_job.status):
@@ -366,10 +600,11 @@ def _normalize_agent_timestamp(value: Optional[datetime]) -> datetime:
     return _as_utc(value)
 
 
-def _get_linked_backup_job(job: AgentJob, db: Session) -> Optional[BackupJob]:
-    if not job.backup_job_id:
+def _get_linked_backup_job(job: AgentJob, db: Session) -> Any:
+    if not job.operation_id:
         return None
-    return db.query(BackupJob).filter(BackupJob.id == job.backup_job_id).first()
+    operation = db.get(Operation, job.operation_id)
+    return BackupJobFacade(db, operation) if operation is not None else None
 
 
 def _collect_agent_logs(job: AgentJob, db: Session) -> str:
@@ -382,7 +617,133 @@ def _collect_agent_logs(job: AgentJob, db: Session) -> str:
     return "\n".join(log.message for log in logs)
 
 
-def _sync_backup_progress(agent_job: AgentJob, backup_job: BackupJob) -> None:
+# The statistics block as `parse_compact_stats` produces it: the counts
+# (non-negative integers below MAX_COUNT), the factors (ratios, bounded)
+# and the precision label. A report from an agent is stored, served and, for the
+# size, acted on as it is, so only these fields in these shapes are taken.
+_COMPACT_STATS_COUNTS = (
+    "archive_count",
+    "source_size",
+    "source_files",
+    "deduplicated_size",
+    "repository_size",
+    "object_count",
+    "compaction_saved",
+)
+_COMPACT_STATS_FACTORS = ("deduplication_factor", "compression_factor")
+
+
+def _compact_stats(
+    agent_job: AgentJob, repository: Repository, logs: str
+) -> Optional[dict]:
+    """The statistics of a Borg 2 compact the agent just completed: the
+    ones its completion report carries (an agent from release 0.1.4 parses
+    its own `compact --stats` output into `result["stats"]`), else the ones
+    the tail of the collected transcript yields, else None. Borg 1 compact
+    prints no statistics, so a report carrying some for a Borg 1 repository
+    is not believed. The transcript is the fallback for an agent that ran
+    `--stats` but reported nothing: its last lines and its completion travel
+    on different paths, so the tail may still be in flight, and then this
+    compact records no statistics, which is logged."""
+    if repository.borg_version != 2:
+        return None
+    result = agent_job.result if isinstance(agent_job.result, dict) else {}
+    stats = _reported_compact_stats(result.get("stats"))
+    if stats is None:
+        stats = parse_compact_stats(logs.splitlines()[-TAIL_LINES:])
+    if stats is None:
+        # The size this compact was asked for is missing. At completion the
+        # cases (an agent that predates the flag or the report, last lines
+        # still in flight, a Borg release that no longer prints them) look
+        # the same, so this is information, not a warning; `ran_stats`
+        # (the report names the command) narrows it for a reader.
+        command = result.get("command")
+        ran_stats = isinstance(command, list) and "--stats" in command
+        (logger.info if ran_stats else logger.debug)(
+            "Agent compact reported no statistics",
+            agent_job_id=agent_job.id,
+            repository_id=repository.id,
+            ran_stats=ran_stats,
+        )
+    return stats
+
+
+def _reported_compact_stats(value) -> Optional[dict]:
+    """`value` reduced to the known statistics fields in their shapes, or
+    None when it is not a statistics block (no usable `repository_size`)."""
+    if not isinstance(value, dict):
+        return None
+    stats: dict = {}
+    for name in _COMPACT_STATS_COUNTS:
+        field = value.get(name)
+        if _is_count(field):
+            stats[name] = field
+    for name in _COMPACT_STATS_FACTORS:
+        field = value.get(name)
+        if _is_factor(field):
+            stats[name] = float(field)
+    if value.get("size_precision") in (PRECISION_EXACT, PRECISION_ROUNDED):
+        stats["size_precision"] = value["size_precision"]
+    if "repository_size" not in stats:
+        return None
+    return stats
+
+
+# The final counters of a backup's archive (`archive.stats` of
+# `borg create --json`) as an agent from release 0.1.9 reports them with the
+# completion, with the column each one lands in.
+_ARCHIVE_STATS_COLUMNS = {
+    "original_size": AgentJob.original_size,
+    "compressed_size": AgentJob.compressed_size,
+    "deduplicated_size": AgentJob.deduplicated_size,
+    "nfiles": AgentJob.nfiles,
+}
+# `nfiles` is a 32-bit column
+_MAX_NFILES = 2**31
+
+
+def _reported_archive_stats(result) -> dict:
+    """The final archive counters a completion report carries, by column;
+    empty when it carries none (an older agent) and without a field Borg
+    did not report (Borg 2 has no compressed or deduplicated size here), so
+    the last progress report's figure stands for those."""
+    value = result.get("archive_stats") if isinstance(result, dict) else None
+    if not isinstance(value, dict):
+        return {}
+    return {
+        column: value[name]
+        for name, column in _ARCHIVE_STATS_COLUMNS.items()
+        if _is_count(value.get(name))
+        and (name != "nfiles" or value[name] < _MAX_NFILES)
+    }
+
+
+def _is_count(value) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value < MAX_COUNT
+    )
+
+
+# Borg prints the factors (ratios) with two decimals; a figure beyond this
+# did not come from Borg.
+_MAX_FACTOR = 1e9
+
+
+def _is_factor(value) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        # bounded before any float conversion: `math.isfinite` itself
+        # refuses an integer too large for a float
+        return 0 <= value < _MAX_FACTOR
+    return (
+        isinstance(value, float) and math.isfinite(value) and 0 <= value < _MAX_FACTOR
+    )
+
+
+def _sync_backup_progress(agent_job: AgentJob, backup_job) -> None:
     for field_name in (
         "progress_percent",
         "current_file",
@@ -422,31 +783,61 @@ def _finish_linked_backup_job(
         if archive_name:
             backup_job.archive_name = archive_name
 
-        repository = (
-            db.query(Repository)
-            .filter(Repository.path == backup_job.repository)
-            .first()
-        )
+        repository = None
+        if backup_job.repository_id:
+            repository = db.get(Repository, backup_job.repository_id)
+        if repository is None:
+            repository = (
+                db.query(Repository)
+                .filter(Repository.path == backup_job.repository)
+                .first()
+            )
         if repository:
-            repository.last_backup = completed_at
             repository.updated_at = _now_utc()
+            from app.services.operations.runner import operation_runner
+
+            if (
+                is_backup_operation(backup_job)
+                and backup_job.id in operation_runner.running_tasks
+            ):
+                # The executor is waiting on this agent job and the runner
+                # enqueues the chain when it returns (spec 7.4).
+                return
+            repository_name = repository.name
+            # archive_sync derives last_backup from the listing; the caller
+            # commits, and the runner polls for the new rows. The attempt
+            # runs in a savepoint: a failed flush inside enqueue would
+            # otherwise leave the session needing a rollback, and a plain
+            # rollback here would discard the terminal state the caller has
+            # pending. Only the enqueue is undone.
+            try:
+                with db.begin_nested():
+                    enqueue_backup_followups(
+                        db,
+                        repository.id,
+                        scheduled_job_id=backup_job.scheduled_job_id,
+                        backup_plan_run_id=backup_job.backup_plan_run_id,
+                        commit=False,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to enqueue index follow-ups",
+                    repository=repository_name,
+                    error=str(exc),
+                )
 
 
 def _get_repository_operation_job(agent_job: AgentJob, db: Session) -> Any | None:
-    payload = agent_job.payload or {}
-    operation = payload.get("operation") if isinstance(payload, dict) else None
-    maintenance_job = (
-        operation.get("maintenance_job") if isinstance(operation, dict) else None
+    """The maintenance job this agent job reports on, resolved from the
+    payload it carries (see `resolve_agent_maintenance_job`)."""
+    return resolve_agent_maintenance_job(
+        db, agent_job.payload, kinds=REPOSITORY_OPERATION_JOB_KINDS
     )
-    if not isinstance(maintenance_job, dict):
-        return None
 
-    kind = str(maintenance_job.get("kind") or "")
-    job_id = maintenance_job.get("id")
-    model = REPOSITORY_OPERATION_JOB_MODELS.get(kind)
-    if not model or not job_id:
-        return None
-    return db.query(model).filter(model.id == int(job_id)).first()
+
+def _maintenance_kind(operation_job: Any) -> Optional[str]:
+    """The kind of a maintenance row, which its facade knows."""
+    return getattr(operation_job, "kind", None)
 
 
 def _sync_repository_operation_progress(agent_job: AgentJob, db: Session) -> None:
@@ -479,8 +870,9 @@ def _finish_linked_repository_operation_job(
         operation_job.started_at = agent_job.started_at or completed_at
     operation_job.completed_at = completed_at
     operation_job.error_message = error_message
-    operation_job.logs = _collect_agent_logs(agent_job, db)
-    operation_job.has_logs = bool(operation_job.logs)
+    logs = _collect_agent_logs(agent_job, db)
+    operation_job.logs = logs
+    operation_job.has_logs = bool(logs)
     if status_value in ("completed", "completed_with_warnings") and hasattr(
         operation_job, "progress"
     ):
@@ -491,33 +883,142 @@ def _finish_linked_repository_operation_job(
         .filter(Repository.id == operation_job.repository_id)
         .first()
     )
+    kind = _maintenance_kind(operation_job)
     if repository and status_value in ("completed", "completed_with_warnings"):
-        if isinstance(operation_job, CheckJob):
+        if kind == "check":
             repository.last_check = completed_at
-        elif isinstance(operation_job, CompactJob):
+        elif kind == "compact":
             repository.last_compact = completed_at
+            apply_compact_stats(
+                operation_job, repository, _compact_stats(agent_job, repository, logs)
+            )
         repository.updated_at = _now_utc()
 
-    # Archives that no longer exist take their job records with them - same
-    # cascade the server-side prune/delete paths run.
+    # Archives that no longer exist are recorded on their backup jobs - the
+    # same mark the server-side prune/delete paths set. The rows stay.
     if status_value in ("completed", "completed_with_warnings"):
         from app.services.job_history_retention import (
             archive_names_from_prune_output,
-            purge_jobs_for_pruned_archives,
+            mark_jobs_of_pruned_archives,
         )
 
-        if isinstance(operation_job, PruneJob):
-            purge_jobs_for_pruned_archives(
+        if kind == "prune":
+            mark_jobs_of_pruned_archives(
                 db,
                 operation_job.repository_id,
                 archive_names_from_prune_output(operation_job.logs or ""),
+                created_before=agent_job.claimed_at,
+                pruned_at=completed_at,
             )
-        elif isinstance(operation_job, DeleteArchiveJob) and getattr(
-            operation_job, "archive_name", None
-        ):
-            purge_jobs_for_pruned_archives(
-                db, operation_job.repository_id, {operation_job.archive_name}
+        elif kind == "delete_archive" and getattr(operation_job, "archive_name", None):
+            mark_jobs_of_pruned_archives(
+                db,
+                operation_job.repository_id,
+                {operation_job.archive_name},
+                created_before=agent_job.claimed_at,
+                pruned_at=completed_at,
             )
+
+
+def _names_repository_operation(payload: Any) -> bool:
+    """Whether an agent job's payload names a maintenance kind this module
+    completes (`REPOSITORY_OPERATION_JOB_KINDS`). Read from the payload
+    alone, for the log paths: they call it for every line, and a backup or
+    restore job's lines can never reach a maintenance operation."""
+    operation = payload.get("operation") if isinstance(payload, dict) else None
+    maintenance = (
+        operation.get("maintenance_job") if isinstance(operation, dict) else None
+    )
+    kind = maintenance.get("kind") if isinstance(maintenance, dict) else None
+    return kind in REPOSITORY_OPERATION_JOB_KINDS
+
+
+def _complete_finished_operation_log(
+    db: Session, agent_job_id: int, sequence: int, message: str, *, payload: Any
+) -> None:
+    """Add a log line that arrived after its agent job finished to the linked
+    maintenance operation's log file.
+
+    The agent sends log lines over its session and the outcome over REST, so
+    lines often land after `_finish_linked_repository_operation_job` wrote
+    the file from the rows present then. Called once the new line is
+    committed. That commit also updates the job row, so it waits for a
+    completion in flight: a job still active here is completed later, from a
+    snapshot that has this line. A line after all others is appended; one
+    that arrived out of order rewrites the file from all rows.
+
+    `payload` is the job's, read by the caller before its commit (which
+    expires the row): a job that names no maintenance kind returns here
+    without a query."""
+    if not _names_repository_operation(payload):
+        return
+    try:
+        status_value = (
+            db.query(AgentJob.status).filter(AgentJob.id == agent_job_id).scalar()
+        )
+        if status_value not in FINAL_AGENT_JOB_STATUSES:
+            return
+        job = db.get(AgentJob, agent_job_id)
+        if job is None or lock_failure_was_deferred(job):
+            # The row was left for another attempt (#1056): its log is that
+            # attempt's, and this job's lines must not replace it.
+            return
+        operation_job = _get_repository_operation_job(job, db)
+        path = getattr(operation_job, "log_file_path", None)
+        if not path:
+            return
+        out_of_order = (
+            db.query(AgentJobLog.id)
+            .filter(
+                AgentJobLog.agent_job_id == agent_job_id,
+                AgentJobLog.sequence > sequence,
+            )
+            .first()
+        )
+        if out_of_order is None:
+            try:
+                # never O_CREAT: a file log retention removed stays removed
+                fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+            except FileNotFoundError:
+                return
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(("\n" if os.fstat(fd).st_size else "") + message)
+            return
+        if not os.path.exists(path):
+            return
+        text = _collect_agent_logs(job, db)
+        tmp_path = f"{path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            os.replace(tmp_path, path)
+        except OSError:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+        # Log retention forgets the path, commits, then unlinks the file. If
+        # it did so meanwhile, the rename brought the file back: remove it.
+        db.rollback()
+        named = db.query(Operation.id).filter(Operation.log_file_path == path).first()
+        if named is None:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+    except Exception as exc:
+        # best effort: the line is stored; a failure here must not fail the
+        # upload or end the agent's session
+        logger.warning(
+            "Failed to complete agent operation log",
+            agent_job_id=agent_job_id,
+            error=str(exc),
+        )
+    finally:
+        # The session socket keeps its session open; end this read
+        # transaction so its connection goes back to the pool.
+        db.rollback()
 
 
 def _get_agent_token_from_websocket(websocket: WebSocket) -> Optional[str]:
@@ -538,24 +1039,44 @@ def _mark_agent_job_claimed(job: AgentJob, *, now: Optional[datetime] = None) ->
 
 def _mark_agent_job_started(
     job: AgentJob, db: Session, *, started_at: Optional[datetime] = None
-) -> None:
+) -> Any:
+    """Returns the linked backup job when this start report is its first one,
+    so the caller can send the backup-start notification exactly once (a
+    requeued job that reconnects does not notify again)."""
     if job.status in FINAL_AGENT_JOB_STATUSES:
-        return
+        return None
     now = _now_utc()
     if job.claimed_at is None:
         job.claimed_at = now
+    started = _normalize_agent_timestamp(started_at)
     if job.started_at is None:
-        job.started_at = _normalize_agent_timestamp(started_at)
+        job.started_at = started
+    # Guarded write: the first start report claims the marker even against a
+    # concurrent report on the other transport, so exactly one report triggers
+    # the backup-start notification. The guard lives on the agent job because
+    # a backup operation already has started_at, written by the runner at
+    # dispatch, so a NULL test on the backup row could never fire; and it uses
+    # its own column rather than started_at because a requeue clears that one,
+    # which would let a reconnect notify a second time.
+    first_start = (
+        db.query(AgentJob)
+        .filter(AgentJob.id == job.id, AgentJob.start_notified_at.is_(None))
+        .update({AgentJob.start_notified_at: started}, synchronize_session=False)
+    )
+    db.expire(job, ["start_notified_at"])
     if job.status != "cancel_requested":
         job.status = "running"
+    newly_started_backup_job = None
     backup_job = _get_linked_backup_job(job, db)
     if backup_job:
-        backup_job.status = "running"
-        if backup_job.started_at is None:
+        if first_start:
             backup_job.started_at = job.started_at
+            newly_started_backup_job = backup_job
+        backup_job.status = "running"
     else:
         _sync_repository_operation_progress(job, db)
     job.updated_at = now
+    return newly_started_backup_job
 
 
 def _apply_agent_job_progress(
@@ -566,7 +1087,9 @@ def _apply_agent_job_progress(
     for field_name, value in progress.items():
         if hasattr(job, field_name):
             setattr(job, field_name, value)
-    job.progress = progress
+    if progress:
+        # a keepalive carries no fields and keeps the last snapshot
+        job.progress = progress
     backup_job = _get_linked_backup_job(job, db)
     if backup_job:
         backup_job.status = "running"
@@ -609,29 +1132,70 @@ def _append_agent_job_log(
     return True
 
 
+def _claim_terminal_transition(
+    job: AgentJob, db: Session, values: dict[Any, Any]
+) -> bool:
+    """Atomically flip the job into a terminal state while it is still active.
+
+    A concurrent report on the other transport (or the reaper's worker thread)
+    may have finalized the job between this handler's load and its write; the
+    WHERE guard makes exactly one writer win, so linked records are finalized
+    and notifications dispatched exactly once, and a loser cannot overwrite
+    the winner's terminal state. On success the ORM object is refreshed so the
+    caller works with the values it just claimed.
+    """
+    claimed = (
+        db.query(AgentJob)
+        .filter(
+            AgentJob.id == job.id,
+            AgentJob.status.notin_(FINAL_AGENT_JOB_STATUSES),
+        )
+        .update(values, synchronize_session=False)
+    )
+    if not claimed:
+        # Reload so the caller (and its response) sees the winner's state
+        # instead of the stale in-memory row.
+        db.expire(job)
+        return False
+    db.refresh(job)
+    return True
+
+
 def _complete_agent_job(
     job: AgentJob,
     db: Session,
     *,
     result: dict[str, Any],
     completed_at: Optional[datetime] = None,
-) -> None:
+) -> bool:
+    """Returns True when this report moved the job into a terminal state, so
+    the caller notifies exactly once even if the report is redelivered."""
     if job.status in FINAL_AGENT_JOB_STATUSES:
-        return
+        return False
     return_code = result.get("return_code") if isinstance(result, dict) else None
-    warning = _is_borg_warning_return_code(return_code)
+    if return_code is not None and (
+        not isinstance(return_code, int) or isinstance(return_code, bool)
+    ):
+        # A completion report is only trusted with a well-formed exit code.
+        # Anything else fails closed instead of being recorded as success.
+        return _fail_agent_job(
+            job,
+            db,
+            error_message=f"agent reported a malformed return code: {return_code!r}",
+            completed_at=completed_at,
+        )
+    warning = is_borg_warning_exit_code(return_code)
     if isinstance(return_code, int) and return_code != 0 and not warning:
         # A completion report carrying an explicit borg *error* code is a
         # failure, no matter which transport delivered it - the server is
         # authoritative over the classification.
-        _fail_agent_job(
+        return _fail_agent_job(
             job,
             db,
             error_message=f"borg exited with code {return_code}",
             return_code=return_code,
             completed_at=completed_at,
         )
-        return
 
     completed = _normalize_agent_timestamp(completed_at)
     status_value = "completed_with_warnings" if warning else "completed"
@@ -645,11 +1209,21 @@ def _complete_agent_job(
         if warning
         else None
     )
-    job.status = status_value
-    job.completed_at = completed
-    job.result = result
-    job.error_message = warning_message
-    job.updated_at = _now_utc()
+    if not _claim_terminal_transition(
+        job,
+        db,
+        {
+            AgentJob.status: status_value,
+            AgentJob.completed_at: completed,
+            AgentJob.result: result,
+            AgentJob.error_message: warning_message,
+            AgentJob.updated_at: _now_utc(),
+            # Progress travels apart from the outcome and is refused once
+            # the job is final, so the outcome's counters are the final ones.
+            **_reported_archive_stats(result),
+        },
+    ):
+        return False
     _finish_linked_backup_job(
         job,
         db,
@@ -671,6 +1245,7 @@ def _complete_agent_job(
         completed_at=completed,
         error_message=warning_message,
     )
+    return True
 
 
 def _fail_agent_job(
@@ -680,29 +1255,109 @@ def _fail_agent_job(
     error_message: str,
     return_code: Optional[int] = None,
     completed_at: Optional[datetime] = None,
-) -> None:
+    stderr_tail: Optional[str] = None,
+    failure_kind: Optional[str] = None,
+) -> bool:
+    """Returns True when this report moved the job into a terminal state."""
+    from app.services.repository_executor import (
+        LOCK_FAILURE_DEFERRED_KEY,
+        _agent_job_failure_message,
+        agent_failure_result,
+    )
+
     if job.status in FINAL_AGENT_JOB_STATUSES:
-        return
+        return False
     completed = _normalize_agent_timestamp(completed_at)
-    job.status = "failed"
-    job.completed_at = completed
-    job.error_message = error_message
-    job.result = {"return_code": return_code} if return_code is not None else {}
-    job.updated_at = _now_utc()
+    result = agent_failure_result(
+        return_code, stderr_tail=stderr_tail, failure_kind=failure_kind
+    )
+    # Decided once, here, and kept in the result: the row's deferral count
+    # moves on with the runner, so a later reader (a late log line) must
+    # not ask again.
+    deferred = _lock_failure_is_deferred(
+        SimpleNamespace(id=job.id, payload=job.payload, result=result), db
+    )
+    if deferred:
+        result[LOCK_FAILURE_DEFERRED_KEY] = True
+    if not _claim_terminal_transition(
+        job,
+        db,
+        {
+            AgentJob.status: "failed",
+            AgentJob.completed_at: completed,
+            AgentJob.error_message: error_message,
+            AgentJob.result: result,
+            AgentJob.updated_at: _now_utc(),
+        },
+    ):
+        return False
+    if deferred:
+        # The caller's wait ends on this failure and raises it as a
+        # deferral; the maintenance row stays open for the next attempt
+        # instead of being closed as failed here.
+        return True
+    # The linked rows (and their notifications) carry Borg's reason from
+    # the report; the agent job keeps the message as the agent sent it.
+    linked_message = _agent_job_failure_message(db, job) or error_message
     _finish_linked_backup_job(
         job,
         db,
         status_value="failed",
         completed_at=completed,
-        error_message=error_message,
+        error_message=linked_message,
     )
     _finish_linked_repository_operation_job(
         job,
         db,
         status_value="failed",
         completed_at=completed,
-        error_message=error_message,
+        error_message=linked_message,
     )
+    return True
+
+
+def _lock_failure_is_deferred(job: Any, db: Session) -> bool:
+    """Whether the runner will defer this lock failure (see
+    `lock_contention_defers`); `job` carries the payload and the failure
+    result. Not once the linked operation's deferral budget is spent: the
+    runner records that attempt as the failure, so the row is finished
+    here, and its notification (a check's) goes out."""
+    from app.services.operations.runner import MAX_DEFERRALS, deferral_count
+    from app.services.repository_executor import lock_contention_defers
+
+    if not lock_contention_defers(job, db):
+        return False
+    operation_job = _get_repository_operation_job(job, db)
+    if operation_job is None:
+        return True
+    # the facade hides the row's params; the budget is the runner's
+    operation = db.get(Operation, operation_job.id)
+    return operation is None or deferral_count(operation) < MAX_DEFERRALS
+
+
+async def _notify_agent_job_outcome(db: Session, job: AgentJob) -> None:
+    """Send user-facing notifications for a finished agent job's linked jobs.
+
+    Server-side runs notify from inside their execution services; an agent job
+    reaches its terminal state only here, so the transport handlers own the
+    dispatch. Called after the terminal state is committed - so even the
+    linked-job lookups (attribute reads on the expired job can hit the
+    database) must stay inside the boundary and never fail the transport.
+    """
+    try:
+        backup_job = _get_linked_backup_job(job, db)
+        if backup_job is not None:
+            await notify_backup_job_finished(db, backup_job)
+            return
+        operation_job = _get_repository_operation_job(job, db)
+        if _maintenance_kind(operation_job) == "check":
+            await notify_check_job_finished(db, operation_job)
+    except Exception as exc:
+        logger.warning(
+            "Failed to dispatch agent job notification",
+            agent_job_id=orm_identity_id(job),
+            error=str(exc),
+        )
 
 
 def _cancel_agent_job(
@@ -711,9 +1366,16 @@ def _cancel_agent_job(
     if job.status in FINAL_AGENT_JOB_STATUSES:
         return
     completed = _normalize_agent_timestamp(completed_at)
-    job.status = "canceled"
-    job.completed_at = completed
-    job.updated_at = _now_utc()
+    if not _claim_terminal_transition(
+        job,
+        db,
+        {
+            AgentJob.status: "canceled",
+            AgentJob.completed_at: completed,
+            AgentJob.updated_at: _now_utc(),
+        },
+    ):
+        return
     _finish_linked_backup_job(
         job,
         db,
@@ -730,24 +1392,27 @@ def _cancel_agent_job(
     )
 
 
-async def _dispatch_queued_agent_jobs(db: Session, agent_machine_id: int) -> None:
-    jobs = (
-        db.query(AgentJob)
-        .filter(
-            AgentJob.agent_machine_id == agent_machine_id,
-            AgentJob.status == "queued",
-        )
-        .order_by(AgentJob.created_at.asc(), AgentJob.id.asc())
-        .all()
+async def _dispatch_queued_agent_jobs(
+    db: Session,
+    agent_machine_id: int,
+    *,
+    source: str = "session_reconnect",
+    older_than: Optional[timedelta] = None,
+) -> None:
+    """Send the agent every queued job of its own over its session, oldest
+    first; with `older_than`, only the jobs queued for at least that long."""
+    query = db.query(AgentJob).filter(
+        AgentJob.agent_machine_id == agent_machine_id,
+        AgentJob.status == "queued",
     )
+    if older_than is not None:
+        # Naive UTC, the form the column stores (see `utc_now`).
+        query = query.filter(AgentJob.created_at <= utc_now() - older_than)
+    jobs = query.order_by(AgentJob.created_at.asc(), AgentJob.id.asc()).all()
     for job in jobs:
         if live_agent_job_kind(job) == "filesystem.browse":
             continue
-        await dispatch_agent_job_best_effort(
-            db,
-            job,
-            source="session_reconnect",
-        )
+        await dispatch_agent_job_best_effort(db, job, source=source)
 
 
 def _load_session_job(
@@ -791,6 +1456,18 @@ async def _handle_agent_session_message(
             synchronize_session=False,
         )
         db.commit()
+        # The agent is idle and listening: a job left queued past the grace
+        # has no other sender in this process before the next reconnect.
+        await _dispatch_queued_agent_jobs(
+            db,
+            agent_machine_id,
+            source="session_heartbeat",
+            older_than=UNDELIVERED_AGENT_JOB_REDISPATCH_AFTER,
+        )
+        # The pass reads even when nothing is queued; end that transaction
+        # here, or the session holds a pooled connection until the next
+        # message, once per idle agent.
+        db.commit()
         return
 
     job = _load_session_job(db, agent_machine_id, job_id)
@@ -803,10 +1480,12 @@ async def _handle_agent_session_message(
 
     if message_type == "job_started":
         if job:
-            _mark_agent_job_started(
+            started_backup_job = _mark_agent_job_started(
                 job, db, started_at=_parse_optional_datetime(message.get("started_at"))
             )
             db.commit()
+            if started_backup_job is not None:
+                await notify_backup_job_started(db, job, started_backup_job)
         return
 
     if message_type == "progress":
@@ -843,7 +1522,9 @@ async def _handle_agent_session_message(
             job_id=_parse_int(job_id, default=0) or None,
         )
         if job:
-            _append_agent_job_log(
+            agent_job_id = job.id
+            job_payload = job.payload
+            appended = _append_agent_job_log(
                 job,
                 db,
                 sequence=sequence,
@@ -852,6 +1533,10 @@ async def _handle_agent_session_message(
                 created_at=_parse_optional_datetime(message.get("created_at")),
             )
             db.commit()
+            if appended:
+                _complete_finished_operation_log(
+                    db, agent_job_id, sequence, text, payload=job_payload
+                )
         return
 
     if message_type == "command_result":
@@ -869,13 +1554,15 @@ async def _handle_agent_session_message(
             job_id=int(job_id) if job_id else None,
         )
         if job:
-            _complete_agent_job(
+            transitioned = _complete_agent_job(
                 job,
                 db,
                 result=result_payload,
                 completed_at=_parse_optional_datetime(message.get("completed_at")),
             )
             db.commit()
+            if transitioned:
+                await _notify_agent_job_outcome(db, job)
         return
 
     if message_type == "command_error":
@@ -901,14 +1588,20 @@ async def _handle_agent_session_message(
             job_id=int(job_id) if job_id else None,
         )
         if job:
-            _fail_agent_job(
+            stderr_tail = error_payload.get("stderr_tail")
+            failure_kind = error_payload.get("failure_kind")
+            transitioned = _fail_agent_job(
                 job,
                 db,
                 error_message=error_message,
                 return_code=error_payload.get("return_code"),
                 completed_at=_parse_optional_datetime(message.get("completed_at")),
+                stderr_tail=stderr_tail if isinstance(stderr_tail, str) else None,
+                failure_kind=failure_kind if isinstance(failure_kind, str) else None,
             )
             db.commit()
+            if transitioned:
+                await _notify_agent_job_outcome(db, job)
         return
 
     if message_type == "job_canceled":
@@ -971,6 +1664,7 @@ async def register_agent(
         os=payload.os,
         arch=payload.arch,
         agent_version=payload.agent_version,
+        timezone=_validated_timezone(payload.timezone),
         default_path=enrollment_token.default_path,
         borg_versions=payload.borg_versions,
         capabilities=payload.capabilities,
@@ -1018,7 +1712,13 @@ async def heartbeat(
     now = _now_utc()
     current_agent.hostname = payload.hostname or current_agent.hostname
     current_agent.agent_version = payload.agent_version or current_agent.agent_version
+    current_agent.timezone = (
+        _validated_timezone(payload.timezone) or current_agent.timezone
+    )
     current_agent.borg_versions = payload.borg_versions
+    # After borg_versions: an endpoint with a Borg pin is only up to date once
+    # this heartbeat's binaries include the pinned major.
+    resolve_agent_upgrade(current_agent)
     current_agent.capabilities = payload.capabilities
     current_agent.last_error = payload.last_error
     current_agent.status = "online"
@@ -1083,7 +1783,13 @@ async def session(websocket: WebSocket, db: Session = Depends(get_db)):
         now = _now_utc()
         current_agent.hostname = hello.hostname or current_agent.hostname
         current_agent.agent_version = hello.agent_version or current_agent.agent_version
+        current_agent.timezone = (
+            _validated_timezone(hello.timezone) or current_agent.timezone
+        )
         current_agent.borg_versions = hello.borg_versions
+        # After borg_versions: an endpoint with a Borg pin is only up to date
+        # once this report's binaries include the pinned major.
+        resolve_agent_upgrade(current_agent)
         current_agent.capabilities = hello.capabilities
         current_agent.status = "online"
         current_agent.last_error = None
@@ -1094,6 +1800,7 @@ async def session(websocket: WebSocket, db: Session = Depends(get_db)):
             current_agent,
             now=now,
             running_job_ids=hello.running_job_ids,
+            ignore_age_for_undelivered=True,
         )
         db.commit()
 
@@ -1181,10 +1888,24 @@ async def claim_job(
 
     if job.status == "queued":
         now = _now_utc()
-        job.status = "claimed"
-        job.claimed_at = now
-        job.updated_at = now
+        # Conditional on `queued`: a cancel that took the job off the queue
+        # after it was read here wins, and the agent is told it is final.
+        claimed = (
+            db.query(AgentJob)
+            .filter(AgentJob.id == job.id, AgentJob.status == "queued")
+            .update(
+                {
+                    AgentJob.status: "claimed",
+                    AgentJob.claimed_at: now,
+                    AgentJob.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+        )
         db.commit()
+        db.refresh(job)
+        if not claimed:
+            _reject_final_job(job)
 
     return AgentJobStatusResponse(id=job.id, status=job.status)
 
@@ -1205,22 +1926,12 @@ async def start_job(
             detail={"key": "backend.errors.agents.jobNotStartable"},
         )
 
-    now = _now_utc()
-    if job.claimed_at is None:
-        job.claimed_at = now
-    if job.started_at is None:
-        job.started_at = _normalize_agent_timestamp(payload.started_at)
-    if job.status != "cancel_requested":
-        job.status = "running"
-    backup_job = _get_linked_backup_job(job, db)
-    if backup_job:
-        backup_job.status = "running"
-        if backup_job.started_at is None:
-            backup_job.started_at = job.started_at
-    else:
-        _sync_repository_operation_progress(job, db)
-    job.updated_at = now
+    # Same path the WebSocket transport takes - one place applies a start
+    # report and decides whether it triggers the backup-start notification.
+    started_backup_job = _mark_agent_job_started(job, db, started_at=payload.started_at)
     db.commit()
+    if started_backup_job is not None:
+        await notify_backup_job_started(db, job, started_backup_job)
 
     return AgentJobStatusResponse(id=job.id, status=job.status)
 
@@ -1238,7 +1949,9 @@ async def update_job_progress(
     progress = payload.model_dump(exclude_none=True)
     for field_name, value in progress.items():
         setattr(job, field_name, value)
-    job.progress = progress
+    if progress:
+        # a keepalive carries no fields and keeps the last snapshot
+        job.progress = progress
     backup_job = _get_linked_backup_job(job, db)
     if backup_job:
         backup_job.status = "running"
@@ -1281,7 +1994,11 @@ async def upload_job_log(
         )
     )
     job.updated_at = _now_utc()
+    job_payload = job.payload
     db.commit()
+    _complete_finished_operation_log(
+        db, job_id, payload.sequence, payload.message, payload=job_payload
+    )
 
     return AgentJobLogResponse(accepted=True, duplicate=False)
 
@@ -1299,10 +2016,12 @@ async def complete_job(
 
     # Same path the WebSocket transport takes - one place decides how a
     # completion (including borg warning exit codes) is classified.
-    _complete_agent_job(
+    transitioned = _complete_agent_job(
         job, db, result=payload.result, completed_at=payload.completed_at
     )
     db.commit()
+    if transitioned:
+        await _notify_agent_job_outcome(db, job)
 
     return AgentJobStatusResponse(id=job.id, status=job.status)
 
@@ -1324,6 +2043,16 @@ async def upload_job_artifact(
     job = _get_agent_job(job_id, current_agent, db)
 
     if not agent_artifact_relay.is_registered(job.id):
+        if _is_delivery_required_job(job):
+            # A listing nobody consumes must not be produced to the end:
+            # answered at once, the agent's send fails or reads the
+            # refusal and ends borg, instead of running a whole diff into
+            # this drain while holding the repository. The refusal alone
+            # may not reach borg in time (a proxy can go on draining the
+            # body), so the job is cancelled as well: the agent's cancel
+            # poll ends borg within its interval.
+            await _cancel_unconsumed_delivery(db, job)
+            return {"accepted": False, "size": 0}
         async for _ in request.stream():
             pass
         return {"accepted": False, "size": 0}
@@ -1339,9 +2068,22 @@ async def upload_job_artifact(
                 # The download consumer is gone; stop relaying (and stop the
                 # agent's upload) instead of draining the whole body for nobody.
                 delivered = False
+                if _is_delivery_required_job(job):
+                    await _cancel_unconsumed_delivery(db, job)
                 break
         if delivered:
-            await agent_artifact_relay.close(job.id)
+            # An empty body pushes nothing, so only the close can tell that
+            # the consumer left meanwhile; a listing is confirmed only once
+            # its consumer took the end marker, a download's consumer reads
+            # at its own pace.
+            delivered = await agent_artifact_relay.close(
+                job.id,
+                confirm_timeout=(
+                    CLOSE_ACK_TIMEOUT_SECONDS
+                    if _is_delivery_required_job(job)
+                    else None
+                ),
+            )
     except Exception as exc:
         await agent_artifact_relay.close(job.id, error=str(exc))
         raise
@@ -1362,31 +2104,20 @@ async def fail_job(
     if job.status in FINAL_AGENT_JOB_STATUSES:
         return AgentJobStatusResponse(id=job.id, status=job.status)
 
-    result = {}
-    if payload.return_code is not None:
-        result["return_code"] = payload.return_code
-
-    now = _now_utc()
-    job.status = "failed"
-    job.completed_at = _normalize_agent_timestamp(payload.completed_at)
-    job.error_message = payload.error_message
-    job.result = result
-    job.updated_at = now
-    _finish_linked_backup_job(
+    # Same path the WebSocket transport takes - one place records the failure
+    # and finishes the linked jobs.
+    transitioned = _fail_agent_job(
         job,
         db,
-        status_value="failed",
-        completed_at=job.completed_at,
         error_message=payload.error_message,
-    )
-    _finish_linked_repository_operation_job(
-        job,
-        db,
-        status_value="failed",
-        completed_at=job.completed_at,
-        error_message=payload.error_message,
+        return_code=payload.return_code,
+        completed_at=payload.completed_at,
+        stderr_tail=payload.stderr_tail,
+        failure_kind=payload.failure_kind,
     )
     db.commit()
+    if transitioned:
+        await _notify_agent_job_outcome(db, job)
 
     return AgentJobStatusResponse(id=job.id, status=job.status)
 
@@ -1402,24 +2133,9 @@ async def mark_job_canceled(
     if job.status in FINAL_AGENT_JOB_STATUSES:
         return AgentJobStatusResponse(id=job.id, status=job.status)
 
-    now = _now_utc()
-    job.status = "canceled"
-    job.completed_at = _normalize_agent_timestamp(payload.completed_at)
-    job.updated_at = now
-    _finish_linked_backup_job(
-        job,
-        db,
-        status_value="cancelled",
-        completed_at=job.completed_at,
-        error_message="Agent job canceled",
-    )
-    _finish_linked_repository_operation_job(
-        job,
-        db,
-        status_value="cancelled",
-        completed_at=job.completed_at,
-        error_message="Agent job canceled",
-    )
+    # Same path the WebSocket transport takes - the guarded transition keeps a
+    # late cancel report from overwriting an already-finalized job.
+    _cancel_agent_job(job, db, completed_at=payload.completed_at)
     db.commit()
 
     return AgentJobStatusResponse(id=job.id, status=job.status)

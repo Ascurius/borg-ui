@@ -554,8 +554,10 @@ export default function Scripts() {
               value={formData.timeout}
               onChange={(e) => setFormData({ ...formData, timeout: parseInt(e.target.value) })}
               fullWidth
-              inputProps={{ min: 30, max: 3600 }}
               helperText={t('scripts.fields.timeoutHint')}
+              slotProps={{
+                htmlInput: { min: 30, max: 3600 },
+              }}
             />
 
             <CodeEditor
@@ -603,12 +605,12 @@ export default function Scripts() {
                           <Box sx={{ display: 'flex', gap: 1, mt: 0.5 }}>
                             {param.default && (
                               <Typography variant="caption" color="text.secondary">
-                                Default: {param.default}
+                                {t('common.default')} {param.default}
                               </Typography>
                             )}
                             {param.required && (
                               <Chip
-                                label="Required"
+                                label={t('common.required')}
                                 size="small"
                                 color="error"
                                 variant="outlined"

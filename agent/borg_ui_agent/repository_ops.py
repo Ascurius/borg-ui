@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
+import selectors
 import shlex
 import shutil
 import signal
@@ -11,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,11 +21,28 @@ from typing import Any, Optional
 
 from agent.borg_ui_agent.backup import (
     _extract_environment,
+    borg1_lock_wait_args,
     build_borg_env,
     parse_borg_progress,
+    progress_replaces_log_line,
 )
 from agent.borg_ui_agent.borg import is_warning_return_code
+from agent.borg_ui_agent.cancel import (
+    KILL_GROUP_AFTER_SECONDS,
+    SELF_CANCELLING_JOB_KINDS,
+    cancel_requested,
+    kill_process_group,
+    start_cancel_poller,
+    start_keepalive,
+)
 from agent.borg_ui_agent.client import AgentClient
+from agent.borg_ui_agent.compact_stats import (
+    TAIL_LINES,
+    has_compact_stats,
+    parse_borg_version,
+    parse_compact_stats,
+)
+from agent.borg_ui_agent.failure_report import FailureTail, failure_report
 
 
 REPOSITORY_JOB_KINDS = {
@@ -35,17 +55,88 @@ REPOSITORY_JOB_KINDS = {
     "repository.break_lock",
     "repository.list_archive_contents",
     "repository.extract_archive_file",
+    "repository.export_archive_tar",
     "repository.restore",
     "repository.check",
     "repository.prune",
     "repository.compact",
     "repository.rclone_sync",
+    "repository.disk_usage",
+    "repository.storage_usage",
+    "repository.diff",
+}
+
+# Kinds whose stdout the server parses timestamps out of. These run under
+# TZ=UTC so borg1's naive rendering is UTC wall clock; borg2 renders an
+# explicit offset either way. Contents listings (browse) stay in the machine
+# zone - their mtimes are relayed for display, not interpreted.
+MACHINE_PARSED_JOB_KINDS = {
+    "repository.info",
+    "repository.rinfo",
+    "repository.archive_info",
+    "repository.list_archives",
+    "repository.diff",
+}
+
+# Borg 2.0.0b22 split repo-create's single --encryption value into the cipher,
+# where the key is stored, and the id hash. The server sends the combined mode
+# name it stores, so the agent translates it the same way the server does for
+# its own repositories (app/core/borg2.py: BORG2_ENCRYPTION_FLAGS). The two are
+# separate packages and share no imports, so the table is stated twice; a mode
+# missing here is rejected up front with the mode name, mirroring the server —
+# passing it to repo-create would fail with an argument-parsing error that
+# does not name the actual problem. b23 folded the id hash into the mode name
+# for the unencrypted modes (no alias for the plain b22 names); the sha256
+# variants keep exactly what `authenticated`/`none` produced before.
+BORG2_ENCRYPTION_FLAGS = {
+    "repokey-aes-ocb": ["--encryption", "aes256-ocb", "--key-location", "repokey"],
+    "repokey-chacha20-poly1305": [
+        "--encryption",
+        "chacha20-poly1305",
+        "--key-location",
+        "repokey",
+    ],
+    "keyfile-aes-ocb": ["--encryption", "aes256-ocb", "--key-location", "keyfile"],
+    "keyfile-chacha20-poly1305": [
+        "--encryption",
+        "chacha20-poly1305",
+        "--key-location",
+        "keyfile",
+    ],
+    "authenticated": ["--encryption", "authenticated-sha256"],
+    "none": ["--encryption", "none-sha256"],
 }
 
 # Kill a streaming extract only when no bytes have flowed for this long — a
 # wedged borg, not a slow one. Idle (not an absolute cap) so a legitimately
 # large/slow download is never truncated mid-transfer.
 STREAM_EXTRACT_IDLE_SECONDS = 300
+
+# A change listing prints a line per changed path and nothing while it
+# compares unchanged ones, so stdout silence says nothing about a diff.
+# Its bound is absolute instead: the server's budget from the payload
+# (`timeout_seconds`), else an hour. A wedged borg looks like a healthy
+# one comparing unchanged paths (the padding below keeps the upload
+# alive either way), so the fallback is how long the repository may be
+# held by a listing that never ends, not how long a listing may take: a
+# longer one gets its budget from the server.
+STREAM_DIFF_MAX_SECONDS = 3600
+
+# While a stream runs, the job row on the server sees no activity: logs and
+# the result arrive at the end, and the heartbeat only lists the job. The
+# server reaps an in-flight job after 15 minutes without activity
+# (app/services/agent_job_reaper.py), so the watchdog reports a progress
+# keepalive this often. Well inside the reaper's window, and cheap.
+STREAM_KEEPALIVE_SECONDS = 60
+
+# A diff's upload carries no bytes while borg compares unchanged paths, and
+# a reverse proxy in front of the server may cut a request body that is
+# idle for a minute (nginx's proxy_read_timeout default). The diff stream
+# is padded with a bare newline after this much silence; the server's
+# parser of these lines (app/core/borg_diff.py) skips blank ones, and a
+# consumer of this stream must keep doing so. Never for an extract: its
+# bytes are the file.
+STREAM_DIFF_PAD_IDLE_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -95,7 +186,7 @@ class RepositoryOperationPayload:
         return self.borg_binary or ("borg2" if self.borg_version == 2 else "borg")
 
     def _base_borg1(self, subcommand: str) -> list[str]:
-        cmd = [self.borg_cmd, subcommand]
+        cmd = [self.borg_cmd, *borg1_lock_wait_args(self.environment), subcommand]
         if self.remote_path:
             cmd.extend(["--remote-path", self.remote_path])
         return cmd
@@ -106,7 +197,14 @@ class RepositoryOperationPayload:
             cmd.extend(["--remote-path", self.remote_path])
         return cmd
 
-    def build_command(self, *, rclone_config_path: Optional[str] = None) -> list[str]:
+    def build_command(
+        self, *, rclone_config_path: Optional[str] = None, compact_stats: bool = True
+    ) -> list[str]:
+        if self.job_kind == "repository.disk_usage":
+            if not self.repository_path:
+                raise ValueError("repository.disk_usage requires a repository path")
+            return ["du", "-sb", "--", self.repository_path]
+
         if self.job_kind == "repository.rclone_sync":
             rclone = _rclone_operation(self.operation)
             remote_name = _require_non_empty_string(
@@ -143,10 +241,15 @@ class RepositoryOperationPayload:
                 raise ValueError("repository.init requires operation.encryption")
             encryption = encryption.strip()
             if self.borg_version == 2:
+                encryption_flags = BORG2_ENCRYPTION_FLAGS.get(encryption)
+                if encryption_flags is None:
+                    raise ValueError(
+                        f"unsupported Borg 2 encryption mode {encryption!r}; "
+                        "expected one of " + ", ".join(BORG2_ENCRYPTION_FLAGS)
+                    )
                 return [
                     *self._base_borg2("repo-create"),
-                    "--encryption",
-                    encryption,
+                    *encryption_flags,
                 ]
             return [
                 *self._base_borg1("init"),
@@ -200,7 +303,19 @@ class RepositoryOperationPayload:
 
         if self.job_kind == "repository.list_archives":
             if self.borg_version == 2:
-                return [*self._base_borg2("repo-list"), "--json"]
+                # A bare `repo-list --json` fills its default keys by reading
+                # every archive's metadata, which borgstore serves as
+                # whole-pack loads on remote repositories — listing N archives
+                # can transfer N packs. Restricting the keys to what the
+                # server reads (name, id, time) keeps the listing to the
+                # archives directory entries; the --json output shape is
+                # unchanged, borg just emits the requested keys.
+                return [
+                    *self._base_borg2("repo-list"),
+                    "--json",
+                    "--format",
+                    "{name}{id}{time}",
+                ]
             return [*self._base_borg1("list"), "--json", self.repository_path]
 
         if self.job_kind == "repository.list_archive_contents":
@@ -217,6 +332,41 @@ class RepositoryOperationPayload:
                 *self._base_borg1("list"),
                 f"{self.repository_path}::{archive}",
                 "--json-lines",
+            ]
+
+        if self.job_kind == "repository.diff":
+            # The change listing the server's history index parses
+            # (app/services/operations/executors/history.py), built the way
+            # the server builds it for its own repositories. Without a
+            # predecessor the archive is the first of its series and gets
+            # the full listing, whose entries all read as added.
+            # `--` closes the options: an archive name is data, whatever it
+            # begins with.
+            archive = _operation_archive(self.operation, self.job_kind)
+            predecessor = _operation_predecessor(self.operation)
+            if self.borg_version == 2:
+                if predecessor is None:
+                    return [*self._base_borg2("list"), "--json-lines", "--", archive]
+                return [
+                    *self._base_borg2("diff"),
+                    "--json-lines",
+                    "--",
+                    predecessor,
+                    archive,
+                ]
+            if predecessor is None:
+                return [
+                    *self._base_borg1("list"),
+                    "--json-lines",
+                    "--",
+                    f"{self.repository_path}::{archive}",
+                ]
+            return [
+                *self._base_borg1("diff"),
+                "--json-lines",
+                "--",
+                f"{self.repository_path}::{predecessor}",
+                archive,
             ]
 
         if self.job_kind == "repository.extract_archive_file":
@@ -236,11 +386,37 @@ class RepositoryOperationPayload:
                 file_path,
             ]
 
+        if self.job_kind == "repository.export_archive_tar":
+            archive = _operation_archive(self.operation, self.job_kind)
+            directory_path = _operation_directory_path(self.operation, self.job_kind)
+            strip_components = _operation_strip_components(
+                self.operation, self.job_kind
+            )
+            if self.borg_version == 2:
+                cmd = [
+                    *self._base_borg2("export-tar"),
+                ]
+                if strip_components:
+                    cmd.extend(["--strip-components", str(strip_components)])
+                return [*cmd, archive, "-", "--", directory_path]
+            cmd = [
+                *self._base_borg1("export-tar"),
+            ]
+            if strip_components:
+                cmd.extend(["--strip-components", str(strip_components)])
+            return [
+                *cmd,
+                f"{self.repository_path}::{archive}",
+                "-",
+                "--",
+                directory_path,
+            ]
+
         if self.job_kind == "repository.restore":
             archive = _operation_archive(self.operation, self.job_kind)
             operation = self.operation or {}
             paths = _restore_paths(operation)
-            strip_components = _restore_strip_components(operation)
+            strip_components = _operation_strip_components(operation, self.job_kind)
             # Mirror BorgRouter.build_restore_extract_command so agent-side
             # restores behave identically to server-side ones. Borg only emits
             # JSON progress events when --progress is paired with --log-json, so
@@ -292,12 +468,15 @@ class RepositoryOperationPayload:
 
         if self.job_kind == "repository.compact":
             if self.borg_version == 2:
-                return [
-                    *self._base_borg2("compact"),
-                    "--progress",
-                    "--verbose",
-                    "--log-json",
-                ]
+                # --stats: the only place Borg 2 reports repository-wide
+                # statistics; parsed from the tail of the output into the
+                # completion report (`_execute_streaming_repository_operation`).
+                # The flag exists from 2.0.0b15 (`compact_stats_supported`).
+                cmd = [*self._base_borg2("compact")]
+                if compact_stats:
+                    cmd.append("--stats")
+                cmd.extend(["--progress", "--verbose", "--log-json"])
+                return cmd
             return [
                 *self._base_borg1("compact"),
                 "--progress",
@@ -348,7 +527,13 @@ class RepositoryOperationPayload:
                     cmd.extend([flag, str(int(value))])
             keep_within = operation.get("keep_within")
             if keep_within is not None and str(keep_within).strip():
-                cmd.append(f"--keep-within={str(keep_within).strip()}")
+                # Borg 2.0.0b22 removed --keep-within (and --keep-last) in
+                # favour of --keep, which takes either form: a count or an
+                # interval like "1d". Borg 1 keeps the old spelling.
+                if self.borg_version == 2:
+                    cmd.extend(["--keep", str(keep_within).strip()])
+                else:
+                    cmd.append(f"--keep-within={str(keep_within).strip()}")
             if dry_run:
                 cmd.append("--dry-run")
             if self.borg_version == 1:
@@ -374,6 +559,29 @@ def _require_non_empty_string(value: Any, field_name: str) -> str:
     return value.strip()
 
 
+def _operation_timeout_seconds(operation: Any, default: float) -> float:
+    """The server's budget for a job (`operation.timeout_seconds`), else
+    `default`. Anything that is not a finite positive number (a missing or
+    malformed payload, "inf", nan) falls back to the default so a stalled
+    tool never runs without a deadline."""
+    if not isinstance(operation, dict):
+        return default
+    raw = operation.get("timeout_seconds")
+    if isinstance(raw, bool):
+        return default
+    try:
+        value = float(raw or 0)
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+def _storage_usage_timeout(operation: Any) -> float:
+    """The server's budget for a storage_usage job, else the measurement's
+    own default."""
+    return _operation_timeout_seconds(operation, 600.0)
+
+
 def _rclone_operation(operation: dict[str, Any] | None) -> dict[str, Any]:
     rclone = (operation or {}).get("rclone")
     if not isinstance(rclone, dict):
@@ -390,6 +598,24 @@ def _operation_archive(operation: dict[str, Any] | None, job_kind: str) -> str:
     return archive.strip()
 
 
+def _operation_predecessor(operation: dict[str, Any] | None) -> Optional[str]:
+    """The archive a diff runs against, or None for a full listing. The key
+    must be present, `null` meaning the first archive of its series: a
+    payload that lost the field would otherwise read as a full listing
+    on top of an indexed predecessor, every path stored as added. An
+    empty value is a payload error for the same reason."""
+    if not isinstance(operation, dict) or "predecessor" not in operation:
+        raise ValueError(
+            "repository.diff requires operation.predecessor (null for a full listing)"
+        )
+    predecessor = operation.get("predecessor")
+    if predecessor is None:
+        return None
+    if not isinstance(predecessor, str) or not predecessor.strip():
+        raise ValueError("repository.diff requires a non-empty operation.predecessor")
+    return predecessor.strip()
+
+
 def _operation_file_path(operation: dict[str, Any] | None, job_kind: str) -> str:
     if not isinstance(operation, dict):
         raise ValueError(f"{job_kind} requires operation.file_path")
@@ -402,6 +628,18 @@ def _operation_file_path(operation: dict[str, Any] | None, job_kind: str) -> str
     return normalized
 
 
+def _operation_directory_path(operation: dict[str, Any] | None, job_kind: str) -> str:
+    if not isinstance(operation, dict):
+        raise ValueError(f"{job_kind} requires operation.directory_path")
+    directory_path = operation.get("directory_path")
+    if not isinstance(directory_path, str) or not directory_path.strip():
+        raise ValueError(f"{job_kind} requires operation.directory_path")
+    normalized = directory_path.strip().strip("/")
+    if not normalized:
+        raise ValueError(f"{job_kind} requires operation.directory_path")
+    return normalized
+
+
 def _restore_paths(operation: dict[str, Any] | None) -> list[str]:
     paths = (operation or {}).get("paths")
     if paths is None:
@@ -411,16 +649,16 @@ def _restore_paths(operation: dict[str, Any] | None) -> list[str]:
     return [path for path in paths if isinstance(path, str) and path.strip()]
 
 
-def _restore_strip_components(operation: dict[str, Any] | None) -> Optional[int]:
+def _operation_strip_components(
+    operation: dict[str, Any] | None, job_kind: str
+) -> Optional[int]:
     value = (operation or {}).get("strip_components")
     if value is None:
         return None
     try:
         number = int(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "repository.restore strip_components must be an integer"
-        ) from exc
+        raise ValueError(f"{job_kind} strip_components must be an integer") from exc
     return number if number > 0 else None
 
 
@@ -471,12 +709,15 @@ def execute_repository_operation_job(
     rclone_config_path: Optional[str] = None
     try:
         payload = RepositoryOperationPayload.from_job_payload(job.get("payload") or {})
+        with_stats = _reports_compact_stats(payload) and compact_stats_supported(
+            payload.borg_cmd
+        )
         try:
             if payload.job_kind == "repository.rclone_sync":
                 rclone_config_path = _write_temp_rclone_config(payload)
                 cmd = payload.build_command(rclone_config_path=rclone_config_path)
             else:
-                cmd = payload.build_command()
+                cmd = payload.build_command(compact_stats=with_stats)
         except Exception:
             _remove_temp_file(rclone_config_path)
             raise
@@ -489,6 +730,21 @@ def execute_repository_operation_job(
         )
 
     env = build_borg_env(payload.environment)
+    if payload.job_kind in MACHINE_PARSED_JOB_KINDS:
+        # The server parses timestamps out of these outputs; pin the render
+        # zone so they come out UTC. Applied after the server-sent overrides:
+        # the reported machine timezone is "UTC" on the same contract.
+        env["TZ"] = "UTC"
+    if with_stats:
+        # Raw units print exact byte counts in the --stats lines instead of
+        # the rounded human form, which follows whatever BORG_UNITS the
+        # machine environment carries.
+        env["BORG_UNITS"] = "raw"
+    if payload.job_kind == "repository.init":
+        # Repo creation must not touch the shared pack cache: borgstore
+        # rejects an already-populated cache directory on create, and borg
+        # misreports that as "repository already exists".
+        env["BORG_STORE_CACHE"] = ""
     sequence = 0
     client.send_log(
         job_id,
@@ -498,13 +754,36 @@ def execute_repository_operation_job(
     )
     sequence += 1
 
+    if payload.job_kind in SELF_CANCELLING_JOB_KINDS and cancel_requested(
+        should_cancel
+    ):
+        # Cancelled between dispatch and start (the log above may have waited
+        # on the server): a fast command (an archive delete) would be done
+        # before the first poll, so it is not started.
+        _remove_temp_file(rclone_config_path)
+        client.cancel_job(job_id)
+        return RepositoryOperationResult(
+            job_id=job_id,
+            status="canceled",
+            message=f"{payload.job_kind} canceled before it started",
+        )
+
+    if payload.job_kind == "repository.delete_archive":
+        # A write that holds the repository lock: a cancel has to end it.
+        try:
+            return _execute_short_repository_operation(
+                job_id, payload, client, cmd, env, should_cancel=should_cancel
+            )
+        finally:
+            _remove_temp_file(rclone_config_path)
+
     if payload.job_kind in {
         "repository.info",
         "repository.rinfo",
         "repository.archive_info",
         "repository.list_archives",
-        "repository.delete_archive",
         "repository.break_lock",
+        "repository.disk_usage",
     }:
         try:
             return _execute_short_repository_operation(
@@ -521,7 +800,38 @@ def execute_repository_operation_job(
         finally:
             _remove_temp_file(rclone_config_path)
 
-    if payload.job_kind == "repository.extract_archive_file":
+    if payload.job_kind == "repository.diff":
+        # Always the artifact path: a change listing of a large archive runs
+        # to tens of megabytes, which the WebSocket result must not carry.
+        # The listing is worthless unless the server consumed it, so a
+        # rejected upload fails the job. Borg reports a warning when it
+        # could not read part of an archive; the listing it did produce is
+        # still consumed, as the server's own history index does for rc 1
+        # (the agent's warning set also covers Borg's modern codes).
+        try:
+            return _execute_streaming_artifact_operation(
+                job_id,
+                payload,
+                client,
+                cmd,
+                env,
+                should_cancel=should_cancel,
+                warnings_ok=True,
+                idle_timeout_seconds=None,
+                max_duration_seconds=_operation_timeout_seconds(
+                    payload.operation, STREAM_DIFF_MAX_SECONDS
+                ),
+                keepalive_seconds=STREAM_KEEPALIVE_SECONDS,
+                pad_idle_seconds=STREAM_DIFF_PAD_IDLE_SECONDS,
+                delivery_required=True,
+            )
+        finally:
+            _remove_temp_file(rclone_config_path)
+
+    if payload.job_kind in {
+        "repository.extract_archive_file",
+        "repository.export_archive_tar",
+    }:
         try:
             return _execute_binary_output_repository_operation(
                 job_id, payload, client, cmd, env, should_cancel=should_cancel
@@ -552,6 +862,7 @@ def execute_repository_operation_job(
             env,
             initial_sequence=sequence,
             should_cancel=should_cancel,
+            compact_stats=with_stats,
         )
     finally:
         _remove_temp_file(rclone_config_path)
@@ -572,11 +883,27 @@ def _execute_short_repository_operation(
     client: AgentClient,
     cmd: list[str],
     env: dict[str, str],
+    *,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> RepositoryOperationResult:
+    """Run a command that finishes within five minutes and report its
+    captured output. With `should_cancel` it runs in its own process group
+    under a cancel poller, which ends it when the server cancels the job."""
     try:
-        process = subprocess.run(
-            cmd, text=True, capture_output=True, env=env, timeout=300
-        )
+        if should_cancel is None:
+            process = subprocess.run(
+                cmd, text=True, capture_output=True, env=env, timeout=300
+            )
+        else:
+            process, cancelled = _run_cancellable(cmd, env, should_cancel, timeout=300)
+            if cancelled:
+                client.cancel_job(job_id)
+                return RepositoryOperationResult(
+                    job_id=job_id,
+                    status="canceled",
+                    return_code=process.returncode,
+                    message=f"{payload.job_kind} canceled",
+                )
     except OSError as exc:
         error_message = f"Failed to start {payload.job_kind}: {exc}"
         client.send_log(job_id, sequence=1, stream="stderr", message=error_message)
@@ -592,7 +919,20 @@ def _execute_short_repository_operation(
             job_id=job_id, status="failed", message=error_message
         )
 
-    if process.stdout:
+    succeeded = process.returncode == 0 or is_warning_return_code(process.returncode)
+    parsed = _parse_json_output(process.stdout) if succeeded else None
+    if parsed is not None and payload.job_kind in MACHINE_PARSED_JOB_KINDS:
+        # The parsed output travels in the completion report; the log keeps
+        # one line about it. A failed run, or output that did not parse,
+        # keeps what Borg printed: the server builds its error message from
+        # these lines.
+        client.send_log(
+            job_id,
+            sequence=1,
+            stream="stdout",
+            message=_output_summary(payload.job_kind, process, parsed),
+        )
+    elif process.stdout:
         client.send_log(
             job_id, sequence=1, stream="stdout", message=process.stdout.rstrip()
         )
@@ -601,11 +941,10 @@ def _execute_short_repository_operation(
             job_id, sequence=2, stream="stderr", message=process.stderr.rstrip()
         )
 
-    if process.returncode == 0 or is_warning_return_code(process.returncode):
+    if succeeded:
         # Warnings (rc 1 / 100-127) mean the operation ran through; the server
         # records completed_with_warnings from the return code, matching the
         # classification its own borg processes get.
-        parsed = _parse_json_output(process.stdout)
         client.complete_job(
             job_id,
             result={
@@ -626,13 +965,89 @@ def _execute_short_repository_operation(
         )
 
     error_message = f"{payload.job_kind} exited with code {process.returncode}"
-    client.fail_job(job_id, error_message=error_message, return_code=process.returncode)
+    client.fail_job(
+        job_id,
+        error_message=error_message,
+        return_code=process.returncode,
+        # borg prints an argument error on stdout
+        **failure_report(process.returncode, process.stderr or process.stdout or ""),
+    )
     return RepositoryOperationResult(
         job_id=job_id,
         status="failed",
         return_code=process.returncode,
         message=error_message,
     )
+
+
+def _output_summary(
+    job_kind: str, process: subprocess.CompletedProcess, parsed: Any
+) -> str:
+    """The log line that stands for a machine-parsed kind's JSON output."""
+    archives = parsed.get("archives") if isinstance(parsed, dict) else None
+    if job_kind == "repository.list_archives" and isinstance(archives, list):
+        detail = f"{len(archives)} archives"
+    else:
+        detail = f"{len(process.stdout)} characters of JSON"
+    name = job_kind.removeprefix("repository.")
+    return f"{name}: {detail}, rc {process.returncode}"
+
+
+def _run_cancellable(
+    cmd: list[str],
+    env: dict[str, str],
+    should_cancel: Callable[[], bool],
+    *,
+    timeout: float,
+) -> tuple[subprocess.CompletedProcess, bool]:
+    """`subprocess.run(capture_output=True, timeout=...)` with a cancel
+    poller: returns the finished process and whether a cancel ended it.
+    Raises `subprocess.TimeoutExpired` like `run` once borg is ended."""
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "env": env,
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(cmd, **popen_kwargs)
+    done = threading.Event()
+    cancelled = _start_cancel_poller(process, should_cancel, done)
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_process(process)
+            try:
+                process.communicate(timeout=KILL_GROUP_AFTER_SECONDS)
+            except subprocess.TimeoutExpired:
+                # A child that ignored SIGTERM still holds the pipes.
+                kill_process_group(process)
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            raise
+        except BaseException:
+            # Interrupted (Ctrl-C on `once`): borg runs in a session of its
+            # own and would go on unsupervised, as `subprocess.run` never let
+            # it.
+            _terminate_process(process)
+            raise
+    finally:
+        done.set()
+    completed = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+    return completed, cancelled.is_set()
+
+
+def _start_cancel_poller(
+    process: subprocess.Popen,
+    should_cancel: Optional[Callable[[], bool]],
+    done: threading.Event,
+) -> threading.Event:
+    """`start_cancel_poller` ending the process group (`_terminate_process`)."""
+    return start_cancel_poller(process, should_cancel, done, _terminate_process)
 
 
 def _execute_limited_output_repository_operation(
@@ -710,7 +1125,12 @@ def _execute_limited_output_repository_operation(
     if stderr:
         client.send_log(job_id, sequence=1, stream="stderr", message=stderr.rstrip())
     error_message = f"{payload.job_kind} exited with code {return_code}"
-    client.fail_job(job_id, error_message=error_message, return_code=return_code)
+    client.fail_job(
+        job_id,
+        error_message=error_message,
+        return_code=return_code,
+        **failure_report(return_code, stderr),
+    )
     return RepositoryOperationResult(
         job_id=job_id,
         status="failed",
@@ -734,19 +1154,88 @@ class _ActivityTrackingReader:
     Lets the streaming watchdog tell an actively-transferring extract (bytes
     flowing) from a wedged one (read blocked, no data) without capping the total
     duration, so legitimately large/slow downloads are never truncated.
+
+    With `pad_idle_seconds`, a read that finds no data for that long returns
+    a bare newline instead of blocking on, so the upload connection carries
+    something while the command is silent. Only for line-oriented output
+    whose consumer skips blank lines. Reads then go to the pipe's file
+    descriptor directly, unbuffered: the buffered `read(n)` of a Popen pipe
+    blocks until it has n bytes, however long the command is silent after
+    writing fewer, and a Python-side buffer would hide bytes from select.
+    Output is passed on whole lines: the command flushes its output in
+    blocks that can end inside a record, and a partial line is held back
+    until its end arrives, so the padding never lands inside one. Padding
+    is not counted as activity or as bytes read. A held-back partial line
+    puts nothing on the wire and grows until its end arrives, so the
+    output must be short lines, as borg's are. Needs a real pipe (posix);
+    elsewhere reads block as before.
     """
 
-    def __init__(self, stream: Any):
+    def __init__(self, stream: Any, *, pad_idle_seconds: Optional[float] = None):
         self._stream = stream
         self.last_activity = time.monotonic()
+        self.bytes_read = 0
+        self._pad_idle_seconds = pad_idle_seconds
+        self._pending = b""
+        self._fd: Optional[int] = None
+        self._selector: Optional[selectors.BaseSelector] = None
+        if pad_idle_seconds is not None and os.name == "posix":
+            try:
+                self._fd = stream.fileno()
+                # The platform's selector, not select(): that one refuses a
+                # descriptor beyond FD_SETSIZE, which an agent holding many
+                # files can reach.
+                self._selector = selectors.DefaultSelector()
+                self._selector.register(self._fd, selectors.EVENT_READ)
+            except (AttributeError, OSError, ValueError):
+                self._fd = None
+                self._selector = None
 
     def read(self, *args: Any) -> bytes:
-        chunk = self._stream.read(*args)
-        if chunk:
+        if self._fd is None:
+            chunk = self._stream.read(*args)
+            if chunk:
+                self.last_activity = time.monotonic()
+                self.bytes_read += len(chunk)
+            return chunk
+        if not (args and isinstance(args[0], int) and args[0] > 0):
+            # A whole-output read would take one batch of lines for the
+            # whole listing; the padded reader serves sized reads only.
+            raise ValueError("padded reads need a size")
+        size = args[0]
+        while True:
+            try:
+                ready = self._selector.select(self._pad_idle_seconds)
+            except (OSError, ValueError):
+                ready = [None]  # a closed pipe: let the read report EOF
+            if not ready:
+                return b"\n"
+            try:
+                data = os.read(self._fd, size)
+            except OSError:
+                data = b""
+            if not data:
+                # End of output: the held-back tail goes out as it is, then
+                # the empty read that ends the upload.
+                self._selector.close()
+                tail, self._pending = self._pending, b""
+                return tail
             self.last_activity = time.monotonic()
-        return chunk
+            self.bytes_read += len(data)
+            combined = self._pending + data
+            cut = combined.rfind(b"\n")
+            if cut < 0:
+                self._pending = combined
+                continue
+            self._pending = combined[cut + 1 :]
+            # May exceed `size`: whole lines only, and the held-back part of
+            # a line joins the read that completes it. The upload's chunked
+            # body loop takes what it gets.
+            return combined[: cut + 1]
 
     def close(self) -> None:
+        if self._selector is not None:
+            self._selector.close()
         self._stream.close()
 
 
@@ -758,14 +1247,50 @@ def _execute_streaming_artifact_operation(
     env: dict[str, str],
     *,
     should_cancel: Optional[Callable[[], bool]] = None,
+    warnings_ok: bool = False,
+    idle_timeout_seconds: Optional[float],
+    max_duration_seconds: Optional[float] = None,
+    keepalive_seconds: Optional[float] = None,
+    pad_idle_seconds: Optional[float] = None,
+    delivery_required: bool = False,
 ) -> RepositoryOperationResult:
-    """Stream `borg extract --stdout` straight to the server over HTTP.
+    """Stream a command's stdout straight to the server over HTTP.
 
-    The file content never enters the WebSocket, so it works at any size. stderr
+    The output never enters the WebSocket, so it works at any size. stderr
     is drained on a thread so a full stderr pipe can't deadlock the stdout the
-    upload is reading. A watchdog terminates borg on cancellation or if it wedges
-    past a deadline, so a hung process can't pin this worker — terminating closes
-    stdout, which unblocks the upload read below.
+    upload is reading. A watchdog terminates borg if it wedges past a deadline,
+    and a poller of `should_cancel` terminates it on cancellation, so a hung
+    process can't pin this worker — terminating closes stdout, which unblocks
+    the upload read below.
+
+    The deadline is `idle_timeout_seconds` without stdout activity (an extract
+    that stopped producing bytes is wedged), `max_duration_seconds` since the
+    start (a diff is silent while it compares unchanged paths, so only an
+    absolute bound tells a long one from a stuck one), or both; None disables
+    that bound.
+
+    `warnings_ok` completes the job on a Borg warning exit code as well: the
+    output was streamed in full and the server decides what the warning
+    means for it. An extract keeps failing on a warning, since a partially
+    served file is not a download.
+
+    `keepalive_seconds` reports an empty progress keepalive this often, so
+    the server sees the job alive while nothing else reaches it; a
+    keepalive that fails to send is dropped, never fatal.
+    `pad_idle_seconds` keeps the upload connection itself carrying bytes
+    while the command is silent (see `_ActivityTrackingReader`).
+
+    `delivery_required` fails the job unless the server confirms the upload
+    (`accepted: true`); it answers `false` when no consumer was registered
+    for the job or it left mid-stream. A download's consumer is a person who
+    may have closed the tab; a listing nobody consumed is a job that did not
+    happen, and a `completed` row would read as a delivered one.
+
+    The stream itself carries no end marker: a kill by the watchdog closes
+    stdout and the server sees a clean end of stream, the same as a run that
+    finished. Whether the bytes are the whole output is the job's terminal
+    status, which lands after the upload; a consumer commits nothing before
+    it has read that status.
     """
     try:
         popen_kwargs: dict[str, Any] = {
@@ -794,46 +1319,99 @@ def _execute_streaming_artifact_operation(
     stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
     stderr_thread.start()
 
-    cancelled = threading.Event()
     timed_out = threading.Event()
+    timeout_reason: list[str] = []
     watchdog_done = threading.Event()
 
-    reader = _ActivityTrackingReader(process.stdout)
+    reader = _ActivityTrackingReader(process.stdout, pad_idle_seconds=pad_idle_seconds)
+    started_at = time.monotonic()
+
+    def _keepalive() -> None:
+        # Its own thread: on the polling transport a send is an HTTP request
+        # with retries, and a server that is down would otherwise hold the
+        # watchdog (cancellation, deadline) for the length of those retries.
+        # The session transport queues the message without blocking. A send
+        # that fails is dropped; the next one is due a minute later.
+        while not watchdog_done.wait(keepalive_seconds):
+            if process.poll() is not None:
+                return
+            try:
+                # No fields: the report is a sign of life, and every field
+                # the progress schema offers is a backup statistic that
+                # would be read as one.
+                client.send_progress(job_id, {})
+            except Exception:  # noqa: BLE001 - a keepalive is best effort
+                pass
 
     def _watchdog() -> None:
         while not watchdog_done.wait(0.5):
             if process.poll() is not None:
                 return
-            if should_cancel is not None and should_cancel():
-                cancelled.set()
-                _terminate_process(process)
-                return
+            now = time.monotonic()
             # Idle, not absolute: only kill borg once no bytes have flowed for
             # the timeout, so an actively-streaming large transfer is not cut off.
-            if time.monotonic() - reader.last_activity >= STREAM_EXTRACT_IDLE_SECONDS:
+            if (
+                idle_timeout_seconds is not None
+                and now - reader.last_activity >= idle_timeout_seconds
+            ):
+                timeout_reason.append(f"no output for {idle_timeout_seconds:g}s")
+                timed_out.set()
+                _terminate_process(process)
+                return
+            if (
+                max_duration_seconds is not None
+                and now - started_at >= max_duration_seconds
+            ):
+                timeout_reason.append(f"ran longer than {max_duration_seconds:g}s")
                 timed_out.set()
                 _terminate_process(process)
                 return
 
     watchdog = threading.Thread(target=_watchdog, daemon=True)
     watchdog.start()
+    # Its own thread, apart from the watchdog: on the polling transport the
+    # check is a heartbeat request with retries, and the deadlines must not
+    # wait for an unreachable server to answer it.
+    cancelled = _start_cancel_poller(process, should_cancel, watchdog_done)
+    if keepalive_seconds is not None:
+        threading.Thread(target=_keepalive, daemon=True).start()
 
     upload_error: Optional[BaseException] = None
+    upload_response: Any = None
     try:
-        client.upload_artifact(job_id, reader)
+        upload_response = client.upload_artifact(job_id, reader)
     except BaseException as exc:  # noqa: BLE001 - reported below
         upload_error = exc
+        # A broken upload leaves nobody reading stdout. Closing the pipe
+        # ends borg only at its next write, and a diff comparing unchanged
+        # paths may not write for a long time; end it now instead.
+        _terminate_process(process)
     finally:
-        # Closing stdout makes borg see EPIPE and exit if the upload broke.
-        if process.stdout is not None:
-            try:
-                process.stdout.close()
-            except OSError:
-                pass
+        # Closing stdout makes borg see EPIPE and exit if the upload broke;
+        # the reader's selector goes with it.
+        try:
+            reader.close()
+        except OSError:
+            pass
+
+    delivered = isinstance(upload_response, dict) and (
+        upload_response.get("accepted") is True
+    )
+    if delivery_required and not delivered and process.poll() is None:
+        # The server ended the request without a consumer while borg is
+        # still comparing: nothing will take the rest, so borg does not
+        # run it (it would otherwise hold the repository until the
+        # deadline, kept alive by the keepalives).
+        _terminate_process(process)
 
     return_code = process.wait()
     watchdog_done.set()
     watchdog.join(timeout=5)
+    # The keepalive and cancel-poller threads are not joined: a request in
+    # flight may be waiting out an unreachable server's retries, and the
+    # verdict must not wait for it. They end on their own, and a progress
+    # report that lands after the verdict is refused by the server as a
+    # report on a final job.
     stderr_thread.join()
     stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
@@ -847,10 +1425,21 @@ def _execute_streaming_artifact_operation(
         )
 
     if timed_out.is_set():
-        error_message = (
-            f"{payload.job_kind} stalled: no output for {STREAM_EXTRACT_IDLE_SECONDS}s"
+        reason = timeout_reason[0] if timeout_reason else "deadline reached"
+        if upload_error is not None:
+            reason = f"{reason}; upload failed meanwhile: {upload_error}"
+        if stderr:
+            # Whatever borg said before it was ended is the operator's lead.
+            client.send_log(
+                job_id, sequence=1, stream="stderr", message=stderr.rstrip()
+            )
+        error_message = f"{payload.job_kind} stopped by the watchdog: {reason}"
+        client.fail_job(
+            job_id,
+            error_message=error_message,
+            return_code=return_code,
+            **failure_report(return_code, stderr),
         )
-        client.fail_job(job_id, error_message=error_message, return_code=return_code)
         return RepositoryOperationResult(
             job_id=job_id,
             status="failed",
@@ -860,7 +1449,12 @@ def _execute_streaming_artifact_operation(
 
     if upload_error is not None:
         error_message = f"{payload.job_kind} artifact upload failed: {upload_error}"
-        client.fail_job(job_id, error_message=error_message, return_code=return_code)
+        client.fail_job(
+            job_id,
+            error_message=error_message,
+            return_code=return_code,
+            **failure_report(return_code, stderr),
+        )
         return RepositoryOperationResult(
             job_id=job_id,
             status="failed",
@@ -868,14 +1462,47 @@ def _execute_streaming_artifact_operation(
             message=error_message,
         )
 
-    if return_code == 0:
+    if delivery_required and not delivered:
+        # The server answers 200 either way; only the body says whether a
+        # consumer took the bytes, so anything but its explicit yes (a
+        # bodyless answer from a proxy included) is not a delivery. Checked
+        # before the exit code: a consumer that left mid-stream closes the
+        # pipe and borg's EPIPE exit would otherwise name the wrong cause.
+        # borg may have failed before writing a byte (a held lock, say): the
+        # consumer gave up waiting, and its reason is on stderr.
+        if stderr:
+            client.send_log(
+                job_id, sequence=1, stream="stderr", message=stderr.rstrip()
+            )
+        error_message = (
+            f"{payload.job_kind} artifact not delivered: the server did not "
+            f"confirm a consumer for it (borg exited with code {return_code})"
+        )
+        client.fail_job(
+            job_id,
+            error_message=error_message,
+            return_code=return_code,
+            **failure_report(return_code, stderr),
+        )
+        return RepositoryOperationResult(
+            job_id=job_id,
+            status="failed",
+            return_code=return_code,
+            message=error_message,
+        )
+
+    if return_code == 0 or (warnings_ok and is_warning_return_code(return_code)):
+        if return_code != 0 and stderr:
+            client.send_log(
+                job_id, sequence=1, stream="stderr", message=stderr.rstrip()
+            )
         client.complete_job(
             job_id,
             result={"return_code": return_code, "command": cmd, "artifact": True},
         )
         return RepositoryOperationResult(
             job_id=job_id,
-            status="completed",
+            status="completed" if return_code == 0 else "completed_with_warnings",
             return_code=return_code,
             message=f"{payload.job_kind} exited with code {return_code}",
         )
@@ -883,7 +1510,12 @@ def _execute_streaming_artifact_operation(
     if stderr:
         client.send_log(job_id, sequence=1, stream="stderr", message=stderr.rstrip())
     error_message = f"{payload.job_kind} exited with code {return_code}"
-    client.fail_job(job_id, error_message=error_message, return_code=return_code)
+    client.fail_job(
+        job_id,
+        error_message=error_message,
+        return_code=return_code,
+        **failure_report(return_code, stderr),
+    )
     return RepositoryOperationResult(
         job_id=job_id,
         status="failed",
@@ -904,7 +1536,14 @@ def _execute_binary_output_repository_operation(
     operation = payload.operation or {}
     if operation.get("delivery") == "artifact" and hasattr(client, "upload_artifact"):
         return _execute_streaming_artifact_operation(
-            job_id, payload, client, cmd, env, should_cancel=should_cancel
+            job_id,
+            payload,
+            client,
+            cmd,
+            env,
+            should_cancel=should_cancel,
+            idle_timeout_seconds=STREAM_EXTRACT_IDLE_SECONDS,
+            keepalive_seconds=STREAM_KEEPALIVE_SECONDS,
         )
 
     try:
@@ -980,7 +1619,13 @@ def _execute_streaming_repository_operation(
     *,
     initial_sequence: int,
     should_cancel: Optional[Callable[[], bool]],
+    compact_stats: bool = False,
 ) -> RepositoryOperationResult:
+    """Run a Borg (or rclone) command to completion, streaming its output
+    as log lines. `compact_stats`: the command is a Borg 2 `compact
+    --stats`, whose statistics are parsed from the tail of the output into
+    the completion report, and whose Borg warning exit code completes the
+    job with warnings (`_warning_exit`)."""
     try:
         popen_kwargs: dict[str, Any] = {
             "stdout": subprocess.PIPE,
@@ -1002,39 +1647,83 @@ def _execute_streaming_repository_operation(
         )
 
     sequence = initial_sequence
-    if process.stdout is not None:
-        for line in process.stdout:
-            message = line.rstrip("\n")
-            client.send_log(job_id, sequence=sequence, stream="stdout", message=message)
-            sequence += 1
-            progress = parse_borg_progress(message)
-            if progress:
-                client.send_progress(job_id, progress)
-            if should_cancel and should_cancel():
-                return_code = _terminate_process(process)
-                client.cancel_job(job_id)
-                return RepositoryOperationResult(
-                    job_id=job_id,
-                    status="canceled",
-                    return_code=return_code,
-                    message=f"{payload.job_kind} canceled",
-                )
+    # The last lines as Borg wrote them, for the compact statistics; and
+    # the last plain lines, for a failure's report.
+    tail: deque[str] = deque(maxlen=TAIL_LINES)
+    failure_tail = FailureTail()
+    done = threading.Event()
+    # The per-line check below answers at once while output flows; the
+    # poller reaches a Borg that prints nothing (a lock wait, a compact).
+    cancelled = _start_cancel_poller(process, should_cancel, done)
+    start_keepalive(process, client, job_id, done)
+    try:
+        if process.stdout is not None:
+            for line in process.stdout:
+                message = line.rstrip("\n")
+                if compact_stats:
+                    tail.append(message)
+                failure_tail.append(message)
+                progress = parse_borg_progress(message)
+                if progress:
+                    client.send_progress(job_id, progress)
+                if not progress_replaces_log_line(progress):
+                    client.send_log(
+                        job_id, sequence=sequence, stream="stdout", message=message
+                    )
+                    sequence += 1
+                if cancel_requested(should_cancel) and process.poll() is None:
+                    # not once Borg ended on its own while the check ran (it
+                    # may have asked the server): that run is its verdict
+                    cancelled.set()
+                    _terminate_process(process)
+                    break
+        return_code = process.wait()
+    except BaseException:
+        # A report that failed (the server unreachable) unwinds this worker;
+        # Borg must not run on unsupervised, holding the repository.
+        _terminate_process(process)
+        raise
+    finally:
+        done.set()
 
-    return_code = process.wait()
-    if return_code == 0:
-        client.complete_job(
-            job_id,
-            result={"return_code": return_code, "command": cmd, "status": "completed"},
-        )
+    if cancelled.is_set():
+        client.cancel_job(job_id)
         return RepositoryOperationResult(
             job_id=job_id,
-            status="completed",
+            status="canceled",
+            return_code=return_code,
+            message=f"{payload.job_kind} canceled",
+        )
+
+    if return_code == 0 or _warning_exit(payload, return_code):
+        status = "completed" if return_code == 0 else "completed_with_warnings"
+        result: dict[str, Any] = {
+            "return_code": return_code,
+            "command": cmd,
+            "status": status,
+        }
+        if compact_stats:
+            # The statistics ride with the completion report: the log lines
+            # that carry them are queued behind it on the outbox, so the
+            # server would otherwise have to wait for them.
+            stats = parse_compact_stats(tail)
+            if stats is not None:
+                result["stats"] = stats
+        client.complete_job(job_id, result=result)
+        return RepositoryOperationResult(
+            job_id=job_id,
+            status=status,
             return_code=return_code,
             message=f"{payload.job_kind} exited with code {return_code}",
         )
 
     error_message = f"{payload.job_kind} exited with code {return_code}"
-    client.fail_job(job_id, error_message=error_message, return_code=return_code)
+    client.fail_job(
+        job_id,
+        error_message=error_message,
+        return_code=return_code,
+        **failure_report(return_code, failure_tail.lines()),
+    )
     return RepositoryOperationResult(
         job_id=job_id,
         status="failed",
@@ -1043,10 +1732,69 @@ def _execute_streaming_repository_operation(
     )
 
 
-def _is_borg_warning_rc(return_code: Optional[int]) -> bool:
-    # Borg uses exit code 1 (and 100-127 in newer builds) for warnings that
-    # still produced output. Mirrors restore_check_service._is_borg_warning_exit_code.
-    return return_code == 1 or (return_code is not None and 100 <= return_code <= 127)
+def _reports_compact_stats(payload: RepositoryOperationPayload) -> bool:
+    """Whether this job is a Borg 2 compact, the one operation with
+    repository statistics (Borg 1 compact has none)."""
+    return payload.job_kind == "repository.compact" and payload.borg_version == 2
+
+
+def _warning_exit(payload: RepositoryOperationPayload, return_code: int) -> bool:
+    """Whether `return_code` is a Borg warning that still leaves this job a
+    completion: a compact that warned ran through and printed its
+    statistics, as the short and backup paths and the server classify it.
+    The other streamed kinds keep failing on any non-zero exit as they did:
+    `check` exits 1 for consistency errors found, which must not count as
+    a repository checked; `prune` is left as it was until its warning
+    semantics are settled with the server's; rclone has no warning range
+    at all."""
+    if payload.job_kind != "repository.compact":
+        return False
+    return is_warning_return_code(return_code)
+
+
+# Whether a Borg 2 binary accepts `compact --stats`, by binary file
+# (path, mtime, size): probed once per file (`borg2 --version` is a
+# subprocess), again when the file changes under a long-lived agent.
+_COMPACT_STATS_SUPPORT: dict[tuple, bool] = {}
+
+
+def _binary_key(binary: str) -> tuple:
+    path = shutil.which(binary) or binary
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return (path, None, None)
+    return (path, stat.st_mtime_ns, stat.st_size)
+
+
+def compact_stats_supported(binary: str) -> bool:
+    """Whether `binary` accepts `compact --stats` (Borg 2.0.0b15 on, see
+    `compact_stats.has_compact_stats`). A binary whose version cannot be
+    read this time (a probe timeout, a banner without a version) does not
+    get the flag: a wrong flag would fail the whole compact, a missing one
+    only its statistics. It is probed again next time; only a read version
+    is remembered."""
+    key = _binary_key(binary)
+    known = _COMPACT_STATS_SUPPORT.get(key)
+    if known is not None:
+        return known
+    try:
+        probe = subprocess.run(
+            [binary, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        version = parse_borg_version(f"{probe.stdout}\n{probe.stderr}")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        # ValueError covers a `--version` output the locale cannot decode
+        version = None
+    if version is None:
+        return False
+    supported = has_compact_stats(version)
+    _COMPACT_STATS_SUPPORT[key] = supported
+    return supported
 
 
 def _resolve_restore_target(operation: dict[str, Any]) -> tuple[str, bool]:
@@ -1130,34 +1878,60 @@ def _execute_restore_operation(
             )
 
         sequence = initial_sequence
-        if process.stdout is not None:
-            for line in process.stdout:
-                message = line.rstrip("\n")
-                client.send_log(
-                    job_id, sequence=sequence, stream="stdout", message=message
-                )
-                sequence += 1
-                progress = parse_borg_progress(message)
-                if progress:
-                    client.send_progress(job_id, progress)
-                if should_cancel and should_cancel():
-                    return_code = _terminate_process(process)
-                    client.cancel_job(job_id)
-                    return RepositoryOperationResult(
-                        job_id=job_id,
-                        status="canceled",
-                        return_code=return_code,
-                        message=f"{payload.job_kind} canceled",
-                    )
+        failure_tail = FailureTail()
+        done = threading.Event()
+        # As in the streaming path: the poller reaches a silent extract.
+        cancelled = _start_cancel_poller(process, should_cancel, done)
+        start_keepalive(process, client, job_id, done)
+        try:
+            if process.stdout is not None:
+                for line in process.stdout:
+                    message = line.rstrip("\n")
+                    failure_tail.append(message)
+                    progress = parse_borg_progress(message)
+                    if progress:
+                        client.send_progress(job_id, progress)
+                    if not progress_replaces_log_line(progress):
+                        client.send_log(
+                            job_id,
+                            sequence=sequence,
+                            stream="stdout",
+                            message=message,
+                        )
+                        sequence += 1
+                    if cancel_requested(should_cancel) and process.poll() is None:
+                        # not once Borg ended on its own while the check ran (it
+                        # may have asked the server): that run is its verdict
+                        cancelled.set()
+                        _terminate_process(process)
+                        break
+            return_code = process.wait()
+        except BaseException:
+            # As in the streaming path: never leave Borg unsupervised.
+            _terminate_process(process)
+            raise
+        finally:
+            done.set()
 
-        return_code = process.wait()
-        warning = _is_borg_warning_rc(return_code)
+        if cancelled.is_set():
+            client.cancel_job(job_id)
+            return RepositoryOperationResult(
+                job_id=job_id,
+                status="canceled",
+                return_code=return_code,
+                message=f"{payload.job_kind} canceled",
+            )
+
+        warning = is_warning_return_code(return_code)
 
         # A hard borg failure has no meaningful verification verdict.
         if return_code != 0 and not warning:
             error_message = f"{payload.job_kind} exited with code {return_code}"
             client.fail_job(
-                job_id, error_message=error_message, return_code=return_code
+                job_id,
+                error_message=error_message,
+                return_code=return_code,
+                **failure_report(return_code, failure_tail.lines()),
             )
             return RepositoryOperationResult(
                 job_id=job_id,
@@ -1303,3 +2077,68 @@ def _terminate_process(process: subprocess.Popen) -> int | None:
         except Exception:
             return process.poll()
         return process.wait(timeout=10)
+
+
+def execute_storage_usage_job(
+    job: dict[str, Any],
+    client: AgentClient,
+    *,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> RepositoryOperationResult:
+    """`repository.storage_usage`: measure a Borg 2 repository read-only and
+    report one JSON object (bytes, objects, source); see storage_usage.py."""
+    from agent.borg_ui_agent import storage_usage
+
+    job_id = int(job["id"])
+    try:
+        payload = RepositoryOperationPayload.from_job_payload(job.get("payload") or {})
+    except (TypeError, ValueError) as exc:
+        error_message = f"Invalid repository operation payload: {exc}"
+        client.send_log(job_id, sequence=0, stream="stderr", message=error_message)
+        client.fail_job(job_id, error_message=error_message)
+        return RepositoryOperationResult(
+            job_id=job_id, status="failed", message=error_message
+        )
+    env = build_borg_env(payload.environment)
+    if payload.remote_path:
+        # The index step runs through Borg's Python API, where the remote
+        # path travels in the environment: the payload's value must win over
+        # an inherited one, unlike --remote-path on the other handlers' argv.
+        env["BORG_REMOTE_PATH"] = payload.remote_path
+    # The server stops waiting after its info timeout; a measurement that
+    # outlives it would hold the job open and refuse the next refresh.
+    timeout = _storage_usage_timeout(payload.operation)
+    try:
+        data = storage_usage.measure(
+            payload.repository_path,
+            borg_version=payload.borg_version,
+            borg_binary=payload.borg_cmd,
+            env=env,
+            timeout=timeout,
+            should_cancel=should_cancel,
+        )
+    except storage_usage.Cancelled:
+        client.cancel_job(job_id)
+        return RepositoryOperationResult(
+            job_id=job_id, status="canceled", message=f"{payload.job_kind} canceled"
+        )
+    except Exception as exc:
+        error_message = f"storage usage failed: {exc}"
+        client.send_log(job_id, sequence=0, stream="stderr", message=error_message)
+        client.fail_job(job_id, error_message=error_message)
+        return RepositoryOperationResult(
+            job_id=job_id, status="failed", message=error_message
+        )
+    stdout = json.dumps(data)
+    client.send_log(job_id, sequence=1, stream="stdout", message=stdout)
+    client.complete_job(
+        job_id,
+        result={
+            "return_code": 0,
+            "command": ["repository.storage_usage"],
+            "stdout": stdout,
+            "stderr": "",
+            "data": data,
+        },
+    )
+    return RepositoryOperationResult(job_id=job_id, status="completed", return_code=0)

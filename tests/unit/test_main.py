@@ -19,59 +19,78 @@ class TestStartupEvent:
         mock.close = Mock()
         return mock
 
+    @pytest.fixture(autouse=True)
+    def _reset_licensing_refresh_task(self):
+        """Startup stores the spawned refresh task in a module global.
+
+        The fakes here return plain Mocks, and a Mock left behind makes every
+        later lifespan shutdown fail with "object Mock can't be used in
+        'await' expression"; the runner then never stops and its event stays
+        bound to a dead loop.
+        """
+        import app.main as main
+
+        yield
+        main.licensing_refresh_task = None
+
     async def test_startup_configures_mqtt(self, mock_db):
         """Test that startup configures MQTT service"""
-        with patch("app.database.migrations.run_migrations"):
-            with patch("app.core.security.create_first_user", new_callable=AsyncMock):
-                mock_settings = Mock()
-                mock_settings.mqtt_enabled = True
-                mock_settings.mqtt_beta_enabled = True
-                mock_settings.mqtt_broker_url = "mqtt://localhost:1883"
-                mock_settings.borg2_binary_path = None
-                mock_db.query.return_value.first.return_value = mock_settings
+        with (
+            patch("app.core.security.create_first_user", new_callable=AsyncMock),
+            patch("app.database.db_upgrade.ensure_schema"),
+        ):
+            mock_settings = Mock()
+            mock_settings.mqtt_enabled = True
+            mock_settings.mqtt_beta_enabled = True
+            mock_settings.mqtt_broker_url = "mqtt://localhost:1883"
+            mock_settings.borg2_binary_path = None
+            mock_db.query.return_value.first.return_value = mock_settings
 
-                with patch("app.database.database.SessionLocal", return_value=mock_db):
-                    with patch("app.services.cache_service.archive_cache"):
-                        with patch(
-                            "app.core.borg.borg.get_system_info", new_callable=AsyncMock
-                        ):
-                            with patch("app.services.backup_service.backup_service"):
+            with patch("app.database.database.SessionLocal", return_value=mock_db):
+                with patch("app.services.cache_service.archive_cache"):
+                    with patch(
+                        "app.core.borg.borg.get_system_info", new_callable=AsyncMock
+                    ):
+                        with patch("app.services.backup_service.backup_service"):
+                            with patch("app.utils.process_utils.cleanup_orphaned_jobs"):
                                 with patch(
-                                    "app.utils.process_utils.cleanup_orphaned_jobs"
+                                    "app.utils.process_utils.cleanup_orphaned_mounts"
                                 ):
                                     with patch(
-                                        "app.utils.process_utils.cleanup_orphaned_mounts"
-                                    ):
+                                        "app.services.mqtt_service.mqtt_service"
+                                    ) as mock_mqtt:
                                         with patch(
-                                            "app.services.mqtt_service.mqtt_service"
-                                        ) as mock_mqtt:
+                                            "app.services.mqtt_service.build_mqtt_runtime_config",
+                                            return_value={},
+                                        ):
                                             with patch(
-                                                "app.services.mqtt_service.build_mqtt_runtime_config",
-                                                return_value={},
+                                                "app.api.schedule.check_scheduled_jobs",
+                                                return_value=AsyncMock(),
                                             ):
-                                                with patch(
-                                                    "app.api.schedule.check_scheduled_jobs",
-                                                    return_value=AsyncMock(),
+                                                with (
+                                                    patch(
+                                                        "app.services.operations.runner.operation_runner"
+                                                    ),
+                                                    patch(
+                                                        "app.services.operations.reconcile.reconcile_scheduler"
+                                                    ),
                                                 ):
                                                     with patch(
-                                                        "app.services.stats_refresh_scheduler.stats_refresh_scheduler"
+                                                        "app.services.mqtt_sync_scheduler.start_mqtt_sync_scheduler",
+                                                        return_value=AsyncMock(),
                                                     ):
                                                         with patch(
-                                                            "app.services.mqtt_sync_scheduler.start_mqtt_sync_scheduler",
-                                                            return_value=AsyncMock(),
+                                                            "asyncio.create_task"
                                                         ):
-                                                            with patch(
-                                                                "asyncio.create_task"
-                                                            ):
-                                                                from app.main import (
-                                                                    startup_event,
-                                                                    app,
-                                                                )
+                                                            from app.main import (
+                                                                startup_event,
+                                                                app,
+                                                            )
 
-                                                                app.state.background_tasks = []
-                                                                await startup_event()
-                                                                mock_mqtt.configure.assert_called_once()
-                                                                mock_mqtt.sync_state_with_db.assert_called_once()
+                                                            app.state.background_tasks = []
+                                                            await startup_event()
+                                                            mock_mqtt.configure.assert_called_once()
+                                                            mock_mqtt.sync_state_with_db.assert_called_once()
 
     async def test_startup_configures_cache_even_when_license_sync_disabled(
         self, mock_db
@@ -83,8 +102,8 @@ class TestStartupEvent:
         mock_db.query.return_value.first.return_value = mock_settings
 
         with (
-            patch("app.database.migrations.run_migrations"),
             patch("app.core.security.create_first_user", new_callable=AsyncMock),
+            patch("app.database.db_upgrade.ensure_schema"),
             patch("app.main.settings.enable_startup_license_sync", False),
             patch("app.database.database.SessionLocal", return_value=mock_db),
             patch("app.services.cache_service.archive_cache") as mock_cache,
@@ -93,7 +112,8 @@ class TestStartupEvent:
             patch("app.utils.process_utils.cleanup_orphaned_jobs"),
             patch("app.utils.process_utils.cleanup_orphaned_mounts"),
             patch("app.api.schedule.check_scheduled_jobs", return_value=AsyncMock()),
-            patch("app.services.stats_refresh_scheduler.stats_refresh_scheduler"),
+            patch("app.services.operations.runner.operation_runner"),
+            patch("app.services.operations.reconcile.reconcile_scheduler"),
             patch(
                 "app.services.mqtt_sync_scheduler.start_mqtt_sync_scheduler",
                 return_value=AsyncMock(),
@@ -111,9 +131,7 @@ class TestStartupEvent:
             cache_max_size_mb=128,
         )
 
-    async def test_background_license_refresh_uses_runtime_version_when_startup_sync_disabled(
-        self, mock_db
-    ):
+    async def test_background_license_refresh_uses_runtime_version(self, mock_db):
         """The refresh loop should not close over an undefined app_version."""
         mock_settings = Mock()
         mock_settings.redis_url = None
@@ -134,9 +152,10 @@ class TestStartupEvent:
             return Mock()
 
         with (
-            patch("app.database.migrations.run_migrations"),
             patch("app.core.security.create_first_user", new_callable=AsyncMock),
-            patch("app.main.settings.enable_startup_license_sync", False),
+            patch("app.database.db_upgrade.ensure_schema"),
+            patch("app.main.settings.enable_startup_license_sync", True),
+            patch("app.main.sync_licensing_state", new_callable=AsyncMock),
             patch("app.database.database.SessionLocal", return_value=mock_db),
             patch("app.main.get_runtime_app_version", return_value="9.9.9"),
             patch(
@@ -149,7 +168,8 @@ class TestStartupEvent:
             patch("app.utils.process_utils.cleanup_orphaned_jobs"),
             patch("app.utils.process_utils.cleanup_orphaned_mounts"),
             patch("app.api.schedule.check_scheduled_jobs", return_value=AsyncMock()),
-            patch("app.services.stats_refresh_scheduler.stats_refresh_scheduler"),
+            patch("app.services.operations.runner.operation_runner"),
+            patch("app.services.operations.reconcile.reconcile_scheduler"),
             patch(
                 "app.services.mqtt_sync_scheduler.start_mqtt_sync_scheduler",
                 return_value=AsyncMock(),
@@ -165,6 +185,65 @@ class TestStartupEvent:
             assert captured_refresh_coro.cr_frame is not None
             assert captured_refresh_coro.cr_frame.f_locals["app_version"] == "9.9.9"
             captured_refresh_coro.close()
+
+    async def test_no_background_license_refresh_when_startup_sync_disabled(
+        self, mock_db
+    ):
+        """ENABLE_STARTUP_LICENSE_SYNC=false has to keep the instance offline.
+
+        The loop used to be spawned unconditionally, so the setting only
+        delayed the first call to the activation service by an hour.
+        """
+        mock_settings = Mock()
+        mock_settings.redis_url = None
+        mock_settings.log_cleanup_on_startup = False
+        mock_settings.mqtt_enabled = False
+        mock_settings.mqtt_beta_enabled = False
+        mock_db.query.return_value.first.return_value = mock_settings
+
+        spawned_coro_names = []
+
+        def fake_spawn_background_task(coro):
+            spawned_coro_names.append(
+                getattr(getattr(coro, "cr_code", None), "co_name", "")
+            )
+            coro.close()
+            return Mock()
+
+        sync = AsyncMock()
+
+        with (
+            patch("app.core.security.create_first_user", new_callable=AsyncMock),
+            patch("app.database.db_upgrade.ensure_schema"),
+            patch("app.main.settings.enable_startup_license_sync", False),
+            patch("app.main.sync_licensing_state", sync),
+            patch("app.database.database.SessionLocal", return_value=mock_db),
+            patch("app.main.get_runtime_app_version", return_value="9.9.9"),
+            patch(
+                "app.main._spawn_background_task",
+                side_effect=fake_spawn_background_task,
+            ),
+            patch("app.services.cache_service.archive_cache"),
+            patch("app.core.borg.borg.get_system_info", new_callable=AsyncMock),
+            patch("app.services.backup_service.backup_service"),
+            patch("app.utils.process_utils.cleanup_orphaned_jobs"),
+            patch("app.utils.process_utils.cleanup_orphaned_mounts"),
+            patch("app.api.schedule.check_scheduled_jobs", return_value=AsyncMock()),
+            patch("app.services.operations.runner.operation_runner"),
+            patch("app.services.operations.reconcile.reconcile_scheduler"),
+            patch(
+                "app.services.mqtt_sync_scheduler.start_mqtt_sync_scheduler",
+                return_value=AsyncMock(),
+            ),
+            patch("asyncio.create_task"),
+        ):
+            from app.main import startup_event, app
+
+            app.state.background_tasks = []
+            await startup_event()
+
+        assert "licensing_refresh_loop" not in spawned_coro_names
+        sync.assert_not_awaited()
 
 
 @pytest.mark.unit
@@ -359,3 +438,43 @@ class TestCatchAll:
             media_type="application/json",
         )
         assert response is sentinel_response
+
+
+class TestStartupBuildsSchema:
+    """The regression the smoke tests caught: startup left the database empty.
+
+    The schema was prepared only by the container entrypoint, so a start that
+    does not go through it — `uvicorn app.main:app` — served an application
+    whose every database read failed.
+    """
+
+    async def test_startup_ensures_the_schema_before_touching_the_database(self):
+        recorder = Mock()
+
+        with (
+            patch("app.database.db_upgrade.ensure_schema") as mock_ensure,
+            patch("app.database.database.SessionLocal") as mock_session,
+            patch("app.core.security.create_first_user", new_callable=AsyncMock),
+            patch("app.services.cache_service.archive_cache"),
+            patch("app.core.borg.borg.get_system_info", new_callable=AsyncMock),
+            patch("app.services.backup_service.backup_service"),
+            patch("app.utils.process_utils.cleanup_orphaned_jobs"),
+            patch("app.utils.process_utils.cleanup_orphaned_mounts"),
+            patch("app.api.schedule.check_scheduled_jobs", return_value=AsyncMock()),
+            patch("app.services.operations.runner.operation_runner"),
+            patch("app.services.operations.reconcile.reconcile_scheduler"),
+            patch("asyncio.create_task"),
+        ):
+            recorder.attach_mock(mock_ensure, "ensure_schema")
+            recorder.attach_mock(mock_session, "SessionLocal")
+
+            from app.main import startup_event, app
+
+            app.state.background_tasks = []
+            await startup_event()
+
+        mock_ensure.assert_called_once()
+        called = [name.split(".")[0] for name, _, _ in recorder.mock_calls]
+        assert called[0] == "ensure_schema", (
+            f"the schema has to exist before anything opens a session, got {called[:3]}"
+        )

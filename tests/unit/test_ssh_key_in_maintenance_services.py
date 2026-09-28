@@ -9,14 +9,13 @@ IP bans on providers that block repeated failed login attempts.
 
 import base64
 import pytest
+import shlex
 import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 from cryptography.fernet import Fernet
 
 from app.database.models import (
-    CheckJob,
-    CompactJob,
-    PruneJob,
+    Operation,
     Repository,
     SSHConnection,
     SSHKey,
@@ -86,10 +85,17 @@ def _mock_process(returncode=0):
 # ---------------------------------------------------------------------------
 
 
+def _rsh_tokens(captured_env: dict) -> list[str]:
+    """BORG_RSH as argv. The string embeds paths (the test data dir among
+    them), so a substring check for "-i" can match inside a random temp
+    name; only a whole token is the identity flag."""
+    return shlex.split(captured_env.get("BORG_RSH", ""))
+
+
 def assert_borg_rsh_has_identity(captured_env: dict):
     """Assert that BORG_RSH contains an -i flag pointing to a key file."""
     borg_rsh = captured_env.get("BORG_RSH", "")
-    assert "-i" in borg_rsh, (
+    assert "-i" in _rsh_tokens(captured_env), (
         f"BORG_RSH does not contain -i (identity) flag: {borg_rsh!r}\n"
         "SSH key was not passed to borg — this is the regression from issue #354."
     )
@@ -118,16 +124,17 @@ class TestPruneServiceSSHKey:
         ssh_key = _make_ssh_key(secret)
         connection = _make_connection(ssh_key_id=ssh_key.id)
         repo = _make_repo(connection_id=connection.id)
-        job = MagicMock(spec=PruneJob)
+        job = MagicMock()
         job.id = 1
         job.status = "pending"
-        job.max_duration = None
+        job.kind = "prune"
+        job.params = {}
 
         captured_env = {}
 
         def mock_query(model):
             m = MagicMock()
-            if model == PruneJob:
+            if model == Operation:
                 m.filter.return_value.first.return_value = job
             elif model == Repository:
                 m.filter.return_value.first.return_value = repo
@@ -173,7 +180,7 @@ class TestPruneServiceSSHKey:
     async def test_no_ssh_key_borg_rsh_has_no_identity_flag(self, service):
         """BORG_RSH must NOT contain -i when repo has no SSH key (local repo)."""
         repo = _make_repo(connection_id=None, ssh_key_id=None, repository_type="local")
-        job = MagicMock(spec=PruneJob)
+        job = MagicMock()
         job.id = 1
         job.status = "pending"
 
@@ -181,7 +188,7 @@ class TestPruneServiceSSHKey:
 
         def mock_query(model):
             m = MagicMock()
-            if model == PruneJob:
+            if model == Operation:
                 m.filter.return_value.first.return_value = job
             elif model == Repository:
                 m.filter.return_value.first.return_value = repo
@@ -217,8 +224,7 @@ class TestPruneServiceSSHKey:
                         keep_yearly=1,
                     )
 
-        borg_rsh = captured_env.get("BORG_RSH", "")
-        assert "-i" not in borg_rsh
+        assert "-i" not in _rsh_tokens(captured_env)
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +243,7 @@ class TestCompactServiceSSHKey:
         ssh_key = _make_ssh_key(secret)
         connection = _make_connection(ssh_key_id=ssh_key.id)
         repo = _make_repo(connection_id=connection.id)
-        job = MagicMock(spec=CompactJob)
+        job = MagicMock()
         job.id = 1
         job.status = "pending"
         job.process_pid = None
@@ -247,7 +253,7 @@ class TestCompactServiceSSHKey:
 
         def mock_query(model):
             m = MagicMock()
-            if model == CompactJob:
+            if model == Operation:
                 m.filter.return_value.first.return_value = job
             elif model == Repository:
                 m.filter.return_value.first.return_value = repo
@@ -291,7 +297,7 @@ class TestCompactServiceSSHKey:
         )
 
         captured_env = {}
-        job = MagicMock(spec=CompactJob)
+        job = MagicMock()
         job.id = 1
         job.status = "pending"
         job.process_pid = None
@@ -299,7 +305,7 @@ class TestCompactServiceSSHKey:
 
         def mock_query(model):
             m = MagicMock()
-            if model == CompactJob:
+            if model == Operation:
                 m.filter.return_value.first.return_value = job
             elif model == Repository:
                 m.filter.return_value.first.return_value = repo
@@ -348,10 +354,11 @@ class TestCheckServiceSSHKey:
         ssh_key = _make_ssh_key(secret)
         connection = _make_connection(ssh_key_id=ssh_key.id)
         repo = _make_repo(connection_id=connection.id)
-        job = MagicMock(spec=CheckJob)
+        job = MagicMock()
         job.id = 1
         job.status = "pending"
-        job.max_duration = None
+        job.kind = "check"
+        job.params = {"max_duration": None}
         job.process_pid = None
         job.process_start_time = None
 
@@ -359,7 +366,7 @@ class TestCheckServiceSSHKey:
 
         def mock_query(model):
             m = MagicMock()
-            if model == CheckJob:
+            if model == Operation:
                 m.filter.return_value.first.return_value = job
             elif model == Repository:
                 m.filter.return_value.first.return_value = repo
@@ -397,11 +404,14 @@ class TestCheckServiceSSHKey:
     @pytest.mark.asyncio
     async def test_extra_flags_are_appended_to_borg_check_command(self):
         repo = _make_repo(repository_type="local")
-        job = MagicMock(spec=CheckJob)
+        job = MagicMock()
         job.id = 1
         job.status = "pending"
-        job.max_duration = 0
-        job.extra_flags = "--verify-data --save-space"
+        job.kind = "check"
+        job.params = {
+            "max_duration": 0,
+            "extra_flags": "--verify-data --save-space",
+        }
         job.process_pid = None
         job.process_start_time = None
 
@@ -409,7 +419,7 @@ class TestCheckServiceSSHKey:
 
         def mock_query(model):
             m = MagicMock()
-            if model == CheckJob:
+            if model == Operation:
                 m.filter.return_value.first.return_value = job
             elif model == Repository:
                 m.filter.return_value.first.return_value = repo
@@ -451,10 +461,11 @@ class TestCheckServiceSSHKey:
         repo = _make_repo(
             connection_id=None, ssh_key_id=ssh_key.id, repository_type="ssh"
         )
-        job = MagicMock(spec=CheckJob)
+        job = MagicMock()
         job.id = 1
         job.status = "pending"
-        job.max_duration = None
+        job.kind = "check"
+        job.params = {"max_duration": None}
         job.process_pid = None
         job.process_start_time = None
 
@@ -462,7 +473,7 @@ class TestCheckServiceSSHKey:
 
         def mock_query(model):
             m = MagicMock()
-            if model == CheckJob:
+            if model == Operation:
                 m.filter.return_value.first.return_value = job
             elif model == Repository:
                 m.filter.return_value.first.return_value = repo

@@ -1,3 +1,5 @@
+import type { IndexMode } from './operations'
+
 export type SourceLocationKind = 'local' | 'remote' | 'agent'
 export type SourceType = SourceLocationKind | 'mixed'
 export type FilesystemSnapshotProvider = 'btrfs' | 'zfs'
@@ -54,6 +56,66 @@ export interface SourceLocation {
   container?: SourceContainerSelection
 }
 
+/** Where a stored repository size came from (`repositories.total_size_source`). */
+export type RepositorySizeSource =
+  'borg1_cache_stats' | 'borg2_index' | 'storage_used' | 'compact_stats'
+
+/** Where the source data size came from: the figure Borg reports for the
+ * whole repository (`info` on Borg 1, a compact's statistics on Borg 2),
+ * or the sum over the archive rows where there is none. */
+export type RepositoryOriginalSizeSource = 'borg1_cache_stats' | 'compact_stats' | 'archives'
+
+/** The newest successful compact's statistics (Borg 2 with `--stats`). */
+export interface RepositoryCompactStats {
+  repository_size?: number | null
+  deduplicated_size?: number | null
+  source_size?: number | null
+  source_files?: number | null
+  compression_factor?: number | null
+  deduplication_factor?: number | null
+  compaction_saved?: number | null
+  object_count?: number | null
+  archive_count?: number | null
+  /** `rounded` when the figures were parsed from Borg's formatted output. */
+  size_precision?: 'exact' | 'rounded' | string
+  [key: string]: unknown
+}
+
+/**
+ * The `storage` object of a repository response (#981): the stored size
+ * with its provenance and time, Borg's last manifest write, the archive
+ * sums and the newest compact statistics. A `null` field is not measured
+ * yet or not reported by this Borg version; `0` is a measurement. The list
+ * carries the stored columns only (`archives_consistent` null), the detail
+ * adds the archive figures.
+ */
+export interface RepositoryStorage {
+  size_bytes: number | null
+  size_source: RepositorySizeSource | string | null
+  measured_at: string | null
+  last_modified: string | null
+  archives_consistent: boolean | null
+  /** Whether a listing has ever completed: with `archives_consistent`
+   * false, true means the sums are catching up, false that nothing has
+   * produced them yet. */
+  archives_listed: boolean | null
+  original_size: number | null
+  original_size_source: RepositoryOriginalSizeSource | string | null
+  /** The time of the run that reported a repository-level source data
+   * size; null when the archive index answered, which is as new as the
+   * listing. */
+  original_size_at: string | null
+  compressed_size: number | null
+  deduplicated_size: number | null
+  latest_archive_files: number | null
+  /** The oldest and the newest current archive; null while the archive
+   * figures are withheld or unknown. */
+  first_backup_at: string | null
+  last_backup_at: string | null
+  compact: RepositoryCompactStats | null
+  compact_at: string | null
+}
+
 export interface Repository {
   id: number
   name: string
@@ -85,9 +147,17 @@ export interface Repository {
   check_extra_flags?: string | null
   archive_count?: number
   total_size?: string | null
+  storage?: RepositoryStorage | null
+  // Index work queued or running for the repository (#1063): `stats`,
+  // `archive_sync`, `history_merge`, `history_index`.
+  index_pending_kinds?: string[]
   last_backup?: string | null
   last_check?: string | null
   last_compact?: string | null
+  last_prune?: string | null
+  last_index?: string | null
+  // How much derived data this repository refreshes (spec 6.8).
+  index_mode?: IndexMode
   has_schedule?: boolean
   schedule_enabled?: boolean
   schedule_name?: string | null
@@ -173,6 +243,7 @@ export interface BackupJob {
   backup_plan_run_id?: number | null
   backup_plan_name?: string | null
   archive_name?: string | null
+  archive_pruned_at?: string | null
   execution_mode?: 'local' | 'remote_ssh' | 'agent' | string
   route_strategy?: string | null
   retry_attempt?: number | null
@@ -319,8 +390,11 @@ export interface BackupPlan {
   max_parallel_repositories: number
   failure_behavior: 'continue' | 'stop'
   schedule_enabled: boolean
+  schedule_mode?: 'cron' | 'availability'
   cron_expression?: string | null
   timezone: string
+  availability_check_interval_minutes?: number | null
+  min_success_interval_minutes?: number | null
   last_run?: string | null
   next_run?: string | null
   repository_count: number
@@ -383,6 +457,7 @@ export interface BackupPlanRun {
   started_at?: string | null
   completed_at?: string | null
   error_message?: string | null
+  skip_reason?: 'minimum_interval_not_elapsed' | 'source_unavailable' | null
   created_at?: string | null
   retry_attempt?: number | null
   retry_original_run_id?: number | null
@@ -412,8 +487,11 @@ export interface BackupPlanData {
   max_parallel_repositories: number
   failure_behavior: 'continue' | 'stop'
   schedule_enabled: boolean
+  schedule_mode?: 'cron' | 'availability'
   cron_expression?: string | null
   timezone: string
+  availability_check_interval_minutes?: number
+  min_success_interval_minutes?: number
   pre_backup_script_id?: number | null
   post_backup_script_id?: number | null
   pre_backup_script_parameters?: Record<string, string> | null

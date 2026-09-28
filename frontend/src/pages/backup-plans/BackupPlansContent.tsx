@@ -50,6 +50,8 @@ interface BackupPlansContentProps {
   onCancelRun: (runId: number) => void
   onViewLogs: (job: BackupPlanRunLogJob) => void
   onTogglePlan: (planId: number) => void
+  onToggleRepository: (planId: number, repositoryId: number) => void
+  togglingRepository: { planId: number; repositoryId: number } | null
   onEditPlan: (plan: BackupPlan) => void
   onDeletePlan: (planId: number) => void
   onViewHistory: (planId: number) => void
@@ -167,6 +169,8 @@ function BackupPlansContentImpl({
   onCancelRun,
   onViewLogs,
   onTogglePlan,
+  onToggleRepository,
+  togglingRepository,
   onEditPlan,
   onDeletePlan,
   onViewHistory,
@@ -257,13 +261,22 @@ function BackupPlansContentImpl({
           <Stack
             direction="row"
             spacing={1.5}
-            alignItems="center"
-            sx={{ mb: 1, color: 'text.secondary' }}
+            sx={{
+              alignItems: 'center',
+              mb: 1,
+              color: 'text.secondary',
+            }}
           >
             <Box sx={{ display: 'flex', color: 'success.main' }}>
               <RefreshCw size={20} className="animate-spin" />
             </Box>
-            <Typography id="backup-plans-running-heading" variant="h6" fontWeight={600}>
+            <Typography
+              id="backup-plans-running-heading"
+              variant="h6"
+              sx={{
+                fontWeight: 600,
+              }}
+            >
               {t('backupPlans.runsPanel.activeTitle')}
             </Typography>
             <Chip
@@ -272,7 +285,13 @@ function BackupPlansContentImpl({
               label={t('backupPlans.runsPanel.activeCount', { count: runningEntries.length })}
             />
           </Stack>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+              mb: 2,
+            }}
+          >
             {t('backupPlans.runsPanel.activeSubtitle')}
           </Typography>
           <Stack spacing={2}>
@@ -594,6 +613,18 @@ function BackupPlansContentImpl({
                           enabled_before: plan.enabled,
                         })
                         onTogglePlan(plan.id)
+                      }}
+                      togglingRepositoryId={
+                        togglingRepository?.planId === plan.id
+                          ? togglingRepository.repositoryId
+                          : null
+                      }
+                      onToggleRepository={(repositoryId) => {
+                        trackBackupPlan(EventAction.EDIT, {
+                          operation: 'enable_plan_repository',
+                          repository_count: plan.repository_count,
+                        })
+                        onToggleRepository(plan.id, repositoryId)
                       }}
                       onEdit={() => {
                         trackBackupPlan(EventAction.VIEW, {

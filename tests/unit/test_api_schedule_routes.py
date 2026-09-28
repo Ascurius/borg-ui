@@ -3,21 +3,26 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError
 
 import app.api.schedule as schedule_api
 from app.database.models import (
-    BackupJob,
     BackupPlan,
     BackupPlanRepository,
     Repository,
     RepositoryStorage,
     RcloneRemote,
-    RcloneSyncJob,
+    Operation,
+    OperationBackupDetails,
+    OperationRcloneDetails,
     ScheduledJob,
     ScheduledJobRepository,
     SSHConnection,
 )
+from app.services.operations.backup_facade import BackupJobFacade
 from app.services.rclone_service import RcloneCommandResult
+from tests.utils.agent_jobs import agent_maintenance_job
+from tests.utils.operations import seed_job_operation
 
 
 class _FixedDateTime(datetime):
@@ -51,8 +56,67 @@ def _create_schedule(
     return schedule
 
 
+def _locked_database() -> OperationalError:
+    """The error SQLAlchemy raises for a locked SQLite database."""
+    return OperationalError("SELECT operations.id", {}, Exception("database is locked"))
+
+
+def _wait_that_fails_once(monkeypatch, caller_session=None):
+    """Stand in for the runner: the first read of the backup raises, the
+    next one finds it completed. Returns the list of sessions polled on.
+    With `caller_session`, checks that the caller holds no connection
+    while the backup runs."""
+    sessions = []
+
+    async def flaky_wait(db, operation_id, **kwargs):
+        sessions.append(db)
+        if caller_session is not None:
+            assert db is not caller_session
+            assert not caller_session.in_transaction()
+        if len(sessions) == 1:
+            raise _locked_database()
+        operation = db.get(Operation, operation_id)
+        operation.status = "completed"
+        db.commit()
+        return "completed"
+
+    monkeypatch.setattr(
+        "app.services.operations.backup_facade.wait_for_backup_operation", flaky_wait
+    )
+    monkeypatch.setattr(
+        "app.services.operations.backup_facade.asyncio.sleep", AsyncMock()
+    )
+    return sessions
+
+
 @pytest.mark.unit
 class TestScheduleRouteContracts:
+    def test_create_availability_schedule_without_cron_expression(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        repository = _create_repo(test_db, "Availability Repo", "/repos/availability")
+
+        response = test_client.post(
+            "/api/schedule/",
+            json={
+                "name": "Availability backup",
+                "schedule_mode": "availability",
+                "availability_check_interval_minutes": 30,
+                "min_success_interval_minutes": 20 * 60,
+                "cron_expression": None,
+                "timezone": "UTC",
+                "repository_id": repository.id,
+                "enabled": True,
+            },
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 200
+        created = response.json()["job"]
+        assert created["schedule_mode"] == "availability"
+        assert created["cron_expression"] is None
+        assert created["next_run"] is not None
+
     def test_list_schedules_includes_deduped_repository_ids(
         self, test_client: TestClient, admin_headers, test_db
     ):
@@ -277,12 +341,13 @@ class TestScheduleRouteContracts:
         self, test_client: TestClient, admin_headers, test_db
     ):
         schedule = _create_schedule(test_db, "Delete Me", repository="/repos/delete-me")
-        backup_job = BackupJob(
+        backup_job = seed_job_operation(
+            test_db,
+            "backup",
             repository="/repos/delete-me",
             status="completed",
             scheduled_job_id=schedule.id,
         )
-        test_db.add(backup_job)
         test_db.commit()
         test_db.refresh(backup_job)
 
@@ -419,11 +484,15 @@ class TestScheduleRouteContracts:
             test_db, schedule, datetime.now(timezone.utc)
         )
 
-        assert run_key == f"backup:{test_db.query(BackupJob).one().id}"
-        backup_job = test_db.query(BackupJob).one()
-        assert backup_job.route_strategy == "remote_direct"
-        assert backup_job.execution_mode == "remote_ssh"
-        assert backup_job.source_ssh_connection_id == connection.id
+        operation = test_db.query(Operation).filter(Operation.kind == "backup").one()
+        details = test_db.get(OperationBackupDetails, operation.id)
+        assert run_key == f"backup:{operation.id}"
+        assert operation.trigger == "schedule"
+        assert operation.scheduled_job_id == schedule.id
+        assert operation.params["archive_name"]
+        assert details.route_strategy == "remote_direct"
+        assert operation.execution_mode == "remote_ssh"
+        assert details.source_ssh_connection_id == connection.id
 
     @pytest.mark.asyncio
     async def test_multi_repo_schedule_applies_backup_route_metadata(
@@ -459,17 +528,285 @@ class TestScheduleRouteContracts:
         )
         test_db.commit()
 
+        # No runner runs in this unit test, so stand in for the verdict it
+        # would write on the row the schedule enqueued.
+        async def _complete(db, operation_id, **kwargs):
+            operation = db.get(Operation, operation_id)
+            operation.status = "completed"
+            db.commit()
+            return "completed"
+
         monkeypatch.setattr(
-            "app.services.backup_service.backup_service.execute_backup",
-            AsyncMock(),
+            "app.services.operations.backup_facade.wait_for_backup_operation", _complete
         )
 
         await schedule_api.execute_multi_repo_schedule(schedule, test_db)
 
-        backup_job = test_db.query(BackupJob).one()
-        assert backup_job.route_strategy == "remote_direct"
-        assert backup_job.execution_mode == "remote_ssh"
-        assert backup_job.source_ssh_connection_id == connection.id
+        operation = test_db.query(Operation).filter(Operation.kind == "backup").one()
+        details = test_db.get(OperationBackupDetails, operation.id)
+        assert operation.scheduled_job_id == schedule.id
+        assert details.route_strategy == "remote_direct"
+        assert operation.execution_mode == "remote_ssh"
+        assert details.source_ssh_connection_id == connection.id
+
+    @pytest.mark.asyncio
+    async def test_multi_repo_schedule_closes_the_prune_operation_when_the_step_raises(
+        self, test_db, monkeypatch
+    ):
+        """The post-backup prune is an inline operation created `running`.
+        When the router raises (an agent job refused by admission), the
+        handler must close that row with the cause and record the failed
+        step on the backup, or the row blocks the repository until a
+        restart."""
+        repo = _create_repo(test_db, "Prune Repo", "/repos/prune")
+        schedule = _create_schedule(
+            test_db,
+            "Prune After",
+            run_prune_after=True,
+            prune_keep_daily=7,
+            run_compact_after=True,
+        )
+        test_db.add(
+            ScheduledJobRepository(
+                scheduled_job_id=schedule.id,
+                repository_id=repo.id,
+                execution_order=0,
+            )
+        )
+        test_db.commit()
+
+        async def _complete(db, operation_id, **kwargs):
+            operation = db.get(Operation, operation_id)
+            operation.status = "completed"
+            db.commit()
+            return "completed"
+
+        monkeypatch.setattr(
+            "app.services.operations.backup_facade.wait_for_backup_operation", _complete
+        )
+        monkeypatch.setattr(
+            "app.api.schedule.BorgRouter.prune",
+            AsyncMock(side_effect=RuntimeError("agent prune failed: refused")),
+        )
+
+        await schedule_api.execute_multi_repo_schedule(schedule, test_db)
+
+        test_db.expire_all()
+        prune = test_db.query(Operation).filter(Operation.kind == "prune").one()
+        assert prune.status == "failed"
+        assert prune.error_message == "agent prune failed: refused"
+        assert prune.completed_at is not None
+        backup = test_db.query(Operation).filter(Operation.kind == "backup").one()
+        assert BackupJobFacade(test_db, backup).maintenance_status == "prune_failed"
+        # the compact does not run on a repository whose prune step raised
+        assert test_db.query(Operation).filter(Operation.kind == "compact").count() == 0
+
+    @pytest.mark.asyncio
+    async def test_multi_repo_schedule_keeps_a_prune_its_agent_is_still_running(
+        self, test_db, monkeypatch
+    ):
+        """The wait on an agent prune can give up (504) while the agent is
+        still running it. The handler records the failed step but must not
+        close the operation: the agent's report will, and until then the
+        repository really is busy."""
+        from app.core.security import get_password_hash
+        from app.database.models import AgentMachine
+
+        repo = _create_repo(test_db, "Slow Prune Repo", "/repos/slow-prune")
+        agent = AgentMachine(
+            name="Agent",
+            agent_id="agt_slow_prune",
+            token_hash=get_password_hash("secret"),
+            token_prefix="secret",
+            status="online",
+        )
+        test_db.add(agent)
+        schedule = _create_schedule(
+            test_db, "Slow Prune After", run_prune_after=True, prune_keep_daily=7
+        )
+        test_db.add(
+            ScheduledJobRepository(
+                scheduled_job_id=schedule.id,
+                repository_id=repo.id,
+                execution_order=0,
+            )
+        )
+        test_db.commit()
+
+        async def _complete(db, operation_id, **kwargs):
+            operation = db.get(Operation, operation_id)
+            operation.status = "completed"
+            db.commit()
+            return "completed"
+
+        async def _timeout(self, job_id, *args, **kwargs):
+            # The agent job for this operation exists and is running when
+            # the server-side wait gives up.
+            agent_maintenance_job(test_db, agent, "prune", job_id)
+            raise RuntimeError(
+                "agent prune failed: backend.errors.agents.repositoryOperationTimeout"
+            )
+
+        monkeypatch.setattr(
+            "app.services.operations.backup_facade.wait_for_backup_operation", _complete
+        )
+        monkeypatch.setattr("app.api.schedule.BorgRouter.prune", _timeout)
+
+        await schedule_api.execute_multi_repo_schedule(schedule, test_db)
+
+        test_db.expire_all()
+        prune = test_db.query(Operation).filter(Operation.kind == "prune").one()
+        assert prune.status == "running"
+        assert prune.error_message is None
+        backup = test_db.query(Operation).filter(Operation.kind == "backup").one()
+        assert BackupJobFacade(test_db, backup).maintenance_status == "prune_failed"
+
+    @pytest.mark.asyncio
+    async def test_multi_repo_schedule_closes_the_compact_operation_when_the_step_raises(
+        self, test_db, monkeypatch
+    ):
+        repo = _create_repo(test_db, "Compact Repo", "/repos/compact")
+        schedule = _create_schedule(test_db, "Compact After", run_compact_after=True)
+        test_db.add(
+            ScheduledJobRepository(
+                scheduled_job_id=schedule.id,
+                repository_id=repo.id,
+                execution_order=0,
+            )
+        )
+        test_db.commit()
+
+        async def _complete(db, operation_id, **kwargs):
+            operation = db.get(Operation, operation_id)
+            operation.status = "completed"
+            db.commit()
+            return "completed"
+
+        monkeypatch.setattr(
+            "app.services.operations.backup_facade.wait_for_backup_operation", _complete
+        )
+        monkeypatch.setattr(
+            "app.api.schedule.BorgRouter.compact",
+            AsyncMock(side_effect=RuntimeError("agent compact failed: refused")),
+        )
+
+        await schedule_api.execute_multi_repo_schedule(schedule, test_db)
+
+        test_db.expire_all()
+        compact = test_db.query(Operation).filter(Operation.kind == "compact").one()
+        assert compact.status == "failed"
+        assert compact.error_message == "agent compact failed: refused"
+        backup = test_db.query(Operation).filter(Operation.kind == "backup").one()
+        assert BackupJobFacade(test_db, backup).maintenance_status == "compact_failed"
+
+    @pytest.mark.asyncio
+    async def test_single_repo_schedule_closes_the_prune_operation_when_the_step_raises(
+        self, test_db, monkeypatch
+    ):
+        """The single-repository schedule path has its own post-backup
+        handlers; they must close the inline operation the same way."""
+        from app.services.operations.backup_facade import create_backup_operation
+
+        repo = _create_repo(test_db, "Single Prune Repo", "/repos/single-prune")
+        schedule = _create_schedule(
+            test_db, "Single Prune After", run_prune_after=True, prune_keep_daily=7
+        )
+        backup_job = create_backup_operation(
+            test_db,
+            repo,
+            trigger="schedule",
+            executor="server",
+            params={},
+            scheduled_job_id=schedule.id,
+        )
+        backup_job.status = "completed"
+        backup_job.completed_at = datetime.utcnow()
+        test_db.commit()
+
+        async def _completed(db, operation_id, **kwargs):
+            return "completed"
+
+        monkeypatch.setattr(
+            "app.services.operations.backup_facade.wait_for_backup_operation",
+            _completed,
+        )
+        monkeypatch.setattr(
+            "app.api.schedule.BorgRouter.prune",
+            AsyncMock(side_effect=RuntimeError("agent prune failed: refused")),
+        )
+
+        await schedule_api.execute_scheduled_backup_with_maintenance(
+            backup_job.id, repo.path, schedule.id
+        )
+
+        test_db.expire_all()
+        prune = test_db.query(Operation).filter(Operation.kind == "prune").one()
+        assert prune.status == "failed"
+        assert prune.error_message == "agent prune failed: refused"
+        assert prune.completed_at is not None
+        backup = test_db.get(Operation, backup_job.id)
+        assert BackupJobFacade(test_db, backup).maintenance_status == "prune_failed"
+
+    @pytest.mark.asyncio
+    async def test_multi_repo_schedule_waits_out_a_failed_read_of_its_backup(
+        self, test_db, monkeypatch
+    ):
+        """A read of the backup that fails is not a failed backup: the
+        schedule waits again and runs the repository's follow-up work once
+        the backup has completed."""
+        repo = _create_repo(test_db, "Flaky Read Repo", "/repos/flaky-read")
+        schedule = _create_schedule(
+            test_db, "Flaky Read", run_prune_after=True, prune_keep_daily=7
+        )
+        test_db.add(
+            ScheduledJobRepository(
+                scheduled_job_id=schedule.id,
+                repository_id=repo.id,
+                execution_order=0,
+            )
+        )
+        test_db.commit()
+        sessions = _wait_that_fails_once(monkeypatch, test_db)
+        prune = AsyncMock()
+        monkeypatch.setattr("app.api.schedule.BorgRouter.prune", prune)
+
+        await schedule_api.execute_multi_repo_schedule(schedule, test_db)
+
+        assert len(sessions) == 2
+        prune.assert_awaited_once()
+        test_db.expire_all()
+        backup = test_db.query(Operation).filter(Operation.kind == "backup").one()
+        assert backup.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_single_repo_schedule_waits_out_a_failed_read_of_its_backup(
+        self, test_db, monkeypatch
+    ):
+        from app.services.operations.backup_facade import create_backup_operation
+
+        repo = _create_repo(test_db, "Single Flaky Repo", "/repos/single-flaky")
+        schedule = _create_schedule(
+            test_db, "Single Flaky Read", run_prune_after=True, prune_keep_daily=7
+        )
+        backup_job = create_backup_operation(
+            test_db,
+            repo,
+            trigger="schedule",
+            executor="server",
+            params={},
+            scheduled_job_id=schedule.id,
+        )
+        # The task opens a session of its own, so none is held here.
+        sessions = _wait_that_fails_once(monkeypatch)
+        prune = AsyncMock()
+        monkeypatch.setattr("app.api.schedule.BorgRouter.prune", prune)
+
+        await schedule_api.execute_scheduled_backup_with_maintenance(
+            backup_job.id, repo.path, schedule.id
+        )
+
+        assert len(sessions) == 2
+        prune.assert_awaited_once()
 
     def test_dispatch_due_multi_repo_schedule_defers_for_active_repository_work(
         self, test_db, monkeypatch
@@ -491,7 +828,9 @@ class TestScheduleRouteContracts:
             )
         )
         test_db.add(
-            BackupJob(
+            seed_job_operation(
+                test_db,
+                "backup",
                 repository=repo.path,
                 repository_id=repo.id,
                 status="running",
@@ -569,27 +908,28 @@ class TestScheduleRouteContracts:
 
         test_db.refresh(repo)
         test_db.refresh(storage)
-        sync_job = (
-            test_db.query(RcloneSyncJob)
+        # Phase 6: the scheduler only queues. The runner starts the sync, and
+        # the executor records the outcome and the storage failure, so this
+        # test now pins the queued row and the schedule bookkeeping only.
+        operation = (
+            test_db.query(Operation)
             .filter(
-                RcloneSyncJob.repository_id == repo.id,
-                RcloneSyncJob.triggered_by == "schedule",
+                Operation.repository_id == repo.id,
+                Operation.kind == "rclone_sync",
+                Operation.trigger == "schedule",
             )
             .one()
         )
+        details = test_db.get(OperationRcloneDetails, operation.id)
         assert repo.path == "/repos/mirror"
         assert storage.rclone_remote_path == "borg-ui/repositories/mirror"
-        assert storage.sync_status == "failed"
-        assert storage.last_sync_error == "remote unavailable"
-        assert storage.last_scheduled_sync_at == now.replace(tzinfo=None)
         assert storage.next_scheduled_sync_at > now.replace(tzinfo=None)
-        assert sync_job.triggered_by == "schedule"
-        assert sync_job.status == "failed"
-        assert sync_job.scheduled_for == now.replace(tzinfo=None) - timedelta(minutes=5)
-        assert sync_job.error_text == "remote unavailable"
-        assert sync_job.log_text == "remote unavailable"
+        assert operation.status == "queued"
+        assert details.operation == "sync"
+        assert details.direction == "primary_to_remote"
+        assert details.scheduled_for == now.replace(tzinfo=None) - timedelta(minutes=5)
 
-    def test_dispatch_scheduled_rclone_mirror_claims_before_background_task(
+    def test_dispatch_scheduled_rclone_mirror_queues_one_run_per_slot(
         self, test_db, monkeypatch
     ):
         from app.services import rclone_mirror_scheduler
@@ -622,32 +962,149 @@ class TestScheduleRouteContracts:
         )
         test_db.add(storage)
         test_db.commit()
-        created_coroutines = []
-
-        class FakeTask:
-            def add_done_callback(self, callback):
-                callback(self)
-
-        def fake_create_task(coro):
-            created_coroutines.append(coro)
-            coro.close()
-            return FakeTask()
-
-        monkeypatch.setattr(
-            rclone_mirror_scheduler.asyncio,
-            "create_task",
-            fake_create_task,
+        dispatched = rclone_mirror_scheduler.dispatch_due_scheduled_rclone_mirrors(
+            test_db, now
         )
+
+        test_db.refresh(storage)
+        operation = (
+            test_db.query(Operation)
+            .filter(
+                Operation.kind == "rclone_sync",
+                Operation.repository_id == repo.id,
+            )
+            .one()
+        )
+        assert dispatched == 1
+        assert operation.status == "queued"
+        assert operation.trigger == "schedule"
+        assert storage.last_scheduled_sync_at is None
+        assert storage.next_scheduled_sync_at > now.replace(tzinfo=None)
+
+        # A second tick over the same slot must not queue a duplicate.
+        second = rclone_mirror_scheduler.dispatch_due_scheduled_rclone_mirrors(
+            test_db, now
+        )
+        assert second == 0
+        assert (
+            test_db.query(Operation).filter(Operation.kind == "rclone_sync").count()
+            == 1
+        )
+
+    def test_dispatch_scheduled_rclone_mirror_skips_a_repository_still_in_flight(
+        self, test_db, monkeypatch
+    ):
+        """The pre-phase-6 scheduler skipped a storage whose sync task was still
+        running. A queued or running scheduled run is the same signal now: the
+        slot stays due and is picked up once that run has finished."""
+        from app.services import rclone_mirror_scheduler
+        from app.services.operations.details import rclone_details
+        from app.services.operations.enqueue import enqueue
+
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        remote = RcloneRemote(name="prod-s3", provider="s3", config_source="managed")
+        repo = Repository(
+            name="Mirror Repo",
+            path="/repos/mirror",
+            encryption="none",
+            repository_type="local",
+            mode="full",
+        )
+        test_db.add_all([remote, repo])
+        test_db.commit()
+        test_db.refresh(remote)
+        test_db.refresh(repo)
+        due_at = now - timedelta(minutes=5)
+        storage = RepositoryStorage(
+            repository_id=repo.id,
+            backend="rclone",
+            rclone_remote_id=remote.id,
+            rclone_remote_path="borg-ui/repositories/mirror",
+            cache_path=repo.path,
+            sync_policy="scheduled",
+            sync_status="syncing",
+            sync_direction="primary_to_remote",
+            sync_cron_expression="*/15 * * * *",
+            sync_timezone="UTC",
+            next_scheduled_sync_at=due_at,
+        )
+        test_db.add(storage)
+        earlier = enqueue(
+            test_db,
+            "rclone_sync",
+            repository_id=repo.id,
+            trigger="schedule",
+            commit=False,
+        )
+        earlier.status = "running"
+        rclone_details(test_db, earlier).scheduled_for = due_at - timedelta(minutes=15)
+        test_db.commit()
 
         dispatched = rclone_mirror_scheduler.dispatch_due_scheduled_rclone_mirrors(
             test_db, now
         )
 
         test_db.refresh(storage)
-        assert dispatched == 1
-        assert len(created_coroutines) == 1
-        assert storage.last_scheduled_sync_at is None
-        assert storage.next_scheduled_sync_at > now.replace(tzinfo=None)
+        assert dispatched == 0
+        assert (
+            test_db.query(Operation).filter(Operation.kind == "rclone_sync").count()
+            == 1
+        )
+        assert storage.next_scheduled_sync_at == due_at.replace(tzinfo=None)
+
+    def test_dispatch_scheduled_rclone_mirror_keeps_the_slot_when_enqueue_fails(
+        self, test_db, monkeypatch
+    ):
+        """The schedule advance and the new operation commit together: if the
+        enqueue raises, the slot is still due on the next tick and no mirror
+        run is lost."""
+        from app.services import rclone_mirror_scheduler
+
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        remote = RcloneRemote(name="prod-s3", provider="s3", config_source="managed")
+        repo = Repository(
+            name="Mirror Repo",
+            path="/repos/mirror",
+            encryption="none",
+            repository_type="local",
+            mode="full",
+        )
+        test_db.add_all([remote, repo])
+        test_db.commit()
+        test_db.refresh(remote)
+        test_db.refresh(repo)
+        due_at = now - timedelta(minutes=5)
+        storage = RepositoryStorage(
+            repository_id=repo.id,
+            backend="rclone",
+            rclone_remote_id=remote.id,
+            rclone_remote_path="borg-ui/repositories/mirror",
+            cache_path=repo.path,
+            sync_policy="scheduled",
+            sync_status="current",
+            sync_direction="primary_to_remote",
+            sync_cron_expression="*/15 * * * *",
+            sync_timezone="UTC",
+            next_scheduled_sync_at=due_at,
+        )
+        test_db.add(storage)
+        test_db.commit()
+
+        def _explode(*args, **kwargs):
+            raise RuntimeError("database locked")
+
+        monkeypatch.setattr(rclone_mirror_scheduler, "enqueue", _explode)
+
+        with pytest.raises(RuntimeError, match="database locked"):
+            rclone_mirror_scheduler.dispatch_due_scheduled_rclone_mirrors(test_db, now)
+
+        test_db.rollback()
+        test_db.refresh(storage)
+        assert storage.next_scheduled_sync_at == due_at.replace(tzinfo=None)
+        assert (
+            test_db.query(Operation).filter(Operation.kind == "rclone_sync").count()
+            == 0
+        )
 
     def test_validate_cron_returns_preview_for_valid_expression(
         self, test_client: TestClient, admin_headers

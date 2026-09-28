@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from '@storybook/react-vite'
-import { Box, Typography } from '@mui/material'
+import { Alert, Box, Button, Link, Typography } from '@mui/material'
 import { Hourglass } from 'lucide-react'
 import StorageBrowserDialog, { type StorageBrowserItem } from './StorageBrowserDialog'
 
@@ -38,7 +38,12 @@ const items: StorageBrowserItem[] = [
 const slowLoadingHint = (
   <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, px: 1.5, py: 1 }}>
     <Hourglass size={17} style={{ marginTop: 2, flexShrink: 0 }} />
-    <Typography variant="body2" color="text.secondary">
+    <Typography
+      variant="body2"
+      sx={{
+        color: 'text.secondary',
+      }}
+    >
       This archive is large, so listing its files takes a little longer. Hang tight.
     </Typography>
   </Box>
@@ -56,4 +61,36 @@ export const Loading: Story = {
 // (managed-agent) listing is still running.
 export const LoadingWithHint: Story = {
   args: { items: null, isLoading: true, loadingHint: slowLoadingHint },
+}
+
+export const WithTitleAction: Story = {
+  args: {
+    items,
+    titleAction: (
+      <Link href="#" variant="body2" underline="hover">
+        Open full page
+      </Link>
+    ),
+  },
+}
+
+// The error slot: a failed listing replaces the content area (no empty-state
+// placeholder underneath) and offers a retry.
+export const Errored: Story = {
+  args: {
+    items: null,
+    error: (
+      <Alert
+        severity="error"
+        sx={{ flexShrink: 0 }}
+        action={
+          <Button color="inherit" size="small">
+            Retry
+          </Button>
+        }
+      >
+        Archive daily not found
+      </Alert>
+    ),
+  },
 }

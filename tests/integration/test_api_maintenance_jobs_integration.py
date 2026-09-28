@@ -2,8 +2,12 @@ from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.utils.operations import seed_job_operation
 
-from app.database.models import CheckJob, CompactJob, PruneJob, Repository
+from app.database.models import (
+    Repository,
+    SystemSettings,
+)
 
 
 def _create_repo(test_db) -> Repository:
@@ -30,7 +34,9 @@ class TestMaintenanceJobApiIntegration:
         repo = _create_repo(test_db)
         test_db.add_all(
             [
-                CheckJob(
+                seed_job_operation(
+                    test_db,
+                    "check",
                     repository_id=repo.id,
                     status="running",
                     progress=25,
@@ -38,14 +44,18 @@ class TestMaintenanceJobApiIntegration:
                     has_logs=True,
                     started_at=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
                 ),
-                CompactJob(
+                seed_job_operation(
+                    test_db,
+                    "compact",
                     repository_id=repo.id,
                     status="completed",
                     progress=100,
                     progress_message="done",
                     started_at=datetime(2026, 1, 1, 12, 10, tzinfo=timezone.utc),
                 ),
-                PruneJob(
+                seed_job_operation(
+                    test_db,
+                    "prune",
                     repository_id=repo.id,
                     status="failed",
                     error_message="prune failed",
@@ -88,19 +98,25 @@ class TestMaintenanceJobApiIntegration:
         compact_log.write_text("compact streamed\n", encoding="utf-8")
         prune_log.write_text("prune streamed\n", encoding="utf-8")
 
-        check_job = CheckJob(
+        check_job = seed_job_operation(
+            test_db,
+            "check",
             repository_id=repo.id,
             status="completed",
             log_file_path=str(check_log),
             has_logs=True,
         )
-        compact_job = CompactJob(
+        compact_job = seed_job_operation(
+            test_db,
+            "compact",
             repository_id=repo.id,
             status="completed",
             log_file_path=str(compact_log),
             has_logs=True,
         )
-        prune_job = PruneJob(
+        prune_job = seed_job_operation(
+            test_db,
+            "prune",
             repository_id=repo.id,
             status="completed",
             log_file_path=str(prune_log),
@@ -111,6 +127,16 @@ class TestMaintenanceJobApiIntegration:
         test_db.refresh(check_job)
         test_db.refresh(compact_job)
         test_db.refresh(prune_job)
+
+        # The shipped default (failed_and_warnings) hides the logs of completed
+        # jobs; all_jobs is the policy under which the endpoints read the
+        # streamed files back.
+        system_settings = test_db.query(SystemSettings).first()
+        if system_settings is None:
+            system_settings = SystemSettings()
+            test_db.add(system_settings)
+        system_settings.log_save_policy = "all_jobs"
+        test_db.commit()
 
         check_response = test_client.get(
             f"/api/repositories/check-jobs/{check_job.id}", headers=admin_headers

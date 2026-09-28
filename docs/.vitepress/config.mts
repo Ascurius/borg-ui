@@ -13,7 +13,7 @@ const withBase = (path: string) => `${siteBase}${path.replace(/^\/+/, '')}`;
 
 export default defineConfig({
   base: siteBase,
-  title: 'Borg Web UI',
+  title: 'Borg UI',
   description: 'A modern web interface for Borg Backup management',
   cleanUrls: true,
   srcExclude: [
@@ -42,7 +42,7 @@ export default defineConfig({
     logo: {
       light: '/logo-light.png',
       dark: '/logo-dark.png',
-      alt: 'Borg Web UI',
+      alt: 'Borg UI',
     },
     siteTitle: false,
     nav: [
@@ -75,6 +75,7 @@ export default defineConfig({
       {
         text: 'Security',
         items: [
+          { text: 'What We Do With Your Data', link: '/trust' },
           { text: 'Authentication and SSO', link: '/authentication' },
           { text: 'Access Control', link: '/access-control' },
           { text: 'Security', link: '/security' },
@@ -101,6 +102,12 @@ export default defineConfig({
           { text: 'Architecture', link: '/SPECIFICATION' },
           { text: 'Job System', link: '/architecture/job-system' },
           { text: 'Development', link: '/development' },
+          {
+            text: 'Storybook',
+            link: 'https://docs.borgui.com/storybook/',
+            target: '_blank',
+            rel: 'noreferrer',
+          },
           { text: 'Testing', link: '/testing' },
           { text: 'Contributing', link: '/contributing' },
         ],

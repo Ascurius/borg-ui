@@ -4,6 +4,7 @@ import type { RepoAction } from '../hooks/usePermissions'
 import { repositoriesAPI } from '../services/api'
 import type { Repository } from '../types'
 import RepositoryCard from './RepositoryCard'
+import { borg1Storage, borg2Storage, unknownStorage } from './repositoryStatsFixtures'
 
 repositoriesAPI.getRunningJobs = async (_id: number) =>
   ({
@@ -14,6 +15,7 @@ repositoriesAPI.getRunningJobs = async (_id: number) =>
       prune_job: null,
       wipe_job: null,
     },
+
     status: 200,
     statusText: 'OK',
     headers: {},
@@ -35,11 +37,59 @@ const sampleRepository: Repository = {
   last_backup: '2026-05-15T16:30:00.000Z',
   last_check: '2026-05-14T09:15:00.000Z',
   last_compact: '2026-05-10T12:00:00.000Z',
+  last_prune: '2026-05-14T09:20:00.000Z',
+  last_index: '2026-05-15T16:35:00.000Z',
   has_schedule: true,
   schedule_enabled: true,
   schedule_name: 'Nightly production backup',
   schedule_timezone: 'UTC',
   next_run: '2026-05-17T02:00:00.000Z',
+}
+
+/** A Borg 2 repository with its stored size (#981): the card reads the same
+ * figure the archive header and the info dialog show, named by its source. */
+const borg2RepositoryWithStoredSize: Repository = {
+  ...sampleRepository,
+  id: 44,
+  name: 'Borg 2 on a store URL',
+  path: 'rest://backup-host/repos/production',
+  repository_type: 'sftp',
+  borg_version: 2,
+  archive_count: 35,
+  total_size: '2.35 GB',
+  storage: borg2Storage,
+}
+
+const borg1RepositoryWithStoredSize: Repository = {
+  ...sampleRepository,
+  id: 45,
+  name: 'Borg 1 with cache statistics',
+  borg_version: 1,
+  archive_count: 21,
+  total_size: '2.40 TB',
+  storage: borg1Storage,
+}
+
+/** Just imported: the chain (stats, archive_sync, history_index) is queued,
+ * so count, size and last backup read "indexing", not 0 / N/A / never (#1063). */
+const freshlyImportedRepository: Repository = {
+  ...sampleRepository,
+  id: 46,
+  name: 'Imported a moment ago',
+  borg_version: 2,
+  archive_count: 0,
+  total_size: null,
+  last_backup: null,
+  last_check: null,
+  last_compact: null,
+  last_prune: null,
+  last_index: null,
+  has_schedule: false,
+  schedule_enabled: false,
+  schedule_name: null,
+  next_run: null,
+  storage: unknownStorage,
+  index_pending_kinds: ['archive_sync', 'history_index', 'stats'],
 }
 
 const localRepositoryWithMirror: Repository = {
@@ -73,6 +123,7 @@ const defaultArgs = {
   onCheck: noop,
   onCompact: noop,
   onPrune: noop,
+  onPrunePreview: noop,
   onWipeContents: noop,
   onBreakLock: noop,
   onEdit: noop,
@@ -110,6 +161,50 @@ export const Default: Story = {
   ),
 }
 
+export const Borg2StoredSize: Story = {
+  args: {
+    ...defaultArgs,
+    repository: borg2RepositoryWithStoredSize,
+  },
+}
+
+export const Borg1StoredSize: Story = {
+  args: {
+    ...defaultArgs,
+    repository: borg1RepositoryWithStoredSize,
+  },
+}
+
+export const SizeUnknown: Story = {
+  args: {
+    ...defaultArgs,
+    repository: {
+      ...borg2RepositoryWithStoredSize,
+      total_size: null,
+      storage: { ...borg2Storage, size_bytes: null, size_source: null, measured_at: null },
+    },
+  },
+}
+
+export const IndexingAfterImport: Story = {
+  args: {
+    ...defaultArgs,
+    repository: freshlyImportedRepository,
+  },
+}
+
+export const SizeStillMeasuring: Story = {
+  args: {
+    ...defaultArgs,
+    repository: {
+      ...borg2RepositoryWithStoredSize,
+      total_size: null,
+      storage: { ...borg2Storage, size_bytes: null, size_source: null, measured_at: null },
+      index_pending_kinds: ['stats'],
+    },
+  },
+}
+
 export const WithoutBreakLockAccess: Story = {
   args: {
     ...defaultArgs,
@@ -130,6 +225,24 @@ export const WithUploadLimit: Story = {
       id: 52,
       name: 'Throttled Production Archive',
       upload_ratelimit_kib: 1536,
+    },
+  },
+  render: (args) => (
+    <Box sx={{ width: 620, maxWidth: 'calc(100vw - 32px)' }}>
+      <RepositoryCard {...args} />
+    </Box>
+  ),
+}
+
+export const WithoutRunHistory: Story = {
+  args: {
+    ...defaultArgs,
+    repository: {
+      ...sampleRepository,
+      last_check: null,
+      last_compact: null,
+      last_prune: null,
+      last_index: null,
     },
   },
   render: (args) => (
@@ -199,6 +312,25 @@ export const EnableCloudMirror: Story = {
       storage_backend: 'local',
       execution_target: 'local',
       rclone_storage: null,
+    },
+  },
+  render: (args) => (
+    <Box sx={{ width: 620, maxWidth: 'calc(100vw - 32px)' }}>
+      <RepositoryCard {...args} />
+    </Box>
+  ),
+}
+
+// Spec 6.8: with background work off, neither last-run entry can move, so
+// the card says so instead of reading "Never".
+export const BackgroundWorkOff: Story = {
+  args: {
+    ...defaultArgs,
+    repository: {
+      ...sampleRepository,
+      index_mode: 'off',
+      last_prune: null,
+      last_index: null,
     },
   },
   render: (args) => (

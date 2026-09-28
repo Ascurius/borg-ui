@@ -6,20 +6,17 @@ import {
   Chip,
   DialogActions,
   FormControl,
-  FormControlLabel,
   FormHelperText,
-  FormLabel,
   InputLabel,
   MenuItem,
   Paper,
-  Radio,
-  RadioGroup,
   Select,
   Stack,
   TextField,
   Typography,
 } from '@mui/material'
 import { AlertTriangle, Globe, Laptop, Monitor, Server, Settings, Terminal } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import WizardDialog, { type WizardStep } from '../../components/shared/WizardDialog'
 import type {
   AgentEnrollmentTokenCreate,
@@ -28,15 +25,10 @@ import type {
 } from '../../services/api'
 import AgentInstallCommand from './AgentInstallCommand'
 import type { AgentServiceUserMode, BorgInstallMode } from './agentInstallCommandText'
+import BorgInstallModeRadioGroup from './BorgInstallModeRadioGroup'
 import { isLocalAgentServerUrl, normalizeAgentServerUrl } from './agentServerUrl'
 
 type WizardStepIndex = 0 | 1 | 2
-
-const wizardSteps: WizardStep[] = [
-  { key: 'location', label: 'Target', icon: <Globe size={16} /> },
-  { key: 'config', label: 'Details', icon: <Settings size={16} /> },
-  { key: 'review', label: 'Install', icon: <Terminal size={16} /> },
-]
 
 function InlineWarning({ children }: { children: ReactNode }) {
   return (
@@ -71,62 +63,9 @@ function InlineWarning({ children }: { children: ReactNode }) {
 
 type ExpiryOption = '1h' | '24h' | '7d' | '30d' | 'never'
 
-const expiryOptions: Array<{ value: ExpiryOption; label: string }> = [
-  { value: '1h', label: '1 hour' },
-  { value: '24h', label: '24 hours' },
-  { value: '7d', label: '7 days' },
-  { value: '30d', label: '30 days' },
-  { value: 'never', label: 'Never' },
-]
+const expiryOptions: ExpiryOption[] = ['1h', '24h', '7d', '30d', 'never']
 
-const borgInstallOptions: Array<{
-  value: BorgInstallMode
-  label: string
-  description: string
-}> = [
-  {
-    value: 'borg1',
-    label: 'Borg 1.x',
-    description: "Default. Installs or verifies Borg 1 as 'borg'.",
-  },
-  {
-    value: 'borg2',
-    label: 'Borg 2.x beta only',
-    description: "Advanced experimental option. Installs or verifies Borg 2 as 'borg2'.",
-  },
-  {
-    value: 'both',
-    label: 'Borg 1.x and Borg 2.x beta',
-    description: "Advanced experimental option. Keeps Borg 1 as 'borg' and Borg 2 as 'borg2'.",
-  },
-  {
-    value: 'skip',
-    label: 'Skip Borg install',
-    description: 'Use this when Borg is managed separately on the agent machine.',
-  },
-]
-
-const serviceUserOptions: Array<{
-  value: AgentServiceUserMode
-  label: string
-  description: string
-}> = [
-  {
-    value: 'current',
-    label: 'Installing user',
-    description: 'The agent can access the same files as the user running the installer.',
-  },
-  {
-    value: 'dedicated',
-    label: 'Dedicated borg-ui-agent user',
-    description: 'Use a separate low-privilege service account for stricter isolation.',
-  },
-  {
-    value: 'root',
-    label: 'Root',
-    description: 'Use only when the agent must back up root-owned paths.',
-  },
-]
+const serviceUserOptions: AgentServiceUserMode[] = ['current', 'dedicated', 'root']
 
 function expiryPayload(option: ExpiryOption): Omit<AgentEnrollmentTokenCreate, 'name'> {
   switch (option) {
@@ -190,6 +129,12 @@ export default function AddAgentDialog({
   initialBorgInstallMode?: BorgInstallMode
   initialServiceUserMode?: AgentServiceUserMode
 }) {
+  const { t } = useTranslation()
+  const wizardSteps: WizardStep[] = [
+    { key: 'location', label: t('managedAgents.add.steps.target'), icon: <Globe size={16} /> },
+    { key: 'config', label: t('managedAgents.add.steps.details'), icon: <Settings size={16} /> },
+    { key: 'review', label: t('managedAgents.add.steps.install'), icon: <Terminal size={16} /> },
+  ]
   const [step, setStep] = useState<WizardStepIndex>(0)
   const [agentName, setAgentName] = useState(initialAgentName)
   const [expiry, setExpiry] = useState<ExpiryOption>('7d')
@@ -243,8 +188,9 @@ export default function AddAgentDialog({
   const serverUrlIsInvalid = !normalizedServerUrl.startsWith('http')
   const canContinue =
     step === 0 ? !serverUrlIsInvalid : step === 1 ? agentName.trim().length > 0 : true
-  const selectedServiceUserOption =
-    serviceUserOptions.find((option) => option.value === serviceUserMode) || serviceUserOptions[0]
+  const selectedServiceUserOption = serviceUserOptions.includes(serviceUserMode)
+    ? serviceUserMode
+    : serviceUserOptions[0]
   const isRootServiceUser = serviceUserMode === 'root'
 
   const handleGenerate = async () => {
@@ -262,7 +208,7 @@ export default function AddAgentDialog({
       const message =
         err && typeof err === 'object' && 'message' in err
           ? String((err as { message?: string }).message)
-          : 'Failed to create enrollment token'
+          : t('managedAgents.add.errors.createToken')
       setError(message)
     }
   }
@@ -270,8 +216,14 @@ export default function AddAgentDialog({
   const renderTargetStep = () => (
     <Stack spacing={2.5}>
       <Stack spacing={1.25}>
-        <Typography variant="overline" color="text.secondary" sx={{ letterSpacing: 0.6 }}>
-          Platform
+        <Typography
+          variant="overline"
+          sx={{
+            color: 'text.secondary',
+            letterSpacing: 0.6,
+          }}
+        >
+          {t('managedAgents.add.platform')}
         </Typography>
         <Box
           sx={{
@@ -290,21 +242,33 @@ export default function AddAgentDialog({
             }}
           >
             <Stack spacing={1}>
-              <Stack direction="row" spacing={1} alignItems="center">
+              <Stack
+                direction="row"
+                spacing={1}
+                sx={{
+                  alignItems: 'center',
+                }}
+              >
                 <Server size={18} />
-                <Typography fontWeight={700}>Linux</Typography>
+                <Typography
+                  sx={{
+                    fontWeight: 700,
+                  }}
+                >
+                  {t('managedAgents.add.platforms.linux')}
+                </Typography>
               </Stack>
               <Chip
                 size="small"
                 color="primary"
-                label="Selected"
+                label={t('managedAgents.add.selected')}
                 sx={{ alignSelf: 'flex-start' }}
               />
             </Stack>
           </Paper>
           {[
-            { label: 'macOS', Icon: Laptop },
-            { label: 'Windows', Icon: Monitor },
+            { label: t('managedAgents.add.platforms.macos'), Icon: Laptop },
+            { label: t('managedAgents.add.platforms.windows'), Icon: Monitor },
           ].map(({ label, Icon }) => (
             <Paper
               key={label}
@@ -312,45 +276,66 @@ export default function AddAgentDialog({
               sx={{ p: 1.5, borderRadius: 1, opacity: 0.62, bgcolor: 'background.paper' }}
             >
               <Stack spacing={1}>
-                <Stack direction="row" spacing={1} alignItems="center">
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{
+                    alignItems: 'center',
+                  }}
+                >
                   <Icon size={18} />
-                  <Typography fontWeight={700}>{label}</Typography>
+                  <Typography
+                    sx={{
+                      fontWeight: 700,
+                    }}
+                  >
+                    {label}
+                  </Typography>
                 </Stack>
-                <Chip size="small" label="Coming later" sx={{ alignSelf: 'flex-start' }} />
+                <Chip
+                  size="small"
+                  label={t('managedAgents.add.comingLater')}
+                  sx={{ alignSelf: 'flex-start' }}
+                />
               </Stack>
             </Paper>
           ))}
         </Box>
       </Stack>
       <Stack spacing={1.25}>
-        <Typography variant="overline" color="text.secondary" sx={{ letterSpacing: 0.6 }}>
-          Server URL
+        <Typography
+          variant="overline"
+          sx={{
+            color: 'text.secondary',
+            letterSpacing: 0.6,
+          }}
+        >
+          {t('managedAgents.add.serverUrl')}
         </Typography>
         <TextField
-          label="Server URL"
+          label={t('managedAgents.add.serverUrl')}
           value={serverUrl}
           onChange={(event) => setServerUrl(event.target.value)}
           error={serverUrlIsInvalid}
           helperText={
             isLocalAgentServerUrl(normalizedServerUrl) && !serverUrlIsInvalid ? (
-              <InlineWarning>
-                localhost only works when the agent runs on the same machine as Borg UI. Remote
-                machines need a reachable host name, IP, or HTTPS URL.
-              </InlineWarning>
+              <InlineWarning>{t('managedAgents.add.localhostWarning')}</InlineWarning>
             ) : (
-              'This URL must be reachable from the agent machine.'
+              t('managedAgents.add.serverUrlHelper')
             )
           }
-          FormHelperTextProps={{
-            component: 'div',
-            sx: {
-              mx: 0,
-              ...(isLocalAgentServerUrl(normalizedServerUrl) && !serverUrlIsInvalid
-                ? { color: 'warning.main' }
-                : null),
+          fullWidth
+          slotProps={{
+            formHelperText: {
+              component: 'div',
+              sx: {
+                mx: 0,
+                ...(isLocalAgentServerUrl(normalizedServerUrl) && !serverUrlIsInvalid
+                  ? { color: 'warning.main' }
+                  : null),
+              },
             },
           }}
-          fullWidth
         />
       </Stack>
     </Stack>
@@ -359,52 +344,61 @@ export default function AddAgentDialog({
   const renderDetailsStep = () => (
     <Stack spacing={2}>
       <TextField
-        label="Agent name"
+        label={t('managedAgents.add.agentName')}
         value={agentName}
         onChange={(event) => setAgentName(event.target.value)}
         fullWidth
         autoFocus
       />
       <TextField
-        label="Default path"
+        label={t('managedAgents.add.defaultPath')}
         value={defaultPath}
         onChange={(event) => setDefaultPath(event.target.value)}
-        placeholder="/home/karanhudia"
-        helperText="Starting directory for browsing this agent's files."
+        placeholder="/home/user"
+        helperText={t('managedAgents.add.defaultPathHelper')}
         fullWidth
       />
       <FormControl fullWidth>
-        <InputLabel id="agent-token-expiry-label">Token expiry</InputLabel>
+        <InputLabel id="agent-token-expiry-label">{t('managedAgents.add.tokenExpiry')}</InputLabel>
         <Select
           labelId="agent-token-expiry-label"
-          label="Token expiry"
+          label={t('managedAgents.add.tokenExpiry')}
           value={expiry}
           onChange={(event) => setExpiry(event.target.value as ExpiryOption)}
         >
           {expiryOptions.map((option) => (
-            <MenuItem key={option.value} value={option.value}>
-              {option.label}
+            <MenuItem key={option} value={option}>
+              {t(`managedAgents.add.expiry.${option}`)}
             </MenuItem>
           ))}
         </Select>
       </FormControl>
       <FormControl fullWidth>
-        <InputLabel id="agent-service-user-label">Service user</InputLabel>
+        <InputLabel id="agent-service-user-label">{t('managedAgents.add.serviceUser')}</InputLabel>
         <Select
           labelId="agent-service-user-label"
-          label="Service user"
+          label={t('managedAgents.add.serviceUser')}
           value={serviceUserMode}
-          renderValue={(value) =>
-            serviceUserOptions.find((option) => option.value === value)?.label || 'Installing user'
-          }
+          renderValue={(value) => t(`managedAgents.add.serviceUsers.${value}.label`)}
           onChange={(event) => setServiceUserMode(event.target.value as AgentServiceUserMode)}
         >
           {serviceUserOptions.map((option) => (
-            <MenuItem key={option.value} value={option.value}>
+            <MenuItem key={option} value={option}>
               <Stack spacing={0.25}>
-                <Typography fontWeight={700}>{option.label}</Typography>
-                <Typography variant="body2" color="text.secondary">
-                  {option.description}
+                <Typography
+                  sx={{
+                    fontWeight: 700,
+                  }}
+                >
+                  {t(`managedAgents.add.serviceUsers.${option}.label`)}
+                </Typography>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: 'text.secondary',
+                  }}
+                >
+                  {t(`managedAgents.add.serviceUsers.${option}.description`)}
                 </Typography>
               </Stack>
             </MenuItem>
@@ -415,63 +409,17 @@ export default function AddAgentDialog({
           sx={{ mx: 0, color: isRootServiceUser ? 'warning.main' : undefined }}
         >
           {isRootServiceUser ? (
-            <InlineWarning>
-              Root mode lets this agent run root-level Borg operations. Use it only for root-owned
-              paths.
-            </InlineWarning>
+            <InlineWarning>{t('managedAgents.add.rootWarning')}</InlineWarning>
           ) : (
-            selectedServiceUserOption.description
+            t(`managedAgents.add.serviceUsers.${selectedServiceUserOption}.description`)
           )}
         </FormHelperText>
       </FormControl>
-      <FormControl component="fieldset">
-        <FormLabel component="legend">Borg installation</FormLabel>
-        <RadioGroup
-          value={borgInstallMode}
-          onChange={(event) => setBorgInstallMode(event.target.value as BorgInstallMode)}
-          sx={{
-            mt: 1,
-            display: 'grid',
-            gap: 1,
-            gridTemplateColumns: { xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' },
-          }}
-        >
-          {borgInstallOptions.map((option) => {
-            const selected = borgInstallMode === option.value
-            return (
-              <FormControlLabel
-                key={option.value}
-                value={option.value}
-                control={<Radio />}
-                label={
-                  <Stack spacing={0.35} sx={{ minWidth: 0 }}>
-                    <Typography fontWeight={700}>{option.label}</Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      {option.description}
-                    </Typography>
-                  </Stack>
-                }
-                sx={{
-                  m: 0,
-                  p: 1.25,
-                  alignItems: 'flex-start',
-                  border: '1px solid',
-                  borderColor: selected ? 'primary.main' : 'divider',
-                  borderRadius: 1,
-                  bgcolor: selected ? 'action.hover' : 'background.paper',
-                  cursor: 'pointer',
-                  transition: 'border-color 180ms ease, background-color 180ms ease',
-                  '&:hover': {
-                    borderColor: selected ? 'primary.main' : 'text.secondary',
-                    bgcolor: 'action.hover',
-                  },
-                  '& .MuiFormControlLabel-label': { width: '100%' },
-                }}
-              />
-            )
-          })}
-        </RadioGroup>
-      </FormControl>
+      <BorgInstallModeRadioGroup
+        value={borgInstallMode}
+        onChange={setBorgInstallMode}
+        i18nPrefix="managedAgents.add"
+      />
     </Stack>
   )
 
@@ -493,9 +441,15 @@ export default function AddAgentDialog({
       open={open}
       onClose={onClose}
       title={
-        <Stack direction="row" spacing={1} alignItems="center">
+        <Stack
+          direction="row"
+          spacing={1}
+          sx={{
+            alignItems: 'center',
+          }}
+        >
           <Terminal size={19} />
-          <span>Add Agent</span>
+          <span>{t('managedAgents.add.title')}</span>
         </Stack>
       }
       steps={wizardSteps}
@@ -506,17 +460,19 @@ export default function AddAgentDialog({
       }}
       footer={
         <DialogActions sx={{ px: { xs: 1, sm: 3 }, pb: { xs: 1, sm: 2 } }}>
-          <Button onClick={onClose}>{step === 2 ? 'Close' : 'Cancel'}</Button>
+          <Button onClick={onClose}>
+            {step === 2 ? t('common.buttons.close') : t('common.buttons.cancel')}
+          </Button>
           <Box sx={{ flex: 1 }} />
           <Button
             disabled={step === 0 || creatingToken}
             onClick={() => setStep((step - 1) as WizardStepIndex)}
           >
-            Back
+            {t('common.buttons.back')}
           </Button>
           {step === 0 ? (
             <Button variant="contained" onClick={() => setStep(1)} disabled={!canContinue}>
-              Next
+              {t('common.buttons.next')}
             </Button>
           ) : step === 1 ? (
             <Button
@@ -524,7 +480,7 @@ export default function AddAgentDialog({
               onClick={handleGenerate}
               disabled={!canContinue || creatingToken}
             >
-              Generate install command
+              {t('managedAgents.add.generateInstallCommand')}
             </Button>
           ) : null}
         </DialogActions>

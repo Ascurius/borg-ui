@@ -4,95 +4,10 @@ import json
 
 import pytest
 
+from fastapi import HTTPException
+from sqlalchemy.exc import OperationalError
+
 from app.core.borg_router import BorgRouter
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_update_stats_delegates_to_v2_repository_helper(db_session):
-    repo = SimpleNamespace(borg_version=2)
-
-    with patch(
-        "app.api.repositories.update_repository_stats",
-        new=AsyncMock(return_value=True),
-    ) as mock_update:
-        result = await BorgRouter(repo).update_stats(db_session)
-
-    assert result is True
-    mock_update.assert_awaited_once_with(repo, db_session)
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_update_stats_delegates_to_v1_repository_helper(db_session):
-    repo = SimpleNamespace(borg_version=1)
-
-    with patch(
-        "app.api.repositories.update_repository_stats",
-        new=AsyncMock(return_value=False),
-    ) as mock_update:
-        result = await BorgRouter(repo).update_stats(db_session)
-
-    assert result is False
-    mock_update.assert_awaited_once_with(repo, db_session)
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_calculate_total_size_bytes_delegates_to_v2_repository_service():
-    repo = SimpleNamespace(
-        borg_version=2,
-        path="/tmp/repo",
-        remote_path="/usr/bin/borg2",
-    )
-
-    with patch(
-        "app.services.v2.repository_service.repository_v2_service.calculate_total_size_bytes",
-        new=AsyncMock(return_value=4096),
-    ) as mock_size:
-        size = await BorgRouter(repo).calculate_total_size_bytes(
-            env={"BORG_PASSPHRASE": "secret"},
-            info_timeout=99,
-            use_bypass_lock=True,
-            temp_key_file="/tmp/key",
-        )
-
-    assert size == 4096
-    mock_size.assert_awaited_once_with(
-        repo,
-        temp_key_file="/tmp/key",
-        timeout=30,
-    )
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_calculate_total_size_bytes_uses_v1_info_command():
-    repo = SimpleNamespace(
-        borg_version=1,
-        path="/tmp/repo",
-        remote_path="/usr/bin/borg",
-    )
-
-    with patch(
-        "app.core.borg.borg._execute_command",
-        new=AsyncMock(
-            return_value={
-                "success": True,
-                "stdout": '{"cache":{"stats":{"unique_csize": 2048}}}',
-            }
-        ),
-    ) as mock_exec:
-        size = await BorgRouter(repo).calculate_total_size_bytes(
-            env={"BORG_PASSPHRASE": "secret"},
-            info_timeout=55,
-            use_bypass_lock=True,
-        )
-
-    assert size == 2048
-    cmd = mock_exec.await_args.args[0]
-    assert "--remote-path" in cmd
-    assert "--bypass-lock" in cmd
 
 
 @pytest.mark.unit
@@ -115,6 +30,7 @@ async def test_check_delegates_to_agent_when_managed():
         job_kind="repository.check",
         maintenance_kind="check",
         maintenance_job_id=7,
+        raise_busy=False,
     )
     mock_v2.assert_not_awaited()
 
@@ -161,15 +77,14 @@ async def test_run_agent_maintenance_translates_http_errors_for_background_flows
 
 
 @pytest.mark.parametrize(
-    "maintenance_kind, job_kind, model_name, extra",
+    "maintenance_kind, job_kind, params",
     [
-        ("prune", "repository.prune", "PruneJob", {}),
-        ("compact", "repository.compact", "CompactJob", {}),
-        ("check", "repository.check", "CheckJob", {}),
+        ("prune", "repository.prune", {}),
+        ("compact", "repository.compact", {}),
+        ("check", "repository.check", {}),
         (
             "delete_archive",
             "repository.delete_archive",
-            "DeleteArchiveJob",
             {"archive_name": "arch-1"},
         ),
     ],
@@ -177,7 +92,7 @@ async def test_run_agent_maintenance_translates_http_errors_for_background_flows
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_run_agent_maintenance_fails_the_job_when_queue_fails(
-    db_session, maintenance_kind, job_kind, model_name, extra
+    db_session, maintenance_kind, job_kind, params
 ):
     # If the agent job cannot even be queued (e.g. database is locked), the
     # already-created maintenance *_job must be failed closed so it does not
@@ -185,30 +100,28 @@ async def test_run_agent_maintenance_fails_the_job_when_queue_fails(
     # the session's transaction, so the fail-closed helper has to recover it and
     # still persist 'failed' -- exercise the real helper against a real row, not
     # a mock that would hide that defect. Parameterized across every maintenance
-    # kind so a wrong entry in the kind->model mapping cannot slip through.
+    # kind so a wrong kind cannot slip through.
     from datetime import datetime
 
-    import app.database.models as models_mod
-    from app.database.models import PruneJob, Repository
+    from app.database.models import Operation, Repository
+    from tests.utils.operations import seed_job_operation
 
-    model = getattr(models_mod, model_name)
     repo_row = Repository(
-        name=f"Locked {model_name}",
+        name=f"Locked {maintenance_kind}",
         path=f"/repos/locked-{maintenance_kind}",
         encryption="none",
         repository_type="local",
     )
     db_session.add(repo_row)
     db_session.flush()
-    job = model(
+    job = seed_job_operation(
+        db_session,
+        maintenance_kind,
         repository_id=repo_row.id,
-        repository_path=repo_row.path,
         status="pending",
         created_at=datetime.utcnow(),
-        **extra,
+        **params,
     )
-    db_session.add(job)
-    db_session.commit()
     job_id = job.id
 
     repo = SimpleNamespace(borg_version=2, id=repo_row.id, executor_type="agent")
@@ -219,8 +132,8 @@ async def test_run_agent_maintenance_fails_the_job_when_queue_fails(
         # failed commit) leaves it requiring a rollback before any further query
         # can run -- exactly the state the fail-closed helper must recover from.
         try:
-            db_session.add(PruneJob(repository_path="/x", status="pending"))
-            db_session.flush()  # repository_id is NOT NULL -> IntegrityError
+            db_session.add(Operation(kind="prune", category="maintenance"))
+            db_session.flush()  # status/run_id are NOT NULL -> IntegrityError
         except Exception:
             pass
         raise RuntimeError("database is locked")
@@ -241,7 +154,7 @@ async def test_run_agent_maintenance_fails_the_job_when_queue_fails(
 
     # The real _fail_orphaned_maintenance_job ran despite the doomed transaction
     # and persisted the failed state.
-    refreshed = db_session.query(model).get(job_id)
+    refreshed = db_session.get(Operation, job_id)
     assert refreshed.status == "failed"
     assert refreshed.completed_at is not None
     assert refreshed.error_message
@@ -267,6 +180,9 @@ async def test_compact_delegates_to_agent_when_managed():
         job_kind="repository.compact",
         maintenance_kind="compact",
         maintenance_job_id=7,
+        is_cancelled=None,
+        wait_for_read_work=False,
+        raise_busy=False,
     )
     mock_v2.assert_not_awaited()
 
@@ -293,6 +209,9 @@ async def test_prune_delegates_to_agent_when_managed():
         job_kind="repository.prune",
         maintenance_kind="prune",
         maintenance_job_id=7,
+        is_cancelled=None,
+        wait_for_read_work=False,
+        raise_busy=False,
         operation={
             "keep_hourly": 1,
             "keep_daily": 2,
@@ -365,7 +284,7 @@ async def test_compact_delegates_to_v1_service():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_prune_delegates_to_v2_service():
+async def test_prune_delegates_to_v2_service_positional_args():
     repo = SimpleNamespace(borg_version=2, id=41)
 
     with patch(
@@ -1133,6 +1052,7 @@ async def test_delete_archive_delegates_to_agent_when_managed():
         maintenance_kind="delete_archive",
         maintenance_job_id=7,
         operation={"archive": "aid:deadbeef"},
+        raise_busy=False,
     )
     mock_v2.assert_not_awaited()
 
@@ -1168,3 +1088,156 @@ async def test_prune_delegates_to_v2_service():
         keep_yearly=6,
         dry_run=True,
     )
+
+
+@pytest.mark.parametrize(
+    "maintenance_kind, job_kind, extra",
+    [
+        ("prune", "repository.prune", {}),
+        ("compact", "repository.compact", {}),
+        ("check", "repository.check", {}),
+        ("delete_archive", "repository.delete_archive", {"archive_name": "arch-1"}),
+    ],
+)
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_run_agent_maintenance_fails_the_operation_when_queue_is_refused(
+    db_session, maintenance_kind, job_kind, extra
+):
+    # The maintenance job is an `operations` row the caller created `running`
+    # (post-backup prune/compact/check). When admission refuses the agent
+    # job, that row must be failed, or it counts as active work and blocks
+    # every backup of the repository until a restart.
+    from app.database.models import Operation, Repository
+    from app.services.operations.maintenance_start import (
+        active_maintenance_operation,
+        start_inline_maintenance,
+    )
+
+    repo_row = Repository(
+        name=f"Refused {maintenance_kind}",
+        path=f"/repos/refused-{maintenance_kind}",
+        encryption="none",
+        repository_type="local",
+        executor_type="agent",
+        execution_target="agent",
+    )
+    db_session.add(repo_row)
+    db_session.commit()
+    operation = start_inline_maintenance(
+        db_session, repo_row, maintenance_kind, params=extra, user_id=None
+    )
+    operation_id = operation.id
+    repository_id = repo_row.id
+    repo = SimpleNamespace(borg_version=1, id=repository_id, executor_type="agent")
+    refused = HTTPException(
+        status_code=409,
+        detail={
+            "key": "backend.errors.jobs.repositoryOperationActive",
+            "params": {
+                "requested_operation": maintenance_kind,
+                "active_operation": "list_archives",
+                "active_job_table": "agent_jobs",
+                "active_status": "running",
+            },
+        },
+    )
+
+    with (
+        patch("app.database.database.SessionLocal", return_value=db_session),
+        patch(
+            "app.services.repository_executor.queue_agent_repository_operation_job",
+            side_effect=refused,
+        ),
+        pytest.raises(
+            RuntimeError,
+            match=(
+                f"agent {maintenance_kind} failed: "
+                "list_archives is active on the repository"
+            ),
+        ),
+    ):
+        await BorgRouter(repo)._run_agent_maintenance(
+            job_kind=job_kind,
+            maintenance_kind=maintenance_kind,
+            maintenance_job_id=operation_id,
+        )
+
+    # The router closed the session it was handed; read the rows back fresh.
+    stored = db_session.get(Operation, operation_id)
+    assert stored.status == "failed"
+    assert stored.completed_at is not None
+    assert (
+        stored.error_message
+        == "agent job could not be queued: list_archives is active on the repository"
+    )
+    # Nothing is left that admission would count as active maintenance.
+    assert (
+        active_maintenance_operation(db_session, repository_id, maintenance_kind)
+        is None
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (
+            HTTPException(
+                status_code=409,
+                detail={
+                    "key": "backend.errors.jobs.repositoryOperationActive",
+                    "params": {"active_operation": "list_archives"},
+                },
+            ),
+            "agent job could not be queued: list_archives is active on the repository",
+        ),
+        (
+            HTTPException(
+                status_code=409,
+                detail={"key": "backend.errors.agents.noQueueableAgent"},
+            ),
+            "agent job could not be queued: backend.errors.agents.noQueueableAgent",
+        ),
+        (
+            RuntimeError("database is locked"),
+            "agent job could not be queued: database is locked",
+        ),
+        (
+            HTTPException(
+                status_code=409,
+                detail={
+                    "key": "backend.errors.repo.pruneAlreadyRunning",
+                    "params": {"active_operation": "prune"},
+                },
+            ),
+            "agent job could not be queued: backend.errors.repo.pruneAlreadyRunning",
+        ),
+        (
+            HTTPException(
+                status_code=502, detail={"key": "x", "message": "agent gone"}
+            ),
+            "agent job could not be queued: agent gone",
+        ),
+        (RuntimeError(), "agent job could not be queued: RuntimeError"),
+    ],
+)
+def test_queue_failure_message_names_the_cause(error, expected):
+    from app.core.borg_router import _queue_failure_message
+
+    assert _queue_failure_message(error) == expected
+
+
+@pytest.mark.unit
+def test_queue_failure_message_keeps_a_database_error_as_the_cause():
+    # SQLAlchemy errors carry a `detail` attribute too (an empty list); only
+    # an HTTPException's detail is the cause, anything else is rendered as is.
+    from app.core.borg_router import _queue_failure_message
+
+    message = _queue_failure_message(
+        OperationalError("INSERT INTO agent_jobs", {}, Exception("database is locked"))
+    )
+
+    # The statement and its parameters (the agent job payload, secrets
+    # included) stay out of the row; the driver's error is the cause.
+    assert message == "agent job could not be queued: Exception: database is locked"

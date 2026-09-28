@@ -12,7 +12,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { formatDateTimeFull } from '../../utils/dateUtils'
-import { useT } from './tokens'
+import { statusColor, useT } from './tokens'
 
 /**
  * Status dot. Was an animated pulse ring with a colored glow; now a static
@@ -41,13 +41,6 @@ type DimStatusItem = {
   status: string
   value: string
   tooltip?: string
-}
-
-const DIM_STATUS: Record<string, { color: string }> = {
-  healthy: { color: '#22c55e' },
-  warning: { color: '#f59e0b' },
-  critical: { color: '#ef4444' },
-  unknown: { color: '#475569' },
 }
 
 function dimSince(dt: string | null, t: (key: string) => string): string {
@@ -84,7 +77,7 @@ function restoreDimValue(
 }
 
 function DimIcon({ status, size = 11 }: { status: string; size?: number }) {
-  const { color } = DIM_STATUS[status] ?? DIM_STATUS.unknown
+  const color = statusColor(status, useT())
   if (status === 'healthy') return <CheckCircle2 size={size} color={color} />
   if (status === 'warning') return <AlertTriangle size={size} color={color} />
   if (status === 'critical') return <XCircle size={size} color={color} />
@@ -189,14 +182,16 @@ export function DimStatusGrid({
       }}
     >
       {items.map((item) => {
-        const { color } = DIM_STATUS[item.status] ?? DIM_STATUS.unknown
+        const color = statusColor(item.status, T)
         return (
           <Stack
             key={item.label}
             direction="row"
             spacing={0.5}
-            alignItems="center"
-            sx={{ minWidth: 0 }}
+            sx={{
+              alignItems: 'center',
+              minWidth: 0,
+            }}
           >
             {/* Inline cell: icon and label on the left, value pushed to the
                 right edge by flexGrow on the label. Translation values are
@@ -295,13 +290,13 @@ export function ScheduleBadge({
       <Stack
         direction="row"
         spacing={0.4}
-        alignItems="center"
         title={
           scheduleName
             ? `${t('dashboard.scheduleBadge.pausedTitle', { name: scheduleName })} (${timezoneLabel})`
             : `${t('dashboard.scheduleBadge.pausedTitleGeneric')} (${timezoneLabel})`
         }
         sx={{
+          alignItems: 'center',
           px: 1,
           py: 0.4,
           bgcolor: T.amberDim,
@@ -332,9 +327,9 @@ export function ScheduleBadge({
       <Stack
         direction="row"
         spacing={0.4}
-        alignItems="center"
         title={`${scheduleName ?? t('dashboard.scheduleBadge.scheduled')} (${timezoneLabel})`}
         sx={{
+          alignItems: 'center',
           px: 1,
           py: 0.4,
           bgcolor: T.blueDim,
@@ -379,13 +374,13 @@ export function ScheduleBadge({
     <Stack
       direction="row"
       spacing={0.5}
-      alignItems="center"
       title={
         scheduleName
           ? `${t('dashboard.scheduleBadge.nextRunTitle', { name: scheduleName, label })} (${timezoneLabel})`
           : `${t('dashboard.scheduleBadge.nextRunTitleGeneric', { label })} (${timezoneLabel})`
       }
       sx={{
+        alignItems: 'center',
         px: 1,
         py: 0.4,
         bgcolor: T.indigoDim,

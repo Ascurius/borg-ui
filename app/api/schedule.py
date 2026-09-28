@@ -7,12 +7,11 @@ import asyncio
 
 from app.database.database import get_db, SessionLocal
 from app.database.models import (
+    Operation,
     User,
     ScheduledJob,
     ScheduledJobRepository,
-    BackupJob,
-    CompactJob,
-    PruneJob,
+    AvailabilityScheduleSkip,
     Repository,
     Script,
     RepositoryScript,
@@ -24,12 +23,15 @@ from app.core.authorization import authorize_request
 from app.core.borg_router import BorgRouter
 from app.core.security import get_current_user, check_repo_access
 from app.config import settings
-from app.api.maintenance_jobs import create_started_maintenance_job
+from app.services.operations.maintenance_start import (
+    fail_inline_maintenance,
+    finish_inline_maintenance,
+    start_inline_maintenance,
+)
 from app.services.notification_service import notification_service
 from app.services.check_scheduler import run_due_scheduled_checks
 from app.services.restore_check_scheduler import run_due_scheduled_restore_checks
 from app.services.rclone_mirror_scheduler import dispatch_due_scheduled_rclone_mirrors
-from app.services.backup_route_planner import apply_repository_route_to_backup_job
 from app.services.job_admission import (
     OPERATION_BACKUP,
     count_active_scheduled_backup_jobs,
@@ -38,6 +40,12 @@ from app.services.job_admission import (
     lock_backup_capacity_scope,
 )
 from app.utils.datetime_utils import serialize_datetime
+from app.services.operations.backup_facade import (
+    create_backup_operation,
+    refresh_backup_job,
+    resolve_backup_job,
+    wait_out_backup_operation,
+)
 from app.utils.archive_names import build_archive_name
 from app.utils.schedule_time import (
     DEFAULT_SCHEDULE_TIMEZONE,
@@ -47,10 +55,36 @@ from app.utils.schedule_time import (
     normalize_schedule_timezone,
     to_utc_naive,
 )
+from app.services.schedule_availability import (
+    DEFAULT_AVAILABILITY_CHECK_INTERVAL_MINUTES,
+    repositories_available,
+    validate_availability_intervals,
+)
 
 logger = structlog.get_logger()
 router = APIRouter(tags=["schedule"], dependencies=[Depends(authorize_request)])
 _active_scheduled_backup_runs: set[str] = set()
+
+
+def _record_availability_skip(
+    db: Session,
+    job: ScheduledJob,
+    now: datetime,
+    *,
+    reason: str,
+    detail: str,
+) -> None:
+    """Persist a neutral availability decision for Activity history."""
+    db.add(
+        AvailabilityScheduleSkip(
+            scheduled_job_id=job.id,
+            reason=reason,
+            detail=detail,
+            occurred_at=now,
+            next_check_at=job.next_run,
+        )
+    )
+
 
 # Pydantic models
 from pydantic import BaseModel
@@ -58,7 +92,12 @@ from pydantic import BaseModel
 
 class ScheduledJobCreate(BaseModel):
     name: str
-    cron_expression: str
+    cron_expression: Optional[str] = None
+    schedule_mode: str = "cron"
+    availability_check_interval_minutes: int = (
+        DEFAULT_AVAILABILITY_CHECK_INTERVAL_MINUTES
+    )
+    min_success_interval_minutes: int = 0
     timezone: Optional[str] = None
     repository: Optional[str] = None  # Legacy single-repo (by path)
     repository_id: Optional[int] = None  # Single-repo (by ID)
@@ -95,6 +134,9 @@ class ScheduledJobCreate(BaseModel):
 class ScheduledJobUpdate(BaseModel):
     name: Optional[str] = None
     cron_expression: Optional[str] = None
+    schedule_mode: Optional[str] = None
+    availability_check_interval_minutes: Optional[int] = None
+    min_success_interval_minutes: Optional[int] = None
     timezone: Optional[str] = None
     repository: Optional[str] = None  # Legacy single-repo (by path)
     repository_id: Optional[int] = None  # Single-repo (by ID)
@@ -148,6 +190,19 @@ def _calculate_next_schedule_run(
     schedule_timezone: Optional[str] = None,
 ) -> datetime:
     return calculate_next_cron_run(cron_expression, base_time, schedule_timezone)
+
+
+def _next_scheduled_job_run(job: ScheduledJob, now: datetime) -> Optional[datetime]:
+    """Return the next due time for cron and availability automations."""
+    if job.schedule_mode == "availability":
+        return now + timedelta(minutes=job.availability_check_interval_minutes)
+    if not job.cron_expression:
+        return None
+    return _calculate_next_schedule_run(
+        job.cron_expression,
+        now,
+        job.timezone or DEFAULT_SCHEDULE_TIMEZONE,
+    )
 
 
 def _raise_invalid_schedule_timezone(exc: InvalidScheduleTimezone) -> NoReturn:
@@ -422,6 +477,9 @@ async def get_scheduled_jobs(
                     "id": job.id,
                     "name": job.name,
                     "cron_expression": job.cron_expression,
+                    "schedule_mode": job.schedule_mode,
+                    "availability_check_interval_minutes": job.availability_check_interval_minutes,
+                    "min_success_interval_minutes": job.min_success_interval_minutes,
                     "timezone": job.timezone or DEFAULT_SCHEDULE_TIMEZONE,
                     "repository": job.repository,
                     "repository_id": job.repository_id,
@@ -581,13 +639,33 @@ async def create_scheduled_job(
             )
             # Continue anyway - the atomic transaction + rollback will protect us
 
-        # Validate timezone and cron expression
+        if job_data.schedule_mode not in {"cron", "availability"}:
+            raise HTTPException(
+                status_code=422, detail={"key": "backend.errors.schedule.invalidMode"}
+            )
+        try:
+            validate_availability_intervals(
+                job_data.availability_check_interval_minutes,
+                job_data.min_success_interval_minutes,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"key": "backend.errors.schedule.invalidAvailabilityInterval"},
+            ) from exc
+
+        # Validate timezone for both trigger types. Cron parsing only applies
+        # to the fixed-time trigger; availability schedules start polling now.
         try:
             schedule_timezone = normalize_schedule_timezone(job_data.timezone)
-            next_run = _calculate_next_schedule_run(
-                job_data.cron_expression,
-                schedule_timezone=schedule_timezone,
-            )
+            if job_data.schedule_mode == "availability":
+                next_run = to_utc_naive(datetime.now(timezone.utc))
+            else:
+                if not job_data.cron_expression:
+                    raise ValueError("cron expression is required")
+                next_run = _calculate_next_schedule_run(
+                    job_data.cron_expression, schedule_timezone=schedule_timezone
+                )
         except InvalidScheduleTimezone as e:
             _raise_invalid_schedule_timezone(e)
         except Exception as e:
@@ -633,7 +711,12 @@ async def create_scheduled_job(
         # Create scheduled job
         scheduled_job = ScheduledJob(
             name=job_data.name,
-            cron_expression=job_data.cron_expression,
+            cron_expression=(
+                job_data.cron_expression if job_data.schedule_mode == "cron" else None
+            ),
+            schedule_mode=job_data.schedule_mode,
+            availability_check_interval_minutes=job_data.availability_check_interval_minutes,
+            min_success_interval_minutes=job_data.min_success_interval_minutes,
             timezone=schedule_timezone,
             repository=job_data.repository,  # Legacy
             repository_id=job_data.repository_id,  # Single-repo by ID
@@ -777,6 +860,13 @@ async def create_scheduled_job(
                 "id": scheduled_job.id,
                 "name": scheduled_job.name,
                 "cron_expression": scheduled_job.cron_expression,
+                "schedule_mode": scheduled_job.schedule_mode,
+                "availability_check_interval_minutes": (
+                    scheduled_job.availability_check_interval_minutes
+                ),
+                "min_success_interval_minutes": (
+                    scheduled_job.min_success_interval_minutes
+                ),
                 "timezone": scheduled_job.timezone or DEFAULT_SCHEDULE_TIMEZONE,
                 "repository": scheduled_job.repository,
                 "enabled": scheduled_job.enabled,
@@ -1040,6 +1130,9 @@ async def get_scheduled_job(
                 "id": job.id,
                 "name": job.name,
                 "cron_expression": job.cron_expression,
+                "schedule_mode": job.schedule_mode,
+                "availability_check_interval_minutes": job.availability_check_interval_minutes,
+                "min_success_interval_minutes": job.min_success_interval_minutes,
                 "timezone": job.timezone or DEFAULT_SCHEDULE_TIMEZONE,
                 "repository": job.repository,
                 "enabled": job.enabled,
@@ -1121,23 +1214,58 @@ async def update_scheduled_job(
         schedule_definition_changed = (
             job_data.cron_expression is not None
             or "timezone" in job_data.model_fields_set
+            or job_data.schedule_mode is not None
+            or job_data.availability_check_interval_minutes is not None
+            or job_data.min_success_interval_minutes is not None
         )
         if schedule_definition_changed:
-            next_cron_expression = (
-                job_data.cron_expression
-                if job_data.cron_expression is not None
-                else job.cron_expression
+            next_schedule_mode = job_data.schedule_mode or job.schedule_mode
+            next_check_interval = (
+                job_data.availability_check_interval_minutes
+                if job_data.availability_check_interval_minutes is not None
+                else job.availability_check_interval_minutes
             )
+            next_min_success_interval = (
+                job_data.min_success_interval_minutes
+                if job_data.min_success_interval_minutes is not None
+                else job.min_success_interval_minutes
+            )
+            if next_schedule_mode not in {"cron", "availability"}:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"key": "backend.errors.schedule.invalidMode"},
+                )
+            try:
+                validate_availability_intervals(
+                    next_check_interval, next_min_success_interval
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "key": "backend.errors.schedule.invalidAvailabilityInterval"
+                    },
+                ) from exc
             try:
                 next_schedule_timezone = normalize_schedule_timezone(
                     job_data.timezone
                     if "timezone" in job_data.model_fields_set
                     else job.timezone
                 )
-                next_run = _calculate_next_schedule_run(
-                    next_cron_expression,
-                    schedule_timezone=next_schedule_timezone,
-                )
+                if next_schedule_mode == "availability":
+                    next_cron_expression = None
+                    next_run = to_utc_naive(datetime.now(timezone.utc))
+                else:
+                    next_cron_expression = (
+                        job_data.cron_expression
+                        if job_data.cron_expression is not None
+                        else job.cron_expression
+                    )
+                    if not next_cron_expression:
+                        raise ValueError("cron expression is required")
+                    next_run = _calculate_next_schedule_run(
+                        next_cron_expression, schedule_timezone=next_schedule_timezone
+                    )
             except InvalidScheduleTimezone as e:
                 _raise_invalid_schedule_timezone(e)
             except Exception as e:
@@ -1150,6 +1278,9 @@ async def update_scheduled_job(
                 )
 
             job.cron_expression = next_cron_expression
+            job.schedule_mode = next_schedule_mode
+            job.availability_check_interval_minutes = next_check_interval
+            job.min_success_interval_minutes = next_min_success_interval
             job.timezone = next_schedule_timezone
             job.next_run = next_run
 
@@ -1162,9 +1293,13 @@ async def update_scheduled_job(
             job.enabled = job_data.enabled
             if job.enabled and not was_enabled and not schedule_definition_changed:
                 try:
-                    job.next_run = _calculate_next_schedule_run(
-                        job.cron_expression,
-                        schedule_timezone=job.timezone or DEFAULT_SCHEDULE_TIMEZONE,
+                    job.next_run = (
+                        to_utc_naive(datetime.now(timezone.utc))
+                        if job.schedule_mode == "availability"
+                        else _calculate_next_schedule_run(
+                            job.cron_expression,
+                            schedule_timezone=job.timezone or DEFAULT_SCHEDULE_TIMEZONE,
+                        )
                     )
                 except InvalidScheduleTimezone as e:
                     _raise_invalid_schedule_timezone(e)
@@ -1302,11 +1437,9 @@ async def delete_scheduled_job(
             )
         _require_schedule_access(db, current_user, job, "operator")
 
-        # Step 1: Set scheduled_job_id to NULL for all backup jobs linked to this schedule
-        # This preserves backup history while breaking the link
-        from app.database.models import BackupJob
-
-        db.query(BackupJob).filter_by(scheduled_job_id=job_id).update(
+        # Step 1: Set scheduled_job_id to NULL for every backup linked to this
+        # schedule. This preserves backup history while breaking the link.
+        db.query(Operation).filter_by(scheduled_job_id=job_id).update(
             {"scheduled_job_id": None}, synchronize_session=False
         )
 
@@ -1358,9 +1491,13 @@ async def toggle_scheduled_job(
         job.enabled = not job.enabled
         if job.enabled:
             try:
-                job.next_run = _calculate_next_schedule_run(
-                    job.cron_expression,
-                    schedule_timezone=job.timezone or DEFAULT_SCHEDULE_TIMEZONE,
+                job.next_run = (
+                    to_utc_naive(datetime.now(timezone.utc))
+                    if job.schedule_mode == "availability"
+                    else _calculate_next_schedule_run(
+                        job.cron_expression,
+                        schedule_timezone=job.timezone or DEFAULT_SCHEDULE_TIMEZONE,
+                    )
                 )
             except InvalidScheduleTimezone as e:
                 _raise_invalid_schedule_timezone(e)
@@ -1427,11 +1564,16 @@ async def duplicate_scheduled_job(
             counter += 1
             new_name = f"{base_name} ({counter})"
 
-        # Calculate next run time from cron expression
+        # Calculate the appropriate first run for the duplicate.
         try:
-            next_run = _calculate_next_schedule_run(
-                original_job.cron_expression,
-                schedule_timezone=original_job.timezone or DEFAULT_SCHEDULE_TIMEZONE,
+            next_run = (
+                to_utc_naive(datetime.now(timezone.utc))
+                if original_job.schedule_mode == "availability"
+                else _calculate_next_schedule_run(
+                    original_job.cron_expression,
+                    schedule_timezone=original_job.timezone
+                    or DEFAULT_SCHEDULE_TIMEZONE,
+                )
             )
         except InvalidScheduleTimezone as e:
             _raise_invalid_schedule_timezone(e)
@@ -1448,6 +1590,11 @@ async def duplicate_scheduled_job(
         duplicated_job = ScheduledJob(
             name=new_name,
             cron_expression=original_job.cron_expression,
+            schedule_mode=original_job.schedule_mode,
+            availability_check_interval_minutes=(
+                original_job.availability_check_interval_minutes
+            ),
+            min_success_interval_minutes=original_job.min_success_interval_minutes,
             timezone=original_job.timezone or DEFAULT_SCHEDULE_TIMEZONE,
             repository=original_job.repository,
             repository_id=original_job.repository_id,
@@ -1565,7 +1712,7 @@ async def run_scheduled_job_now(
 ):
     """Run a scheduled job immediately"""
     try:
-        from app.database.models import BackupJob, Repository
+        from app.database.models import Repository
 
         job = db.query(ScheduledJob).filter(ScheduledJob.id == job_id).first()
         if not job:
@@ -1621,21 +1768,6 @@ async def run_scheduled_job_now(
 
             ensure_repository_admission(db, repo, OPERATION_BACKUP)
 
-            # Create backup job record with scheduled_job_id
-            backup_job = BackupJob(
-                repository=repo.path,
-                repository_id=repo.id,
-                status="pending",
-                scheduled_job_id=job.id,  # Link to scheduled job
-                created_at=datetime.now(
-                    timezone.utc
-                ),  # Explicit timestamp to prevent NULL
-            )
-            apply_repository_route_to_backup_job(backup_job, repo)
-            db.add(backup_job)
-            db.commit()
-            db.refresh(backup_job)
-
             # Generate archive name
             _now = datetime.now()
             archive_name = build_archive_name(
@@ -1647,6 +1779,15 @@ async def run_scheduled_job_now(
                 time_str=_now.strftime("%H:%M:%S"),
                 unix_timestamp=str(int(_now.timestamp())),
                 stable_series=getattr(repo, "borg_version", 1) == 2,
+            )
+
+            backup_job = create_backup_operation(
+                db,
+                repo,
+                trigger="schedule",
+                executor="server",
+                params={"archive_name": archive_name},
+                scheduled_job_id=job.id,
             )
 
             # Execute backup with optional prune/compact asynchronously (non-blocking)
@@ -1903,8 +2044,7 @@ async def execute_multi_repo_schedule(scheduled_job: ScheduledJob, db: Session):
         scheduled_job: The ScheduledJob object
         db: Database session
     """
-    from app.database.models import Repository, BackupJob
-    from app.services.backup_service import backup_service
+    from app.database.models import Repository
 
     logger.info(
         "Executing multi-repo schedule",
@@ -1995,22 +2135,6 @@ async def execute_multi_repo_schedule(scheduled_job: ScheduledJob, db: Session):
 
             ensure_repository_admission(db, repo, OPERATION_BACKUP)
 
-            # Create backup job record
-            backup_job = BackupJob(
-                repository=repo.path,
-                repository_id=repo.id,
-                status="pending",
-                scheduled_job_id=scheduled_job.id,
-                created_at=datetime.now(
-                    timezone.utc
-                ),  # Explicit timestamp to prevent NULL
-            )
-            apply_repository_route_to_backup_job(backup_job, repo)
-            db.add(backup_job)
-            db.commit()
-            db.refresh(backup_job)
-            backup_jobs.append(backup_job)
-
             # Generate archive name
             archive_name = build_archive_name(
                 job_name=scheduled_job.name,
@@ -2022,6 +2146,19 @@ async def execute_multi_repo_schedule(scheduled_job: ScheduledJob, db: Session):
                 unix_timestamp=timestamp_unix,
                 stable_series=getattr(repo, "borg_version", 1) == 2,
             )
+
+            backup_job = create_backup_operation(
+                db,
+                repo,
+                trigger="schedule",
+                executor="server",
+                params={
+                    "archive_name": archive_name,
+                    "skip_hooks": scheduled_job.run_repository_scripts,
+                },
+                scheduled_job_id=scheduled_job.id,
+            )
+            backup_jobs.append(backup_job)
 
             # Run repository-level pre-scripts if enabled
             if scheduled_job.run_repository_scripts:
@@ -2107,14 +2244,16 @@ async def execute_multi_repo_schedule(scheduled_job: ScheduledJob, db: Session):
             # Execute backup.
             # When run_repository_scripts=True the schedule already ran pre-backup scripts
             # explicitly above, so tell execute_backup to skip its own hook execution to
-            # avoid running the same scripts a second time.
-            await backup_service.execute_backup(
-                backup_job.id,
-                repo.path,
-                db,
-                archive_name=archive_name,
-                skip_hooks=scheduled_job.run_repository_scripts,
-            )
+            # avoid running the same scripts a second time. A read of the
+            # backup that fails is waited out: its post-scripts and
+            # maintenance follow the backup, not the read. The wait polls on
+            # a session of its own, so this one ends its transaction first:
+            # a connection held idle for the whole backup is one the runner
+            # cannot use, and one a database may close under it. The id is
+            # read first: the commit expires the row.
+            operation_id = backup_job.id
+            db.commit()
+            await wait_out_backup_operation(operation_id)
 
             # Run repository-level post-scripts if enabled
             if scheduled_job.run_repository_scripts:
@@ -2126,7 +2265,7 @@ async def execute_multi_repo_schedule(scheduled_job: ScheduledJob, db: Session):
                     # Get backup result for post-script context.
                     # Inline and library script executors expect the normalized
                     # status token, not a stats dict.
-                    db.refresh(backup_job)
+                    refresh_backup_job(db, backup_job)
                     if backup_job.status == "completed":
                         result_status = "success"
                     elif backup_job.status == "completed_with_warnings":
@@ -2211,18 +2350,34 @@ async def execute_multi_repo_schedule(scheduled_job: ScheduledJob, db: Session):
                     )
 
             # Run prune/compact if enabled and backup succeeded
-            db.refresh(backup_job)
+            refresh_backup_job(db, backup_job)
             if backup_job.status in ["completed", "completed_with_warnings"]:
+                # A prune step that raised leaves the repository in a state the
+                # next step cannot rely on: its agent may still be pruning (the
+                # wait gave up), so compact is skipped for this run.
+                maintenance_aborted = False
                 # Run prune if enabled
                 if scheduled_job.run_prune_after:
                     prune_job = None
                     try:
                         logger.info("Running scheduled prune", repository=repo.path)
-                        prune_job = create_started_maintenance_job(
+                        prune_job = start_inline_maintenance(
                             db,
-                            PruneJob,
                             repo,
-                            extra_fields={"scheduled_prune": True},
+                            "prune",
+                            params={
+                                "keep_hourly": scheduled_job.prune_keep_hourly,
+                                "keep_daily": scheduled_job.prune_keep_daily,
+                                "keep_weekly": scheduled_job.prune_keep_weekly,
+                                "keep_monthly": scheduled_job.prune_keep_monthly,
+                                "keep_quarterly": scheduled_job.prune_keep_quarterly,
+                                "keep_yearly": scheduled_job.prune_keep_yearly,
+                                "keep_within": scheduled_job.prune_keep_within,
+                                "scheduled_prune": True,
+                            },
+                            user_id=None,
+                            run_id=backup_job.operation.run_id,
+                            depends_on_id=backup_job.id,
                         )
 
                         # Update backup job status to show prune is running
@@ -2243,6 +2398,7 @@ async def execute_multi_repo_schedule(scheduled_job: ScheduledJob, db: Session):
 
                         # Refresh job to get updated status
                         db.refresh(prune_job)
+                        finish_inline_maintenance(db, prune_job)
 
                         if prune_job.status == "completed":
                             scheduled_job.last_prune = datetime.now(timezone.utc)
@@ -2262,12 +2418,11 @@ async def execute_multi_repo_schedule(scheduled_job: ScheduledJob, db: Session):
                     except Exception as e:
                         # Ensure maintenance_status is always cleared even if commit fails
                         try:
+                            # Close the prune operation if it was created; it
+                            # rolls the session back, so it goes first.
+                            if prune_job is not None:
+                                await fail_inline_maintenance(db, prune_job, e)
                             backup_job.maintenance_status = "prune_failed"
-                            # Update PruneJob record if it was created
-                            if prune_job:
-                                prune_job.status = "failed"
-                                prune_job.completed_at = datetime.now(timezone.utc)
-                                prune_job.error_message = str(e)
                             db.commit()
                         except Exception as commit_error:
                             logger.error(
@@ -2275,19 +2430,24 @@ async def execute_multi_repo_schedule(scheduled_job: ScheduledJob, db: Session):
                             )
                             # If commit fails, at least clear the running status in memory
                             backup_job.maintenance_status = None
+                        maintenance_aborted = True
                         logger.error(
                             "Scheduled prune failed", repository=repo.path, error=str(e)
                         )
 
                 # Run compact if enabled
-                if scheduled_job.run_compact_after:
+                if scheduled_job.run_compact_after and not maintenance_aborted:
+                    compact_job = None
                     try:
                         logger.info("Running scheduled compact", repository=repo.path)
-                        compact_job = create_started_maintenance_job(
+                        compact_job = start_inline_maintenance(
                             db,
-                            CompactJob,
                             repo,
-                            extra_fields={"scheduled_compact": True},
+                            "compact",
+                            params={"scheduled_compact": True},
+                            user_id=None,
+                            run_id=backup_job.operation.run_id,
+                            depends_on_id=backup_job.id,
                         )
 
                         # Update backup job status to show compact is running
@@ -2298,6 +2458,7 @@ async def execute_multi_repo_schedule(scheduled_job: ScheduledJob, db: Session):
 
                         # Refresh job to get updated status
                         db.refresh(compact_job)
+                        finish_inline_maintenance(db, compact_job)
 
                         if compact_job.status == "completed":
                             scheduled_job.last_compact = datetime.now(timezone.utc)
@@ -2315,24 +2476,20 @@ async def execute_multi_repo_schedule(scheduled_job: ScheduledJob, db: Session):
                                 error=compact_job.error_message,
                             )
                     except Exception as e:
-                        backup_job.maintenance_status = "compact_failed"
-                        # Update CompactJob record if it was created
+                        # Ensure maintenance_status is always cleared even if commit fails
                         try:
-                            if "compact_job" in locals():
-                                db.refresh(compact_job)
-                                if compact_job.status not in [
-                                    "failed",
-                                    "cancelled",
-                                    "completed",
-                                ]:
-                                    compact_job.status = "failed"
-                                    compact_job.completed_at = datetime.now(
-                                        timezone.utc
-                                    )
-                                    compact_job.error_message = str(e)
-                        except:
-                            pass
-                        db.commit()
+                            # Close the compact operation if it was created; it
+                            # rolls the session back, so it goes first.
+                            if compact_job is not None:
+                                await fail_inline_maintenance(db, compact_job, e)
+                            backup_job.maintenance_status = "compact_failed"
+                            db.commit()
+                        except Exception as commit_error:
+                            logger.error(
+                                "Failed to update compact status",
+                                error=str(commit_error),
+                            )
+                            backup_job.maintenance_status = None
                         logger.error(
                             "Scheduled compact failed",
                             repository=repo.path,
@@ -2424,18 +2581,16 @@ async def execute_scheduled_backup_with_maintenance(
         scheduled_job_id: Scheduled job ID
         archive_name: Optional custom archive name
     """
-    from app.database.models import Repository, BackupJob
-    from app.services.backup_service import backup_service
+    from app.database.models import Repository
 
     db = next(get_db())
     try:
-        # Execute the backup with custom archive name if provided
-        await backup_service.execute_backup(
-            backup_job_id, repository_path, db, archive_name=archive_name
-        )
+        # The runner dispatches the row; wait for the verdict it writes. A
+        # read that fails is waited out, or prune/compact would never run.
+        await wait_out_backup_operation(backup_job_id)
 
         # Check if backup was successful (or completed with warnings)
-        backup_job = db.query(BackupJob).filter(BackupJob.id == backup_job_id).first()
+        backup_job = resolve_backup_job(db, backup_job_id)
         if not backup_job or backup_job.status not in [
             "completed",
             "completed_with_warnings",
@@ -2462,6 +2617,10 @@ async def execute_scheduled_backup_with_maintenance(
             )
             return
 
+        # A prune step that raised leaves the repository in a state the next
+        # step cannot rely on: its agent may still be pruning (the wait gave
+        # up), so compact is skipped for this run.
+        maintenance_aborted = False
         # Run prune if enabled
         if scheduled_job.run_prune_after:
             prune_job = None
@@ -2472,12 +2631,24 @@ async def execute_scheduled_backup_with_maintenance(
                     repository=repository_path,
                 )
 
-                # Create a PruneJob record for tracking and activity feed
-                prune_job = create_started_maintenance_job(
+                # Create a prune operation for tracking and activity feed
+                prune_job = start_inline_maintenance(
                     db,
-                    PruneJob,
                     repo,
-                    extra_fields={"scheduled_prune": True},
+                    "prune",
+                    params={
+                        "keep_hourly": scheduled_job.prune_keep_hourly,
+                        "keep_daily": scheduled_job.prune_keep_daily,
+                        "keep_weekly": scheduled_job.prune_keep_weekly,
+                        "keep_monthly": scheduled_job.prune_keep_monthly,
+                        "keep_quarterly": scheduled_job.prune_keep_quarterly,
+                        "keep_yearly": scheduled_job.prune_keep_yearly,
+                        "keep_within": scheduled_job.prune_keep_within,
+                        "scheduled_prune": True,
+                    },
+                    user_id=None,
+                    run_id=backup_job.operation.run_id,
+                    depends_on_id=backup_job.id,
                 )
 
                 # Update backup job status to show prune is running
@@ -2498,6 +2669,7 @@ async def execute_scheduled_backup_with_maintenance(
 
                 # Refresh job to get updated status
                 db.refresh(prune_job)
+                finish_inline_maintenance(db, prune_job)
 
                 if prune_job.status == "completed":
                     scheduled_job.last_prune = datetime.now(timezone.utc)
@@ -2521,12 +2693,11 @@ async def execute_scheduled_backup_with_maintenance(
             except Exception as e:
                 # Ensure maintenance_status is always cleared even if commit fails
                 try:
+                    # Close the prune operation if it was created; it rolls
+                    # the session back, so it goes first.
+                    if prune_job is not None:
+                        await fail_inline_maintenance(db, prune_job, e)
                     backup_job.maintenance_status = "prune_failed"
-                    # Update PruneJob record if it was created
-                    if prune_job:
-                        prune_job.status = "failed"
-                        prune_job.completed_at = datetime.now(timezone.utc)
-                        prune_job.error_message = str(e)
                     db.commit()
                 except Exception as commit_error:
                     logger.error(
@@ -2534,16 +2705,16 @@ async def execute_scheduled_backup_with_maintenance(
                     )
                     # If commit fails, at least clear the running status in memory
                     backup_job.maintenance_status = None
+                maintenance_aborted = True
                 logger.error(
                     "Failed to run scheduled prune",
                     scheduled_job_id=scheduled_job_id,
                     error=str(e),
                 )
 
-        # Run compact if enabled (only after successful prune or if prune not enabled)
-        if scheduled_job.run_compact_after and (
-            scheduled_job.run_prune_after or not scheduled_job.run_prune_after
-        ):
+        # Run compact if enabled, unless the prune step raised
+        if scheduled_job.run_compact_after and not maintenance_aborted:
+            compact_job = None
             try:
                 logger.info(
                     "Running scheduled compact",
@@ -2551,12 +2722,15 @@ async def execute_scheduled_backup_with_maintenance(
                     repository=repository_path,
                 )
 
-                # Create a CompactJob record for tracking and activity feed
-                compact_job = create_started_maintenance_job(
+                # Create a compact operation for tracking and activity feed
+                compact_job = start_inline_maintenance(
                     db,
-                    CompactJob,
                     repo,
-                    extra_fields={"scheduled_compact": True},
+                    "compact",
+                    params={"scheduled_compact": True},
+                    user_id=None,
+                    run_id=backup_job.operation.run_id,
+                    depends_on_id=backup_job.id,
                 )
 
                 # Update backup job status to show compact is running
@@ -2567,6 +2741,7 @@ async def execute_scheduled_backup_with_maintenance(
 
                 # Refresh job to get updated status
                 db.refresh(compact_job)
+                finish_inline_maintenance(db, compact_job)
 
                 if compact_job.status == "completed":
                     scheduled_job.last_compact = datetime.now(timezone.utc)
@@ -2588,24 +2763,20 @@ async def execute_scheduled_backup_with_maintenance(
                     )
 
             except Exception as e:
-                backup_job.maintenance_status = "compact_failed"
-
-                # Update CompactJob record if it was created
+                # Ensure maintenance_status is always cleared even if commit fails
                 try:
-                    if "compact_job" in locals():
-                        db.refresh(compact_job)
-                        if compact_job.status not in [
-                            "failed",
-                            "cancelled",
-                            "completed",
-                        ]:
-                            compact_job.status = "failed"
-                            compact_job.completed_at = datetime.now(timezone.utc)
-                            compact_job.error_message = str(e)
-                except:
-                    pass
-
-                db.commit()
+                    # Close the compact operation if it was created; it rolls
+                    # the session back, so it goes first.
+                    if compact_job is not None:
+                        await fail_inline_maintenance(db, compact_job, e)
+                    backup_job.maintenance_status = "compact_failed"
+                    db.commit()
+                except Exception as commit_error:
+                    logger.error(
+                        "Failed to update compact status", error=str(commit_error)
+                    )
+                    # If commit fails, at least clear the running status in memory
+                    backup_job.maintenance_status = None
                 logger.error(
                     "Failed to run scheduled compact",
                     scheduled_job_id=scheduled_job_id,
@@ -2707,18 +2878,6 @@ def _dispatch_due_scheduled_job(
                 return None
             raise
 
-        backup_job = BackupJob(
-            repository=repo.path,
-            repository_id=repo.id,
-            status="pending",
-            scheduled_job_id=job.id,
-            created_at=datetime.now(timezone.utc),
-        )
-        apply_repository_route_to_backup_job(backup_job, repo)
-        db.add(backup_job)
-        db.commit()
-        db.refresh(backup_job)
-
         _now = datetime.now()
         archive_name = build_archive_name(
             job_name=job.name,
@@ -2729,6 +2888,15 @@ def _dispatch_due_scheduled_job(
             time_str=_now.strftime("%H:%M:%S"),
             unix_timestamp=str(int(_now.timestamp())),
             stable_series=getattr(repo, "borg_version", 1) == 2,
+        )
+
+        backup_job = create_backup_operation(
+            db,
+            repo,
+            trigger="schedule",
+            executor="server",
+            params={"archive_name": archive_name},
+            scheduled_job_id=job.id,
         )
 
         run_key = f"backup:{backup_job.id}"
@@ -2749,14 +2917,23 @@ def _dispatch_due_scheduled_job(
         return None
 
     job.last_run = now
-    job.next_run = _calculate_next_schedule_run(
-        job.cron_expression,
-        now,
-        job.timezone or DEFAULT_SCHEDULE_TIMEZONE,
-    )
+    job.next_run = _next_scheduled_job_run(job, now)
     db.commit()
     logger.info("Scheduled job started", job_id=job.id, name=job.name, run_key=run_key)
     return run_key
+
+
+async def _send_schedule_failure(
+    job_name: str, repository: Optional[str], error: str
+) -> None:
+    """Fire-and-forget alert on its own session; the caller's closes first."""
+    db = SessionLocal()
+    try:
+        await notification_service.send_schedule_failure(
+            db, job_name, repository, error
+        )
+    finally:
+        db.close()
 
 
 async def dispatch_due_scheduled_backups(
@@ -2794,10 +2971,95 @@ async def dispatch_due_scheduled_backups(
         return
 
     dispatched = 0
+    skipped = 0
     for job in jobs:
         if dispatched >= available_slots:
             break
         try:
+            if job.schedule_mode == "availability":
+                last_success = (
+                    db.query(Operation.completed_at)
+                    .filter(
+                        Operation.kind == "backup",
+                        Operation.scheduled_job_id == job.id,
+                        Operation.status.in_(["completed", "completed_with_warnings"]),
+                        Operation.completed_at.isnot(None),
+                    )
+                    .order_by(Operation.completed_at.desc())
+                    .first()
+                )
+                if last_success and job.min_success_interval_minutes:
+                    allowed_at = to_utc_naive(last_success[0]) + timedelta(
+                        minutes=job.min_success_interval_minutes
+                    )
+                    if now < allowed_at:
+                        job.next_run = min(
+                            allowed_at,
+                            now
+                            + timedelta(
+                                minutes=job.availability_check_interval_minutes
+                            ),
+                        )
+                        _record_availability_skip(
+                            db,
+                            job,
+                            now,
+                            reason="minimum_interval_not_elapsed",
+                            detail="Minimum interval after the last successful backup has not elapsed.",
+                        )
+                        db.commit()
+                        skipped += 1
+                        logger.info(
+                            "Availability schedule skipped: minimum success interval",
+                            job_id=job.id,
+                        )
+                        continue
+                linked_repositories = (
+                    db.query(Repository)
+                    .join(
+                        ScheduledJobRepository,
+                        ScheduledJobRepository.repository_id == Repository.id,
+                    )
+                    .filter(ScheduledJobRepository.scheduled_job_id == job.id)
+                    .all()
+                )
+                if not linked_repositories and job.repository_id:
+                    repository = db.get(Repository, job.repository_id)
+                    linked_repositories = [repository] if repository else []
+                if not linked_repositories and job.repository:
+                    repository = (
+                        db.query(Repository)
+                        .filter(Repository.path == job.repository)
+                        .first()
+                    )
+                    linked_repositories = [repository] if repository else []
+                sources_available = False
+                decision_reason = "No repositories are configured for this automation."
+                if linked_repositories:
+                    decision = await repositories_available(db, linked_repositories)
+                    sources_available = decision.available
+                    decision_reason = (
+                        decision.reason or "The backup source is unavailable."
+                    )
+                if not sources_available:
+                    job.next_run = now + timedelta(
+                        minutes=job.availability_check_interval_minutes
+                    )
+                    _record_availability_skip(
+                        db,
+                        job,
+                        now,
+                        reason="source_unavailable",
+                        detail=decision_reason,
+                    )
+                    db.commit()
+                    skipped += 1
+                    logger.info(
+                        "Availability schedule skipped: source unavailable",
+                        job_id=job.id,
+                        reason=decision_reason,
+                    )
+                    continue
             run_key = _dispatch_due_scheduled_job(db, job, now)
             if run_key:
                 dispatched += 1
@@ -2808,9 +3070,7 @@ async def dispatch_due_scheduled_backups(
 
             try:
                 asyncio.create_task(
-                    notification_service.send_schedule_failure(
-                        db, job.name, job.repository, str(e)
-                    )
+                    _send_schedule_failure(job.name, job.repository, str(e))
                 )
             except Exception as notif_error:
                 logger.warning(
@@ -2818,7 +3078,7 @@ async def dispatch_due_scheduled_backups(
                     error=str(notif_error),
                 )
 
-    deferred = len(jobs) - dispatched
+    deferred = len(jobs) - dispatched - skipped
     if deferred > 0:
         logger.info(
             "Deferred due scheduled backups until capacity is available",
@@ -2839,7 +3099,7 @@ async def check_scheduled_jobs():
                 backup_plan_execution_service,
             )
 
-            backup_plan_execution_service.dispatch_due_runs(db, now)
+            await backup_plan_execution_service.dispatch_due_runs(db, now)
             await run_due_scheduled_checks(db, now)
             await run_due_scheduled_restore_checks(db, now)
             dispatch_due_scheduled_rclone_mirrors(db, now)

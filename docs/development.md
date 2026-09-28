@@ -103,6 +103,16 @@ npm run format:check
 npm run build
 ```
 
+`npm ci` in a fresh checkout or worktree can fail on the platform-specific
+optional packages (`@rolldown/binding-*`, `@oxlint/binding-*`) because of a
+long-standing npm lockfile bug. `npm install` installs them, so prefer it
+locally. If a build still reports a missing binding, copy that package
+directory over from another checkout of the same `frontend/package-lock.json`
+on the same platform. The lockfile pins these bindings per version and per
+OS/CPU, so one copied from elsewhere will not load. Do not delete
+`package-lock.json` to work around it: reinstalling from scratch rewrites the
+lockfile, which is a repository change, not a local fix.
+
 ## Backend Commands
 
 Run from the repository root:
@@ -153,7 +163,7 @@ Install hooks if you use them locally:
 pre-commit install --hook-type pre-commit --hook-type pre-push
 ```
 
-Make sure frontend dependencies are installed first, otherwise pre-push hooks that call `prettier`, `tsc`, or `eslint` will fail.
+Make sure frontend dependencies are installed first, otherwise pre-push hooks that call `prettier`, `tsc`, or `oxlint` will fail.
 
 ## Releases
 
@@ -175,6 +185,55 @@ before creating the GitHub release or publishing Docker images.
 
 Published tags are immutable. If a released version needs a correction, publish
 the next patch release rather than amending or re-pointing the existing tag.
+
+## Testing the Native Installer
+
+`scripts/install.sh` provisions a whole host, so reading it does not tell you
+much. Almost every defect found in it so far has been state left inconsistent
+by a **second** run, a run with **different flags**, or a run over an
+**interrupted** one, and those are only reachable by running it.
+
+Build the tarball once, then run the matrix against it:
+
+```bash
+fnm exec --using=22 -- ./scripts/build-native-tarball.sh dist
+./scripts/test-native-install.sh
+```
+
+The harness boots a throwaway Debian container with systemd as PID 1 and runs
+the installer against it: a fresh install, a plain re-run, a re-run passing a
+different `--data-dir` and `--port`, `--no-start` against a running service,
+`--skip-borg2` over an existing Borg 2, a half-built virtualenv, and a
+`--service-user` change. Each case asserts the service is still up and
+answering afterwards.
+
+Needs Docker with a Linux daemon, and Node 22 for the build. The harness never
+builds on its own: `npm ci` deletes `frontend/node_modules`, and a worktree
+that shares one install with another checkout through a symlink would lose that
+other checkout's modules. `build-native-tarball.sh` refuses outright when it
+sees such a symlink.
+
+Run one case, or keep the container to poke at it:
+
+```bash
+./scripts/test-native-install.sh --case serviceuser
+./scripts/test-native-install.sh --keep
+docker exec -it borg-ui-install-test journalctl -u borg-ui -n 50 --no-pager
+```
+
+To try the installer on a real host instead, build the tarball, copy it over,
+and point the installer at it:
+
+```bash
+TARBALL=$(ls -t dist/borg-ui-*.tar.gz | head -n 1)
+scp "$TARBALL" scripts/install.sh root@host:/tmp/
+ssh root@host "bash /tmp/install.sh --tarball /tmp/$(basename "$TARBALL")"
+```
+
+One explicit path, not a glob: with more than one build in `dist/` a glob
+copies them all and hands `--tarball` several arguments.
+
+`--tarball` skips the release download, so it also covers air-gapped installs.
 
 ## Smoke Tests
 

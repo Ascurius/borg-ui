@@ -210,7 +210,29 @@ The first implementation supports:
 - `filesystem.browse` for source path selection from the central Borg UI
 - `repository.init`, `repository.info`, `repository.list_archives`,
   `repository.list_archive_contents`, `repository.extract_archive_file`,
-  `repository.check`, `repository.prune`, `repository.compact`, and
-  `repository.rclone_sync` for agent-owned repositories
-- log and progress upload
-- cancellation through heartbeat
+  `repository.check`, `repository.prune`, `repository.compact`,
+  `repository.rclone_sync`, and `repository.diff` (the change listing the
+  server's archive history is built from) for agent-owned repositories
+- log and progress upload; from 0.1.8 a line whose progress report says
+  all it did (`progress_percent`, `archive_progress`) is not stored as a
+  log line too, while a `file_status` line of `create --list` is reported
+  and stored, being the listing that was asked for; `repository.info`,
+  `repository.rinfo`, `repository.archive_info` and
+  `repository.list_archives` log a one-line summary instead of their JSON
+  output (a failed run keeps the output); from 0.1.9 the steps Borg's
+  progress indicators print (such as the cache transaction, as
+  `progress_message` or as a `log_message` of `borg.output.progress`)
+  are neither stored nor reported, and a backup's completion carries the
+  archive's final counters (`archive_stats`, from `archive.stats` of
+  `borg create --json`), which the server keeps over the last progress
+  report
+- from 0.1.10 a failure report carries the last lines Borg wrote
+  (`stderr_tail`, at most 40 lines / 4 KiB) and a `failure_kind`
+  (`lock_contention` when Borg gave up on a lock another process holds -
+  exit codes 70, 71 and 73, or the `(timeout)` lock line of a Borg 1 on
+  legacy exit codes; not 72, a lock file Borg could not create -
+  else `other`), so the server does not depend on the log lines, which
+  can land after the report
+- cancellation through heartbeat; from 0.1.7 (`jobs.cancel`) a running
+  backup, check, prune, compact, restore or archive delete stops as well,
+  even while Borg prints nothing

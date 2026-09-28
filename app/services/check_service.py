@@ -5,13 +5,25 @@ from datetime import datetime
 from pathlib import Path
 import structlog
 from sqlalchemy.orm import Session
-from app.database.models import CheckJob, Repository
+from app.database.models import Repository
 from app.database.database import SessionLocal
 from app.config import settings
 from app.core.borg import borg
+from app.core.borg_errors import is_borg_warning_exit_code
 from app.services.notification_service import NotificationService
+from app.services.operations.job_facade import refresh_job, resolve_maintenance_job
 from app.utils.db_retries import commit_with_retry
-from app.utils.borg_env import build_repository_borg_env, cleanup_temp_key_file
+from app.utils.borg_env import (
+    build_repository_borg_env,
+    cleanup_temp_key_file,
+    effective_repository_remote_path,
+    with_lock_wait,
+)
+
+from app.services.process_cancel import (
+    terminate_process,
+    terminate_tracked_process,
+)
 
 logger = structlog.get_logger()
 
@@ -42,6 +54,10 @@ class CheckService:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.running_processes = {}  # Track running processes by job_id
 
+    async def cancel_check(self, job_id: int) -> bool:
+        """Cancel a running check job by terminating its tracked process."""
+        return await terminate_tracked_process(self.running_processes, job_id, "check")
+
     async def execute_check(self, job_id: int, repository_id: int, db: Session = None):
         """Execute repository check operation with progress tracking"""
 
@@ -51,7 +67,7 @@ class CheckService:
 
         try:
             # Get job
-            job = db.query(CheckJob).filter(CheckJob.id == job_id).first()
+            job = resolve_maintenance_job(db, job_id, "check")
             if not job:
                 logger.error("Check job not found", job_id=job_id)
                 return
@@ -132,8 +148,8 @@ class CheckService:
                         error=str(exc),
                     )
 
-            if repository.remote_path:
-                cmd.extend(["--remote-path", repository.remote_path])
+            if remote_path := effective_repository_remote_path(repository):
+                cmd.extend(["--remote-path", remote_path])
             cmd.append(repository.path)
 
             logger.info(
@@ -146,7 +162,7 @@ class CheckService:
             # Execute command
             # Note: --progress writes to stderr, not stdout, so we need to capture stderr separately
             process = await asyncio.create_subprocess_exec(
-                *cmd,
+                *with_lock_wait(cmd, env),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,  # Capture stderr separately for progress
                 env=env,
@@ -200,21 +216,13 @@ class CheckService:
                 nonlocal cancelled
                 while not cancelled and process.returncode is None:
                     await asyncio.sleep(3)
-                    db.refresh(job)
+                    refresh_job(db, job)
                     if job.status == "cancelled":
                         logger.info(
                             "Check job cancelled, terminating process", job_id=job_id
                         )
                         cancelled = True
-                        process.terminate()
-                        try:
-                            await asyncio.wait_for(process.wait(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "Process didn't terminate, killing it", job_id=job_id
-                            )
-                            process.kill()
-                            await process.wait()
+                        await terminate_process(process, job_id, "check")
                         break
 
             async def stream_logs():
@@ -359,8 +367,7 @@ class CheckService:
             except asyncio.CancelledError:
                 logger.info("Check task cancelled", job_id=job_id)
                 cancelled = True
-                process.terminate()
-                await process.wait()
+                await terminate_process(process, job_id, "check")
                 raise
 
             # Wait for process to complete
@@ -379,7 +386,7 @@ class CheckService:
                 # Update repository's last_check timestamp
                 repository.last_check = datetime.utcnow()
                 logger.info("Check completed successfully", job_id=job_id)
-            elif process.returncode == 1 or (100 <= process.returncode <= 127):
+            elif is_borg_warning_exit_code(process.returncode):
                 # Warning (legacy exit code 1 or modern exit codes 100-127)
                 job.status = "completed_with_warnings"
                 job.progress = 100
@@ -510,9 +517,11 @@ class CheckService:
             try:
                 completed_at = datetime.utcnow()
 
+                error_message = str(e)
+
                 def persist_failure_state():
                     job.status = "failed"
-                    job.error_message = str(e)
+                    job.error_message = error_message
                     job.completed_at = completed_at
 
                 await commit_with_retry(

@@ -24,6 +24,7 @@ import type {
   AuthEventStats,
   AuthEvents,
 } from './types'
+import { parseBackendDate } from '../../utils/dateUtils'
 
 interface OidcSectionProps {
   systemSettings?: SystemSettings
@@ -332,14 +333,26 @@ const OidcSection: React.FC<OidcSectionProps> = ({
         <Stack
           direction={{ xs: 'column', md: 'row' }}
           spacing={1.5}
-          justifyContent="space-between"
-          alignItems={{ xs: 'stretch', md: 'flex-start' }}
+          sx={{
+            justifyContent: 'space-between',
+            alignItems: { xs: 'stretch', md: 'flex-start' },
+          }}
         >
           <Box>
-            <Typography variant="subtitle1" fontWeight={600}>
+            <Typography
+              variant="subtitle1"
+              sx={{
+                fontWeight: 600,
+              }}
+            >
               {t('systemSettings.oidcEventsTitle')}
             </Typography>
-            <Typography variant="body2" color="text.secondary">
+            <Typography
+              variant="body2"
+              sx={{
+                color: 'text.secondary',
+              }}
+            >
               {t('systemSettings.oidcEventsDescription')}
             </Typography>
           </Box>
@@ -356,7 +369,14 @@ const OidcSection: React.FC<OidcSectionProps> = ({
           </Tooltip>
         </Stack>
 
-        <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+        <Stack
+          direction="row"
+          spacing={1}
+          useFlexGap
+          sx={{
+            flexWrap: 'wrap',
+          }}
+        >
           <Chip
             size="small"
             variant="outlined"
@@ -382,7 +402,14 @@ const OidcSection: React.FC<OidcSectionProps> = ({
           />
         </Stack>
 
-        <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+        <Stack
+          direction="row"
+          spacing={1}
+          useFlexGap
+          sx={{
+            flexWrap: 'wrap',
+          }}
+        >
           {(
             [
               ['all', 'systemSettings.authEventFilters.all'],
@@ -430,10 +457,19 @@ const OidcSection: React.FC<OidcSectionProps> = ({
                   <Stack
                     direction={{ xs: 'column', md: 'row' }}
                     spacing={1.5}
-                    justifyContent="space-between"
+                    sx={{
+                      justifyContent: 'space-between',
+                    }}
                   >
                     <Stack spacing={0.4}>
-                      <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{
+                          flexWrap: 'wrap',
+                        }}
+                      >
                         <Chip
                           size="small"
                           label={formatAuthEventType(event.event_type)}
@@ -447,10 +483,20 @@ const OidcSection: React.FC<OidcSectionProps> = ({
                           color={event.auth_source === 'oidc' ? 'info' : 'default'}
                         />
                       </Stack>
-                      <Typography variant="body2" fontWeight={600}>
+                      <Typography
+                        variant="body2"
+                        sx={{
+                          fontWeight: 600,
+                        }}
+                      >
                         {event.username || event.email || t('systemSettings.authEventAnonymous')}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: 'text.secondary',
+                        }}
+                      >
                         {[
                           event.email,
                           event.actor_user_id
@@ -461,12 +507,22 @@ const OidcSection: React.FC<OidcSectionProps> = ({
                           .join(' • ')}
                       </Typography>
                       {event.detail && (
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: 'text.secondary',
+                          }}
+                        >
                           {event.detail}
                         </Typography>
                       )}
                     </Stack>
-                    <Stack spacing={0.4} alignItems={{ xs: 'flex-start', md: 'flex-end' }}>
+                    <Stack
+                      spacing={0.4}
+                      sx={{
+                        alignItems: { xs: 'flex-start', md: 'flex-end' },
+                      }}
+                    >
                       <Typography
                         variant="caption"
                         sx={{
@@ -484,8 +540,13 @@ const OidcSection: React.FC<OidcSectionProps> = ({
                             ? t('systemSettings.authEventSuccess')
                             : t('systemSettings.authEventFailed')}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary">
-                        {new Date(event.created_at).toLocaleString()}
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: 'text.secondary',
+                        }}
+                      >
+                        {parseBackendDate(event.created_at).toLocaleString()}
                       </Typography>
                     </Stack>
                   </Stack>

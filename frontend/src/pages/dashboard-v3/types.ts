@@ -1,3 +1,16 @@
+import type { StoredPruneRetention } from '../../types/archives'
+
+export interface SpaceSaving {
+  repository_id: number
+  repository_name: string
+  candidate: string
+  label: string
+  retention: StoredPruneRetention | null
+  freed_at_least: number
+  computed_at: string
+  stale: boolean
+}
+
 export type UpcomingTask = {
   id: number | string
   type: string
@@ -7,6 +20,16 @@ export type UpcomingTask = {
   cron?: string
   timezone?: string | null
   next_run?: string | null
+}
+
+export type ActivityEntry = {
+  id: number
+  type: string
+  status: string
+  repository: string
+  timestamp: string
+  message: string
+  error: string | null
 }
 
 export interface DashboardOverview {
@@ -65,15 +88,23 @@ export interface DashboardOverview {
     }
   }>
   upcoming_tasks: UpcomingTask[]
-  activity_feed: Array<{
-    id: number
+  space_savings: SpaceSaving[]
+  // Per calendar day (in the zone the request named) and job type: how
+  // many runs started and how many of them failed, last 14 days.
+  // Optional for a remote backend of the same major version that still
+  // sends `activity_feed` only; the page then derives both from the feed.
+  activity_timeline?: Array<{
+    date: string
     type: string
-    status: string
-    repository: string
-    timestamp: string
-    message: string
-    error: string | null
+    total: number
+    failed: number
   }>
+  // Failed runs of the timeline window that no later completed run of the
+  // same type on the same repository has resolved, newest first.
+  current_failures?: Array<ActivityEntry>
+  // The previous release's feed: every run of the window. A server of this
+  // release fills it with the current failures for one release.
+  activity_feed?: Array<ActivityEntry>
   system_metrics: {
     cpu_usage: number
     cpu_count: number

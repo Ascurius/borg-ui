@@ -1,0 +1,609 @@
+"""History executors: history_index and history_merge (spec 8.3, 8.4, 6.7).
+
+history_index streams `borg diff` per (predecessor, archive) pair, or a
+full `borg list` for the first archive of a series, drops excluded paths,
+resolves absolute sizes for modified files from the last known size in the
+series, caps rows per archive, and writes each archive in one transaction.
+merge_removed_archive folds a removed archive's rows into its successor;
+archive_sync calls it for every archive its listing no longer sees.
+"""
+
+import asyncio
+import re
+import time
+from collections import Counter
+from typing import Iterable, Optional
+
+import structlog
+from sqlalchemy.orm import Session
+
+from app.api.repositories import _prepare_repository_borg_env
+from app.config import settings
+from app.core.borg_diff import ChangeRecord, parse_diff_line, parse_list_line
+from app.core.borg_router import BorgRouter
+from app.database.models import (
+    DEFAULT_HISTORY_INDEX_EXCLUDES,
+    Archive,
+    ArchiveChange,
+    Repository,
+    utc_now,
+)
+from app.services.operations import executors
+from app.services.operations.executors.agent_changes import (
+    AgentChangeStream,
+    AgentUnavailable,
+    OperationCancelled,
+)
+from app.services.operations.executors.index import _load_repository
+from app.services.operations.history_fold import (
+    change_to_row_dict,
+    fold_pair,
+    rows_to_changes,
+)
+from app.services.operations.runner import Outcome, repository_busy
+from app.services.repository_command_lock import run_serialized_repository_command
+from app.services.repository_executor import (
+    AGENT_DIFF_JOB_KIND,
+    agent_supports_job,
+    is_agent_executor,
+    lock_contention_error,
+)
+from app.utils.borg_env import cleanup_temp_key_file
+
+logger = structlog.get_logger()
+
+BATCH_SIZE = 5000
+SUMMARY_DEPTH = 3
+SIZE_LOOKUP_CHUNK = 500
+
+# How many times an archive that fails to index is retried before it is left
+# alone. Each attempt is a full borg diff under the repository metadata lock,
+# so retrying a deterministic failure forever would block other metadata work
+# on that repository once per reconcile run, indefinitely.
+MAX_HISTORY_ATTEMPTS = 3
+# Borg's warning codes (legacy 1, modern 100-127, see is_borg_warning_exit_code);
+# the diff is still complete
+BORG_OK_EXIT_CODES = (0, 1, *range(100, 128))
+
+
+# -- excludes -------------------------------------------------------------------
+
+
+def glob_to_regex(pattern: str) -> re.Pattern:
+    """Translate a glob with `**` (any depth), `*` (one segment), `?` into a
+    regex anchored to the whole path. A leading `**/` matches zero or more
+    directories so `**/.cache/**` covers `.cache/x` at the root too."""
+    out = ""
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if pattern.startswith("**/", i):
+            out += "(?:.*/)?"
+            i += 3
+        elif pattern.startswith("**", i):
+            out += ".*"
+            i += 2
+        elif c == "*":
+            out += "[^/]*"
+            i += 1
+        elif c == "?":
+            out += "[^/]"
+            i += 1
+        else:
+            out += re.escape(c)
+            i += 1
+    return re.compile(f"^{out}$")
+
+
+def compile_excludes(patterns: Optional[list[str]]) -> list[re.Pattern]:
+    """None means the column predates the row and the defaults apply, matching
+    what the API reports for it. An empty list means exclude nothing."""
+    if patterns is None:
+        patterns = list(DEFAULT_HISTORY_INDEX_EXCLUDES)
+    return [glob_to_regex(p) for p in patterns if p]
+
+
+def is_excluded(path: str, compiled: list[re.Pattern]) -> bool:
+    return any(rx.match(path) for rx in compiled)
+
+
+def summary_prefix(path: str) -> str:
+    return "/".join(path.split("/")[:SUMMARY_DEPTH])
+
+
+# -- row collection -------------------------------------------------------------
+
+
+def summary_row_dicts(archive_id: int, overflow: Counter) -> list[dict]:
+    return [
+        {
+            "archive_id": archive_id,
+            "path": prefix,
+            "change": "summary",
+            "size_before": None,
+            "size_after": None,
+            "mode_changed": False,
+            "owner_changed": False,
+            "summary_count": n,
+        }
+        for prefix, n in sorted(overflow.items())
+    ]
+
+
+def capped_rows(
+    archive_id: int, changes, max_rows: int
+) -> tuple[list[dict], list[dict], bool]:
+    """Detail rows up to `max_rows`, the rest collapsed into summary rows, the
+    same spec 6.7 cap RowCollector applies while indexing. Summary rows already
+    present in `changes` keep their counts."""
+    detail: list[dict] = []
+    overflow: Counter = Counter()
+    for change in changes:
+        if change.change == "summary":
+            overflow[summary_prefix(change.path)] += change.summary_count or 0
+        elif len(detail) < max_rows:
+            detail.append(change_to_row_dict(change, archive_id))
+        else:
+            overflow[summary_prefix(change.path)] += 1
+    return detail, summary_row_dicts(archive_id, overflow), bool(overflow)
+
+
+class RowCollector:
+    """Rows for one archive with the spec 6.7 cap applied on the fly."""
+
+    def __init__(self, archive_id: int, max_rows: int):
+        self.archive_id = archive_id
+        self.max_rows = max_rows
+        self.detail: list[dict] = []
+        self.overflow: Counter = Counter()
+        self.count = 0
+
+    def add(
+        self,
+        record: ChangeRecord,
+        size_before: Optional[int],
+        size_after: Optional[int],
+    ) -> None:
+        self.count += 1
+        if len(self.detail) < self.max_rows:
+            self.detail.append(
+                {
+                    "archive_id": self.archive_id,
+                    "path": record.path,
+                    "change": record.change,
+                    "size_before": size_before,
+                    "size_after": size_after,
+                    "mode_changed": record.mode_changed,
+                    "owner_changed": record.owner_changed,
+                    "summary_count": None,
+                }
+            )
+        else:
+            self.overflow[summary_prefix(record.path)] += 1
+
+    @property
+    def truncated(self) -> bool:
+        return bool(self.overflow)
+
+    def summary_rows(self) -> list[dict]:
+        return summary_row_dicts(self.archive_id, self.overflow)
+
+
+def known_sizes(
+    db: Session, repository_id: int, series: str, before_start, paths: Iterable[str]
+) -> dict[str, int]:
+    """Last known size of each path in earlier archives of the series."""
+    paths = list(dict.fromkeys(paths))
+    result: dict[str, int] = {}
+    for i in range(0, len(paths), SIZE_LOOKUP_CHUNK):
+        chunk = paths[i : i + SIZE_LOOKUP_CHUNK]
+        rows = (
+            db.query(ArchiveChange.path, ArchiveChange.size_after)
+            .join(Archive, Archive.id == ArchiveChange.archive_id)
+            .filter(
+                Archive.repository_id == repository_id,
+                Archive.series == series,
+                Archive.start < before_start,
+                ArchiveChange.path.in_(chunk),
+                ArchiveChange.change.in_(("added", "modified")),
+                ArchiveChange.size_after.isnot(None),
+            )
+            .order_by(Archive.start.desc(), Archive.id.desc())
+            .all()
+        )
+        for path, size in rows:
+            result.setdefault(path, size)
+    return result
+
+
+# -- archive neighbours ---------------------------------------------------------
+
+
+def predecessor_of(db: Session, archive: Archive) -> Optional[Archive]:
+    return (
+        db.query(Archive)
+        .filter(
+            Archive.repository_id == archive.repository_id,
+            Archive.series == archive.series,
+            Archive.start < archive.start,
+        )
+        .order_by(Archive.start.desc(), Archive.id.desc())
+        .first()
+    )
+
+
+def successor_of(db: Session, archive: Archive) -> Optional[Archive]:
+    return (
+        db.query(Archive)
+        .filter(
+            Archive.repository_id == archive.repository_id,
+            Archive.series == archive.series,
+            Archive.start > archive.start,
+        )
+        .order_by(Archive.start.asc(), Archive.id.asc())
+        .first()
+    )
+
+
+def archive_ref(repository: Repository, archive: Archive) -> str:
+    return (
+        f"aid:{archive.borg_id}"
+        if (repository.borg_version or 1) == 2
+        else archive.name
+    )
+
+
+# -- collecting one archive -----------------------------------------------------
+
+
+async def collect_changes(
+    ctx,
+    db: Session,
+    repository: Repository,
+    archive: Archive,
+    predecessor: Optional[Archive],
+    env: dict,
+    excludes: list[re.Pattern],
+    max_rows: int,
+) -> RowCollector:
+    agent = is_agent_executor(repository)
+    parser = parse_list_line if predecessor is None else parse_diff_line
+    if agent:
+        # The agent runs the same listing on its machine and relays stdout.
+        stream = AgentChangeStream(
+            db,
+            repository,
+            archive_ref(repository, archive),
+            archive_ref(repository, predecessor) if predecessor is not None else None,
+            # a diff of unchanged paths yields no line for hours: the
+            # stream itself has to notice a cancellation
+            cancelled=ctx.cancelled,
+        )
+    elif predecessor is None:
+        stream = BorgRouter(repository).list_archive_lines(
+            archive_ref(repository, archive), env=env
+        )
+    else:
+        stream = BorgRouter(repository).diff_archives(
+            archive_ref(repository, predecessor),
+            archive_ref(repository, archive),
+            env=env,
+        )
+    collector = RowCollector(archive.id, max_rows)
+    pending_modified: list[ChangeRecord] = []
+
+    def flush_modified() -> None:
+        if not pending_modified:
+            return
+        sizes = known_sizes(
+            db,
+            repository.id,
+            archive.series,
+            archive.start,
+            (r.path for r in pending_modified),
+        )
+        for rec in pending_modified:
+            before = sizes.get(rec.path)
+            after = before + rec.size_delta if before is not None else None
+            collector.add(rec, before, after)
+        pending_modified.clear()
+
+    try:
+        async for line in stream:
+            if ctx.cancelled():
+                await stream.close()
+                raise OperationCancelled()
+            rec = parser(line)
+            if rec is None or rec.is_directory or is_excluded(rec.path, excludes):
+                continue
+            if rec.change == "modified" and rec.size_delta is not None:
+                pending_modified.append(rec)
+                if len(pending_modified) >= SIZE_LOOKUP_CHUNK:
+                    flush_modified()
+            else:
+                collector.add(rec, rec.size_before, rec.size_after)
+        flush_modified()
+    except BaseException:
+        if agent:
+            # a job left running would hold the repository on the agent
+            await stream.close()
+        raise
+    if stream.return_code not in BORG_OK_EXIT_CODES:
+        reason = (stream.stderr or "").strip()[-500:]
+        if getattr(stream, "lock_contention", False):
+            # the runner defers the operation (`repository_busy`)
+            raise lock_contention_error(reason)
+        raise RuntimeError(f"borg exited {stream.return_code}: {reason}")
+    return collector
+
+
+def write_archive_rows(db: Session, archive: Archive, collector: RowCollector) -> None:
+    """Replace the archive's rows and mark it indexed, in one transaction."""
+    db.query(ArchiveChange).filter(ArchiveChange.archive_id == archive.id).delete(
+        synchronize_session=False
+    )
+    for i in range(0, len(collector.detail), BATCH_SIZE):
+        db.bulk_insert_mappings(ArchiveChange, collector.detail[i : i + BATCH_SIZE])
+    summaries = collector.summary_rows()
+    if summaries:
+        db.bulk_insert_mappings(ArchiveChange, summaries)
+    archive.history_state = "indexed"
+    archive.history_indexed_at = utc_now()
+    archive.history_rows = len(collector.detail) + len(summaries)
+    archive.history_truncated = collector.truncated
+    archive.history_attempts = 0
+    db.commit()
+
+
+# -- executor: history_index ----------------------------------------------------
+
+
+async def run_history_index(ctx) -> Outcome:
+    repository = _load_repository(ctx)
+    if repository is None:
+        return Outcome(status="skipped", skip_reason="repository_missing")
+    db = ctx.db
+    # "failed" is retried: nothing else moves an archive out of that state, so
+    # skipping it would stall the series for good, since every later archive
+    # needs an indexed predecessor. The retry is bounded, because each attempt
+    # costs a full diff under the repository lock.
+    candidates = (
+        db.query(Archive)
+        .filter(
+            Archive.repository_id == repository.id,
+            Archive.history_state.in_(("pending", "failed")),
+        )
+        .order_by(Archive.series.asc(), Archive.start.asc(), Archive.id.asc())
+        .all()
+    )
+    exhausted = [
+        a
+        for a in candidates
+        if a.history_state == "failed"
+        and (a.history_attempts or 0) >= MAX_HISTORY_ATTEMPTS
+    ]
+    pending = [a for a in candidates if a not in exhausted]
+    agent = is_agent_executor(repository)
+    if agent and not agent_supports_job(db, repository, AGENT_DIFF_JOB_KIND):
+        # The chains do not create this stage for a repository whose agent
+        # cannot produce the listing; a row that reaches it anyway (queued
+        # before the agent was replaced by an older one) marks what the
+        # listing marks: every archive not indexed, the exhausted failures
+        # included (nothing can retry them here either).
+        for archive in candidates:
+            archive.history_state = "skipped"
+        db.commit()
+        return Outcome(
+            status="skipped",
+            skip_reason="agent_diff_unsupported",
+            result={"archives": len(candidates)},
+        )
+    if not pending:
+        return Outcome(
+            status="completed_with_warnings" if exhausted else "completed",
+            result={
+                "indexed": 0,
+                "failed": 0,
+                "left_pending": 0,
+                "exhausted": len(exhausted),
+            },
+        )
+    excludes = compile_excludes(repository.history_index_excludes)
+    max_rows = settings.index_history_max_rows
+    # the agent holds the repository's credentials; the server prepares none
+    env, temp_key_file = (
+        ({}, None) if agent else _prepare_repository_borg_env(repository, db)
+    )
+    indexed = failed = left = remaining = 0
+    agent_unavailable: Optional[str] = None
+    total = len(pending)
+    # Per-run budget (#1103). Without it one run works through every pending
+    # archive of the repository, and a backfill (an agent update reopening
+    # every skipped archive) holds an index worker for hours while the
+    # listings and stats of every other repository wait. The archives past
+    # the budget stay `pending` for the next reconcile run.
+    budget = settings.index_history_seconds_per_run
+    started = time.monotonic()
+    try:
+        for position, archive in enumerate(pending):
+            if ctx.cancelled():
+                break
+            if (
+                budget > 0
+                and (indexed or failed)
+                and (time.monotonic() - started >= budget)
+            ):
+                # Only a diff that ran spends the budget, so a run always
+                # attempts at least one archive (a repository whose single
+                # diff outlasts the budget still makes progress), and
+                # predecessor-blocked archives, which cost nothing, never
+                # end a run on their own. A failed diff counts: it costs
+                # the same repository lock and worker time as one that
+                # succeeded.
+                remaining = total - position
+                ctx.log(f"per-run budget reached: {remaining} archives left pending")
+                break
+            predecessor = predecessor_of(db, archive)
+            if predecessor is not None and predecessor.history_state != "indexed":
+                left += 1
+                continue
+            label = f"{predecessor.name if predecessor else 'full listing'} → {archive.name}"
+            await ctx.progress(current=position, total=total, message=label)
+            try:
+                collector = await run_serialized_repository_command(
+                    repository.id,
+                    lambda: collect_changes(
+                        ctx,
+                        db,
+                        repository,
+                        archive,
+                        predecessor,
+                        env,
+                        excludes,
+                        max_rows,
+                    ),
+                    scope="metadata",
+                )
+                write_archive_rows(db, archive, collector)
+                indexed += 1
+                ctx.log(
+                    f"{label}: {collector.count} changes, truncated={collector.truncated}"
+                )
+                # Let other coroutines (SSE, API) run between archives
+                await asyncio.sleep(0)
+            except OperationCancelled:
+                db.rollback()
+                break
+            except AgentUnavailable as exc:
+                # Not the archive's fault: it and every archive after it stay
+                # `pending` with their retry budget, for the next run.
+                db.rollback()
+                agent_unavailable = str(exc)
+                left += total - position
+                ctx.log(f"{label}: agent unavailable: {exc}")
+                break
+            except Exception as exc:
+                db.rollback()
+                if repository_busy(exc):
+                    # Another job holds the repository: the runner defers the
+                    # operation and retries; indexed archives stay indexed.
+                    raise
+                archive.history_state = "failed"
+                archive.history_attempts = (archive.history_attempts or 0) + 1
+                db.commit()
+                failed += 1
+                ctx.log(f"{label}: failed: {exc}")
+                logger.warning(
+                    "history index failed for archive",
+                    repository_id=repository.id,
+                    archive=archive.name,
+                    error=str(exc),
+                )
+        await ctx.progress(current=total, total=total, message=f"{indexed} indexed")
+        # left > 0 means an archive could not be diffed because its predecessor
+        # is not indexed; reporting that as a clean completion would hide a
+        # stalled series. Same for archives that have used up their retries.
+        status = (
+            "completed_with_warnings" if failed or left or exhausted else "completed"
+        )
+        result = {
+            "indexed": indexed,
+            "failed": failed,
+            "left_pending": left,
+            "exhausted": len(exhausted),
+        }
+        if remaining:
+            result["remaining"] = remaining
+        if agent_unavailable is not None:
+            result["agent_unavailable"] = agent_unavailable
+        return Outcome(status=status, result=result)
+    finally:
+        cleanup_temp_key_file(temp_key_file)
+
+
+# -- removed archives ------------------------------------------------------------
+
+
+def _delete_rows(db: Session, archive_id: int) -> None:
+    db.query(ArchiveChange).filter(ArchiveChange.archive_id == archive_id).delete(
+        synchronize_session=False
+    )
+
+
+def merge_removed_archive(
+    db: Session,
+    removed: Archive,
+    *,
+    reset_state: str = "pending",
+) -> str:
+    """Fold `removed` into its successor and delete it, in one transaction.
+
+    Returns "folded" when both archives were indexed, "reset" when the
+    successor was indexed against an archive that never was (its delta is
+    now against the wrong base, so it goes back to `reset_state`: pending,
+    or skipped where no history run will come, an agent's repository), and
+    "dropped" when there is no successor or the successor is not indexed
+    yet (it will be diffed against the new predecessor when it is).
+    """
+    successor = successor_of(db, removed)
+    try:
+        if successor is None:
+            outcome = "dropped"
+        elif (
+            successor.history_state == "indexed" and removed.history_state == "indexed"
+        ):
+            older = rows_to_changes(
+                db.query(ArchiveChange)
+                .filter(ArchiveChange.archive_id == removed.id)
+                .all()
+            )
+            newer = rows_to_changes(
+                db.query(ArchiveChange)
+                .filter(ArchiveChange.archive_id == successor.id)
+                .all()
+            )
+            folded = list(fold_pair(older, newer).values())
+            _delete_rows(db, successor.id)
+            # The fold keeps rows distinct in either archive, so it can exceed
+            # the per-archive cap; apply the same cap the indexer does.
+            detail, summaries, overflowed = capped_rows(
+                successor.id, folded, settings.index_history_max_rows
+            )
+            mappings = detail + summaries
+            for i in range(0, len(mappings), BATCH_SIZE):
+                db.bulk_insert_mappings(ArchiveChange, mappings[i : i + BATCH_SIZE])
+            successor.history_rows = len(mappings)
+            successor.history_truncated = bool(
+                overflowed or successor.history_truncated or removed.history_truncated
+            )
+            outcome = "folded"
+        elif successor.history_state == "indexed":
+            _delete_rows(db, successor.id)
+            successor.history_state = reset_state
+            successor.history_indexed_at = None
+            successor.history_rows = None
+            successor.history_truncated = False
+            outcome = "reset"
+        else:
+            outcome = "dropped"
+        # Explicit delete of the rows: SQLite only cascades with
+        # foreign_keys=ON, which the app does not guarantee.
+        _delete_rows(db, removed.id)
+        db.delete(removed)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return outcome
+
+
+async def run_history_merge(ctx) -> Outcome:
+    """history_merge left every chain: archive_sync deletes the archives its
+    listing no longer sees. A row an older version queued finishes here,
+    which frees its dependents; the next listing reports its targets again
+    and deletes them."""
+    return Outcome(status="skipped", skip_reason="merged_by_archive_sync")
+
+
+executors.register("history_index", run_history_index)
+executors.register("history_merge", run_history_merge)

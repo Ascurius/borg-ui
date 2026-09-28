@@ -19,10 +19,6 @@ interface BackupFlowPreviewProps {
   sourceSshConnection?: SSHConnection | null
 }
 
-const BLUE = '#3b82f6'
-const EMERALD = '#10b981'
-const AMBER = '#f59e0b'
-
 // Compact horizontal node card: [icon badge] label / subtitle
 function FlowNode({
   icon,
@@ -75,10 +71,12 @@ function FlowNode({
         <Tooltip title={label} placement="top" disableHoverListener={label.length < 16}>
           <Typography
             variant="body2"
-            fontWeight={600}
-            fontSize="0.78rem"
             noWrap
-            sx={{ color: 'text.primary' }}
+            sx={{
+              fontWeight: 600,
+              fontSize: '0.78rem',
+              color: 'text.primary',
+            }}
           >
             {label}
           </Typography>
@@ -86,10 +84,12 @@ function FlowNode({
         {subtitle && (
           <Typography
             variant="caption"
-            color="text.secondary"
-            fontSize="0.68rem"
-            display="block"
             noWrap
+            sx={{
+              color: 'text.secondary',
+              fontSize: '0.68rem',
+              display: 'block',
+            }}
           >
             {subtitle}
           </Typography>
@@ -98,13 +98,12 @@ function FlowNode({
           <Tooltip title={path} placement="bottom">
             <Typography
               variant="caption"
-              fontFamily="monospace"
-              fontSize="0.65rem"
               noWrap
-              display="block"
               sx={{
+                fontFamily: 'monospace',
+                fontSize: '0.65rem',
+                display: 'block',
                 color: accentColor,
-                opacity: 0.85,
                 cursor: 'default',
                 mt: 0.15,
               }}
@@ -120,6 +119,7 @@ function FlowNode({
 
 // Dashed connector between nodes
 function Connector({ double = false }: { double?: boolean }) {
+  const theme = useTheme()
   return (
     <Box
       sx={{
@@ -133,21 +133,21 @@ function Connector({ double = false }: { double?: boolean }) {
       <Box
         sx={{
           width: 20,
-          borderTop: `2px dashed ${alpha(BLUE, 0.4)}`,
+          borderTop: `2px dashed ${alpha(theme.palette.primary.main, 0.4)}`,
         }}
       />
       {double ? (
-        <Box sx={{ display: 'flex', color: alpha(BLUE, 0.7) }}>
+        <Box sx={{ display: 'flex', color: alpha(theme.palette.primary.main, 0.75) }}>
           <ArrowRight size={13} />
           <ArrowRight size={13} style={{ marginLeft: -6 }} />
         </Box>
       ) : (
-        <MoveRight size={14} color={alpha(BLUE, 0.75)} />
+        <MoveRight size={14} color={alpha(theme.palette.primary.main, 0.75)} />
       )}
       <Box
         sx={{
           width: 20,
-          borderTop: `2px dashed ${alpha(BLUE, 0.4)}`,
+          borderTop: `2px dashed ${alpha(theme.palette.primary.main, 0.4)}`,
         }}
       />
     </Box>
@@ -210,7 +210,7 @@ export default function BackupFlowPreview({
     <Box
       sx={{
         borderRadius: 2,
-        bgcolor: alpha(BLUE, theme.palette.mode === 'dark' ? 0.06 : 0.04),
+        bgcolor: alpha(theme.palette.primary.main, theme.palette.mode === 'dark' ? 0.06 : 0.04),
         p: 1.5,
         display: 'flex',
         flexDirection: 'column',
@@ -233,7 +233,14 @@ export default function BackupFlowPreview({
         >
           Backup Flow
         </Typography>
-        <Typography variant="caption" fontWeight={500} fontSize="0.72rem" sx={{ color: BLUE }}>
+        <Typography
+          variant="caption"
+          sx={{
+            fontWeight: 500,
+            fontSize: '0.72rem',
+            color: theme.palette.primary.main,
+          }}
+        >
           {getSummaryText()}
         </Typography>
       </Box>
@@ -252,7 +259,7 @@ export default function BackupFlowPreview({
           icon={getSourceIcon()}
           label={getSourceLabel()}
           subtitle={sourceSubtitle}
-          accentColor={BLUE}
+          accentColor={theme.palette.primary.main}
         />
 
         <Connector double={showSshfsIntermediate} />
@@ -263,7 +270,7 @@ export default function BackupFlowPreview({
             <FlowNode
               icon={<Server size={16} />}
               label={t('wizard.backupFlowPreview.viaSSHFS')}
-              accentColor={AMBER}
+              accentColor={theme.palette.warning.main}
             />
             <Connector />
           </>
@@ -273,7 +280,7 @@ export default function BackupFlowPreview({
         <FlowNode
           icon={getRepoIcon()}
           label={getRepoLabel()}
-          accentColor={EMERALD}
+          accentColor={theme.palette.success.main}
           path={repositoryPath || undefined}
         />
       </Box>

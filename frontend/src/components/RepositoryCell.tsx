@@ -1,6 +1,7 @@
 import React from 'react'
 import { Box, Stack, Typography, Tooltip } from '@mui/material'
 import { HardDrive } from 'lucide-react'
+import { subjectText } from '../theme'
 import { useTranslation } from 'react-i18next'
 
 interface RepositoryCellProps {
@@ -25,13 +26,22 @@ export const RepositoryCell: React.FC<RepositoryCellProps> = ({
 
   return (
     <Tooltip title={displayPath || t('repositoryCell.noPath')} placement="top" arrow>
-      <Stack direction="row" spacing={1} alignItems="flex-start" sx={{ color: 'text.secondary' }}>
+      <Stack
+        direction="row"
+        spacing={1}
+        sx={{
+          alignItems: 'flex-start',
+          color: 'text.secondary',
+        }}
+      >
         {withIcon && <HardDrive size={16} style={{ flexShrink: 0, marginTop: 2 }} />}
         <Box sx={{ minWidth: 0, flex: 1, overflow: 'hidden' }}>
           <Typography
             variant="body2"
-            fontWeight={500}
             sx={{
+              // Not the secondary colour the stack sets for the icon and the
+              // path: the name is the row's subject.
+              color: subjectText,
               overflow: 'hidden',
               textOverflow: 'ellipsis',
               whiteSpace: 'nowrap',
@@ -42,8 +52,8 @@ export const RepositoryCell: React.FC<RepositoryCellProps> = ({
           {repositoryPath && (
             <Typography
               variant="caption"
-              color="text.secondary"
               sx={{
+                color: 'text.secondary',
                 fontFamily: 'monospace',
                 fontSize: '0.7rem',
                 overflow: 'hidden',
