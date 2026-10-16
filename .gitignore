@@ -166,3 +166,4 @@ MagicMock/
 # Local lint/typecheck output (contains absolute paths)
 frontend/lint_report.txt
 frontend/lint_results.txt
+.github-token
