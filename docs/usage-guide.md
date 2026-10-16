@@ -28,6 +28,10 @@ admin / admin123
 
 Change the password in Settings > Account.
 
+For your first backup, the easiest path is **New backup** at the top of the
+sidebar. See [Quick Start](quick-start). The rest of this guide walks through
+the same setup by hand.
+
 ## Understand Container Paths
 
 Borg UI sees paths inside the container, not host paths.
@@ -101,7 +105,9 @@ Cloud mirrors keep the primary repository local, SSH-backed, or managed-agent-ba
 4. Enable the mirror, choose the rclone remote, and enter or browse a relative remote path.
 5. Review and save.
 
-For SSH repositories, Borg UI mounts the repository on the server with SSHFS during each mirror sync, then unmounts it after rclone finishes. Borg UI owns that temporary mount path; the UI and API do not ask for a cache or staging path.
+For SSH repositories, Borg UI mounts the repository read-only on the server with SSHFS during each mirror sync, then unmounts it after rclone finishes. Borg UI owns that temporary mount path; the UI and API do not ask for a cache or staging path.
+
+The mount needs SFTP access. Some hosts, such as BorgBase, only let a key be used for either Borg or SFTP, so the repository's Borg key gets `Connection reset by peer` when mounting. In that case give that host a second key with SFTP access, then in the Cloud Mirror step choose **Add key** next to **SSH key for cloud sync** and paste its private key (keys with a passphrase are not supported). The mirror signs in to the same connection with that key; Borg keeps using the connection's own key. Several repositories can share one SFTP key. To remove a key, select it in the same picker and use the delete button next to **Add key**; any repository that used it goes back to the connection's key.
 
 For managed-agent repositories, the selected agent syncs its agent-local repository path to the configured rclone remote. Borg UI owns the mirror metadata and rclone target; the agent owns any temporary rclone execution files and removes them after the sync.
 
@@ -147,6 +153,14 @@ A repository is the storage target. Use it to inspect repository-level informati
 A Backup Plan is the backup workflow. It defines what to back up, which repository or repositories to use, when the backup should run, and which scripts or maintenance actions should run around it.
 
 Community plans can use one repository. Pro plans can use multiple repositories, such as one local target and one off-site target, and can run them one after another or in parallel.
+
+Some settings, such as compression, exist on both. The Backup Plan value is
+the one its backups use. The repository value applies to backups started from
+the repository itself (Backup Now on a repository, legacy repository
+schedules) and is the default copied into a plan created from that
+repository. Only one value ever reaches Borg, so if the two differ, the plan
+wins for plan runs. (The API can also set a plan-to-repository link to use
+the repository value or a custom one; the UI does not expose that yet.)
 
 ## Choose Backup Sources
 

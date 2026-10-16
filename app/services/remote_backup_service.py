@@ -17,8 +17,10 @@ from urllib.parse import urlparse
 import structlog
 from sqlalchemy.orm import Session
 
+from app.utils.ssh_host_validation import ssh_destination
 from app.database.models import Repository, SSHConnection, SSHKey
 from app.utils.borg_env import effective_repository_remote_path
+from app.utils.borg_flags import parse_borg_flags
 from app.database.database import SessionLocal
 from app.config import settings
 from app.core.borg_errors import is_borg_warning_exit_code
@@ -474,11 +476,12 @@ class RemoteBackupService:
 
         # Compression
         if compression:
-            cmd_parts.extend(["--compression", compression])
+            cmd_parts.extend(["--compression", shlex.quote(compression)])
 
-        # Custom flags
-        if custom_flags:
-            cmd_parts.append(custom_flags)
+        # Custom flags: allowlisted and re-quoted, since this is a shell string
+        custom_flag_list = parse_borg_flags(custom_flags, "create", local_paths=False)
+        if custom_flag_list:
+            cmd_parts.append(shlex.join(custom_flag_list))
 
         # Exclude patterns
         for pattern in exclude_patterns:
@@ -569,7 +572,8 @@ class RemoteBackupService:
                     "ServerAliveCountMax=3",
                     "-p",
                     str(ssh_connection.port),
-                    f"{ssh_connection.username}@{ssh_connection.host}",
+                    "--",
+                    ssh_destination(ssh_connection.username, ssh_connection.host),
                     command,
                 ]
 
@@ -779,7 +783,8 @@ class RemoteBackupService:
                     *host_key_ssh_opts(ssh_connection, db),
                     "-p",
                     str(ssh_connection.port),
-                    f"{ssh_connection.username}@{ssh_connection.host}",
+                    "--",
+                    ssh_destination(ssh_connection.username, ssh_connection.host),
                     remote_command,
                 ]
 

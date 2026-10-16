@@ -28,6 +28,7 @@ from app.database.models import (
     RepositoryStorage,
     ScheduledJob,
     ScheduledJobRepository,
+    SSHKey,
     SystemSettings,
     User,
     UserRepositoryPermission,
@@ -145,6 +146,7 @@ from app.utils.source_locations import (
     legacy_source_fields,
     normalize_source_locations,
 )
+from app.utils.borg_flags import borg_flags_validator, parse_borg_flags
 from app.utils.borg_env import (
     build_repository_borg_env,
     effective_repository_remote_path,
@@ -229,10 +231,20 @@ def _normalize_restore_check_paths(paths: Any) -> list[str]:
     return normalized_paths
 
 
-def _normalize_optional_flags(value: Any) -> Optional[str]:
+def _normalize_check_flags(value: Any) -> Optional[str]:
     if value is None:
         return None
     text = str(value).strip()
+    try:
+        parse_borg_flags(text, "check")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "key": "backend.errors.repo.invalidBorgFlags",
+                "params": {"reason": str(exc)},
+            },
+        ) from exc
     return text or None
 
 
@@ -653,11 +665,17 @@ async def _run_repository_command(
     *,
     log_message: Optional[str] = None,
     log_fields: Optional[Dict[str, Any]] = None,
+    passphrase: Optional[str] = None,
 ):
-    """Execute a repository-scoped Borg command with common SSH/env handling."""
+    """Execute a repository-scoped Borg command with common SSH/env handling.
+
+    ``passphrase`` replaces the stored one for this command only.
+    """
     env, temp_key_file = _prepare_repository_borg_env(
         repository, db, lock_wait=REQUEST_LOCK_WAIT
     )
+    if passphrase is not None:
+        env["BORG_PASSPHRASE"] = passphrase
     # Both callers machine-parse the JSON output; pin the render zone so borg1
     # timestamps come out UTC instead of server-local.
     env["TZ"] = "UTC"
@@ -1085,7 +1103,8 @@ async def _update_agent_repository_stats(
                 du_result = await wait(du_job, timeouts["info_timeout"])
                 du_meta = du_result or {}
                 if du_meta.get("return_code", 0) == 0:
-                    # `du -sb` prints "<bytes>\t<path>".
+                    # "<bytes>\t<path>": `du -sb`, or on macOS (agent 0.1.15)
+                    # `du -A -sk` scaled to bytes by the agent.
                     stdout = (du_meta.get("stdout") or "").strip()
                     first = stdout.split("\n")[0] if stdout else ""
                     fields = first.split()
@@ -1374,6 +1393,7 @@ class RepositoryCreate(BaseModel):
     custom_flags: Optional[str] = (
         None  # Custom command-line flags for borg create (e.g., "--stats --list")
     )
+    _validate_custom_flags = borg_flags_validator("custom_flags", "create")
     upload_ratelimit_kib: Optional[int] = None
     source_connection_id: Optional[int] = (
         None  # SSH connection ID for remote data source (pull-based backups)
@@ -1384,6 +1404,7 @@ class RepositoryCreate(BaseModel):
     storage_backend: str = "local"  # local, ssh, agent_local, rclone
     rclone_remote_id: Optional[int] = None
     rclone_remote_path: Optional[str] = None
+    rclone_sftp_ssh_key_id: Optional[int] = None
     cloud_mirror_enabled: bool = False
     rclone_remote_path_verified: bool = False
     rclone_sync_policy: str = "after_success"
@@ -1430,6 +1451,7 @@ class RepositoryImport(BaseModel):
     custom_flags: Optional[str] = (
         None  # Custom command-line flags for borg create (e.g., "--stats --list")
     )
+    _validate_custom_flags = borg_flags_validator("custom_flags", "create")
     upload_ratelimit_kib: Optional[int] = None
     source_connection_id: Optional[int] = (
         None  # SSH connection ID for remote data source (pull-based backups)
@@ -1443,6 +1465,7 @@ class RepositoryImport(BaseModel):
     storage_backend: str = "local"  # local, ssh, agent_local, rclone
     rclone_remote_id: Optional[int] = None
     rclone_remote_path: Optional[str] = None
+    rclone_sftp_ssh_key_id: Optional[int] = None
     cloud_mirror_enabled: bool = False
     rclone_remote_path_verified: bool = False
     rclone_sync_policy: str = "after_success"
@@ -1484,6 +1507,7 @@ class RepositoryUpdate(BaseModel):
     history_index_excludes: Optional[List[str]] = None
     index_mode: Optional[Literal["full", "archives", "off"]] = None
     custom_flags: Optional[str] = None  # Custom command-line flags for borg create
+    _validate_custom_flags = borg_flags_validator("custom_flags", "create")
     upload_ratelimit_kib: Optional[int] = None
     source_connection_id: Optional[int] = (
         None  # SSH connection ID for remote data source
@@ -1494,6 +1518,7 @@ class RepositoryUpdate(BaseModel):
     storage_backend: Optional[str] = None
     rclone_remote_id: Optional[int] = None
     rclone_remote_path: Optional[str] = None
+    rclone_sftp_ssh_key_id: Optional[int] = None
     cloud_mirror_enabled: Optional[bool] = None
     rclone_remote_path_verified: Optional[bool] = None
     rclone_sync_policy: Optional[str] = None
@@ -1501,6 +1526,12 @@ class RepositoryUpdate(BaseModel):
     rclone_sync_timezone: Optional[str] = None
     rclone_extra_flags: Optional[List[str]] = None
     rclone_cache_path: Optional[str] = None
+    passphrase: Optional[str] = None  # Blank or absent keeps the stored one
+
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase_single_line(cls, value: Optional[str]) -> Optional[str]:
+        return _single_line_passphrase(value)
 
 
 class RepositoryInfo(BaseModel):
@@ -1521,6 +1552,53 @@ class RepositoryInfo(BaseModel):
 def _uses_borg2_payload(data: Union[RepositoryCreate, RepositoryImport]) -> bool:
     requested_version = getattr(data, "borg_version", 1) or 1
     return requested_version == 2 or data.encryption in V2_ONLY_ENCRYPTION_MODES
+
+
+# Repository URLs only Borg 2 can open.
+BORG2_ONLY_URL_PREFIXES = (
+    "rest://",
+    "sftp://",
+    "http://",
+    "https://",
+    "s3:",
+    "b2:",
+    "rclone:",
+)
+
+
+def _reject_borg2_only_url_for_borg1(
+    path: Optional[str],
+    *,
+    borg2: bool,
+    connection_id: Optional[int],
+    agent: bool,
+) -> None:
+    """Refuse a repository URL only Borg 2 can open for a Borg 1 repository.
+
+    Borg 1 refuses none of them: it reads the ``scheme://`` forms as a local
+    directory and the ``name:`` forms as an ssh host of that name, so every job
+    on such a repository fails with an error that names something else. With
+    an SSH connection the path is a directory on that host and is left alone.
+    An agent hands the path to Borg as it is, so only there can ``s3:path``
+    have meant an ssh host; the answer for an agent says how to write one.
+    """
+    if borg2 or connection_id:
+        return
+    lowered = (path or "").strip().lower()
+    for prefix in BORG2_ONLY_URL_PREFIXES:
+        if not lowered.startswith(prefix):
+            continue
+        if prefix.endswith("//") or not agent:
+            detail = {
+                "key": "backend.errors.repo.borg2OnlyUrl",
+                "params": {"scheme": prefix},
+            }
+        else:
+            detail = {
+                "key": "backend.errors.repo.borg2OnlyUrlOrSshHost",
+                "params": {"scheme": prefix, "host": prefix[:-1]},
+            }
+        raise HTTPException(status_code=400, detail=detail)
 
 
 def _is_rclone_payload(data: Union[RepositoryCreate, RepositoryImport]) -> bool:
@@ -1662,6 +1740,8 @@ def _apply_mirror_source_strategy(
     else:
         storage.cache_path = repository.path
         storage.sync_direction = SYNC_DIRECTION_PRIMARY_TO_REMOTE
+    if source_backend != "ssh":
+        storage.sftp_ssh_key_id = None
 
 
 def _reject_unsupported_rclone_borg2(
@@ -1700,6 +1780,7 @@ def _validate_direct_rclone_payload(
         or data.cloud_mirror_enabled
         or data.rclone_remote_id is not None
         or bool((data.rclone_remote_path or "").strip())
+        or data.rclone_sftp_ssh_key_id is not None
         or bool(data.rclone_extra_flags)
         or data.rclone_sync_policy != "after_success"
         or bool((data.rclone_sync_cron_expression or "").strip())
@@ -1722,6 +1803,7 @@ def _validate_direct_rclone_update(
         or bool((repo_data.rclone_cache_path or "").strip())
         or repo_data.rclone_remote_id is not None
         or bool((repo_data.rclone_remote_path or "").strip())
+        or repo_data.rclone_sftp_ssh_key_id is not None
         or bool(repo_data.rclone_extra_flags)
         or bool((repo_data.rclone_sync_cron_expression or "").strip())
         or bool((repo_data.rclone_sync_timezone or "").strip())
@@ -1757,6 +1839,7 @@ def _strip_direct_rclone_noop_update_fields(update_data: dict[str, Any]) -> None
         "storage_backend",
         "rclone_remote_id",
         "rclone_remote_path",
+        "rclone_sftp_ssh_key_id",
         "rclone_sync_policy",
         "rclone_sync_cron_expression",
         "rclone_sync_timezone",
@@ -1817,6 +1900,7 @@ def _strip_disabled_rclone_noop_update_fields(update_data: dict[str, Any]) -> No
         "cloud_mirror_enabled": {None, False},
         "rclone_remote_id": {None},
         "rclone_remote_path": {None, ""},
+        "rclone_sftp_ssh_key_id": {None},
         "rclone_remote_path_verified": {None, False},
         "rclone_sync_policy": {None, "after_success"},
         "rclone_sync_cron_expression": {None, ""},
@@ -1847,6 +1931,7 @@ def _rclone_feature_gate_updates(
     default_values = {
         "rclone_remote_id": {None},
         "rclone_remote_path": {None, ""},
+        "rclone_sftp_ssh_key_id": {None},
         "rclone_remote_path_verified": {None, False},
         "rclone_sync_policy": {None, "after_success"},
         "rclone_sync_cron_expression": {None, ""},
@@ -1992,6 +2077,15 @@ def _validate_rclone_payload(
     return remote
 
 
+def _require_sftp_ssh_key(ssh_key_id: int | None, db: Session) -> None:
+    if ssh_key_id is None:
+        return
+    if not db.query(SSHKey.id).filter(SSHKey.id == ssh_key_id).first():
+        raise HTTPException(
+            status_code=404, detail={"key": "backend.errors.ssh.sshKeyNotFound"}
+        )
+
+
 def _validate_cloud_mirror_payload(
     data: Union[RepositoryCreate, RepositoryImport],
     db: Session,
@@ -2011,6 +2105,7 @@ def _validate_cloud_mirror_payload(
             status_code=400,
             detail={"key": "backend.errors.rclone.mirrorUnsupportedPrimary"},
         )
+    _require_sftp_ssh_key(data.rclone_sftp_ssh_key_id, db)
     if not data.rclone_remote_id:
         raise HTTPException(
             status_code=400,
@@ -2532,6 +2627,13 @@ async def _create_agent_repository_record(
     *,
     imported: bool,
 ):
+    # Recorded below with the payload's major, whatever the encryption mode says.
+    _reject_borg2_only_url_for_borg1(
+        repo_data.path,
+        borg2=(repo_data.borg_version or 1) == 2,
+        connection_id=repo_data.connection_id,
+        agent=True,
+    )
     cloud_mirror_remote = _validate_cloud_mirror_payload(repo_data, db)
     await _preflight_cloud_mirror_path(repo_data, cloud_mirror_remote)
     agent = await _validate_agent_repository_payload(repo_data, db)
@@ -3459,6 +3561,12 @@ async def create_repository(
         _reject_unsupported_rclone_borg2(repo_data)
         if _is_rclone_payload(repo_data):
             return await _create_rclone_repository_record(repo_data, current_user, db)
+        _reject_borg2_only_url_for_borg1(
+            repo_data.path,
+            borg2=_uses_borg2_payload(repo_data),
+            connection_id=repo_data.connection_id,
+            agent=executor_type == "agent",
+        )
         if _uses_borg2_payload(repo_data):
             _require_borg2_feature(db)
             if executor_type == "agent":
@@ -3768,6 +3876,7 @@ async def create_repository(
                 extra_flags=repo_data.rclone_extra_flags,
                 sync_cron_expression=repo_data.rclone_sync_cron_expression,
                 sync_timezone=repo_data.rclone_sync_timezone,
+                sftp_ssh_key_id=repo_data.rclone_sftp_ssh_key_id,
             )
             db.add(storage)
             db.commit()
@@ -3865,6 +3974,12 @@ async def import_repository(
         _reject_unsupported_rclone_borg2(repo_data)
         if _is_rclone_payload(repo_data):
             return await _import_rclone_repository_record(repo_data, current_user, db)
+        _reject_borg2_only_url_for_borg1(
+            repo_data.path,
+            borg2=_uses_borg2_payload(repo_data),
+            connection_id=repo_data.connection_id,
+            agent=executor_type == "agent",
+        )
         if _uses_borg2_payload(repo_data):
             _require_borg2_feature(db)
             if executor_type == "agent":
@@ -4153,6 +4268,7 @@ async def import_repository(
                 extra_flags=repo_data.rclone_extra_flags,
                 sync_cron_expression=repo_data.rclone_sync_cron_expression,
                 sync_timezone=repo_data.rclone_sync_timezone,
+                sftp_ssh_key_id=repo_data.rclone_sftp_ssh_key_id,
             )
             db.add(storage)
             db.commit()
@@ -4218,7 +4334,7 @@ async def import_repository(
 
 
 @router.get("/{repo_id}/rclone/status")
-async def get_repository_rclone_status(
+def get_repository_rclone_status(
     repo_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -4417,7 +4533,7 @@ async def download_keyfile(repo_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{repo_id}/storage")
-async def get_repository_storage(
+def get_repository_storage(
     repo_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -4632,6 +4748,60 @@ def _relink_over_cancelled(
     db.commit()
 
 
+async def _verify_updated_passphrase(
+    repository: Repository, db: Session, passphrase: str
+) -> None:
+    """Refuse a new passphrase the repository does not open with, so a wrong
+    value is never stored. Runs the command of the info route."""
+    router = BorgRouter(repository)
+    cmd = router.build_repo_info_command(repository.path)
+    if remote_path := effective_repository_remote_path(repository):
+        cmd.extend(["--remote-path", remote_path])
+    use_bypass_lock, _ = _resolve_bypass_lock(repository, db, "bypass_lock_on_info")
+    if use_bypass_lock and not router.is_v2:
+        cmd.append("--bypass-lock")
+
+    # Preparing the command can commit its session (a host key pinned on
+    # first use). A session of its own keeps the pending update out of that.
+    command_db = SessionLocal()
+    timeout = get_operation_timeouts(db)["info_timeout"]
+
+    async def _operation():
+        return await _run_repository_command(
+            repository, command_db, cmd, timeout, passphrase=passphrase
+        )
+
+    try:
+        returncode, _, stderr = await run_serialized_repository_command(
+            repository.id, _operation
+        )
+        error_msg = stderr.decode(errors="replace").strip() if stderr else ""
+    except asyncio.TimeoutError:
+        returncode, error_msg = None, "Repository verification timed out"
+    except Exception as e:
+        returncode, error_msg = None, str(e)
+    finally:
+        command_db.close()
+    if returncode == 0:
+        return
+
+    logger.warning(
+        "Repository did not verify with the new passphrase",
+        repo_id=repository.id,
+        borg_exit_code=returncode,
+        error=error_msg,
+    )
+    if "passphrase" in error_msg.lower() or "encrypted" in error_msg.lower():
+        raise HTTPException(
+            status_code=400,
+            detail={"key": "backend.errors.repo.encryptedPassphraseIncorrect"},
+        )
+    raise HTTPException(
+        status_code=400,
+        detail={"key": "backend.errors.repo.failedToVerifyRepository"},
+    )
+
+
 @router.put("/{repo_id}")
 async def update_repository(
     repo_id: int,
@@ -4652,6 +4822,13 @@ async def update_repository(
         update_data = repo_data.model_dump(exclude_unset=True)
         if "upload_ratelimit_kib" in update_data:
             _validate_upload_ratelimit_kib(repo_data.upload_ratelimit_kib)
+
+        # No response returns the passphrase, so the edit form submits a blank
+        # one unless a new one was typed: blank keeps the stored value.
+        passphrase_changed = bool(
+            (repo_data.passphrase or "").strip()
+            and repo_data.passphrase != repository.passphrase
+        )
 
         # Update fields
         if repo_data.name is not None:
@@ -4706,6 +4883,7 @@ async def update_repository(
             "storage_backend",
             "rclone_remote_id",
             "rclone_remote_path",
+            "rclone_sftp_ssh_key_id",
             "rclone_sync_policy",
             "rclone_sync_cron_expression",
             "rclone_sync_timezone",
@@ -4797,6 +4975,7 @@ async def update_repository(
                     for key in (
                         "rclone_remote_id",
                         "rclone_remote_path",
+                        "rclone_sftp_ssh_key_id",
                         "rclone_sync_policy",
                         "rclone_sync_cron_expression",
                         "rclone_sync_timezone",
@@ -4849,6 +5028,7 @@ async def update_repository(
                         detail={"key": "backend.errors.rclone.invalidSyncPolicy"},
                     )
                 _validate_rclone_schedule_payload(repo_data)
+                _require_sftp_ssh_key(repo_data.rclone_sftp_ssh_key_id, db)
                 remote = (
                     db.query(RcloneRemote)
                     .filter(RcloneRemote.id == repo_data.rclone_remote_id)
@@ -4993,6 +5173,7 @@ async def update_repository(
                                 "message": str(exc),
                             },
                         ) from exc
+                _require_sftp_ssh_key(repo_data.rclone_sftp_ssh_key_id, db)
                 _apply_mirror_source_strategy(storage, repository)
 
             if should_update_direct_rclone:
@@ -5090,6 +5271,14 @@ async def update_repository(
 
         if "path" in update_data and repo_data.path is not None:
             raw_path = repo_data.path.strip()
+            # The form sends the path with every edit; only a new one is checked.
+            if raw_path != repository.path:
+                _reject_borg2_only_url_for_borg1(
+                    raw_path,
+                    borg2=(repository.borg_version or 1) == 2,
+                    connection_id=target_connection_id,
+                    agent=target_executor_type == "agent",
+                )
 
         target_path = raw_path if raw_path is not None else repository.path
         if target_executor_type == "agent":
@@ -5113,6 +5302,11 @@ async def update_repository(
             else:
                 # Switching to SSH - set repository_type (for backward compatibility with old code)
                 repository.repository_type = "ssh"
+
+        stored_passphrase = repository.passphrase
+        if passphrase_changed:
+            # The path handling below opens a changed path with it.
+            repository.passphrase = repo_data.passphrase
 
         # Reconstruct path if connection_id or path changed (similar to create endpoint logic)
         path_changed = False
@@ -5268,6 +5462,11 @@ async def update_repository(
                         new_path=repository.path,
                         borg_version=repository.borg_version or 1,
                     )
+
+        if passphrase_changed and not path_changed:
+            # Not verified yet, and the steps up to the verification may
+            # commit the session: keep it off the row until then.
+            repository.passphrase = stored_passphrase
 
         if repo_data.compression is not None:
             repository.compression = repo_data.compression
@@ -5455,7 +5654,32 @@ async def update_repository(
             and existing_rclone_storage.backend == "rclone"
             and repository.repository_type != "rclone"
         ):
+            # Applied here, after connection_id and the executor are updated,
+            # so a PUT that switches to SSH keeps it (the strategy clears it
+            # for any other source).
+            if "rclone_sftp_ssh_key_id" in update_data:
+                existing_rclone_storage.sftp_ssh_key_id = (
+                    repo_data.rclone_sftp_ssh_key_id
+                )
             _apply_mirror_source_strategy(existing_rclone_storage, repository)
+
+        if passphrase_changed:
+            # A changed path was opened with the new passphrase above. An
+            # agent runs Borg itself, so its repositories take the value as
+            # given, like an agent import. Verified before the first
+            # statement of this update is sent, so that the wait for Borg
+            # holds no write lock on the database.
+            if not path_changed:
+                if repository_executor_type(repository) != "agent":
+                    await _verify_updated_passphrase(
+                        repository, db, repo_data.passphrase
+                    )
+                repository.passphrase = repo_data.passphrase
+            logger.info(
+                "Repository passphrase updated",
+                repo_id=repo_id,
+                user=current_user.username,
+            )
 
         if reopen_history:
             # On the server the history stage exists again: the archives an
@@ -5731,7 +5955,7 @@ async def check_repository(
         # Extract max_duration from request body (default to 3600)
         max_duration = request.get("max_duration", 3600) if request else 3600
         check_extra_flags = (
-            _normalize_optional_flags(request.get("check_extra_flags"))
+            _normalize_check_flags(request.get("check_extra_flags"))
             if request
             else None
         )
@@ -6055,7 +6279,7 @@ async def execute_repository_wipe(
 
 
 @router.get("/{repo_id}/wipe-jobs/{job_id}")
-async def get_repository_wipe_job(
+def get_repository_wipe_job(
     repo_id: int,
     job_id: int,
     current_user: User = Depends(get_current_user),
@@ -6588,7 +6812,7 @@ async def get_repository_stats(
 
 # Check job endpoints
 @router.get("/check-jobs/{job_id}")
-async def get_check_job_status(
+def get_check_job_status(
     job_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -6618,7 +6842,7 @@ async def get_check_job_status(
 
 
 @router.get("/{repo_id}/check-jobs")
-async def get_repository_check_jobs(
+def get_repository_check_jobs(
     repo_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -6657,7 +6881,7 @@ async def get_repository_check_jobs(
 
 
 @router.get("/restore-check-jobs/{job_id}")
-async def get_restore_check_job_status(
+def get_restore_check_job_status(
     job_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -6699,7 +6923,7 @@ async def get_restore_check_job_status(
 
 
 @router.get("/{repo_id}/restore-check-jobs")
-async def get_repository_restore_check_jobs(
+def get_repository_restore_check_jobs(
     repo_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -6747,7 +6971,7 @@ async def get_repository_restore_check_jobs(
 
 # Compact job endpoints
 @router.get("/compact-jobs/{job_id}")
-async def get_compact_job_status(
+def get_compact_job_status(
     job_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -6777,7 +7001,7 @@ async def get_compact_job_status(
 
 
 @router.get("/{repo_id}/compact-jobs")
-async def get_repository_compact_jobs(
+def get_repository_compact_jobs(
     repo_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -6810,7 +7034,7 @@ async def get_repository_compact_jobs(
 
 
 @router.get("/prune-jobs/{job_id}")
-async def get_prune_job_status(
+def get_prune_job_status(
     job_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -6839,7 +7063,7 @@ async def get_prune_job_status(
 
 
 @router.get("/{repo_id}/prune-jobs")
-async def get_repository_prune_jobs(
+def get_repository_prune_jobs(
     repo_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -6872,7 +7096,7 @@ async def get_repository_prune_jobs(
 
 # Helper endpoint to check if repository has running maintenance jobs
 @router.get("/{repo_id}/running-jobs")
-async def get_running_jobs(
+def get_running_jobs(
     repo_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -7052,7 +7276,7 @@ async def update_check_schedule(
             repo.check_max_duration = max_duration
 
         if "check_extra_flags" in request:
-            repo.check_extra_flags = _normalize_optional_flags(
+            repo.check_extra_flags = _normalize_check_flags(
                 request.get("check_extra_flags")
             )
 
@@ -7324,7 +7548,7 @@ async def update_restore_check_schedule(
 
 
 @router.get("/{repo_id}/check-schedule")
-async def get_check_schedule(
+def get_check_schedule(
     repo_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -7370,7 +7594,7 @@ async def get_check_schedule(
 
 
 @router.get("/{repo_id}/restore-check-schedule")
-async def get_restore_check_schedule(
+def get_restore_check_schedule(
     repo_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

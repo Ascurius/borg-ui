@@ -4,6 +4,7 @@
       "save": "Salva",
       "cancel": "Annulla",
       "delete": "Elimina",
+      "deleting": "Eliminazione in corso...",
       "edit": "Modifica",
       "create": "Crea",
       "update": "Aggiorna",
@@ -65,7 +66,8 @@
     "undoneWarning": "Questa azione non può essere annullata.",
     "version": "Versione",
     "errors": {
-      "unexpectedError": "Si è verificato un errore imprevisto"
+      "unexpectedError": "Si è verificato un errore imprevisto",
+      "copyFailed": "Impossibile copiare negli appunti"
     }
   },
   "login": {
@@ -357,6 +359,8 @@
         "description": "Esegui questo comando sulla macchina registrata per aggiornare il pacchetto dell'agente Borg UI e riavviare il servizio systemd. Non sono richiesti token o passaggi di registrazione.",
         "configPreserved": "Lo script conserva la configurazione dell'agente esistente in",
         "serviceUserPreserved": "Il servizio continua inoltre a essere eseguito con l'utente registrato nella sua unità systemd: esegui il comando da qualsiasi account con sudo.",
+        "descriptionMacos": "Esegui questo sul Mac per aggiornare il pacchetto dell'agente Borg UI e riavviare il job di launchd. Non sono richiesti token di iscrizione né registrazione.",
+        "runAsAgentUser": "Eseguilo come l'utente con cui viene eseguito l'agente, senza sudo.",
         "borgInstallation": "Installazione di Borg",
         "borgSelectionHint": "Selezionando le versioni di Borg quei binari sull'agente vengono aggiornati alle versioni offerte da questo server. Lascia la selezione su Salta se non intendi eseguire un upgrade di Borg.",
         "borgOptions": {
@@ -490,6 +494,7 @@
         "removesVenv": "L'ambiente virtuale in /opt/borg-ui-agent",
         "removesConfig": "La configurazione in /etc/borg-ui-agent, credenziale inclusa",
         "removesUser": "L'utente di servizio dedicato borg-ui-agent, se l'installazione ne ha creato uno",
+        "removesUserDirectory": "La directory dell'agente in ~/Library/Application Support, i suoi log e i suoi job di launchd",
         "keepsBorg": "La tua installazione di Borg non viene toccata. Vengono rimossi solo i binari collocati da questo programma di installazione.",
         "keepsRepositories": "I tuoi repository di backup non vengono toccati.",
         "copyCommand": "Copia comando"
@@ -500,6 +505,8 @@
       "title": "Comando di installazione",
       "copy": "Copia comando di installazione",
       "description": "Esegui il comando sul computer Linux. Il programma di installazione registra l'agente e abilita il servizio systemd per impostazione predefinita.",
+      "descriptionMacos": "Esegui il comando sul Mac come l'utente i cui dati vengono salvati, senza sudo. Il programma di installazione scarica un runtime Python e Borg, registra l'agente e lo carica come agente utente di launchd.",
+      "repositoryPlaceholder": "Sostituisci {{placeholder}} con il repository in cui questo computer esegue i backup, ad esempio ssh://user@host:23/./repo. Borg UI precompila con esso il modulo del repository. Rimuovi --borg-repo se non ne esiste ancora uno.",
       "connected": "{{name}} connesso",
       "waiting": "In attesa della connessione dell'agente…",
       "connectedDescription": "Puoi chiudere questa finestra; l'agente continuerà a funzionare.",
@@ -513,10 +520,16 @@
       "copyInstallCommands": "Copia comandi di installazione",
       "copyStatusCommand": "Copia comando di stato",
       "copySystemdCommands": "Copia comandi systemd",
+      "copyMacosSetupCommand": "Copia comando di configurazione macOS",
+      "copyMacosStatusCommand": "Copia comando di stato launchd",
+      "copyLaunchdCommands": "Copia comandi launchd",
+      "linuxLabel": "Linux",
+      "macosLabel": "macOS",
       "steps": {
         "install": {
-          "title": "1. Esegui il programma di installazione Linux",
-          "description": "Esegui questa operazione sul computer Linux che possiede i file di cui Borg deve eseguire il backup. Il programma di installazione installa le dipendenze, registra l'agente e abilita il servizio systemd. Per impostazione predefinita, il servizio viene eseguito come l'utente che ha invocato sudo, quindi i percorsi del repository e delle origini devono essere accessibili a tale utente."
+          "title": "1. Esegui il programma di installazione",
+          "description": "Esegui questa operazione sul computer Linux che possiede i file di cui Borg deve eseguire il backup. Il programma di installazione installa le dipendenze, registra l'agente e abilita il servizio systemd. Per impostazione predefinita, il servizio viene eseguito come l'utente che ha invocato sudo, quindi i percorsi del repository e delle origini devono essere accessibili a tale utente.",
+          "descriptionMacos": "Su un Mac, esegui questa operazione come l'utente i cui dati vengono salvati, senza sudo. Il programma di installazione scarica un runtime Python e la versione di Borg eseguita da questo server, registra l'agente e lo carica come agente utente di launchd, in esecuzione finché quell'utente è connesso."
         },
         "server": {
           "title": "2. URL del server e token",
@@ -529,7 +542,8 @@
         },
         "service": {
           "title": "4. Controlli del servizio",
-          "description": "Il programma di installazione abilita systemd per impostazione predefinita, così l'agente sopravvive al riavvio. Usa questi comandi solo quando controlli o ripari un'installazione manuale."
+          "description": "Il programma di installazione abilita systemd per impostazione predefinita, così l'agente sopravvive al riavvio. Usa questi comandi solo quando controlli o ripari un'installazione manuale.",
+          "descriptionMacos": "Su un Mac l'agente è un agente utente di launchd nel dominio dell'utente connesso. Controllalo con il primo comando. Il secondo blocco adatta il modello alla tua cartella home e lo carica; il modello si aspetta l'agente in ~/Library/Application Support/borg-ui-agent, dove lo colloca il programma di installazione."
         }
       }
     },
@@ -551,6 +565,8 @@
       },
       "selected": "Selezionato",
       "comingLater": "Disponibile in seguito",
+      "select": "Seleziona",
+      "macosHint": "L'agente viene eseguito come l'utente connesso sotto launchd e solo finché quell'utente è connesso. Nulla viene installato a livello di sistema.",
       "serverUrl": "URL del server",
       "localhostWarning": "localhost funziona solo quando l'agente e Borg UI sono sullo stesso computer. I computer remoti richiedono un nome host, un indirizzo IP o un URL HTTPS raggiungibile.",
       "serverUrlHelper": "Questo URL deve essere raggiungibile dal computer dell'agente.",
@@ -1307,6 +1323,8 @@
       "runCompactTip": "Il repository viene compattato dopo ogni backup",
       "runCheck": "Controlla",
       "runCheckTip": "Il controllo di integrità viene eseguito dopo ogni backup (oltre a qualsiasi controllo pianificato qui sotto)",
+      "runRestoreCheck": "Test di ripristino",
+      "runRestoreCheckTip": "Ripristina il nuovo archivio dopo ogni backup, con le impostazioni del test di ripristino del repository",
       "collapse": "Comprimi",
       "expand": "Espandi",
       "togglePlan": "{{action}} {{name}}"
@@ -1906,6 +1924,7 @@
         "runPruneAfter": "Esegui prune dopo backup repository riusciti",
         "runCompactAfter": "Esegui compact dopo la manutenzione del backup",
         "runCheckAfter": "Esegui check dopo backup repository riusciti",
+        "runRestoreCheckAfter": "Esegui test di ripristino sul nuovo archivio dopo backup repository riusciti",
         "checkMaxDurationHelper": "Secondi. Usa 0 per nessun limite.",
         "checkExtraFlagsHelper": "Opzioni aggiuntive di borg check aggiunte ai check di manutenzione del piano."
       },
@@ -1936,6 +1955,7 @@
         "retentionValueWithWithin": "Entro {{within}} / H {{hourly}} / G {{daily}} / S {{weekly}} / M {{monthly}} / T {{quarterly}} / A {{yearly}}",
         "compact": "Compatta",
         "check": "Controllo",
+        "restoreCheck": "Test di ripristino",
         "checkExtraFlags": "Flag di check",
         "checkDuration": "{{seconds}} secondi",
         "pathCount_one": "{{count}} percorso",
@@ -4249,7 +4269,8 @@
     "hint": "Specifica pattern da escludere dal backup (es., *.log, *.tmp, __pycache__, node_modules)",
     "placeholder": "*.log o /percorso/da/escludere",
     "browseToExclude": "Sfoglia per escludere",
-    "add": "Aggiungi"
+    "add": "Aggiungi",
+    "remove": "Rimuovi {{pattern}}"
   },
   "pruneSettings": {
     "keepHourly": "Mantieni Orari",
@@ -4810,7 +4831,7 @@
       "remotePathVerified": "Percorso verificato dalla navigazione del remoto.",
       "browseRemote": "Sfoglia remoto rclone",
       "routePreview": "Server Borg UI -> percorso repository primario -> sincronizzazione rclone -> remoto",
-      "sshRoutePreview": "Il server Borg UI monta il repository SSH tramite SSHFS -> sincronizzazione rclone -> remoto",
+      "sshRoutePreview": "Il server Borg UI monta il repository SSH in sola lettura tramite SSHFS -> sincronizzazione rclone -> remoto",
       "agentRoutePreview": "L'agente gestito selezionato sincronizza il proprio percorso repository con il remoto rclone. Borg UI non richiede un percorso cache.",
       "cachedRepositoryRoutePreview": "Cache del server Borg UI -> sincronizzazione rclone -> remoto",
       "browseFailed": "Impossibile sfogliare il remoto rclone.",
@@ -4818,7 +4839,24 @@
       "remoteRoot": "Radice remota",
       "browsing": "Navigazione remoto...",
       "noRemoteFolders": "Nessuna cartella trovata in questo percorso remoto.",
-      "useFolder": "Usa cartella"
+      "useFolder": "Usa cartella",
+      "sftpKeyLabel": "Chiave SSH per la sincronizzazione cloud",
+      "sftpKeyDefault": "Stessa chiave della connessione",
+      "sftpKeyAdd": "Aggiungi chiave",
+      "sftpKeyHelper": "Alcuni provider, come BorgBase, consentono di usare una chiave solo per Borg o solo per SFTP. Aggiungi qui la chiave con accesso SFTP; Borg continua a usare la chiave della connessione.",
+      "sshKeyDialogTitle": "Aggiungi chiave SSH per la sincronizzazione cloud",
+      "sshKeyNameLabel": "Nome della chiave",
+      "sshKeyPrivateKeyLabel": "Chiave privata",
+      "sshKeyPrivateKeyHelper": "Incolla la chiave privata la cui chiave pubblica ha accesso SFTP presso il provider di archiviazione. Le chiavi protette da passphrase non sono supportate.",
+      "sshKeyDialogSubmit": "Salva chiave",
+      "sshKeyCreateFailed": "Impossibile salvare la chiave SSH",
+      "sftpKeyDelete": "Elimina chiave",
+      "sshKeyDeleteTitle": "Eliminare {{name}}?",
+      "sshKeyDeleteInUse_one": "{{count}} repository usa questa chiave per la sincronizzazione cloud. Tornerà alla chiave della connessione e la sincronizzazione fallirà finché non scegli un'altra chiave SFTP.",
+      "sshKeyDeleteInUse_other": "{{count}} repository usano questa chiave per la sincronizzazione cloud. Torneranno alla chiave della connessione e la sincronizzazione fallirà finché non scegli un'altra chiave SFTP.",
+      "sshKeyDeleteUnused": "Nessun repository usa questa chiave per la sincronizzazione cloud. La chiave privata viene rimossa da Borg UI.",
+      "sshKeyDeleteConfirm": "Elimina chiave",
+      "sshKeyDeleteFailed": "Impossibile eliminare la chiave SSH"
     },
     "restoreDestination": {
       "port": "Porta {{port}}",
@@ -5780,7 +5818,7 @@
         "backupArchiveNameRequired": "Il nome archivio è obbligatorio",
         "backupRepositoryPathRequired": "Il percorso del repository è obbligatorio",
         "backupSourcePathRequired": "È richiesto almeno un percorso sorgente",
-        "capabilityMissing": "Questo agente non supporta la funzionalità richiesta",
+        "capabilityMissing": "Questo agente non supporta la funzionalità richiesta ({{capability}})",
         "enrollmentExpiryAmbiguous": "Scegli una sola opzione di scadenza per il token di registrazione",
         "enrollmentExpiryTooShort": "Il token di registrazione deve durare almeno cinque minuti",
         "enrollmentNameRequired": "Il nome del token di registrazione è obbligatorio",
@@ -5815,6 +5853,8 @@
         "encryptedPassphraseRequired": "La passphrase è richiesta per la modalità di crittografia '{{mode}}'",
         "agentBorg2Unavailable": "Questo endpoint non ha Borg 2 installato, quindi non è possibile creare o aprire un repository Borg 2. Installa Borg 2 sull'endpoint oppure scegli Borg 1.",
         "agentBorg2TooOld": "Il Borg 2 di questo endpoint è {{version}}; borg-ui richiede {{minimum}} o successivo per un repository Borg 2. Aggiorna Borg 2 sull'endpoint oppure scegli Borg 1.",
+        "borg2OnlyUrl": "Un URL di repository {{scheme}} richiede Borg 2; Borg 1 non può aprirlo. Scegli Borg 2 per questo repository.",
+        "borg2OnlyUrlOrSshHost": "Un URL di repository {{scheme}} richiede Borg 2; Borg 1 lo legge come un host SSH chiamato {{host}}. Scegli Borg 2 per questo repository oppure scrivi l'host SSH come ssh://{{host}}/percorso (ssh://{{host}}/./percorso per un percorso relativo alla directory di login).",
         "agentPassphraseUnavailable": "Questo agent gestito non ha segnalato una BORG_PASSPHRASE, quindi non può aprire un repository crittografato. Imposta BORG_PASSPHRASE nell'ambiente dell'agent oppure inserisci qui una passphrase.",
         "encryptedPassphraseIncorrect": "Il repository è crittografato ma la passphrase non è corretta o mancante. Fornisci la passphrase corretta.",
         "encryptionKeyfileNotRequired": "Il repository usa la crittografia '{{mode}}', che non richiede un file chiave. Il caricamento del file chiave è necessario solo per le modalità di crittografia 'keyfile' o 'keyfile-blake2'.",
@@ -5828,6 +5868,7 @@
         "cannotDeleteRepoWithArchives": "Impossibile eliminare il repository con archivi esistenti. Elimina prima tutti gli archivi.",
         "checkAlreadyRunning": "Un'operazione di controllo è già in esecuzione per questo repository",
         "checkFlagsRequireUnlimitedDuration": "Imposta la durata massima a 0 (illimitata) quando usi {{flags}} perché questi flag di Borg check richiedono un controllo completo con archivi.",
+        "invalidBorgFlags": "Questi flag di Borg non sono consentiti: {{reason}}",
         "compactAlreadyRunning": "Un'operazione di compattazione è già in esecuzione per questo repository",
         "restoreCheckCanaryUnsupportedObserve": "I controlli di ripristino canary non sono disponibili per i repository solo osservazione. Usa percorsi di prova selezionati o una verifica dell'intero archivio.",
         "breakLockTimeout": "Timeout durante il tentativo di rompere il blocco",
@@ -5965,7 +6006,9 @@
         "sshToSshNotSupported": "Il ripristino da repository SSH a destinazione SSH non è supportato",
         "failedStartRestore": "Impossibile avviare il ripristino",
         "failedFetchArchives": "Impossibile recuperare gli archivi",
-        "failedFetchArchiveContents": "Impossibile recuperare il contenuto dell'archivio"
+        "failedFetchArchiveContents": "Impossibile recuperare il contenuto dell'archivio",
+        "destinationNotAllowed": "La destinazione del ripristino è al di fuori dei punti di montaggio locali consentiti: {{path}}",
+        "operatorAccessRequired": "È richiesto l'accesso come operatore o amministratore per ripristinare su una connessione SSH"
       },
       "schedule": {
         "adminAccessRequired": "Accesso amministratore richiesto",
@@ -6005,6 +6048,7 @@
         "privateKeyFileNotFound": "File chiave privata non trovato: {{path}}",
         "publicKeyFileNotFound": "File chiave pubblica non trovato: {{path}}",
         "sshConnectionNotFound": "Connessione SSH non trovata",
+        "sshConnectionUsedByBackupPlans": "Questa connessione è la sorgente di questi piani di backup: {{plans}}. Cambia prima la loro sorgente, poi eliminala.",
         "sshKeyNotFound": "Chiave SSH non trovata",
         "systemKeyAlreadyExists": "Chiave SSH di sistema già esistente",
         "failedRetrieveSystemSshKey": "Impossibile recuperare la chiave SSH di sistema: {{error}}",
@@ -6126,7 +6170,11 @@
         "permissionDeniedCreateFolder": "Permesso negato per creare la cartella",
         "sshConnectionDetailsRequired": "Dettagli connessione SSH richiesti",
         "sshConnectionTimeout": "Timeout connessione SSH",
-        "sshParamsRequired": "ID chiave SSH, host e nome utente sono richiesti per la navigazione SSH"
+        "sshParamsRequired": "ID chiave SSH, host e nome utente sono richiesti per la navigazione SSH",
+        "operatorAccessRequired": "È richiesto l'accesso come operatore o amministratore",
+        "invalidRemotePath": "Questo percorso contiene virgolette, interruzioni di riga o caratteri nulli, che non possono essere usati su una connessione SSH",
+        "invalidSshTarget": "Host o nome utente SSH non valido",
+        "sshConnectionNotSaved": "Sfoglia questo host tramite una connessione SSH salvata"
       },
       "mounts": {
         "canOnlyUnmountBorgMounts": "Puoi smontare solo mount di archivi Borg tramite questo endpoint",
@@ -6134,6 +6182,7 @@
         "mountNotFound": "Mount {{mountId}} non trovato",
         "unmountFailed": "Impossibile smontare {{mountId}}",
         "failedMountArchive": "Impossibile montare l'archivio",
+        "agentRepository": "Questo repository è eseguito da un agente, quindi il server non può montarlo",
         "mountUnavailable": "Il montaggio degli archivi non è disponibile in questo ambiente",
         "failedUnmount": "Impossibile smontare",
         "failedListMounts": "Impossibile elencare i mount",
@@ -6555,6 +6604,242 @@
       "refreshFailed": "Impossibile avviare il confronto.",
       "autoOff": "Le anteprime di prune automatiche sono disattivate, quindi questo confronto non è aggiornato e non viene mostrato. Premi Confronta ora per eseguirlo.",
       "autoOffAction": "Attiva nelle Impostazioni"
+    }
+  },
+  "quickStart": {
+    "title": "Avvio rapido",
+    "subtitle": "Rispondi a poche domande e Borg UI configura per te un backup pianificato che si mantiene da solo.",
+    "create": "Crea backup",
+    "steps": {
+      "app": "App",
+      "what": "Cosa",
+      "connect": "Connetti",
+      "folders": "Cartelle",
+      "destination": "Dove",
+      "protect": "Proteggi",
+      "schedule": "Quando",
+      "review": "Verifica"
+    },
+    "what": {
+      "title": "Cosa vuoi salvare?",
+      "server": "File su questo server",
+      "serverDesc": "Cartelle sulla macchina che esegue Borg UI, come la tua cartella home, i documenti o i dati delle app.",
+      "ssh": "File su un altro computer",
+      "sshDesc": "Un server, NAS o PC che questo server raggiunge via SSH. Borg UI preleva i file da lì.",
+      "notSure": "Non sei sicuro? Scegli \"File su questo server\" se i dati si trovano dove gira Borg UI. Scegli \"altro computer\" se si trovano altrove e puoi accedervi con nome utente e password.",
+      "agent": "Un altro computer con l'agente di Borg UI",
+      "agentDesc": "Installa un piccolo agente su un portatile, desktop o server. Si collega da solo a Borg UI, quindi funziona anche dietro un firewall, e salva i backup sul proprio disco.",
+      "agentPro": "Richiede un piano Pro o Enterprise."
+    },
+    "folders": {
+      "title": "Scegli le cartelle da salvare",
+      "hint": "Aggiungi una o più cartelle. In Docker, il disco del server di solito compare sotto /local.",
+      "pathLabel": "Cartella",
+      "add": "Aggiungi",
+      "empty": "Nessuna cartella. Scrivi un percorso o usa il pulsante cartella per sfogliare.",
+      "remoteHint": "Cartelle su {{machine}}. Usa il pulsante cartella per sfogliarlo."
+    },
+    "destination": {
+      "title": "Dove devono stare i backup?",
+      "server": "Un disco su questo server",
+      "serverDesc": "Ideale per un secondo disco o una condivisione NAS montata.",
+      "pathLabel": "Posizione dei backup",
+      "pathHint": "Una cartella nuova e vuota. Borg UI la crea se non esiste.",
+      "insideSource": "Questa cartella si trova dentro una delle cartelle che stai salvando. Scegli una posizione esterna.",
+      "offsiteTip": "Un backup sullo stesso disco dei dati non sopravvive a un guasto del disco. Se puoi, usa un secondo disco o un'altra macchina.",
+      "ssh": "Un altro server via SSH",
+      "sshDesc": "Un NAS o un server remoto. Lì deve essere installato Borg.",
+      "sshLabel": "Server di backup",
+      "remotePathHint": "Una cartella su {{machine}}. Borg UI la crea se non esiste.",
+      "agent": "Un disco su {{machine}}",
+      "agentDesc": "L'agente salva i backup in una cartella dello stesso computer, come un secondo disco o una condivisione NAS montata."
+    },
+    "protect": {
+      "title": "Dai un nome ai backup e proteggili",
+      "hint": "I backup sono cifrati. Solo chi ha la passphrase può leggerli.",
+      "nameLabel": "Nome",
+      "nameHint": "Usato per il repository e il piano di backup.",
+      "passphraseLabel": "Passphrase",
+      "passphraseHint": "Almeno {{count}} caratteri. Qualche parola casuale funziona bene.",
+      "confirmLabel": "Ripeti la passphrase",
+      "mismatch": "Le passphrase non coincidono.",
+      "showPassphrase": "Mostra passphrase",
+      "hidePassphrase": "Nascondi passphrase",
+      "warning": "Conserva questa passphrase in un posto sicuro fuori da questo server. Se la perdi, i backup non potranno essere ripristinati.",
+      "download": "Scarica",
+      "savedConfirm": "Ho salvato la mia passphrase in un posto sicuro",
+      "unencrypted": "La cifratura è disattivata. Chiunque abbia accesso alla posizione dei backup può leggere i tuoi file."
+    },
+    "schedule": {
+      "title": "Quando deve essere eseguito?",
+      "hint": "Gli orari sono in {{timezone}}. Puoi cambiarlo più avanti nel piano di backup.",
+      "presets": {
+        "daily": "Ogni giorno",
+        "dailyDesc": "Alle 02:00, quando la maggior parte delle macchine è inattiva.",
+        "every6h": "Ogni 6 ore",
+        "every6hDesc": "Per dati che cambiano spesso.",
+        "weekly": "Ogni settimana",
+        "weeklyDesc": "La domenica alle 02:00.",
+        "custom": "Personalizzato",
+        "customDesc": "Scegli la tua pianificazione."
+      }
+    },
+    "review": {
+      "title": "Verifica e crea",
+      "hint": "Ecco cosa configurerà Borg UI. I valori predefiniti vanno bene per la maggior parte delle persone.",
+      "backUp": "Salva",
+      "storeIn": "Archivia in",
+      "schedule": "Pianificazione",
+      "manualOnly": "Solo manuale",
+      "keepLabel": "Conserva",
+      "keepAll": "Ogni backup (non viene eliminato nulla)",
+      "keep": {
+        "keepHourly": "{{count}} orari",
+        "keepDaily": "{{count}} giornalieri",
+        "keepWeekly": "{{count}} settimanali",
+        "keepMonthly": "{{count}} mensili",
+        "keepQuarterly": "{{count}} trimestrali",
+        "keepYearly": "{{count}} annuali"
+      },
+      "afterEachRun": "Dopo ogni esecuzione",
+      "nothing": "Niente",
+      "maintenance": {
+        "prune": "elimina i backup vecchi",
+        "compact": "libera spazio",
+        "check": "verifica l'integrità"
+      },
+      "encryption": "Cifratura",
+      "encrypted": "Attiva ({{mode}})",
+      "unencrypted": "Disattivata",
+      "creates": "Crea",
+      "createsList": "Repository «{{name}}» e piano di backup «{{name}}»",
+      "thisServer": "questo server",
+      "onMachine": "su {{machine}}",
+      "skips": "Salta",
+      "checksFirst": "Controlla prima"
+    },
+    "customize": {
+      "title": "Personalizza",
+      "subtitle": "Facoltativo. Modifica cifratura, conservazione, manutenzione e compressione.",
+      "schedule": "Esegui secondo pianificazione",
+      "scheduleHint": "Disattivato significa che il piano si avvia solo quando lo avvii tu.",
+      "encrypt": "Cifra i backup",
+      "encryptHint": "Fortemente consigliato.",
+      "prune": "Elimina i backup vecchi",
+      "pruneHint": "Mantiene le quantità qui sotto ed elimina i backup più vecchi dopo ogni esecuzione.",
+      "compact": "Libera spazio",
+      "compactHint": "Recupera spazio su disco dopo l'eliminazione dei backup vecchi.",
+      "check": "Verifica l'integrità",
+      "checkHint": "Verifica il repository fino a un'ora dopo ogni esecuzione, riprendendo da dove si era fermato.",
+      "borgVersion": "Versione di Borg"
+    },
+    "progress": {
+      "title": "Configurazione del backup in corso",
+      "doneTitle": "Il tuo backup è pronto",
+      "doneHint": "È tutto pronto. Avvia ora il primo backup o lascia che parta con la pianificazione.",
+      "failed": "Configurazione interrotta",
+      "retry": "Riprova",
+      "editAnswers": "Modifica risposte",
+      "openPlan": "Apri i piani di backup",
+      "runNow": "Avvia ora il primo backup",
+      "backupStarted": "Primo backup avviato",
+      "actions": {
+        "create_repository": "Crea il repository",
+        "create_script": "Crea il controllo pre-backup",
+        "create_plan": "Crea il piano di backup con la sua pianificazione"
+      },
+      "status": {
+        "pending": "in attesa",
+        "running": "in corso",
+        "done": "fatto",
+        "failed": "non riuscito"
+      }
+    },
+    "repositoryAlreadyCreated": "Il repository è già stato creato. Le modifiche a posizione, passphrase o cifratura non verranno applicate. Puoi ancora cambiare nome del piano, cartelle e pianificazione.",
+    "connect": {
+      "title": "Connetti l'altro computer",
+      "hint": "Scegli un computer che Borg UI conosce già o aggiungine uno. Borg UI installa lì la sua chiave SSH così i backup funzionano senza password.",
+      "label": "Computer"
+    },
+    "ssh": {
+      "addMachine": "Aggiungi computer",
+      "newMachine": "Aggiungi computer",
+      "newMachineHint": "Inserisci l'accesso che useresti con SSH. La password viene usata una sola volta per installare la chiave di Borg UI e non viene salvata.",
+      "host": "Nome host o indirizzo IP",
+      "port": "Porta",
+      "username": "Nome utente",
+      "password": "Password",
+      "passwordHint": "Usata una volta, non salvata.",
+      "connect": "Connetti",
+      "connecting": "Connessione…",
+      "connectFailed": "Connessione non riuscita: {{reason}}",
+      "noConnectionsNoPermission": "Non ci sono ancora computer configurati. Chiedi a un amministratore di aggiungerne uno in Macchine Remote."
+    },
+    "agent": {
+      "title": "Scegli il computer",
+      "hint": "Scegli un computer su cui gira già l'agente di Borg UI o aggiungine uno. Aggiungendolo vedrai un comando da eseguire su quel computer; l'avvio rapido prosegue appena si connette.",
+      "label": "Computer",
+      "add": "Aggiungi computer",
+      "noAgentsNoPermission": "Nessun computer esegue ancora l'agente. Chiedi a un amministratore di aggiungerne uno in Agenti gestiti.",
+      "loadFailed": "Impossibile caricare i computer. Riprova tra poco.",
+      "offlineBrowse": "{{machine}} è offline, quindi non è possibile sfogliarne le cartelle. Scrivi il percorso o attendi che l'agente si connetta."
+    },
+    "app": {
+      "title": "Quale app vuoi salvare?",
+      "hint": "Scegliendo un'app viene inserita la sua cartella, si salta ciò che può rigenerare e si aggiungono i controlli necessari.",
+      "pickApp": "Un'app",
+      "pickAppDesc": "Un'app self-hosted come Immich. Borg UI trova la sua cartella e aggiunge i controlli necessari.",
+      "other": "Qualcos'altro",
+      "otherDesc": "Scegli tu le cartelle: documenti, dati delle app, qualsiasi cosa sul disco."
+    }
+  },
+  "appTemplates": {
+    "scanAgain": "Cerca di nuovo",
+    "pickManually": "Scegli sotto la cartella di {{app}}. È {{hint}}.",
+    "scanning": "Ricerca di {{app}}…",
+    "notReadable": "{{app}} trovato, ma Borg UI non può leggere {{path}}. Aggiungi questa riga ai volumi di Borg UI in docker-compose.yml, riavvia Borg UI e cerca di nuovo:",
+    "useFolder": "Usa questa cartella",
+    "found": "{{app}} trovato (container {{container}})",
+    "notFound": "Nessun {{app}} in esecuzione qui. Scegli sotto la sua cartella. È {{hint}}.",
+    "verified": "Verificato con {{app}} {{version}}.",
+    "docs": "Documentazione backup di {{app}}",
+    "select": {
+      "label": "App",
+      "search": "Cerca app",
+      "noResults": "Nessuna app corrisponde. Scegli «Qualcos'altro» e seleziona le cartelle.",
+      "placeholder": "Scegli un'app"
+    },
+    "folders": {
+      "title": "Cosa viene salvato",
+      "missing": "Ancora vuoto",
+      "unmeasured": "Troppo grande per misurarlo in fretta",
+      "latestDump": "Ultimo dump {{when}}",
+      "staleDump": "Ultimo dump {{when}}. Più vecchio di {{hours}} ore: i backup si fermano finché {{app}} non ne scrive uno nuovo.",
+      "noDump": "Ancora nessun dump del database di {{app}}: i backup si fermano finché non ce n'è uno. Le note sotto spiegano come attivarlo.",
+      "madeBeforeBackup": "Borg UI fa una copia nuova prima di ogni backup.",
+      "total": "Verranno salvati circa {{size}}.",
+      "totalAtLeast": "Verranno salvati almeno {{size}}.",
+      "noAccess": "{{user}} non può aprirlo",
+      "backUp": "Salva"
+    },
+    "missingRoot": "{{path}} non esiste su quella macchina. Scegli la cartella con i file di {{app}}: {{hint}}.",
+    "denied": {
+      "title": "Borg UI non può aprire {{path}} come {{user}}",
+      "why": "Docker rende i volumi con nome leggibili solo da root. Borg si collega con lo stesso utente, quindi anche il backup fallirebbe.",
+      "fixFolder": "Soluzione più semplice: tieni i file di {{app}} in una cartella normale. Imposta {{hint}} su una cartella come /srv/{{id}}, sposta lì i file e riavvia {{app}}.",
+      "fixAcl": "Oppure consenti a {{user}} di leggere questo volume (serve il pacchetto acl su quella macchina):"
+    },
+    "goodToKnow": "Da sapere",
+    "tab": {
+      "kind": "App",
+      "title": "Salva un'app",
+      "runsOn": "Dove gira l'app",
+      "folder": "Cartella dell'app",
+      "add": "Aggiungi {{app}}",
+      "inPlan": "App in questo piano",
+      "folderCount_one": "{{count}} cartella",
+      "folderCount_other": "{{count}} cartelle",
+      "remove": "Rimuovi {{app}}"
     }
   }
 }

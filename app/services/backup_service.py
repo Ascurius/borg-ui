@@ -38,6 +38,7 @@ from app.services.filesystem_snapshot_service import (
     PreparedFilesystemSnapshot,
     build_filesystem_snapshot_plans,
 )
+from app.utils.borg_flags import parse_borg_flags
 from app.utils.fs import remove_tree_without_crossing_mounts
 from app.utils.ssh_paths import resolve_sshfs_source_path
 from app.utils.source_locations import (
@@ -67,6 +68,28 @@ from app.services.process_cancel import (
 logger = structlog.get_logger()
 
 REMOTE_EXECUTION_MODES = {"remote_ssh", "remote_direct"}
+
+
+def _parse_created_archive_id(lines: list[str]) -> str | None:
+    """The id of the archive `borg create --json` reported, read from the
+    tail of its output (`archive.id` of the pretty-printed result document,
+    which is the last top-level `{` ... `}` in the stream; --log-json lines
+    may follow it). None when the output carries no such document."""
+    starts = [i for i, line in enumerate(lines) if line.strip() == "{"]
+    if not starts:
+        return None
+    start = starts[-1]
+    for end in range(start + 1, len(lines)):
+        if lines[end].strip() != "}":
+            continue
+        try:
+            document = json.loads("\n".join(lines[start : end + 1]))
+        except json.JSONDecodeError:
+            continue
+        archive = document.get("archive") if isinstance(document, dict) else None
+        archive_id = archive.get("id") if isinstance(archive, dict) else None
+        return archive_id if isinstance(archive_id, str) and archive_id else None
+    return None
 
 
 def _uses_remote_execution(job) -> bool:
@@ -1917,7 +1940,6 @@ class BackupService:
                 job_id=job_id,
             )
 
-            custom_flag_list = []
             custom_flags_text = (
                 custom_flags_override
                 if custom_flags_override is not None
@@ -1925,25 +1947,14 @@ class BackupService:
                 if repo_record
                 else None
             )
-            if custom_flags_text:
-                custom_flags = custom_flags_text.strip()
-                if custom_flags:
-                    import shlex
-
-                    try:
-                        custom_flag_list = shlex.split(custom_flags)
-                        logger.info(
-                            "Added custom flags to borg create command",
-                            job_id=job_id,
-                            custom_flags=custom_flags,
-                        )
-                    except ValueError as e:
-                        logger.warning(
-                            "Failed to parse custom flags, skipping",
-                            job_id=job_id,
-                            custom_flags=custom_flags,
-                            error=str(e),
-                        )
+            # A stored value the allowlist rejects fails the job here.
+            custom_flag_list = parse_borg_flags(custom_flags_text, "create")
+            if custom_flag_list:
+                logger.info(
+                    "Added custom flags to borg create command",
+                    job_id=job_id,
+                    custom_flags=custom_flag_list,
+                )
 
             cmd = router.build_backup_create_command(
                 repository_path=actual_repository_path,
@@ -2454,6 +2465,13 @@ class BackupService:
             # Wait for process to complete if not already terminated
             if not process_wait_task.done():
                 await process_wait_task
+
+            # The archive Borg made, by id, when the create command printed
+            # its --json result (Borg 2): the post-backup restore check
+            # targets that exact archive (#1232).
+            created_archive_id = _parse_created_archive_id(log_buffer)
+            if created_archive_id:
+                job.archive_id = created_archive_id
 
             def publish_terminal_state(reason: str):
                 """Persist a terminal state before slow post-processing runs."""

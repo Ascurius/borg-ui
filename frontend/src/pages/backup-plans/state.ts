@@ -45,6 +45,7 @@ export const createInitialState = (): WizardState => ({
   runPruneAfter: false,
   runCompactAfter: false,
   runCheckAfter: false,
+  runRestoreCheckAfter: false,
   checkMaxDuration: 3600,
   checkExtraFlags: '',
   pruneKeepHourly: 0,
@@ -201,6 +202,7 @@ function normalizePlanSourceLocations(plan: BackupPlan): SourceLocation[] {
           paths,
           ...(database ? { database } : {}),
           ...(container ? { container } : {}),
+          ...(location.app ? { app: location.app } : {}),
         }
       }
       if (location.source_type === 'agent') {
@@ -215,6 +217,7 @@ function normalizePlanSourceLocations(plan: BackupPlan): SourceLocation[] {
           paths,
           ...(database ? { database } : {}),
           ...(container ? { container } : {}),
+          ...(location.app ? { app: location.app } : {}),
         }
       }
       const database = normalizeDatabase(location, paths)
@@ -226,6 +229,7 @@ function normalizePlanSourceLocations(plan: BackupPlan): SourceLocation[] {
         paths,
         ...(database ? { database } : {}),
         ...(container ? { container } : {}),
+        ...(location.app ? { app: location.app } : {}),
       }
     })
     .filter((location): location is SourceLocation => location !== null)
@@ -373,6 +377,7 @@ export function planToState(plan: BackupPlan): WizardState {
     runPruneAfter: Boolean(plan.run_prune_after),
     runCompactAfter: Boolean(plan.run_compact_after),
     runCheckAfter: Boolean(plan.run_check_after),
+    runRestoreCheckAfter: Boolean(plan.run_restore_check_after),
     checkMaxDuration: plan.check_max_duration ?? 3600,
     checkExtraFlags: plan.check_extra_flags || '',
     pruneKeepHourly: plan.prune_keep_hourly ?? 0,

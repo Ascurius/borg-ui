@@ -27,6 +27,10 @@ OPERATION_RESTORE = "restore"
 OPERATION_RESTORE_CHECK = "restore_check"
 OPERATION_COMPACT = "compact"
 OPERATION_PRUNE = "prune"
+# `prune --dry-run`: the retention comparison's and the preview page's. It
+# holds the exclusive repository lock like a real prune, so it is a write,
+# but a backup does not conflict with it (see `ensure_repository_admission`).
+OPERATION_PRUNE_DRY_RUN = "prune.dry_run"
 OPERATION_DELETE_ARCHIVE = "delete_archive"
 OPERATION_REPOSITORY_WIPE = "repository_wipe"
 OPERATION_REPOSITORY_INIT = "repository.init"
@@ -60,6 +64,12 @@ ACTIVE_MAINTENANCE_STATUSES = {"pending", "running"}
 ACTIVE_AGENT_STATUSES = {"queued", "claimed", "cancel_requested", "running"}
 ACTIVE_OPERATION_STATUSES = {"queued", "running"}
 
+# `agent_jobs.job_type` of the row that carries a backup to its agent. Named
+# once: the writers set it, `get_agent_job_for_backup` reads it and admission
+# counts it, and a mismatch between them fails silently — the cancel route
+# would find no job and refuse, the log endpoints would serve nothing.
+BACKUP_AGENT_JOB_TYPE = "backup"
+
 # Every kind admission watches, mapped to the admission operation it is
 # recorded as.
 MIGRATED_OPERATION_KINDS = {
@@ -79,6 +89,7 @@ WRITE_OPERATIONS = {
     OPERATION_BACKUP,
     OPERATION_COMPACT,
     OPERATION_PRUNE,
+    OPERATION_PRUNE_DRY_RUN,
     OPERATION_DELETE_ARCHIVE,
     OPERATION_REPOSITORY_WIPE,
     OPERATION_REPOSITORY_INIT,
@@ -187,6 +198,22 @@ def _is_ignored(work: ActiveRepositoryWork, ignore: Optional[IgnoreActiveJob]) -
     )
 
 
+def _carries_ignored_operation(
+    job: AgentJob, ignore: Optional[IgnoreActiveJob]
+) -> bool:
+    """Whether `job` carries the operation `ignore` names to its agent."""
+    return bool(
+        ignore
+        and ignore.job_table == Operation.__tablename__
+        and job.operation_id is not None
+        and job.operation_id == ignore.job_id
+    )
+
+
+def _is_dry_run(params: Any) -> bool:
+    return isinstance(params, dict) and bool(params.get("dry_run"))
+
+
 def _dialect_name(db: Session) -> str:
     try:
         return db.get_bind().dialect.name
@@ -256,6 +283,13 @@ def list_active_repository_work(
     `ignore_queued_operations` leaves out `operations` rows that are still
     queued. Such a row holds no lock, and it starts only through the
     runner's repository lane, which the operation asking here already holds.
+
+    A backup's agent job counts for as long as the agent has not reported
+    its end, whatever became of the backup's own row: a row closed without
+    the agent's word (a restart's recovery, an executor that failed) leaves
+    Borg running on the agent, holding the repository lock. An ignored
+    operation's own agent jobs are ignored with it, as they were before
+    they counted.
     """
     active: list[ActiveRepositoryWork] = []
     operation_statuses = (
@@ -276,10 +310,13 @@ def list_active_repository_work(
         )
         .all()
     ):
+        operation = MIGRATED_OPERATION_KINDS[op.kind]
+        if operation == OPERATION_PRUNE and _is_dry_run(op.params):
+            operation = OPERATION_PRUNE_DRY_RUN
         active.append(
             _active_work(
                 repository,
-                MIGRATED_OPERATION_KINDS[op.kind],
+                operation,
                 Operation.__tablename__,
                 op,
                 status=legacy_status(op.status),
@@ -289,7 +326,7 @@ def list_active_repository_work(
     agent_jobs = (
         db.query(AgentJob)
         .filter(
-            AgentJob.job_type == "repository",
+            AgentJob.job_type.in_(("repository", BACKUP_AGENT_JOB_TYPE)),
             AgentJob.status.in_(ACTIVE_AGENT_STATUSES),
         )
         .all()
@@ -303,6 +340,13 @@ def list_active_repository_work(
         payload_repo_path = repository_payload.get("path")
         if payload_repo_id != repository.id and payload_repo_path != repository.path:
             continue
+        if job.job_type == BACKUP_AGENT_JOB_TYPE:
+            if _carries_ignored_operation(job, ignore):
+                continue
+            active.append(
+                _active_work(repository, OPERATION_BACKUP, AgentJob.__tablename__, job)
+            )
+            continue
         job_kind = payload.get("job_kind")
         try:
             operation = operation_for_agent_job_kind(str(job_kind))
@@ -311,6 +355,8 @@ def list_active_repository_work(
             # a borg lock, so count it as (write-class) conflicting work rather
             # than ignoring it -- otherwise break_lock could run alongside it.
             operation = OPERATION_UNKNOWN_REPOSITORY
+        if operation == OPERATION_PRUNE and _is_dry_run(payload.get("operation")):
+            operation = OPERATION_PRUNE_DRY_RUN
         active.append(_active_work(repository, operation, AgentJob.__tablename__, job))
 
     return [work for work in active if not _is_ignored(work, ignore)]
@@ -390,6 +436,16 @@ def ensure_repository_admission(
         if OPERATION_CLASS_REPOSITORY_OBSERVE in (
             requested_class,
             active.operation_class,
+        ):
+            continue
+        # A dry run yields to a backup. Both are exclusive on the runner's
+        # repository lane, so the backup's row stays queued until the dry
+        # run's own row (or the comparison carrying it) ends; refusing it
+        # instead failed the backup over derived data. Should the backup
+        # still meet the lock, Borg waits it out (BORG_LOCK_WAIT, 180s).
+        if (
+            operation == OPERATION_BACKUP
+            and active.operation == OPERATION_PRUNE_DRY_RUN
         ):
             continue
         conflicts = requested_class == OPERATION_CLASS_REPOSITORY_WRITE or (

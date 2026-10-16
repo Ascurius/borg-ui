@@ -14,6 +14,7 @@ import { useAuth } from '../hooks/useAuth'
 import { useLockBreakPermissions } from '../hooks/useLockBreakPermissions'
 import { useOperationEvents } from '../hooks/useOperationEvents'
 import { usePlan } from '../hooks/usePlan'
+import { usePendingDeletes } from '../hooks/usePendingDeletes'
 import { usePermissions } from '../hooks/usePermissions'
 import { useAppState } from '../context/AppContext'
 import { AxiosResponse } from 'axios'
@@ -41,6 +42,7 @@ import {
 import type { PruneForm, Repository } from './repositories-page/types'
 import type { BackupPlan, RepositoryWipeExecuteRequest, RepositoryWipeJob } from '../types'
 import type { OperationItem } from '../types/operations'
+import { useQuickStart } from '../components/quick-start/quickStartContext'
 import { SUCCESS_OPERATION_STATUSES } from '../utils/operationStatus'
 
 const EMPTY_REPOSITORIES: Repository[] = []
@@ -145,6 +147,7 @@ export default function Repositories() {
   const { hasGlobalPermission } = useAuth()
   const { can } = usePlan()
   const canManageRepositoriesGlobally = hasGlobalPermission('repositories.manage_all')
+  const quickStart = useQuickStart()
   const canUseManagedAgents = can('managed_agents')
   const canUseRclone = can('rclone')
   const permissions = usePermissions()
@@ -402,15 +405,17 @@ export default function Repositories() {
   }, [infoError])
 
   // Mutations
+  const deletingRepositories = usePendingDeletes()
   const deleteRepositoryMutation = useMutation({
     mutationFn: repositoriesAPI.deleteRepository,
-    onSuccess: (_response, repositoryId) => {
+    onSuccess: async (_response, repositoryId) => {
       toast.success(t('repositories.toasts.deleted'))
-      queryClient.invalidateQueries({ queryKey: ['repositories'] })
       queryClient.invalidateQueries({ queryKey: ['app-repositories'] })
       appState.refetch()
       const repository = repositories.find((repo: Repository) => repo.id === repositoryId)
       trackRepository(EventAction.DELETE, repository)
+      // Awaited so the card stays disabled until the list no longer has it.
+      await queryClient.invalidateQueries({ queryKey: ['repositories'] })
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onError: (error: any) => {
@@ -715,8 +720,12 @@ export default function Repositories() {
 
   // Event handlers
   const handleDeleteRepository = (repository: Repository) => {
+    if (deletingRepositories.isDeleting(repository.id)) return
     if (window.confirm(t('repositories.deleteConfirmation', { name: repository.name }))) {
-      deleteRepositoryMutation.mutate(repository.id)
+      // onError already reports the failure.
+      void deletingRepositories.run(repository.id, () =>
+        deleteRepositoryMutation.mutateAsync(repository.id).catch(() => undefined)
+      )
     }
   }
 
@@ -1118,6 +1127,7 @@ export default function Repositories() {
         canBreakLock={(repository) => canBreakLock({ repository_id: repository.id })}
         onSearchChange={setSearchQuery}
         onOpenWizard={openWizard}
+        onQuickStart={quickStart?.openQuickStart}
         onViewInfo={setViewingInfoRepository}
         onCheck={handleCheckRepository}
         onCompact={handleCompactRepository}
@@ -1127,6 +1137,7 @@ export default function Repositories() {
         onBreakLock={handleBreakLockRepository}
         onEdit={openEditModal}
         onDelete={handleDeleteRepository}
+        deletingRepositoryIds={deletingRepositories.pending}
         onPermanentDelete={handlePermanentDeleteRepository}
         onBackupNow={handleBackupNow}
         onViewArchives={handleViewArchives}

@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import uuid
 import platform
+import re
 import json
 import shlex
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ import structlog
 import base64
 from cryptography.fernet import Fernet
 
+from app.utils.ssh_host_validation import ssh_destination
 from app.config import settings
 from app.core.borg_router import BorgRouter
 from app.utils.borg_env import (
@@ -176,6 +178,19 @@ def _sshfs_login_relative_candidate(
 
     relative_path = normalized.lstrip("/")
     return relative_path or None
+
+
+_SYNOLOGY_VOLUME_PREFIX = re.compile(r"^/volume\d+/(?=.)")
+
+
+def _sshfs_volume_stripped_candidate(remote_path: str) -> Optional[str]:
+    """`/volume1/backups/x` -> `/backups/x`.
+
+    Synology DSM chroots SFTP at the shared-folder root, so the path Borg
+    uses over SSH is not the one SSHFS can mount (#1280).
+    """
+    stripped = _SYNOLOGY_VOLUME_PREFIX.sub("/", (remote_path or "").strip(), count=1)
+    return stripped if stripped != remote_path else None
 
 
 async def _communicate_or_kill(
@@ -500,7 +515,12 @@ class MountService:
             logger.error("Failed to cleanup orphaned mount directories", error=str(e))
 
     async def mount_ssh_directory(
-        self, connection_id: int, remote_path: str, job_id: Optional[int] = None
+        self,
+        connection_id: int,
+        remote_path: str,
+        job_id: Optional[int] = None,
+        read_only: bool = False,
+        ssh_key_id: Optional[int] = None,
     ) -> Tuple[str, str]:
         """
         Mount a remote SSH directory via SSHFS with proper SSH key authentication
@@ -509,6 +529,8 @@ class MountService:
             connection_id: SSHConnection ID to use
             remote_path: Remote path to mount
             job_id: Optional backup job ID for tracking
+            read_only: Mount with ``-o ro`` so nothing can write through it
+            ssh_key_id: Sign in with this key instead of the connection's own
 
         Returns:
             Tuple of (temp_root, mount_id)
@@ -529,13 +551,12 @@ class MountService:
                 raise Exception(f"SSH connection {connection_id} not found")
 
             # Get SSH key
-            ssh_key = (
-                db.query(SSHKey).filter(SSHKey.id == connection.ssh_key_id).first()
-            )
+            key_id = ssh_key_id or connection.ssh_key_id
+            ssh_key = db.query(SSHKey).filter(SSHKey.id == key_id).first()
 
             if not ssh_key:
                 raise Exception(
-                    f"SSH key {connection.ssh_key_id} not found for connection {connection_id}"
+                    f"SSH key {key_id} not found for connection {connection_id}"
                 )
 
             # Check if SSHFS is available
@@ -581,6 +602,7 @@ class MountService:
                     remote_path=remote_path,
                     mount_point=mount_dir,
                     temp_key_file=temp_key_file,
+                    read_only=read_only,
                 )
 
                 # Verify mount with READ-ONLY check (NEVER write to user data!)
@@ -1463,18 +1485,24 @@ class MountService:
     ) -> list[str]:
         """The paths the SSHFS mount tries for `remote_path`, in order.
 
-        A missing absolute path is retried relative to the login directory
-        (see `_mount_sshfs`), so anything that inspects the path first has to
-        resolve it the same way or it judges a different path than the one
-        that gets mounted.
+        A missing absolute path is retried relative to the login directory,
+        then without a Synology `/volumeN` prefix (see `_mount_sshfs`), so
+        anything that inspects the path first has to resolve it the same way
+        or it judges a different path than the one that gets mounted.
         """
         default_path = getattr(connection, "default_path", None)
-        login_relative_path = _sshfs_login_relative_candidate(
-            remote_path, default_path if isinstance(default_path, str) else None
-        )
-        if login_relative_path and login_relative_path != remote_path:
-            return [remote_path, login_relative_path]
-        return [remote_path]
+        candidates = [
+            remote_path,
+            _sshfs_login_relative_candidate(
+                remote_path, default_path if isinstance(default_path, str) else None
+            ),
+            _sshfs_volume_stripped_candidate(remote_path),
+        ]
+        return [
+            c
+            for i, c in enumerate(candidates)
+            if c is not None and c not in candidates[:i]
+        ]
 
     async def _check_remote_is_file(
         self, connection: SSHConnection, remote_path: str, temp_key_file: str
@@ -1511,7 +1539,8 @@ class MountService:
                 "ConnectTimeout=10",
                 "-p",
                 str(connection.port),
-                f"{connection.username}@{connection.host}",
+                "--",
+                ssh_destination(connection.username, connection.host),
                 f"{check} && echo 'FILE' || echo 'DIR'",
             ]
 
@@ -1591,7 +1620,8 @@ class MountService:
             "ConnectTimeout=10",
             "-P",
             str(connection.port),
-            f"{connection.username}@{connection.host}",
+            "--",
+            ssh_destination(connection.username, connection.host),
         ]
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -1666,12 +1696,14 @@ class MountService:
         mount_point: str,
         temp_key_file: str,
         preserve_symlinks: bool = False,
+        read_only: bool = False,
     ):
         """Execute SSHFS mount command with SSH key authentication.
 
         ``preserve_symlinks`` selects faithful symlink handling for backup sources
         and restore destinations (see ``_sshfs_symlink_options``); browse and
         cloud-mirror keep the default ``follow_symlinks`` behavior.
+        ``read_only`` adds ``-o ro`` for callers that only ever read.
         """
         sftp_server_path = None
         use_sudo = getattr(connection, "use_sudo", False)
@@ -1688,7 +1720,8 @@ class MountService:
                     "ConnectTimeout=10",
                     "-p",
                     str(connection.port),
-                    f"{connection.username}@{connection.host}",
+                    "--",
+                    ssh_destination(connection.username, connection.host),
                     # Emit key=value lines for parsing; also locate sftp-server binary
                     "printf 'user=%s\\n' \"$(whoami)\"; "
                     "printf 'uid=%s\\n' \"$(id -u)\"; "
@@ -1737,7 +1770,7 @@ class MountService:
             # Build SSHFS command WITH IdentityFile (this is the fix!)
             cmd = [
                 "sshfs",
-                f"{connection.username}@{connection.host}:{path_to_mount}",
+                f"{ssh_destination(connection.username, connection.host)}:{path_to_mount}",
                 mount_point,
                 "-p",
                 str(connection.port),
@@ -1761,6 +1794,8 @@ class MountService:
                 "-o",
                 "workaround=rename",
             ]
+            if read_only:
+                cmd.extend(["-o", "ro"])
 
             # When use_sudo is enabled, tell SSHFS to run the remote sftp-server via sudo.
             # This allows reading files owned by root/other users (e.g. vault TLS keys, raft DB).
@@ -1778,7 +1813,6 @@ class MountService:
             )
 
         mount_attempts = self._remote_path_candidates(connection, remote_path)
-        login_relative_path = mount_attempts[1] if len(mount_attempts) > 1 else None
 
         for attempt_index, path_to_mount in enumerate(mount_attempts):
             cmd = build_sshfs_command(path_to_mount)
@@ -1810,15 +1844,14 @@ class MountService:
                     error_msg = (
                         stderr.decode(errors="replace") if stderr else "Unknown error"
                     )
-                    if (
-                        attempt_index == 0
-                        and login_relative_path
-                        and _sshfs_missing_remote_path(error_msg)
-                    ):
+                    next_attempt = mount_attempts[attempt_index + 1 :][:1]
+                    if next_attempt and _sshfs_missing_remote_path(error_msg):
                         logger.warning(
-                            "SSHFS absolute path missing, retrying relative to login directory",
-                            remote_path=remote_path,
-                            retry_remote_path=login_relative_path,
+                            "SSHFS remote path missing, retrying with next candidate",
+                            remote_path=path_to_mount,
+                            retry_remote_path=next_attempt[0],
+                            attempt=attempt_index + 1,
+                            attempts=len(mount_attempts),
                             error=error_msg.strip(),
                         )
                         continue

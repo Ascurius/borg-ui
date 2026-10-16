@@ -1,0 +1,13 @@
+# CodeRabbit configuration. Schema: https://coderabbit.ai/integrations/schema.v2.json
+inheritance: true
+reviews:
+  pre_merge_checks:
+    # Coverage is measured over every function the diff touches, tests included,
+    # so almost every PR failed the default 80% threshold. Docstrings are
+    # reviewed like any other code instead. See issue #929.
+    docstrings:
+      mode: off
+  auto_review:
+    # Review PRs into the Borg 2.0.0b25 integration branch too (#1252).
+    base_branches:
+      - "^borg2-b25$"

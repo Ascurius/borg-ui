@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock, MagicMock, patch
 import asyncio
+import subprocess
 
 from pydantic import ValidationError
 
@@ -609,6 +610,68 @@ class TestSSHKeysEndpoints:
 
 
 @pytest.mark.unit
+class TestExtraSSHKeys:
+    def test_create_ssh_key_derives_public_key_from_private_key(
+        self, test_client: TestClient, admin_headers, test_db, tmp_path
+    ):
+        key_path = tmp_path / "key"
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", str(key_path)],
+            check=True,
+        )
+
+        response = test_client.post(
+            "/api/ssh-keys",
+            json={"name": "borgbase-sftp", "private_key": key_path.read_text()},
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 200, response.json()
+        created = response.json()["ssh_key"]
+        assert created["key_type"] == "ed25519"
+        assert (
+            created["public_key"].split()[:2]
+            == (tmp_path / "key.pub").read_text().split()[:2]
+        )
+
+    def test_create_ssh_key_rejects_unreadable_private_key(
+        self, test_client: TestClient, admin_headers
+    ):
+        response = test_client.post(
+            "/api/ssh-keys",
+            json={"name": "broken", "private_key": "not a key"},
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 400
+        assert (
+            response.json()["detail"]["key"]
+            == "backend.errors.ssh.invalidPrivateKeyFormat"
+        )
+
+    def test_delete_extra_key_keeps_system_key_files(
+        self, test_client: TestClient, admin_headers, test_db, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(ssh_keys_api.settings, "ssh_home_dir", str(tmp_path))
+        system_file = tmp_path / "id_ed25519"
+        system_file.write_text("system key")
+        extra = SSHKey(
+            name="extra",
+            key_type="ed25519",
+            public_key="ssh-ed25519 AAAA",
+            private_key="x",
+        )
+        test_db.add(extra)
+        test_db.commit()
+
+        response = test_client.delete(
+            f"/api/ssh-keys/{extra.id}", headers=admin_headers
+        )
+
+        assert response.status_code == 200, response.json()
+        assert system_file.exists()
+
+
 class TestRunDfCommand:
     """Test _run_df_command helper function"""
 
@@ -1417,6 +1480,36 @@ class TestSSHConnectionDelete:
         )
         assert scheduled_after is not None
         assert scheduled_after.source_ssh_connection_id is None
+
+    def test_delete_connection_used_by_backup_plan_is_refused(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        """A plan's source connection can't be nulled out; refuse and name the plan"""
+        from app.database.models import BackupPlan
+
+        conn = SSHConnection(host="plan-src.example", username="root", port=22)
+        test_db.add(conn)
+        test_db.flush()
+        test_db.add(
+            BackupPlan(
+                name="nightly-nas",
+                source_type="remote",
+                source_ssh_connection_id=conn.id,
+                source_directories='["/srv"]',
+            )
+        )
+        test_db.commit()
+
+        response = test_client.delete(
+            f"/api/ssh-keys/connections/{conn.id}", headers=admin_headers
+        )
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail["key"] == "backend.errors.ssh.sshConnectionUsedByBackupPlans"
+        assert detail["params"]["plans"] == "nightly-nas"
+        test_db.expire_all()
+        assert test_db.get(SSHConnection, conn.id) is not None
 
     def test_delete_connection_not_found(self, test_client: TestClient, admin_headers):
         """Deleting a non-existent connection returns 404"""

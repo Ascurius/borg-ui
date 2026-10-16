@@ -54,6 +54,22 @@ export interface SourceLocation {
   snapshot?: SourceSnapshotConfig
   database?: SourceDatabaseSelection
   container?: SourceContainerSelection
+  app?: SourceAppSelection
+}
+
+/** An app template (Immich and the like) applied to this source. */
+export interface SourceAppSelection {
+  template_id: string
+  template_version?: number | null
+  display_name: string
+  /** The app's own folder; paths may also hold its external libraries. */
+  root: string
+  /** Plan excludes this app added, removed again with the app. */
+  exclude_patterns: string[]
+  script_execution_target: 'source' | 'server'
+  pre_backup_script_id?: number | null
+  pre_backup_script_parameters?: Record<string, string> | null
+  script_execution_order?: number
 }
 
 /** Where a stored repository size came from (`repositories.total_size_source`). */
@@ -175,6 +191,7 @@ export interface RcloneStorage {
   rclone_remote_id: number
   rclone_remote_name?: string | null
   rclone_remote_path: string
+  sftp_ssh_key_id?: number | null
   rclone_target?: string | null
   cache_path?: string | null
   cache_present?: boolean
@@ -408,6 +425,7 @@ export interface BackupPlan {
   run_prune_after?: boolean
   run_compact_after?: boolean
   run_check_after?: boolean
+  run_restore_check_after?: boolean
   check_max_duration?: number
   check_extra_flags?: string | null
   prune_keep_hourly?: number
@@ -501,6 +519,7 @@ export interface BackupPlanData {
   run_prune_after: boolean
   run_compact_after: boolean
   run_check_after: boolean
+  run_restore_check_after: boolean
   check_max_duration: number
   check_extra_flags?: string | null
   prune_keep_hourly: number

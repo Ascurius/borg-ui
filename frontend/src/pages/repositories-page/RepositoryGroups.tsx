@@ -1,6 +1,7 @@
 import Add from '@mui/icons-material/Add'
 import FileUpload from '@mui/icons-material/FileUpload'
 import FilterList from '@mui/icons-material/FilterList'
+import RocketLaunch from '@mui/icons-material/RocketLaunch'
 import Storage from '@mui/icons-material/Storage'
 import { Box, Button, Divider, Stack, Typography } from '@mui/material'
 import { useTranslation } from 'react-i18next'
@@ -21,6 +22,8 @@ interface RepositoryGroupsProps {
   canBreakLock: (repository: Repository) => boolean
   onSearchChange: (value: string) => void
   onOpenWizard: (mode: 'create' | 'edit' | 'import', repository?: Repository) => void
+  /** Opens Quick Start from the empty state; omitted where Quick Start is unavailable. */
+  onQuickStart?: () => void
   onViewInfo: (repository: Repository) => void
   onCheck: (repository: Repository) => void
   onCompact: (repository: Repository) => void
@@ -30,6 +33,8 @@ interface RepositoryGroupsProps {
   onBreakLock: (repository: Repository) => void
   onEdit: (repository: Repository) => void
   onDelete: (repository: Repository) => void
+  /** Repositories whose delete is still out: their delete action is disabled. */
+  deletingRepositoryIds?: ReadonlySet<number>
   onPermanentDelete: (repository: Repository) => void
   onBackupNow: (repository: Repository) => void
   onViewArchives: (repository: Repository) => void
@@ -53,6 +58,7 @@ export function RepositoryGroups({
   canBreakLock,
   onSearchChange,
   onOpenWizard,
+  onQuickStart,
   onViewInfo,
   onCheck,
   onCompact,
@@ -62,6 +68,7 @@ export function RepositoryGroups({
   onBreakLock,
   onEdit,
   onDelete,
+  deletingRepositoryIds,
   onPermanentDelete,
   onBackupNow,
   onViewArchives,
@@ -101,8 +108,18 @@ export function RepositoryGroups({
                 justifyContent: 'center',
               }}
             >
+              {onQuickStart && (
+                <Button
+                  variant="contained"
+                  startIcon={<RocketLaunch />}
+                  onClick={onQuickStart}
+                  sx={{ width: { xs: '100%', sm: 'auto' } }}
+                >
+                  {t('quickStart.title')}
+                </Button>
+              )}
               <Button
-                variant="contained"
+                variant={onQuickStart ? 'outlined' : 'contained'}
                 startIcon={<Add />}
                 onClick={() => onOpenWizard('create')}
                 sx={{ width: { xs: '100%', sm: 'auto' } }}
@@ -193,6 +210,7 @@ export function RepositoryGroups({
                 onBreakLock={() => onBreakLock(repository)}
                 onEdit={() => onEdit(repository)}
                 onDelete={() => onDelete(repository)}
+                isDeleting={deletingRepositoryIds?.has(repository.id) ?? false}
                 onPermanentDelete={() => onPermanentDelete(repository)}
                 onBackupNow={() => onBackupNow(repository)}
                 onViewArchives={() => onViewArchives(repository)}

@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, joinedload
 
+from app.utils.ssh_host_validation import ssh_destination
 from app.config import settings
 from app.core.borg_router import BorgRouter
 from app.core.security import decrypt_secret
@@ -59,6 +60,7 @@ from app.services.repository_executor import (
 )
 from app.services.upload_ratelimit_policies import resolve_scheduled_upload_ratelimit
 from app.services.notification_service import notification_service
+from app.services.restore_check_service import restore_check_service
 from app.services.script_executor import execute_script
 from app.services.template_service import get_system_variables
 from app.services.operations.backup_facade import (
@@ -72,6 +74,7 @@ from app.services.operations.events import broadcast_operation_updated
 from app.services.operations.runner import operation_runner
 from app.services.operations.vocab import TERMINAL_STATUSES
 from app.utils.archive_names import build_archive_name
+from app.utils.http_detail import detail_text
 from app.utils.script_params import SYSTEM_VARIABLE_PREFIX
 from app.utils.ssh_host_keys import host_key_ssh_opts
 from app.utils.ssh_utils import ssh_key_auth_args, write_ssh_key_to_tempfile
@@ -100,6 +103,7 @@ TERMINAL_PLAN_RUN_REPOSITORY_STATUSES = {
 SUCCESS_BACKUP_STATUSES = {"completed", "completed_with_warnings"}
 WARNING_BACKUP_STATUSES = {"completed_with_warnings", "skipped"}
 CANCELLED_MESSAGE = '{"key": "backend.errors.backup.cancelledByUser"}'
+RESTORE_CHECK_CANCEL_POLL_SECONDS = 2
 
 
 @dataclass(frozen=True)
@@ -128,6 +132,7 @@ class PlanRunContext:
     run_prune_after: bool
     run_compact_after: bool
     run_check_after: bool
+    run_restore_check_after: bool
     check_max_duration: int
     check_extra_flags: Optional[str]
     prune_keep_hourly: int
@@ -200,16 +205,6 @@ def _database_source_location(
     )
 
 
-def _database_source_locations(
-    source_locations: list[dict[str, Any]],
-) -> list[tuple[int, dict[str, Any]]]:
-    return [
-        (index, location)
-        for index, location in enumerate(source_locations, start=1)
-        if isinstance(location.get("database"), dict)
-    ]
-
-
 def _container_source_location(
     source_locations: list[dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
@@ -221,16 +216,6 @@ def _container_source_location(
         ),
         None,
     )
-
-
-def _container_source_locations(
-    source_locations: list[dict[str, Any]],
-) -> list[tuple[int, dict[str, Any]]]:
-    return [
-        (index, location)
-        for index, location in enumerate(source_locations, start=1)
-        if isinstance(location.get("container"), dict)
-    ]
 
 
 def _database_script_env_for_location(
@@ -347,43 +332,36 @@ def _container_remote_source_connection_id(
     return _container_remote_source_connection_id_for_location(location)
 
 
-def _database_source_script_assignments(
-    source_locations: list[dict[str, Any]], hook_type: str
+def _selection_script_assignments(
+    source_locations: list[dict[str, Any]], hook_type: str, kind: str
 ) -> list[dict[str, Any]]:
-    script_id_key = (
-        "pre_backup_script_id"
-        if hook_type == "source-pre-backup"
-        else "post_backup_script_id"
-    )
-    parameters_key = (
-        "pre_backup_script_parameters"
-        if hook_type == "source-pre-backup"
-        else "post_backup_script_parameters"
-    )
+    """Scripts attached to one kind of source selection (database, container,
+    app), in execution order."""
+    prefix = "pre" if hook_type == "source-pre-backup" else "post"
     assignments: list[dict[str, Any]] = []
-    for source_index, location in _database_source_locations(source_locations):
-        database = location.get("database") or {}
-        script_id = database.get(script_id_key)
-        if script_id in (None, ""):
+    for source_index, location in enumerate(source_locations, start=1):
+        selection = location.get(kind)
+        if not isinstance(selection, dict):
             continue
         try:
-            script_id_int = int(script_id)
+            script_id = int(selection.get(f"{prefix}_backup_script_id"))
         except (TypeError, ValueError):
             continue
-        if script_id_int <= 0:
+        if script_id <= 0:
             continue
-        execution_order = database.get("script_execution_order") or source_index
         try:
-            execution_order_int = int(execution_order)
+            execution_order = int(
+                selection.get("script_execution_order") or source_index
+            )
         except (TypeError, ValueError):
-            execution_order_int = source_index
+            execution_order = source_index
         assignments.append(
             {
                 "source_index": source_index,
-                "execution_order": execution_order_int,
+                "execution_order": execution_order,
                 "location": location,
-                "script_id": script_id_int,
-                "parameters": database.get(parameters_key) or {},
+                "script_id": script_id,
+                "parameters": selection.get(f"{prefix}_backup_script_parameters") or {},
             }
         )
 
@@ -394,55 +372,33 @@ def _database_source_script_assignments(
             assignment["source_index"],
         ),
     )
+
+
+def _database_source_script_assignments(
+    source_locations: list[dict[str, Any]], hook_type: str
+) -> list[dict[str, Any]]:
+    return _selection_script_assignments(source_locations, hook_type, "database")
 
 
 def _container_source_script_assignments(
     source_locations: list[dict[str, Any]], hook_type: str
 ) -> list[dict[str, Any]]:
-    script_id_key = (
-        "pre_backup_script_id"
-        if hook_type == "source-pre-backup"
-        else "post_backup_script_id"
-    )
-    parameters_key = (
-        "pre_backup_script_parameters"
-        if hook_type == "source-pre-backup"
-        else "post_backup_script_parameters"
-    )
-    assignments: list[dict[str, Any]] = []
-    for source_index, location in _container_source_locations(source_locations):
-        container = location.get("container") or {}
-        script_id = container.get(script_id_key)
-        if script_id in (None, ""):
-            continue
-        try:
-            script_id_int = int(script_id)
-        except (TypeError, ValueError):
-            continue
-        if script_id_int <= 0:
-            continue
-        execution_order = container.get("script_execution_order") or source_index
-        try:
-            execution_order_int = int(execution_order)
-        except (TypeError, ValueError):
-            execution_order_int = source_index
-        assignments.append(
-            {
-                "source_index": source_index,
-                "execution_order": execution_order_int,
-                "location": location,
-                "script_id": script_id_int,
-                "parameters": container.get(parameters_key) or {},
-            }
-        )
+    return _selection_script_assignments(source_locations, hook_type, "container")
 
-    return sorted(
-        assignments,
-        key=lambda assignment: (
-            assignment["execution_order"],
-            assignment["source_index"],
-        ),
-    )
+
+def _app_remote_source_connection_id_for_location(
+    location: Optional[dict[str, Any]],
+) -> Optional[int]:
+    # An app's check runs where the app is: on the SSH machine for remote sources.
+    if not location:
+        return None
+    app = location.get("app") or {}
+    if app.get("script_execution_target") != "source":
+        return None
+    if location.get("source_type") != "remote":
+        return None
+    connection_id = location.get("source_ssh_connection_id")
+    return int(connection_id) if connection_id not in (None, "") else None
 
 
 def _source_script_assignments(
@@ -452,6 +408,7 @@ def _source_script_assignments(
         [
             *_database_source_script_assignments(source_locations, hook_type),
             *_container_source_script_assignments(source_locations, hook_type),
+            *_selection_script_assignments(source_locations, hook_type, "app"),
         ],
         key=lambda assignment: (
             assignment["execution_order"],
@@ -629,19 +586,6 @@ def _write_bookkeeping(
             time.sleep(delay * (attempt + 1))
         finally:
             db.close()
-
-
-def _http_detail_message(exc: HTTPException) -> Optional[str]:
-    """A human-ish string from an HTTPException detail (which is usually a
-    ``{"key": ..., "params": ...}`` dict) for logging/recording."""
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, dict):
-        key = detail.get("key")
-        params = detail.get("params")
-        if key and params:
-            return f"{key} {params}"
-        return str(key) if key else str(detail)
-    return str(detail) if detail is not None else None
 
 
 def _should_run_plan_script(run_on: str, backup_result: Optional[str]) -> bool:
@@ -1216,6 +1160,7 @@ class BackupPlanExecutionService:
                 run_prune_after=bool(plan.run_prune_after),
                 run_compact_after=bool(plan.run_compact_after),
                 run_check_after=bool(plan.run_check_after),
+                run_restore_check_after=bool(plan.run_restore_check_after),
                 check_max_duration=plan.check_max_duration,
                 check_extra_flags=plan.check_extra_flags,
                 prune_keep_hourly=plan.prune_keep_hourly,
@@ -1553,7 +1498,7 @@ class BackupPlanExecutionService:
                     db, agent, script_name=agent_script_name, env=env
                 )
             except HTTPException as exc:
-                message = _http_detail_message(exc) or "agent cannot run scripts"
+                message = detail_text(exc.detail) or "agent cannot run scripts"
                 _finish("failed", message, None, None, None)
                 return (
                     False,
@@ -1695,9 +1640,13 @@ class BackupPlanExecutionService:
                 if source_location is not None
                 else _container_remote_source_connection_id(context.source_locations)
             )
+            app_remote_connection_id = _app_remote_source_connection_id_for_location(
+                source_location
+            )
             source_connection_id = (
                 database_remote_connection_id
                 or container_remote_connection_id
+                or app_remote_connection_id
                 or (
                     context.source_ssh_connection_id
                     if context.source_type == "remote"
@@ -1764,7 +1713,9 @@ class BackupPlanExecutionService:
             if source_location is not None:
                 execution_context = f"{execution_context}:source:{source_index or ''}"
             if (
-                database_remote_connection_id or container_remote_connection_id
+                database_remote_connection_id
+                or container_remote_connection_id
+                or app_remote_connection_id
             ) and source_connection:
                 result = await self._execute_remote_source_script(
                     source_connection=source_connection,
@@ -1874,7 +1825,8 @@ class BackupPlanExecutionService:
                 "ServerAliveCountMax=3",
                 "-p",
                 str(source_connection.port or 22),
-                f"{source_connection.username}@{source_connection.host}",
+                "--",
+                ssh_destination(source_connection.username, source_connection.host),
                 "/bin/bash -s",
             ]
             logger.info(
@@ -2233,7 +2185,22 @@ class BackupPlanExecutionService:
         context: PlanRunContext,
         run_id: int,
     ) -> str:
-        maintenance_ok = True
+        # The first failed step's label outlives later steps, so a run with
+        # a failed prune does not end up reading "maintenance_completed".
+        failed_status = None
+        check_ok = True
+        warned = False
+
+        def record_step(
+            kind: str, job: Operation, succeeded: Any = ("completed",)
+        ) -> bool:
+            nonlocal failed_status
+            ok = job.status in succeeded
+            if not ok:
+                failed_status = failed_status or f"{kind}_failed"
+            backup_job.maintenance_status = failed_status or f"{kind}_completed"
+            db.commit()
+            return ok
 
         if context.run_prune_after:
             if self._is_run_cancelled(run_id):
@@ -2279,12 +2246,7 @@ class BackupPlanExecutionService:
             )
             if self._is_run_cancelled(run_id):
                 return "cancelled"
-            if prune_job.status == "completed":
-                backup_job.maintenance_status = "prune_completed"
-            else:
-                backup_job.maintenance_status = "prune_failed"
-                maintenance_ok = False
-            db.commit()
+            record_step("prune", prune_job)
 
         if context.run_compact_after:
             if self._is_run_cancelled(run_id):
@@ -2313,12 +2275,7 @@ class BackupPlanExecutionService:
             )
             if self._is_run_cancelled(run_id):
                 return "cancelled"
-            if compact_job.status == "completed":
-                backup_job.maintenance_status = "compact_completed"
-            else:
-                backup_job.maintenance_status = "compact_failed"
-                maintenance_ok = False
-            db.commit()
+            record_step("compact", compact_job)
 
         if context.run_check_after:
             if self._is_run_cancelled(run_id):
@@ -2347,21 +2304,79 @@ class BackupPlanExecutionService:
             )
             if self._is_run_cancelled(run_id):
                 return "cancelled"
-            if check_job.status == "completed":
-                backup_job.maintenance_status = "check_completed"
-            else:
-                backup_job.maintenance_status = "check_failed"
-                maintenance_ok = False
-            db.commit()
+            check_ok = record_step("check", check_job)
 
-        if (
-            backup_job.maintenance_status
-            and "failed" not in backup_job.maintenance_status
-        ):
+        # Last, so a repository the check just failed is not restore-checked.
+        if context.run_restore_check_after and check_ok:
+            if self._is_run_cancelled(run_id):
+                return "cancelled"
+            restore_check_job = start_inline_maintenance(
+                db,
+                repo,
+                "restore_check",
+                params={
+                    # The archive this run just wrote, not whatever is newest.
+                    "archive_name": (backup_job.operation.params or {}).get(
+                        "archive_name"
+                    ),
+                    # The id Borg reported for it, when the backup recorded
+                    # one: a Borg 2 series shares the name (#1232).
+                    "archive_id": backup_job.archive_id,
+                    "probe_paths": repo.restore_check_paths,
+                    "full_archive": bool(repo.restore_check_full_archive),
+                    "scheduled_restore_check": False,
+                },
+                user_id=None,
+                run_id=backup_job.operation.run_id,
+                depends_on_id=backup_job.id,
+            )
+            backup_job.maintenance_status = "running_restore_check"
+            db.commit()
+            await self._run_inline_maintenance(
+                db,
+                backup_job,
+                restore_check_job,
+                run_id,
+                lambda: self._restore_check_until_cancelled(
+                    db, repo, restore_check_job.id, run_id
+                ),
+            )
+            if self._is_run_cancelled(run_id):
+                return "cancelled"
+            # borg's warning exit still restored; the run says so
+            warned = restore_check_job.status == "completed_with_warnings"
+            record_step("restore_check", restore_check_job, SUCCESS_BACKUP_STATUSES)
+
+        if backup_job.maintenance_status and not failed_status:
             backup_job.maintenance_status = "maintenance_completed"
             db.commit()
+        return "completed_with_warnings" if failed_status or warned else "completed"
 
-        return "completed" if maintenance_ok else "completed_with_warnings"
+    async def _restore_check_until_cancelled(
+        self, db: Session, repo: Repository, operation_id: int, run_id: int
+    ) -> None:
+        """Run the restore check, stopping it if the plan run is cancelled.
+        `cancel_run` only reaches the backup, which is done by now, and a
+        full-archive extract can run for hours."""
+        from app.services.operations.executors.maintenance import (
+            cancel_agent_operation_job,
+        )
+        from app.services.repository_executor import is_agent_executor
+
+        task = asyncio.ensure_future(
+            restore_check_service.execute_restore_check(operation_id, repo.id)
+        )
+        stopped = False
+        while not task.done():
+            await asyncio.wait({task}, timeout=RESTORE_CHECK_CANCEL_POLL_SECONDS)
+            if task.done() or stopped or not self._is_run_cancelled(run_id):
+                continue
+            # False means "ask again": the agent has not taken the job yet.
+            if is_agent_executor(repo):
+                stopped = await cancel_agent_operation_job(db, repo, operation_id)
+            else:
+                stopped = await restore_check_service.cancel_restore_check(operation_id)
+        await task
 
     def _mark_repository_skipped(self, run_id: int, repository_id: int) -> None:
         """Mark a pending repository child as skipped."""

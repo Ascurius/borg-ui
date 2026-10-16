@@ -5,24 +5,68 @@ Filesystem browsing API endpoints
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 from typing import List, Optional
+import asyncio
 import os
+import shlex
 import subprocess
 import structlog
 import tempfile
 from datetime import datetime, timezone
 
-from app.core.security import get_current_user, decrypt_secret
+from app.core.security import (
+    decrypt_secret,
+    get_current_user,
+    require_role_dependency,
+)
 from app.database.database import get_db
 from sqlalchemy.orm import Session
 from app.database.models import SSHConnection, SSHKey
 from app.config import settings
 from app.utils.ssh_host_keys import host_key_ssh_opts_for_host
 from app.utils.datetime_utils import serialize_datetime
-from app.utils.ssh_utils import ssh_key_auth_args
+from app.utils.ssh_utils import resolve_ssh_key_file_by_id, ssh_key_auth_args
+from app.utils.local_paths import is_within_local_mount, mount_entries_below
+from app.utils.ssh_host_validation import (
+    normalize_ssh_host,
+    normalize_ssh_username,
+    ssh_destination,
+)
 
 logger = structlog.get_logger()
 
-router = APIRouter()
+# Admin or operator: the repository wizard, backup plan source picker and
+# restore destination picker are the only callers.
+router = APIRouter(
+    dependencies=[
+        Depends(
+            require_role_dependency(
+                "admin",
+                "operator",
+                detail_key="backend.errors.filesystem.operatorAccessRequired",
+            )
+        )
+    ]
+)
+
+
+def _confined(user) -> bool:
+    # Admins configure the mounts and repositories themselves, so only
+    # operators are held to LOCAL_MOUNT_POINTS.
+    return user.role != "admin"
+
+
+def _require_local_mount_path(path: str, user) -> str:
+    """Resolve a local path and refuse it unless it is inside a mount point."""
+    resolved = os.path.realpath(path)
+    if _confined(user) and not is_within_local_mount(resolved):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "key": "backend.errors.filesystem.permissionDenied",
+                "params": {"path": path},
+            },
+        )
+    return resolved
 
 
 SSH_REMOTE_PATH_FAILURE_MARKERS = (
@@ -34,6 +78,10 @@ SSH_REMOTE_PATH_FAILURE_MARKERS = (
     "cannot",
     "failure",
 )
+
+# sftp batch files have no quoting that survives these: a newline ends the
+# command, and a following line starting with "!" runs on this host.
+SFTP_BATCH_UNSAFE_CHARS = ("\n", "\r", "\0", '"')
 
 
 class FileSystemItem(BaseModel):
@@ -114,7 +162,10 @@ def is_borg_repository_ssh(
     try:
         # Check for config file and data directory using 'ls' (compatible with restricted shells)
         # We'll check if both config and data exist
-        check_cmd = f'ls "{remote_path}/config" "{remote_path}/data"'
+        check_cmd = (
+            f"ls {shlex.quote(f'{remote_path}/config')} "
+            f"{shlex.quote(f'{remote_path}/data')}"
+        )
 
         ssh_cmd = [
             "ssh",
@@ -124,7 +175,8 @@ def is_borg_repository_ssh(
             *host_key_ssh_opts_for_host(host, port, username),
             "-o",
             "ConnectTimeout=5",
-            f"{username}@{host}",
+            "--",
+            ssh_destination(username, host),
             check_cmd,
         ]
 
@@ -159,6 +211,41 @@ def _get_matching_ssh_connection(
         return None
 
 
+def _validate_remote_path(path: Optional[str]) -> None:
+    """Refuse a path that would break out of its sftp batch argument."""
+    if path and any(char in path for char in SFTP_BATCH_UNSAFE_CHARS):
+        raise HTTPException(
+            status_code=400,
+            detail={"key": "backend.errors.filesystem.invalidRemotePath"},
+        )
+
+
+def _resolve_ssh_target(
+    db: Session, current_user, ssh_key_id: int, host: str, username: str, port: int
+):
+    """Normalize host and username, and keep non-admins on saved connections.
+
+    A stored key is only ever used against the target it was saved with, so a
+    non-admin cannot point the server's private key at a host of their choice.
+    """
+    try:
+        host = normalize_ssh_host(host)
+        username = normalize_ssh_username(username)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail={"key": "backend.errors.filesystem.invalidSshTarget"},
+        )
+
+    connection = _get_matching_ssh_connection(db, ssh_key_id, host, username, port)
+    if connection is None and not current_user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail={"key": "backend.errors.filesystem.sshConnectionNotSaved"},
+        )
+    return host, username, connection
+
+
 def _login_relative_remote_path_candidate(
     remote_path: str, default_path: Optional[str] = None
 ) -> Optional[str]:
@@ -175,6 +262,55 @@ def _login_relative_remote_path_candidate(
 
     relative_path = normalized.lstrip("/")
     return relative_path or None
+
+
+SFTP_PWD_PREFIX = "Remote working directory:"
+
+
+def _sftp_working_directory(stdout: str) -> Optional[str]:
+    """The absolute path sftp's pwd printed, or None if it printed none."""
+    for line in (stdout or "").splitlines():
+        if line.startswith(SFTP_PWD_PREFIX):
+            cwd = line[len(SFTP_PWD_PREFIX) :].strip()
+            if cwd.startswith("/") and not any(
+                char in cwd for char in SFTP_BATCH_UNSAFE_CHARS
+            ):
+                return os.path.normpath(cwd)
+    return None
+
+
+def _run_sftp_batch(
+    key_file: str, host: str, username: str, port: int, commands: List[str]
+):
+    """Run sftp batch commands. SFTP only, so restricted shells work too."""
+    batch_file = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", delete=False, suffix=".sftp"
+        ) as batch_f:
+            batch_f.write("".join(f"{command}\n" for command in commands))
+            batch_file = batch_f.name
+
+        sftp_cmd = [
+            "sftp",
+            "-b",
+            batch_file,
+            *ssh_key_auth_args(key_file),
+            "-P",
+            str(port),
+            *host_key_ssh_opts_for_host(host, port, username),
+            "-o",
+            "ConnectTimeout=10",
+            "--",
+            ssh_destination(username, host),
+        ]
+        return subprocess.run(sftp_cmd, capture_output=True, text=True, timeout=30)
+    finally:
+        if batch_file and os.path.exists(batch_file):
+            try:
+                os.unlink(batch_file)
+            except Exception:
+                pass
 
 
 def _join_remote_path(base_path: str, name: str) -> str:
@@ -216,7 +352,7 @@ async def browse_filesystem(
     """
     try:
         if connection_type == "local":
-            return await browse_local_filesystem(path)
+            return await browse_local_filesystem(path, confine=_confined(current_user))
         elif connection_type == "ssh":
             if not all([ssh_key_id, host, username]):
                 raise HTTPException(
@@ -225,15 +361,8 @@ async def browse_filesystem(
                 )
 
             # Check if SSH connection has a default_path and use it when path is "/" or "/local"
-            ssh_connection = (
-                db.query(SSHConnection)
-                .filter(
-                    SSHConnection.ssh_key_id == ssh_key_id,
-                    SSHConnection.host == host,
-                    SSHConnection.username == username,
-                    SSHConnection.port == port,
-                )
-                .first()
+            host, username, ssh_connection = _resolve_ssh_target(
+                db, current_user, ssh_key_id, host, username, port
             )
 
             if (
@@ -268,10 +397,68 @@ async def browse_filesystem(
         )
 
 
-async def browse_local_filesystem(path: str) -> BrowseResponse:
+@router.get("/ssh-home")
+async def ssh_home_directory(
+    ssh_key_id: int = Query(..., description="SSH key ID"),
+    host: str = Query(..., description="SSH host"),
+    username: str = Query(..., description="SSH username"),
+    port: int = Query(22, description="SSH port"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The folder an SSH login lands in, or null when the machine does not say.
+
+    Cheaper than browsing "/": no listing and no per-folder repository checks.
+    """
+    host, username, _ = _resolve_ssh_target(
+        db, current_user, ssh_key_id, host, username, port
+    )
+    key_file = resolve_ssh_key_file_by_id(ssh_key_id, db)
+    if not key_file:
+        raise HTTPException(
+            status_code=404, detail={"key": "backend.errors.ssh.sshKeyNotFound"}
+        )
+    try:
+        result = await asyncio.to_thread(
+            _run_sftp_batch, key_file, host, username, port, ["pwd"]
+        )
+    except Exception as exc:
+        # Only a prefill hint: a timeout, host-key lookup or target error
+        # means "no suggestion", never a failed request.
+        logger.warning("SSH home lookup failed", host=host, error=str(exc))
+        return {"path": None}
+    finally:
+        try:
+            os.unlink(key_file)
+        except OSError as exc:
+            logger.warning("Failed to delete temporary SSH key file", error=str(exc))
+    if result.returncode != 0:
+        logger.warning(
+            "SSH home lookup failed",
+            host=host,
+            returncode=result.returncode,
+            stderr=result.stderr[:500] if result.stderr else None,
+        )
+        return {"path": None}
+    return {"path": _sftp_working_directory(result.stdout)}
+
+
+async def browse_local_filesystem(path: str, confine: bool = True) -> BrowseResponse:
     """Browse local filesystem"""
-    # Security: Prevent directory traversal attacks
-    path = os.path.abspath(path)
+    # Symlinks and ".." are resolved before the mount check. Ancestors of a
+    # mount point (such as "/") list only the entries leading down to it.
+    path = os.path.realpath(path)
+    visible_entries = None
+    if confine and not is_within_local_mount(path):
+        visible_entries = mount_entries_below(path)
+        if not visible_entries:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "key": "backend.errors.filesystem.permissionDenied",
+                    "params": {"path": path},
+                },
+            )
 
     # Check if path exists
     if not os.path.exists(path):
@@ -298,6 +485,8 @@ async def browse_local_filesystem(path: str) -> BrowseResponse:
     try:
         # List directory contents
         entries = os.listdir(path)
+        if visible_entries is not None:
+            entries = [entry for entry in entries if entry in visible_entries]
 
         # Get mount points once for reuse
         mount_points = settings.get_local_mount_points()
@@ -396,42 +585,11 @@ async def browse_ssh_filesystem(
         os.chmod(temp_key_file, 0o600)
 
         def run_sftp_listing(cd_path: Optional[str]):
-            sftp_batch_file = None
-            try:
-                # Create SFTP batch file with commands
-                with tempfile.NamedTemporaryFile(
-                    mode="w", delete=False, suffix=".sftp"
-                ) as batch_f:
-                    if cd_path:
-                        batch_f.write(f'cd "{cd_path}"\n')
-                    batch_f.write("ls -la\n")
-                    sftp_batch_file = batch_f.name
-
-                logger.info("Browsing SSH path via SFTP", host=host, path=path)
-
-                sftp_cmd = [
-                    "sftp",
-                    "-b",
-                    sftp_batch_file,
-                    *ssh_key_auth_args(temp_key_file),
-                    "-P",
-                    str(port),
-                    *host_key_ssh_opts_for_host(host, port, username),
-                    "-o",
-                    "ConnectTimeout=10",
-                    f"{username}@{host}",
-                ]
-
-                return subprocess.run(
-                    sftp_cmd, capture_output=True, text=True, timeout=30
-                )
-            finally:
-                # Clean up SFTP batch file
-                if sftp_batch_file and os.path.exists(sftp_batch_file):
-                    try:
-                        os.unlink(sftp_batch_file)
-                    except Exception:
-                        pass
+            _validate_remote_path(cd_path)
+            # Without a cd, sftp lists the login directory; pwd names it.
+            logger.info("Browsing SSH path via SFTP", host=host, path=path)
+            commands = [f'cd "{cd_path}"' if cd_path else "pwd", "ls -la"]
+            return _run_sftp_batch(temp_key_file, host, username, port, commands)
 
         def has_sftp_listing_entries(stdout: str) -> bool:
             for line in stdout.strip().split("\n"):
@@ -502,6 +660,10 @@ async def browse_ssh_filesystem(
                 detail=f"Failed to list remote directory '{path}': {error_msg or 'Permission denied or path not found'}",
             )
 
+        # "/" lists the login directory (see #488), so report its real path.
+        if path == "/":
+            path = _sftp_working_directory(result.stdout) or path
+
         # Log raw output for debugging
         output_lines = result.stdout.strip().split("\n")
         logger.info(
@@ -522,6 +684,7 @@ async def browse_ssh_filesystem(
                 not line
                 or line.startswith("sftp>")
                 or line.startswith("total")
+                or line.startswith(SFTP_PWD_PREFIX)
                 or "Connecting to" in line
             ):
                 continue
@@ -650,7 +813,7 @@ async def browse_ssh_filesystem(
 
 
 @router.post("/validate-path")
-async def validate_path(
+def validate_path(
     path: str = Query(..., description="Path to validate"),
     connection_type: str = Query("local", description="Connection type"),
     ssh_key_id: Optional[int] = Query(None),
@@ -666,6 +829,7 @@ async def validate_path(
     """
     try:
         if connection_type == "local":
+            _require_local_mount_path(path, current_user)
             exists = os.path.exists(path)
             is_dir = os.path.isdir(path) if exists else False
             is_borg = is_borg_repository(path) if is_dir else False
@@ -684,6 +848,10 @@ async def validate_path(
                     status_code=400,
                     detail={"key": "backend.errors.filesystem.sshParamsRequired"},
                 )
+
+            host, username, _ = _resolve_ssh_target(
+                db, current_user, ssh_key_id, host, username, port
+            )
 
             ssh_key = db.query(SSHKey).filter(SSHKey.id == ssh_key_id).first()
             if not ssh_key:
@@ -710,7 +878,7 @@ async def validate_path(
                 def run_ssh_stat(command_path: str):
                     # Check if path exists via SSH using 'stat' (compatible with restricted shells like Hetzner Storage Box)
                     # stat returns exit code 0 if path exists, non-zero if not
-                    check_cmd = f'stat "{command_path}"'
+                    check_cmd = f"stat {shlex.quote(command_path)}"
 
                     ssh_cmd = [
                         "ssh",
@@ -720,7 +888,8 @@ async def validate_path(
                         *host_key_ssh_opts_for_host(host, port, username),
                         "-o",
                         "ConnectTimeout=5",
-                        f"{username}@{host}",
+                        "--",
+                        ssh_destination(username, host),
                         check_cmd,
                     ]
 
@@ -800,7 +969,7 @@ class CreateFolderRequest(BaseModel):
 
 
 @router.post("/create-folder")
-async def create_folder(
+def create_folder(
     request: CreateFolderRequest,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -825,6 +994,7 @@ async def create_folder(
         full_path = os.path.join(path, folder_name)
 
         if connection_type == "local":
+            _require_local_mount_path(full_path, current_user)
             # Create local folder
             try:
                 os.makedirs(full_path, exist_ok=False)
@@ -866,6 +1036,10 @@ async def create_folder(
                     },
                 )
 
+            host, username, _ = _resolve_ssh_target(
+                db, current_user, ssh_key_id, host, username, port
+            )
+
             # Get SSH key
             ssh_key = db.query(SSHKey).filter(SSHKey.id == ssh_key_id).first()
             if not ssh_key:
@@ -889,6 +1063,7 @@ async def create_folder(
                 os.chmod(temp_key_file, 0o600)
 
                 def run_sftp_mkdir(command_path: str):
+                    _validate_remote_path(command_path)
                     sftp_batch_file = None
                     try:
                         # Create SFTP batch file to create directory
@@ -912,7 +1087,8 @@ async def create_folder(
                             *host_key_ssh_opts_for_host(host, port, username),
                             "-o",
                             "ConnectTimeout=10",
-                            f"{username}@{host}",
+                            "--",
+                            ssh_destination(username, host),
                         ]
 
                         return subprocess.run(

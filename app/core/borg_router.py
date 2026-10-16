@@ -18,6 +18,7 @@ import structlog
 from sqlalchemy.orm import Session
 
 from app.utils.borg_env import effective_repository_remote_path
+from app.utils.borg_flags import parse_borg_flags
 
 logger = structlog.get_logger()
 
@@ -196,7 +197,7 @@ class BorgRouter:
             cmd.extend(["--upload-ratelimit", str(upload_ratelimit_kib)])
         for pattern in exclude_patterns:
             cmd.extend(["--exclude", pattern])
-        cmd.extend(custom_flags)
+        cmd.extend(parse_borg_flags(custom_flags, "create"))
         cmd.append(f"{repository_path}::{archive_name}")
         return cmd
 
@@ -663,7 +664,7 @@ class BorgRouter:
             # post-backup flows that have no HTTP context. Translate to a plain
             # error so background maintenance doesn't surface an HTTP-specific
             # exception; the linked maintenance job already records the detail.
-            from app.services.operations.maintenance_start import detail_text
+            from app.utils.http_detail import detail_text
 
             raise RuntimeError(
                 f"agent {maintenance_kind} failed: {detail_text(exc.detail)}"

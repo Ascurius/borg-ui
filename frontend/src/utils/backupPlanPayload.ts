@@ -51,6 +51,7 @@ export interface BackupPlanPayloadState {
   runPruneAfter: boolean
   runCompactAfter: boolean
   runCheckAfter: boolean
+  runRestoreCheckAfter: boolean
   checkMaxDuration: number
   checkExtraFlags: string
   pruneKeepHourly: number
@@ -295,6 +296,7 @@ function normalizeSourceLocations(state: BackupPlanPayloadState): SourceLocation
           paths,
           ...(database ? { database } : {}),
           ...(container ? { container } : {}),
+          ...(location.app ? { app: location.app } : {}),
         }
       }
       if (location.source_type === 'agent') {
@@ -309,6 +311,7 @@ function normalizeSourceLocations(state: BackupPlanPayloadState): SourceLocation
           paths,
           ...(database ? { database } : {}),
           ...(container ? { container } : {}),
+          ...(location.app ? { app: location.app } : {}),
         }
       }
       const snapshot = normalizeSnapshot(location)
@@ -322,6 +325,7 @@ function normalizeSourceLocations(state: BackupPlanPayloadState): SourceLocation
         ...(snapshot ? { snapshot } : {}),
         ...(database ? { database } : {}),
         ...(container ? { container } : {}),
+        ...(location.app ? { app: location.app } : {}),
       }
     })
     .filter((location): location is SourceLocation => location !== null)
@@ -423,6 +427,7 @@ export function buildBackupPlanPayload(
     run_prune_after: state.runPruneAfter,
     run_compact_after: state.runCompactAfter,
     run_check_after: state.runCheckAfter,
+    run_restore_check_after: state.runRestoreCheckAfter,
     check_max_duration: state.checkMaxDuration,
     check_extra_flags: state.checkExtraFlags.trim() || null,
     prune_keep_hourly: state.pruneKeepHourly,

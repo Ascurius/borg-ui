@@ -52,6 +52,7 @@ from app.services.log_policy import (
 )
 from app.services.operations.backup_facade import BackupJobFacade
 from app.services.repository_executor import repository_executor_type
+from app.utils.borg_flags import borg_flags_validator, parse_borg_flags
 from app.utils.datetime_utils import serialize_datetime
 from app.utils.schedule_time import (
     InvalidScheduleTimezone,
@@ -99,6 +100,10 @@ class BackupPlanRepositoryPayload(BaseModel):
     custom_flags_override: Optional[str] = None
     upload_ratelimit_kib_override: Optional[int] = None
     failure_behavior_override: Optional[str] = None
+
+    _validate_custom_flags_override = borg_flags_validator(
+        "custom_flags_override", "create"
+    )
 
 
 class UploadRatelimitSchedulePolicyPayload(BaseModel):
@@ -162,6 +167,7 @@ class BackupPlanPayload(BaseModel):
     run_prune_after: bool = False
     run_compact_after: bool = False
     run_check_after: bool = False
+    run_restore_check_after: bool = False
     check_max_duration: int = 3600
     check_extra_flags: Optional[str] = None
     prune_keep_hourly: int = 0
@@ -173,6 +179,9 @@ class BackupPlanPayload(BaseModel):
     prune_keep_within: Optional[str] = None
     repositories: list[BackupPlanRepositoryPayload]
     clear_legacy_source_repository_ids: list[int] = Field(default_factory=list)
+
+    _validate_custom_flags = borg_flags_validator("custom_flags", "create")
+    _validate_check_extra_flags = borg_flags_validator("check_extra_flags", "check")
 
 
 class BackupPlanFromRepositoryPayload(BaseModel):
@@ -348,6 +357,7 @@ def _payload_from_repository(
         run_prune_after=bool(schedule and schedule.run_prune_after),
         run_compact_after=bool(schedule and schedule.run_compact_after),
         run_check_after=False,
+        run_restore_check_after=False,
         check_max_duration=3600,
         check_extra_flags=None,
         prune_keep_hourly=schedule.prune_keep_hourly if schedule else 0,
@@ -660,6 +670,7 @@ def _serialize_plan(plan: BackupPlan, *, detail: bool = False) -> dict[str, Any]
                 "run_prune_after": bool(plan.run_prune_after),
                 "run_compact_after": bool(plan.run_compact_after),
                 "run_check_after": bool(plan.run_check_after),
+                "run_restore_check_after": bool(plan.run_restore_check_after),
                 "check_max_duration": plan.check_max_duration,
                 "prune_keep_hourly": plan.prune_keep_hourly,
                 "prune_keep_daily": plan.prune_keep_daily,
@@ -1386,6 +1397,7 @@ def _apply_payload(plan: BackupPlan, payload: BackupPlanPayload) -> None:
     plan.run_prune_after = payload.run_prune_after
     plan.run_compact_after = payload.run_compact_after
     plan.run_check_after = payload.run_check_after
+    plan.run_restore_check_after = payload.run_restore_check_after
     plan.check_max_duration = payload.check_max_duration
     plan.check_extra_flags = (
         payload.check_extra_flags.strip() if payload.check_extra_flags else None
@@ -1427,7 +1439,7 @@ def _replace_repository_links(
 
 
 @router.get("/")
-async def list_backup_plans(
+def list_backup_plans(
     repository_id: int | None = Query(default=None, ge=1),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1450,7 +1462,7 @@ async def list_backup_plans(
 
 
 @router.get("/runs")
-async def list_backup_plan_runs(
+def list_backup_plan_runs(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     limit: int = 50,
@@ -1497,7 +1509,7 @@ async def list_backup_plan_runs(
 
 
 @router.get("/runs/{run_id}")
-async def get_backup_plan_run(
+def get_backup_plan_run(
     run_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1613,6 +1625,16 @@ async def create_backup_plan_from_repository(
     else:
         plan_name = _unique_backup_plan_name(db, f"{repository.name} Backup Plan")
 
+    try:
+        parse_borg_flags(repository.custom_flags, "create", local_paths=False)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "key": "backend.errors.repo.invalidBorgFlags",
+                "params": {"reason": str(exc)},
+            },
+        ) from exc
     plan_payload = _payload_from_repository(
         repository,
         schedule,
@@ -1748,7 +1770,7 @@ async def run_backup_plan(
 
 
 @router.get("/{plan_id}/runs")
-async def list_backup_plan_runs_for_plan(
+def list_backup_plan_runs_for_plan(
     plan_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1787,7 +1809,7 @@ async def list_backup_plan_runs_for_plan(
 
 
 @router.post("/{plan_id}/toggle")
-async def toggle_backup_plan(
+def toggle_backup_plan(
     plan_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1836,7 +1858,7 @@ async def toggle_backup_plan(
 
 
 @router.post("/{plan_id}/repositories/{repository_id}/toggle")
-async def toggle_backup_plan_repository(
+def toggle_backup_plan_repository(
     plan_id: int,
     repository_id: int,
     current_user: User = Depends(get_current_user),
@@ -1912,7 +1934,7 @@ async def toggle_backup_plan_repository(
 
 
 @router.get("/{plan_id}")
-async def get_backup_plan(
+def get_backup_plan(
     plan_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1927,7 +1949,7 @@ async def get_backup_plan(
 
 
 @router.put("/{plan_id}")
-async def update_backup_plan(
+def update_backup_plan(
     plan_id: int,
     payload: BackupPlanPayload,
     current_user: User = Depends(get_current_user),
@@ -1967,7 +1989,7 @@ async def update_backup_plan(
 
 
 @router.delete("/{plan_id}")
-async def delete_backup_plan(
+def delete_backup_plan(
     plan_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

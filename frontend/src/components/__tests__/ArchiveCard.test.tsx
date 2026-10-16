@@ -31,6 +31,16 @@ describe('ArchiveCard', () => {
     expect(screen.getAllByText(/2024/)).toHaveLength(2) // Archive name + formatted date
   })
 
+  it('disables delete and says so while the delete job runs (#1197)', () => {
+    render(<ArchiveCard archive={mockArchive} {...mockHandlers} isDeleting />)
+
+    const deleteButton = screen.getByRole('button', { name: /delete/i })
+    expect(deleteButton).toBeDisabled()
+    fireEvent.click(deleteButton)
+    expect(mockHandlers.onDelete).not.toHaveBeenCalled()
+    expect(screen.getByText(/deleting/i)).toBeInTheDocument()
+  })
+
   it('renders all action buttons', () => {
     render(<ArchiveCard archive={mockArchive} {...mockHandlers} />)
 
@@ -39,6 +49,20 @@ describe('ArchiveCard', () => {
     expect(screen.getByRole('button', { name: /mount/i })).toBeInTheDocument()
     // Delete button is an IconButton with aria-label
     expect(screen.getByRole('button', { name: /delete/i })).toBeInTheDocument()
+  })
+
+  it('hides the restore action when no restore handler is given', () => {
+    render(<ArchiveCard archive={mockArchive} {...mockHandlers} onRestore={undefined} />)
+
+    expect(screen.queryByRole('button', { name: /restore/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /mount/i })).toBeInTheDocument()
+  })
+
+  it('offers no mount for an agent-executed repository', () => {
+    render(<ArchiveCard archive={mockArchive} {...mockHandlers} mountHidden />)
+
+    expect(screen.queryByRole('button', { name: /mount/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /restore/i })).toBeInTheDocument()
   })
 
   it('opens the archive on a row click, but not from an action button', () => {

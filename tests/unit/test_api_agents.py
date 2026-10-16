@@ -771,6 +771,42 @@ class TestAgentJobTransport:
         )
         assert after_complete.status_code == 409
 
+    def test_completion_records_the_archive_id_on_the_backup(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        """The id borg reported for the archive the agent made is kept on
+        the backup row: its restore check targets that archive (#1232)."""
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        job = _create_agent_job(test_db, agent, status="running")
+        backup_job = seed_job_operation(
+            test_db, "backup", repository="/repo", status="running"
+        )
+        test_db.commit()
+        job.operation_id = backup_job.id
+        test_db.commit()
+
+        complete = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={
+                "result": {
+                    "archive_name": "plan-daily",
+                    "archive_id": "ab12cd34ef56ab12",
+                    "return_code": 0,
+                }
+            },
+            headers=_agent_headers(registered["agent_token"]),
+        )
+        assert complete.status_code == 200
+
+        test_db.expire_all()
+        backup_job = resolve_backup_job(test_db, backup_job.id)
+        assert backup_job.archive_name == "plan-daily"
+        assert backup_job.archive_id == "ab12cd34ef56ab12"
+
     def test_warning_return_code_completes_with_warnings(
         self, test_client: TestClient, test_db, admin_headers
     ):
@@ -3029,7 +3065,7 @@ class TestAgentOperationLogLateLines:
         before the commit expires the row (no refresh)."""
         from types import SimpleNamespace
 
-        from sqlalchemy import event
+        from tests.utils.statements import session_cursor_listener
 
         agent, headers, _, _ = self._setup(test_client, test_db, admin_headers)
         backup = AgentJob(
@@ -3050,9 +3086,7 @@ class TestAgentOperationLogLateLines:
             ):
                 selects.append(" ".join(statement.split()))
 
-        engine = test_db.get_bind()
-        event.listen(engine, "before_cursor_execute", record)
-        try:
+        with session_cursor_listener(test_db, record):
             self._post_line(test_client, headers, SimpleNamespace(id=backup_id), 1)
             await _handle_agent_session_message(
                 test_db,
@@ -3065,8 +3099,6 @@ class TestAgentOperationLogLateLines:
                     "message": "line 2",
                 },
             )
-        finally:
-            event.remove(engine, "before_cursor_execute", record)
 
         # Only the handlers' own lookup of the agent's job, once per line.
         assert len(selects) == 2

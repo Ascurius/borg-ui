@@ -314,6 +314,12 @@ async def _cancel_running_maintenance_job(db: Session, backup_job):
             process_killed = await compact_service.cancel_compact(maintenance_job.id)
     elif failure_status == "check_failed":
         process_killed = False
+    elif failure_status == "restore_check_failed":
+        from app.services.restore_check_service import restore_check_service
+
+        process_killed = await restore_check_service.cancel_restore_check(
+            maintenance_job.id
+        )
     else:
         return None
 
@@ -499,7 +505,7 @@ async def retry_backup_job(
 
 
 @router.get("/jobs")
-async def get_all_backup_jobs(
+def get_all_backup_jobs(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     limit: int = 200,
@@ -583,7 +589,7 @@ async def get_all_backup_jobs(
 
 
 @router.get("/status/{job_id}")
-async def get_backup_status(
+def get_backup_status(
     job_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -779,7 +785,7 @@ async def cancel_backup_job(job_id: int, current_user: User, db: Session):
 
 
 @router.get("/logs/{job_id}/download")
-async def download_backup_logs(
+def download_backup_logs(
     job_id: int,
     current_user: User = Depends(get_current_download_user),
     db: Session = Depends(get_db),
@@ -880,7 +886,7 @@ async def download_backup_logs(
 
 
 @router.get("/logs/{job_id}/stream")
-async def stream_backup_logs(
+def stream_backup_logs(
     job_id: int,
     offset: int = 0,  # Line number to start from
     current_user: User = Depends(get_current_user),

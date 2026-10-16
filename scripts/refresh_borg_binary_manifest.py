@@ -12,10 +12,11 @@ new Borg version is therefore: change runtime-base.env, run this, commit.
 
 --latest asks GitHub which releases exist, and if a newer one carries the Linux
 binaries this installer needs, bumps the version in runtime-base.env (and the
-Dockerfile ARG that mirrors it) and regenerates the manifest. It is what the
-scheduled workflow runs to open the adoption PR; the runtime-base image still has
-to be rebuilt and re-tagged by a human, which is the point — the red build is the
-checklist.
+Dockerfile ARG that mirrors it) and regenerates the manifest. A Borg 2 bump also
+moves BORGSTORE_VERSION to the newest borgstore the new release accepts, as its
+PyPI metadata states it. It is what the scheduled workflow runs to open the
+adoption PR; the runtime-base image still has to be rebuilt and re-tagged by a
+human, which is the point — the red build is the checklist.
 
 The digests come from the release API rather than from hashing a download, so a
 version bump does not require pulling ~180 MB of binaries. Nothing here runs at
@@ -32,6 +33,8 @@ import sys
 import urllib.request
 from pathlib import Path
 
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -42,6 +45,13 @@ MANIFEST = REPO_ROOT / "app" / "api" / "borg_binaries.json"
 API = "https://api.github.com/repos/borgbackup/borg/releases/tags/{version}"
 RELEASES_API = "https://api.github.com/repos/borgbackup/borg/releases?per_page=100"
 RELEASE_URL = "https://github.com/borgbackup/borg/releases/download/{version}/{asset}"
+PYPI_RELEASE_API = "https://pypi.org/pypi/borgbackup/{version}/json"
+PYPI_BORGSTORE_API = "https://pypi.org/pypi/borgstore/json"
+
+# What a PyPI answer that cannot be read raises on the way: the request
+# (URLError and HTTPError are OSErrors), the JSON decode (a ValueError, as is a
+# malformed requirement), and a payload without the expected shape.
+PYPI_ERRORS = (OSError, ValueError, KeyError, TypeError, AttributeError)
 
 # The published Linux binaries a Debian-family installer can use, recognised by
 # the shape of the asset name rather than by a list of the names seen so far.
@@ -55,6 +65,11 @@ RELEASE_URL = "https://github.com/borgbackup/borg/releases/download/{version}/{a
 # version is carried in the name as its digits without the dot (glibc239 =
 # glibc 2.39), so it is read back the same way.
 LINUX_ASSET = re.compile(r"^borg-linux-glibc(\d)(\d+)-(x86_64|arm64)(?:-gh)?$")
+
+# The macOS builds, named after the runner's macOS major the same way the Linux
+# ones carry their glibc: borg-macos-15-arm64-gh was built on macOS 15 and runs
+# on that or newer. The managed agent installer uses them on Darwin.
+MACOS_ASSET = re.compile(r"^borg-macos-(\d+)-(x86_64|arm64)-gh$")
 
 # borgbackup names the ARM asset after the Debian architecture; the installer
 # matches on `uname -m`.
@@ -79,6 +94,14 @@ def _get_json(url: str):
         return json.load(response)
 
 
+def _get_pypi_json(url: str):
+    """Fetch and decode JSON from PyPI, anonymously: the GitHub token _get_json
+    sends is for GitHub alone."""
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
 def versions_from_env() -> dict[str, str]:
     """The Borg versions this repo's runtime base installs, from the single source
     of truth."""
@@ -92,35 +115,161 @@ def versions_from_env() -> dict[str, str]:
     return versions
 
 
+def _env_value(name: str) -> str:
+    match = re.search(rf"^{name}=(\S+)", ENV_FILE.read_text("utf-8"), re.M)
+    if not match:
+        raise SystemExit(f"No {name} in {ENV_FILE.name}")
+    return match.group(1)
+
+
+def borgstore_from_env() -> str:
+    """The borgstore version the runtime base installs next to Borg 2."""
+    return _env_value("BORGSTORE_VERSION")
+
+
+def _borgstore_requirement(borg2_version: str, python: str) -> SpecifierSet:
+    """The borgstore versions Borg `borg2_version` accepts, from the
+    Requires-Dist of its PyPI release.
+
+    Only the lines pip applies to the runtime base count: it installs borgbackup
+    without extras on Python `python`, so a line marked for an extra or another
+    Python is left out (installing borgstore with extras does not activate
+    borgbackup's)."""
+    environment = {"extra": "", "python_version": python, "python_full_version": python}
+    try:
+        info = _get_pypi_json(PYPI_RELEASE_API.format(version=borg2_version))["info"]
+        requirements = [
+            requirement
+            for requirement in map(Requirement, info.get("requires_dist") or [])
+            if requirement.name.lower() == "borgstore"
+            and (requirement.marker is None or requirement.marker.evaluate(environment))
+        ]
+    except PYPI_ERRORS as error:
+        raise SystemExit(
+            f"Cannot read which borgstore Borg {borg2_version} requires from PyPI "
+            f"({error}); nothing was changed"
+        ) from error
+    if not requirements:
+        raise SystemExit(
+            f"Borg {borg2_version} names no borgstore requirement for Python "
+            f"{python} on PyPI; nothing was changed"
+        )
+    combined = SpecifierSet()
+    for requirement in requirements:
+        combined &= requirement.specifier
+    return combined
+
+
+def _installable(file: dict, python: str) -> bool:
+    """A release file pip would take on Python `python`: not yanked, and not
+    restricted to other Pythons."""
+    if file.get("yanked"):
+        return False
+    try:
+        return python in SpecifierSet(file.get("requires_python") or "")
+    except ValueError:  # a Requires-Python pip could not read either
+        return False
+
+
+def borgstore_for(borg2_version: str, python: str) -> str:
+    """The newest borgstore release Borg `borg2_version` accepts on the
+    runtime base's Python.
+
+    The runtime base installs exactly BORGSTORE_VERSION next to Borg 2, which
+    pins its store to one minor series (2.0.0b25: ~= 0.7.0). A Borg 2 bump that
+    leaves the store behind writes a pair pip cannot install, so a range this
+    cannot satisfy stops the run before anything is written.
+    """
+    required = _borgstore_requirement(borg2_version, python)
+    try:
+        releases = _get_pypi_json(PYPI_BORGSTORE_API)["releases"].items()
+    except PYPI_ERRORS as error:
+        raise SystemExit(
+            f"Cannot read the borgstore releases from PyPI ({error}); Borg "
+            f"{borg2_version} requires borgstore{required}, nothing was changed"
+        ) from error
+    published = {}
+    for name, files in releases:
+        # Withdrawn (every file yanked), or built for other Pythons only.
+        if not any(_installable(file, python) for file in files or []):
+            continue
+        try:
+            published[Version(name)] = name
+        except InvalidVersion:
+            continue
+    accepted = list(required.filter(published))
+    if not accepted:
+        raise SystemExit(
+            f"Borg {borg2_version} requires borgstore{required}, but PyPI lists no "
+            f"release in that range for Python {python}; nothing was changed"
+        )
+    return published[max(accepted)]
+
+
+def _digest(asset: dict) -> str:
+    # GitHub serves "digest": null for an asset it has not hashed yet.
+    digest = asset.get("digest") or ""
+    if not digest.startswith("sha256:"):
+        raise SystemExit(f"No sha256 digest published for {asset['name']}")
+    return digest.removeprefix("sha256:")
+
+
 def _linux_binaries(release: dict) -> list[dict]:
-    """The manifest entries an installer can use from a release's assets."""
+    """The manifest entries a Linux installer can use from a release's assets."""
     entries = []
     for asset in release.get("assets", []):
         match = LINUX_ASSET.match(asset["name"])
         if match is None:
             continue
         glibc_major, glibc_minor, arch = match.groups()
-        digest = asset.get("digest", "")
-        if not digest.startswith("sha256:"):
-            raise SystemExit(f"No sha256 digest published for {asset['name']}")
         entries.append(
             {
+                "platform": "linux",
                 "arch": ARCH_NAMES[arch],
                 "min_glibc": f"{glibc_major}.{glibc_minor}",
                 "asset": asset["name"],
-                "sha256": digest.removeprefix("sha256:"),
+                "sha256": _digest(asset),
+            }
+        )
+    return entries
+
+
+def _darwin_binaries(release: dict) -> list[dict]:
+    """The manifest entries a macOS installer can use from a release's assets."""
+    entries = []
+    for asset in release.get("assets", []):
+        match = MACOS_ASSET.match(asset["name"])
+        if match is None:
+            continue
+        # Not hashed yet, or uploaded before GitHub published digests: left
+        # out rather than fatal, so macOS cannot hold the Linux pin back. The
+        # coverage report names the gap.
+        if not (asset.get("digest") or "").startswith("sha256:"):
+            print(f"Skipping {asset['name']}: no sha256 digest published")
+            continue
+        macos_major, arch = match.groups()
+        entries.append(
+            {
+                "platform": "darwin",
+                "arch": ARCH_NAMES[arch],
+                "min_macos": macos_major,
+                "asset": asset["name"],
+                "sha256": _digest(asset),
             }
         )
     return entries
 
 
 def binaries_for(version: str) -> list[dict]:
-    entries = _linux_binaries(_get_json(API.format(version=version)))
+    release = _get_json(API.format(version=version))
+    entries = _linux_binaries(release)
     if not entries:
         raise SystemExit(
             f"Borg {version} publishes no Linux binary this installer can use"
         )
-    return entries
+    # macOS coverage is reported as a regression rather than required: a
+    # release without it must not hold the Linux pin back.
+    return entries + _darwin_binaries(release)
 
 
 def write_manifest(current: dict[str, str]) -> None:
@@ -204,14 +353,33 @@ def bump_version(major: str, new_version: str) -> None:
     _rewrite(DOCKERFILE, rf"^(ARG BORG{major}_VERSION=)\S+", new_version)
 
 
+def bump_borgstore(new_version: str) -> None:
+    """Move BORGSTORE_VERSION and its Dockerfile ARG mirror together, as
+    bump_version does for Borg."""
+    _rewrite(ENV_FILE, r"^(BORGSTORE_VERSION=)\S+", new_version)
+    _rewrite(DOCKERFILE, r"^(ARG BORGSTORE_VERSION=)\S+", new_version)
+
+
+def _floor(entry: dict) -> str:
+    return (
+        entry["min_macos"] if entry.get("platform") == "darwin" else entry["min_glibc"]
+    )
+
+
 def _coverage(binaries: list[dict]) -> dict[str, str]:
-    """The lowest glibc offered per architecture — the floor a machine of that
-    architecture must clear to get a server-source binary at all."""
+    """The lowest floor offered per platform and architecture: the glibc or
+    macOS version a machine must clear to get a server-source binary at all.
+
+    Keyed by the architecture alone for Linux, which is what the manifest held
+    before macOS was listed, and by ``darwin/<arch>`` for macOS."""
     lowest: dict[str, str] = {}
     for entry in binaries:
-        arch, glibc = entry["arch"], entry["min_glibc"]
-        if arch not in lowest or Version(glibc) < Version(lowest[arch]):
-            lowest[arch] = glibc
+        key = entry["arch"]
+        if entry.get("platform", "linux") != "linux":
+            key = f"{entry['platform']}/{entry['arch']}"
+        floor = _floor(entry)
+        if key not in lowest or Version(floor) < Version(lowest[key]):
+            lowest[key] = floor
     return lowest
 
 
@@ -226,11 +394,12 @@ def _coverage_regressions(old: list[dict], new: list[dict]) -> list[str]:
     """
     before, after = _coverage(old), _coverage(new)
     notes = []
-    for arch, floor in sorted(before.items()):
-        if arch not in after:
-            notes.append(f"drops {arch} (was glibc {floor})")
-        elif Version(after[arch]) > Version(floor):
-            notes.append(f"raises {arch} glibc floor {floor} -> {after[arch]}")
+    for key, floor in sorted(before.items()):
+        kind = "macOS" if key.startswith("darwin/") else "glibc"
+        if key not in after:
+            notes.append(f"drops {key} (was {kind} {floor})")
+        elif Version(after[key]) > Version(floor):
+            notes.append(f"raises {key} {kind} floor {floor} -> {after[key]}")
     return notes
 
 
@@ -271,6 +440,14 @@ def adopt_latest() -> int:
         _emit_output(changed="false", unadoptable=passed_over)
         return 0
 
+    # Resolved before the first write: when PyPI cannot say which store the new
+    # Borg 2 takes, the run fails on a clean tree instead of opening a PR whose
+    # image cannot build.
+    old_store = new_store = None
+    if "2" in bumps:
+        python = _env_value("PYTHON_VERSION")
+        old_store, new_store = borgstore_from_env(), borgstore_for(bumps["2"], python)
+
     # Read the coverage the outgoing versions offer before the manifest is
     # overwritten, so the new binaries can be measured against it.
     old_binaries = json.loads(MANIFEST.read_text(encoding="utf-8")).get("binaries", {})
@@ -284,6 +461,9 @@ def adopt_latest() -> int:
         )
         for note in regressions:
             warnings.append(f"Borg {major} {new_version} {note}")
+    if new_store != old_store:
+        print(f"borgstore: {old_store} -> {new_store}")
+        bump_borgstore(new_store)
     write_manifest({**current, **bumps})
 
     # A new Borg version is a fresh image lineage — reset the runtime-base revision
@@ -297,6 +477,9 @@ def adopt_latest() -> int:
     summary = "; ".join(
         f"Borg {major} {current[major]} -> {ver}" for major, ver in bumps.items()
     )
+    if new_store != old_store:
+        title += f", borgstore {new_store}"
+        summary += f"; borgstore {old_store} -> {new_store}"
     warnings_md = ""
     if warnings:
         title += " — coverage regression"

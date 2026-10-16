@@ -169,10 +169,13 @@ resolve_version() {
   fi
 
   log "Resolving the latest release"
-  local tag
-  tag="$(curl -fsSL --proto '=https' --tlsv1.2 \
-    "https://api.github.com/repos/${REPO}/releases/latest" |
-    grep -m1 '"tag_name"' | cut -d'"' -f4 || true)"
+  # The response is captured before it is searched: grep -m1 exits on the
+  # first match, and curl, still writing the rest, reported a harmless but
+  # alarming "(23) Failure writing output to destination" in the log.
+  local json tag
+  json="$(curl -fsSL --proto '=https' --tlsv1.2 \
+    "https://api.github.com/repos/${REPO}/releases/latest" || true)"
+  tag="$(grep -m1 '"tag_name"' <<<"${json}" | cut -d'"' -f4 || true)"
   [[ -n "${tag}" ]] || die "could not resolve the latest release; pass --version explicitly"
   VERSION="${tag#v}"
 }
@@ -251,7 +254,10 @@ download_release() {
   local tmp
   install -d -m 0755 "${PREFIX}/releases"
   tmp="$(mktemp -d "${PREFIX}/releases/.staging.XXXXXX")"
-  trap 'rm -rf "${tmp}"' RETURN
+  # Self-clearing: a RETURN trap outlives the function and would fire again on
+  # main's next return (the versions.env source), where the local is gone and
+  # set -u aborts the install.
+  trap 'rm -rf "${tmp:-}"; trap - RETURN' RETURN
 
   log "Downloading Borg UI ${VERSION}"
   url="${base}/${tarball}"
@@ -394,6 +400,8 @@ def parts(value):
 
 best = None
 for row in manifest["binaries"].get(version, []):
+    if row.get("platform", "linux") != "linux":
+        continue
     if row["arch"] != arch or parts(row["min_glibc"]) > parts(glibc):
         continue
     if best is None or parts(row["min_glibc"]) > parts(best["min_glibc"]):

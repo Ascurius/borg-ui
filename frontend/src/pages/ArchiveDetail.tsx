@@ -8,6 +8,7 @@ import {
   Box,
   Breadcrumbs,
   Button,
+  CircularProgress,
   Link,
   Stack,
   Tab,
@@ -35,9 +36,11 @@ import RestoreWizard, { type RestoreData } from '../components/RestoreWizard'
 import RestoreProgressPanel from '../components/archives/RestoreProgressPanel'
 import { cornerStackSx } from '../components/archives/cornerStack'
 import { resyncStoredArchives } from '../utils/archiveResync'
+import { waitForArchiveDeleteJob } from '../utils/archiveDeleteJob'
 import type { RestorePathMetadata } from '../utils/restorePaths'
 import type { ArchiveDetailResponse } from '../types/archives'
 import type { Archive, Repository } from '@/types'
+import { usePermissions } from '../hooks/usePermissions'
 
 type DetailTab = 'changes' | 'files'
 
@@ -56,6 +59,7 @@ export default function ArchiveDetail() {
 
   const repositoryId = Number(repositoryIdParam)
   const archiveId = Number(archiveIdParam)
+  const canRestore = usePermissions().canDo(repositoryId, 'restore')
   const validParams = Number.isFinite(repositoryId) && Number.isFinite(archiveId)
 
   // A tab the page does not have would leave the header without a selected
@@ -167,13 +171,19 @@ export default function ArchiveDetail() {
       if (!repository || !archiveRef) throw new Error('not ready')
       return new BorgApiClient(repository).deleteArchive(archiveRef)
     },
-    onSuccess: (data) => {
+    onSuccess: async (data) => {
       const jobId = data.data.job_id
       toast.success(t('archives.deletionStarted', { id: jobId }))
       setShowDeleteConfirm(false)
-      // The Archives page reads the stored list, so the deleted archive stays
-      // in it until archive_sync runs again.
-      void resyncStoredArchives(queryClient, repositoryId)
+      // The delete is a queued job: the button stays disabled until it has
+      // finished (#1197), and only then is the stored list, which the
+      // Archives page reads, asked to reconcile. A resync before that would
+      // list the archive again.
+      const status = await waitForArchiveDeleteJob(new BorgApiClient(repository!), jobId)
+      if (status === 'failed') {
+        toast.error(t('archives.toasts.deleteFailed'))
+      }
+      await resyncStoredArchives(queryClient, repositoryId)
     },
     onError: (error: unknown) => {
       const err = error as { response?: { data?: { detail?: BackendDetail } } }
@@ -391,31 +401,42 @@ export default function ArchiveDetail() {
           </Box>
         </Stack>
         <Stack direction="row" spacing={1} sx={{ flexShrink: 0 }}>
-          <Button
-            variant="contained"
-            disableElevation
-            startIcon={<RotateCcw size={16} />}
-            onClick={() => openRestore()}
-          >
-            {t('archives.detail.restore')}
-          </Button>
-          <Button
-            variant="outlined"
-            startIcon={<HardDrive size={16} />}
-            onClick={() => {
-              setCustomMountPoint(getDefaultMountPoint(archive.name))
-              setShowMountDialog(true)
-            }}
-          >
-            {t('archives.detail.mount')}
-          </Button>
+          {canRestore && (
+            <Button
+              variant="contained"
+              disableElevation
+              startIcon={<RotateCcw size={16} />}
+              onClick={() => openRestore()}
+            >
+              {t('archives.detail.restore')}
+            </Button>
+          )}
+          {repository && repository.executor_type !== 'agent' && (
+            <Button
+              variant="outlined"
+              startIcon={<HardDrive size={16} />}
+              onClick={() => {
+                setCustomMountPoint(getDefaultMountPoint(archive.name))
+                setShowMountDialog(true)
+              }}
+            >
+              {t('archives.detail.mount')}
+            </Button>
+          )}
           <Button
             variant="outlined"
             color="error"
-            startIcon={<Trash2 size={16} />}
+            startIcon={
+              deleteMutation.isPending ? (
+                <CircularProgress size={16} color="inherit" />
+              ) : (
+                <Trash2 size={16} />
+              )
+            }
             onClick={() => setShowDeleteConfirm(true)}
+            disabled={deleteMutation.isPending}
           >
-            {t('archives.detail.delete')}
+            {deleteMutation.isPending ? t('common.buttons.deleting') : t('archives.detail.delete')}
           </Button>
         </Stack>
         <Box sx={{ flexBasis: '100%' }}>
@@ -445,9 +466,7 @@ export default function ArchiveDetail() {
             repositoryId={repositoryId}
             repository={repository}
             archive={archive}
-            onRestorePaths={(paths, items, fromArchiveId) =>
-              openRestore(paths, items, fromArchiveId)
-            }
+            onRestorePaths={canRestore ? openRestore : undefined}
             cornerStack={cornerStack}
             selectionResetToken={selectionEpoch}
           />

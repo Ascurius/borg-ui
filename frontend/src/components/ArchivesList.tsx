@@ -41,9 +41,13 @@ interface ArchivesListProps {
   onOpenArchive?: (archive: Archive) => void
   /** The detail route for an archive, when the page knows it. */
   archiveHref?: (archive: Archive) => string | undefined
-  onRestoreArchive: (archive: Archive) => void
+  /** Omit when the user cannot restore from this repository. */
+  onRestoreArchive?: (archive: Archive) => void
   onMountArchive: (archive: Archive) => void
+  mountHidden?: boolean
   onDeleteArchive: (archive: Archive) => void
+  /** Archives whose delete job is still running: their delete action is disabled. */
+  deletingArchiveIds?: ReadonlySet<string>
   mountDisabled?: boolean
   canDelete?: boolean
   defaultRowsPerPage?: number
@@ -59,7 +63,9 @@ export default function ArchivesList({
   onRestoreArchive,
   onMountArchive,
   onDeleteArchive,
+  deletingArchiveIds,
   mountDisabled = false,
+  mountHidden = false,
   canDelete = true,
   defaultRowsPerPage = 10,
   rowsPerPageOptions = [5, 10, 25, 50, 100],
@@ -650,7 +656,9 @@ export default function ArchivesList({
                     onRestore={onRestoreArchive}
                     onMount={onMountArchive}
                     onDelete={onDeleteArchive}
+                    isDeleting={deletingArchiveIds?.has(archive.id) ?? false}
                     mountDisabled={mountDisabled}
+                    mountHidden={mountHidden}
                     canDelete={canDelete}
                   />
                 ))}
@@ -682,7 +690,9 @@ export default function ArchivesList({
                   onRestore={onRestoreArchive}
                   onMount={onMountArchive}
                   onDelete={onDeleteArchive}
+                  isDeleting={deletingArchiveIds?.has(archive.id) ?? false}
                   mountDisabled={mountDisabled}
+                  mountHidden={mountHidden}
                   canDelete={canDelete}
                 />
               ))}

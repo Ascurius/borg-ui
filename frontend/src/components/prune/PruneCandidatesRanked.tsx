@@ -10,7 +10,7 @@ export interface PruneCandidatesRankedProps {
   onOpen: (archiveId: number) => void
 }
 
-const VISIBLE_CAP = 25
+const VISIBLE_CAP = 5
 
 const rowSx = { display: 'flex', alignItems: 'center', gap: 1.5, width: '100%', px: 0.5 }
 
@@ -67,7 +67,9 @@ export default function PruneCandidatesRanked({
           ? t('prunePreview.remeasuredPartial', { cap: 50, count: deleted.length })
           : t('prunePreview.remeasured', { count: deleted.length })}
       </Typography>
-      <Stack spacing={0.75}>
+      {/* Same scroll box as the lost-files table: the page scrolls, the
+          list scrolls inside it, and the button stays reachable. */}
+      <Stack spacing={0.75} sx={{ maxHeight: 420, overflowY: 'auto', pr: 0.5 }}>
         {visible.map((a, i) => {
           const size = a.deduplicated_size
           const width = size != null && max > 0 ? Math.max(2, (size / max) * 100) : 0

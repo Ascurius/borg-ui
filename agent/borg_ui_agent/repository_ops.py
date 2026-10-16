@@ -27,6 +27,7 @@ from agent.borg_ui_agent.backup import (
     progress_replaces_log_line,
 )
 from agent.borg_ui_agent.borg import is_warning_return_code
+from agent.borg_ui_agent.borg_flags import parse_borg_flags
 from agent.borg_ui_agent.cancel import (
     KILL_GROUP_AFTER_SECONDS,
     SELF_CANCELLING_JOB_KINDS,
@@ -203,7 +204,9 @@ class RepositoryOperationPayload:
         if self.job_kind == "repository.disk_usage":
             if not self.repository_path:
                 raise ValueError("repository.disk_usage requires a repository path")
-            return ["du", "-sb", "--", self.repository_path]
+            from agent.borg_ui_agent import storage_usage
+
+            return storage_usage.du_command(self.repository_path)[0]
 
         if self.job_kind == "repository.rclone_sync":
             rclone = _rclone_operation(self.operation)
@@ -255,6 +258,8 @@ class RepositoryOperationPayload:
                 *self._base_borg1("init"),
                 "--encryption",
                 encryption,
+                # Borg 2 creates missing parents on its own; Borg 1 needs asking.
+                "--make-parent-dirs",
                 self.repository_path,
             ]
 
@@ -453,7 +458,9 @@ class RepositoryOperationPayload:
             return cmd
 
         if self.job_kind == "repository.check":
-            extra_flags = _split_flags((self.operation or {}).get("check_extra_flags"))
+            extra_flags = parse_borg_flags(
+                _split_flags((self.operation or {}).get("check_extra_flags")), "check"
+            )
             max_duration = (self.operation or {}).get("max_duration")
             if self.borg_version == 2:
                 cmd = [*self._base_borg2("check"), "--progress", "--log-json"]
@@ -918,6 +925,11 @@ def _execute_short_repository_operation(
         return RepositoryOperationResult(
             job_id=job_id, status="failed", message=error_message
         )
+
+    if payload.job_kind == "repository.disk_usage":
+        from agent.borg_ui_agent import storage_usage
+
+        process.stdout = storage_usage.du_output_in_bytes(process.stdout)
 
     succeeded = process.returncode == 0 or is_warning_return_code(process.returncode)
     parsed = _parse_json_output(process.stdout) if succeeded else None

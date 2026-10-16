@@ -13,21 +13,40 @@ from app.services.mount_service import MountInfo, MountType
 from app.database.models import Repository
 
 
+def _seed_repo(db, name="Main Repo", path="/backups/main"):
+    """A repository row so the mount endpoints' repo-access check can resolve
+    it. Admin (admin_headers) bypasses the role check but the repo must exist.
+    """
+    repo = Repository(
+        name=name,
+        path=path,
+        encryption="none",
+        compression="lz4",
+        repository_type="local",
+    )
+    db.add(repo)
+    db.commit()
+    db.refresh(repo)
+    return repo
+
+
 @pytest.mark.unit
 class TestMountArchiveEndpoints:
     def test_mount_borg_archive_success(
         self,
         test_client: TestClient,
         admin_headers,
+        test_db,
         monkeypatch,
     ):
+        repo = _seed_repo(test_db)
         mount_info = MountInfo(
             mount_id="mount-1",
             mount_type=MountType.BORG_ARCHIVE,
             mount_point="/mnt/repo",
             source="Repo::archive",
             created_at=datetime.now(timezone.utc),
-            repository_id=1,
+            repository_id=repo.id,
         )
 
         monkeypatch.setattr(
@@ -41,7 +60,7 @@ class TestMountArchiveEndpoints:
 
         response = test_client.post(
             "/api/mounts/borg",
-            json={"repository_id": 1, "archive_name": "archive"},
+            json={"repository_id": repo.id, "archive_name": "archive"},
             headers=admin_headers,
         )
 
@@ -52,12 +71,51 @@ class TestMountArchiveEndpoints:
         assert data["mount_type"] == MountType.BORG_ARCHIVE.value
         assert data["source"] == "Repo::archive"
 
+    def test_mount_refuses_an_agent_executed_repository(
+        self,
+        test_client: TestClient,
+        test_db,
+        admin_headers,
+        monkeypatch,
+    ):
+        """The service mounts under this server's data directory; an agent
+        repository is on another machine, so the request is refused before
+        the service is reached."""
+        repo = Repository(
+            name="Agent Repo",
+            path="/on/the/agent",
+            encryption="none",
+            compression="lz4",
+            executor_type="agent",
+            execution_target="agent",
+            repository_type="local",
+        )
+        test_db.add(repo)
+        test_db.commit()
+        test_db.refresh(repo)
+        mount = AsyncMock(return_value=("/mnt/repo", "mount-1"))
+        monkeypatch.setattr(mounts.mount_service, "mount_borg_archive", mount)
+
+        response = test_client.post(
+            "/api/mounts/borg",
+            json={"repository_id": repo.id, "archive_name": "archive"},
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"]["key"] == (
+            "backend.errors.mounts.agentRepository"
+        )
+        mount.assert_not_awaited()
+
     def test_mount_borg_archive_missing_mount_info_returns_500(
         self,
         test_client: TestClient,
         admin_headers,
+        test_db,
         monkeypatch,
     ):
+        _seed_repo(test_db)
         monkeypatch.setattr(
             mounts.mount_service,
             "mount_borg_archive",
@@ -81,8 +139,10 @@ class TestMountArchiveEndpoints:
         self,
         test_client: TestClient,
         admin_headers,
+        test_db,
         monkeypatch,
     ):
+        _seed_repo(test_db)
         monkeypatch.setattr(
             mounts.mount_service,
             "mount_borg_archive",
@@ -108,8 +168,10 @@ class TestMountArchiveEndpoints:
         self,
         test_client: TestClient,
         admin_headers,
+        test_db,
         monkeypatch,
     ):
+        _seed_repo(test_db)
         mount_info = MountInfo(
             mount_id="mount-1",
             mount_type=MountType.BORG_ARCHIVE,
@@ -235,8 +297,10 @@ class TestMountListingAndInfo:
         self,
         test_client: TestClient,
         admin_headers,
+        test_db,
         monkeypatch,
     ):
+        _seed_repo(test_db)
         mount_info = MountInfo(
             mount_id="mount-1",
             mount_type=MountType.BORG_ARCHIVE,

@@ -14,9 +14,22 @@ from app.database.database import get_db
 from app.database.models import NotificationSettings, Repository
 from app.services.notification_service import notification_service
 from app.api.auth import get_current_user, User
+from app.core.security import require_role_dependency
 from app.utils.datetime_utils import serialize_datetime
 
-router = APIRouter(prefix="/api/notifications", tags=["notifications"])
+# Admin only: settings hold provider secrets in service_url, and /test makes
+# the server send requests to arbitrary URLs.
+router = APIRouter(
+    prefix="/api/notifications",
+    tags=["notifications"],
+    dependencies=[
+        Depends(
+            require_role_dependency(
+                "admin", detail_key="backend.errors.settings.adminAccessRequired"
+            )
+        )
+    ],
+)
 
 
 # Pydantic models
@@ -127,7 +140,7 @@ class TestNotificationRequest(BaseModel):
 
 # Endpoints
 @router.get("", response_model=List[NotificationSettingsResponse])
-async def list_notification_settings(
+def list_notification_settings(
     db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
 ):
     """List all notification settings."""
@@ -136,7 +149,7 @@ async def list_notification_settings(
 
 
 @router.get("/{setting_id}", response_model=NotificationSettingsResponse)
-async def get_notification_setting(
+def get_notification_setting(
     setting_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -189,7 +202,7 @@ async def create_notification_setting(
 
 
 @router.put("/{setting_id}", response_model=NotificationSettingsResponse)
-async def update_notification_setting(
+def update_notification_setting(
     setting_id: int,
     setting_data: NotificationSettingsUpdate,
     db: Session = Depends(get_db),
@@ -233,7 +246,7 @@ async def update_notification_setting(
 
 
 @router.delete("/{setting_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_notification_setting(
+def delete_notification_setting(
     setting_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),

@@ -11,6 +11,7 @@ from typing import List, Optional
 from app.core.borg2 import borg2
 from app.database.models import Repository
 from app.utils.borg_env import effective_repository_remote_path
+from app.utils.borg_flags import parse_borg_flags
 
 
 class BackupV2Service:
@@ -48,6 +49,10 @@ class BackupV2Service:
             repository_path,
             "create",
             "--stats",
+            # The result document names the archive Borg made (its id): a
+            # series shares the name, and the post-backup restore check
+            # targets that exact archive (#1232).
+            "--json",
             "--compression",
             compression,
         ]
@@ -55,7 +60,7 @@ class BackupV2Service:
             cmd.extend(["--upload-ratelimit", str(upload_ratelimit_kib)])
         for pattern in exclude_patterns:
             cmd.extend(["--exclude", pattern])
-        cmd.extend(custom_flags)
+        cmd.extend(parse_borg_flags(custom_flags, "create"))
         cmd.append(archive_name)
         return cmd
 

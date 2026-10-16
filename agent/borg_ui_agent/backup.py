@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from agent.borg_ui_agent.borg import is_warning_return_code
+from agent.borg_ui_agent.borg_flags import parse_borg_flags
 from agent.borg_ui_agent.cancel import (
     cancel_requested,
     start_cancel_poller,
@@ -57,12 +58,12 @@ class BackupCreatePayload:
             raise ValueError("backup.create payload requires backup.source_paths")
 
         custom_flags = backup.get("custom_flags", payload.get("custom_flags", []))
-        if isinstance(custom_flags, str):
-            custom_flags = shlex.split(custom_flags)
-        if not isinstance(custom_flags, list) or not all(
-            isinstance(flag, str) for flag in custom_flags
+        if not isinstance(custom_flags, (str, list)) or (
+            isinstance(custom_flags, list)
+            and not all(isinstance(flag, str) for flag in custom_flags)
         ):
             raise ValueError("backup.create custom_flags must be a string or list")
+        custom_flags = parse_borg_flags(custom_flags, "create")
 
         exclude_patterns = backup.get(
             "exclude_patterns", payload.get("exclude_patterns", [])
@@ -351,6 +352,22 @@ def _parse_created_archive_name(stdout: str) -> Optional[str]:
     return None
 
 
+def _parse_created_archive_id(stdout: str) -> Optional[str]:
+    """The id borg reported for the archive it made (``archive.id`` of the
+    ``borg create --json`` document), or None when there is none."""
+    if not stdout or not stdout.strip():
+        return None
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    archive = data.get("archive") if isinstance(data, dict) else None
+    archive_id = archive.get("id") if isinstance(archive, dict) else None
+    if isinstance(archive_id, str) and archive_id.strip():
+        return archive_id.strip()
+    return None
+
+
 def _parse_created_archive_stats(stdout: str) -> Optional[dict[str, int]]:
     """The final counters of the archive ``borg create --json`` made
     (``archive.stats``), or None when there are none.
@@ -515,6 +532,10 @@ def execute_backup_create_job(
         archive_stats = _parse_created_archive_stats(stdout)
         if archive_stats:
             result["archive_stats"] = archive_stats
+        # The server's post-backup restore check targets this exact archive.
+        archive_id = _parse_created_archive_id(stdout)
+        if archive_id:
+            result["archive_id"] = archive_id
         client.complete_job(job_id, result=result)
         return BackupExecutionResult(
             job_id=job_id,

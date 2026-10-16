@@ -31,6 +31,7 @@ import type {
   TestConnectionPayload,
   UpdateConnectionPayload,
 } from './ssh-connections-single-key/types'
+import { copyText } from '../utils/clipboard'
 
 export default function SSHConnectionsSingleKey() {
   const { t } = useTranslation()
@@ -198,12 +199,13 @@ export default function SSHConnectionsSingleKey() {
 
   const deleteConnectionMutation = useMutation({
     mutationFn: (connectionId: number) => sshKeysAPI.deleteSSHConnection(connectionId),
-    onSuccess: () => {
+    onSuccess: async () => {
       toast.success(t('sshConnections.toasts.connectionDeleted'))
-      queryClient.invalidateQueries({ queryKey: ['ssh-connections'] })
+      track(EventCategory.SSH, EventAction.DELETE, { resource: 'connection' })
+      // The dialog stays open until the list no longer has the row (#1197).
+      await queryClient.invalidateQueries({ queryKey: ['ssh-connections'] })
       setDeleteConnectionDialogOpen(false)
       setSelectedConnection(null)
-      track(EventCategory.SSH, EventAction.DELETE, { resource: 'connection' })
     },
     onError: (error: unknown) => {
       console.error('Failed to delete connection:', error)
@@ -302,12 +304,13 @@ export default function SSHConnectionsSingleKey() {
 
   const deleteKeyMutation = useMutation({
     mutationFn: (keyId: number) => sshKeysAPI.deleteSSHKey(keyId),
-    onSuccess: () => {
+    onSuccess: async () => {
       toast.success(t('sshConnections.toasts.keyDeleted'))
-      queryClient.invalidateQueries({ queryKey: ['system-ssh-key'] })
-      queryClient.invalidateQueries({ queryKey: ['ssh-connections'] })
-      setDeleteKeyDialogOpen(false)
       track(EventCategory.SSH, EventAction.DELETE, { resource: 'key' })
+      queryClient.invalidateQueries({ queryKey: ['ssh-connections'] })
+      // The dialog stays open until the key card no longer shows it (#1197).
+      await queryClient.invalidateQueries({ queryKey: ['system-ssh-key'] })
+      setDeleteKeyDialogOpen(false)
     },
     onError: (error: unknown) => {
       console.error('Failed to delete SSH key:', error)
@@ -408,9 +411,12 @@ export default function SSHConnectionsSingleKey() {
     importKeyMutation.mutate(importForm)
   }
 
-  const handleCopyPublicKey = () => {
+  const handleCopyPublicKey = async () => {
     if (systemKey?.public_key) {
-      navigator.clipboard.writeText(systemKey.public_key)
+      if (!(await copyText(systemKey.public_key))) {
+        toast.error(t('common.errors.copyFailed'))
+        return
+      }
       toast.success(t('sshConnections.toasts.publicKeyCopied'))
     }
   }

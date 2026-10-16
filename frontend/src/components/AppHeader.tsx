@@ -26,6 +26,7 @@ import { useNavigate } from 'react-router-dom'
 import { PLAN_LABEL } from '../core/features'
 import { getProfileMenuColors, getRoleBadgeStyles } from './profileMenuColors'
 import BackendTargetSwitcher from './BackendTargetSwitcher'
+import QuickStartHeaderButton from './quick-start/QuickStartHeaderButton'
 import { useTheme } from '../context/ThemeContext'
 
 const drawerWidth = 240
@@ -77,6 +78,9 @@ export default function AppHeader({ onToggleMobileMenu }: AppHeaderProps) {
   const canManageSystemSettings = Boolean(
     user?.global_permissions?.includes('settings.system.manage') || user?.role === 'admin'
   )
+  const canManageNotifications = Boolean(
+    user?.global_permissions?.includes('settings.notifications.manage') || user?.role === 'admin'
+  )
 
   return (
     <AppBar
@@ -109,6 +113,8 @@ export default function AppHeader({ onToggleMobileMenu }: AppHeaderProps) {
         </IconButton>
 
         <Box sx={{ flexGrow: 1 }} />
+
+        <QuickStartHeaderButton />
 
         <Box sx={{ mr: 1, display: 'flex', alignItems: 'center' }}>
           <BackendTargetSwitcher />
@@ -498,12 +504,16 @@ export default function AppHeader({ onToggleMobileMenu }: AppHeaderProps) {
                   desc: t('navigation.menu.appearanceDesc', 'Theme, language'),
                   route: '/settings/appearance',
                 },
-                {
-                  icon: Bell,
-                  label: t('navigation.settings.notifications', 'Notifications'),
-                  desc: t('navigation.menu.notificationsDesc', 'Alerts & preferences'),
-                  route: '/settings/notifications',
-                },
+                ...(canManageNotifications
+                  ? [
+                      {
+                        icon: Bell,
+                        label: t('navigation.settings.notifications', 'Notifications'),
+                        desc: t('navigation.menu.notificationsDesc', 'Alerts & preferences'),
+                        route: '/settings/notifications',
+                      },
+                    ]
+                  : []),
                 ...(canManageSystemSettings
                   ? [
                       {

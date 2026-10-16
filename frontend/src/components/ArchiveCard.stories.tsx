@@ -32,3 +32,13 @@ export const Openable: Story = { args: { onOpen: fn() } }
 
 /** Without an opener the row is inert; only its action icons do anything. */
 export const ActionsOnly: Story = {}
+
+/** The delete job is queued or running (#1197): the row says so and its
+ * delete action is disabled until the stored list no longer has it. */
+export const Deleting: Story = { args: { onOpen: fn(), isDeleting: true } }
+
+/** A viewer cannot restore, so the restore action is left out of the row. */
+export const Viewer: Story = { args: { onOpen: fn(), onRestore: undefined } }
+
+/** An agent-executed repository cannot be mounted on the server, so the row offers no mount. */
+export const AgentRepository: Story = { args: { onOpen: fn(), mountHidden: true } }

@@ -788,7 +788,7 @@ async def _tar_download_response(stream, directory_path: str) -> StreamingRespon
 
 
 @router.get("/delete-jobs/{job_id}", dependencies=[BORG2])
-async def get_delete_job_status(
+def get_delete_job_status(
     job_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -798,6 +798,18 @@ async def get_delete_job_status(
     if not job:
         raise HTTPException(
             status_code=404, detail={"key": "backend.errors.archives.deleteJobNotFound"}
+        )
+
+    # A delete job carries the repo id, archive name, error and full log file;
+    # gate it on viewer access to its repository. Fail closed for non-admins if
+    # the repository can no longer be resolved.
+    repo = db.query(Repository).filter(Repository.id == job.repository_id).first()
+    if repo is not None:
+        check_repo_access(db, current_user, repo, "viewer")
+    elif current_user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail={"key": "backend.errors.auth.notEnoughPermissions"},
         )
 
     has_logs = job_has_logs_by_policy(

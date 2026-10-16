@@ -170,7 +170,11 @@ const skippedRepositoryPlan: BackupPlan = {
   ],
 }
 
-function SkippedRepositoryBackupPlans() {
+function SkippedRepositoryBackupPlans({
+  deletingPlanIds,
+}: {
+  deletingPlanIds?: ReadonlySet<number>
+} = {}) {
   const [searchQuery, setSearchQuery] = useState('')
   const [sortBy, setSortBy] = useState('name-asc')
   const [groupBy, setGroupBy] = useState('none')
@@ -211,6 +215,7 @@ function SkippedRepositoryBackupPlans() {
         togglingRepository={null}
         onEditPlan={noop}
         onDeletePlan={noop}
+        deletingPlanIds={deletingPlanIds}
         onViewHistory={noop}
         onViewRepositories={noop}
         formatStatusLabel={(status) => status ?? t('backupPlans.statuses.unknown')}
@@ -269,6 +274,56 @@ function CommunityLockedBackupPlans() {
   )
 }
 
+function EmptyBackupPlansWithQuickStart() {
+  const [searchQuery, setSearchQuery] = useState('')
+  const [sortBy, setSortBy] = useState('name-asc')
+  const [groupBy, setGroupBy] = useState('none')
+
+  return (
+    <Box sx={{ p: 3, maxWidth: 1120, mx: 'auto' }}>
+      <BackupPlansContent
+        loadingPlans={false}
+        backupPlans={[]}
+        processedPlans={{ groups: [{ name: null, plans: [] }] }}
+        latestRunByPlan={new Map()}
+        backupPlanRuns={[]}
+        searchQuery={searchQuery}
+        setSearchQuery={setSearchQuery}
+        sortBy={sortBy}
+        setSortBy={setSortBy}
+        groupBy={groupBy}
+        setGroupBy={setGroupBy}
+        repositoryFilter={null}
+        onClearRepositoryFilter={noop}
+        startingPlanId={null}
+        highlightedPlanId={null}
+        canUseMultiRepository={false}
+        canUseManagedAgents={false}
+        canUseDatabaseDiscovery={false}
+        canUseContainerBackups={false}
+        cancellingRunId={null}
+        runPending={false}
+        togglePending={false}
+        toggleVariables={undefined}
+        openCreateWizard={noop}
+        onQuickStart={noop}
+        onRunPlan={noop}
+        onCancelRun={noop}
+        onViewLogs={noop}
+        onTogglePlan={noop}
+        onToggleRepository={noop}
+        togglingRepository={null}
+        onEditPlan={noop}
+        onDeletePlan={noop}
+        onViewHistory={noop}
+        onViewRepositories={noop}
+        formatStatusLabel={(status) => status ?? t('backupPlans.statuses.unknown')}
+        t={t}
+      />
+    </Box>
+  )
+}
+
 const meta = {
   title: 'Pages/Backup Plans/Content',
   parameters: {
@@ -288,6 +343,14 @@ export const SkippedRepository: Story = {
   render: () => <SkippedRepositoryBackupPlans />,
 }
 
+/** A plan whose delete is out (#1197): its delete action is disabled and
+ * shows a spinner until the list no longer has it. */
+export const DeletingPlan: Story = {
+  render: () => (
+    <SkippedRepositoryBackupPlans deletingPlanIds={new Set([skippedRepositoryPlan.id])} />
+  ),
+}
+
 export const SkippedRepositoryDark: Story = {
   render: () => (
     <ThemeProvider theme={getTheme('dark')}>
@@ -295,4 +358,8 @@ export const SkippedRepositoryDark: Story = {
       <SkippedRepositoryBackupPlans />
     </ThemeProvider>
   ),
+}
+
+export const EmptyWithQuickStart: Story = {
+  render: () => <EmptyBackupPlansWithQuickStart />,
 }

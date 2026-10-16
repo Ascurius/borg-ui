@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from typing import Optional, Dict, Any
 from datetime import datetime
@@ -16,9 +17,11 @@ import time
 from app.database.database import get_db
 from app.database.models import (
     User,
+    BackupPlan,
     SSHKey,
     SSHConnection,
     Repository,
+    RepositoryStorage,
     OperationBackupDetails,
     OperationRestoreDetails,
     ScheduledJob,
@@ -39,7 +42,11 @@ from app.utils.ssh_host_keys import (
     sort_host_key_lines,
 )
 from app.utils.datetime_utils import serialize_datetime
-from app.utils.ssh_host_validation import normalize_ssh_host
+from app.utils.ssh_host_validation import (
+    normalize_ssh_host,
+    normalize_ssh_username,
+    ssh_destination,
+)
 from app.utils.ssh_utils import ssh_key_auth_args, write_ssh_key_to_tempfile
 import hashlib
 
@@ -96,7 +103,8 @@ async def _run_df_command(
         "ConnectTimeout=10",
         "-p",
         str(connection.port),
-        f"{connection.username}@{connection.host}",
+        "--",
+        ssh_destination(connection.username, connection.host),
         df_command,
     ]
 
@@ -238,7 +246,8 @@ class SSHKeyCreate(BaseModel):
     name: str
     description: Optional[str] = None
     key_type: str = "rsa"  # rsa, ed25519, ecdsa
-    public_key: str
+    # Derived from private_key with ssh-keygen when omitted.
+    public_key: Optional[str] = None
     private_key: str
 
 
@@ -287,6 +296,13 @@ class SSHQuickSetup(BaseModel):
             return value
         return normalize_ssh_host(value)
 
+    @field_validator("username")
+    @classmethod
+    def normalize_username(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        return normalize_ssh_username(value)
+
 
 class SSHConnectionCreate(BaseModel):
     host: str
@@ -309,6 +325,11 @@ class SSHConnectionCreate(BaseModel):
     def normalize_host(cls, value: str) -> str:
         return normalize_ssh_host(value)
 
+    @field_validator("username")
+    @classmethod
+    def normalize_username(cls, value: str) -> str:
+        return normalize_ssh_username(value)
+
 
 class SSHConnectionTest(BaseModel):
     host: str
@@ -319,6 +340,11 @@ class SSHConnectionTest(BaseModel):
     @classmethod
     def normalize_host(cls, value: str) -> str:
         return normalize_ssh_host(value)
+
+    @field_validator("username")
+    @classmethod
+    def normalize_username(cls, value: str) -> str:
+        return normalize_ssh_username(value)
 
 
 class SSHConnectionUpdate(BaseModel):
@@ -337,6 +363,13 @@ class SSHConnectionUpdate(BaseModel):
         if value is None:
             return value
         return normalize_ssh_host(value)
+
+    @field_validator("username")
+    @classmethod
+    def normalize_username(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        return normalize_ssh_username(value)
 
 
 class SSHConnectionStorage(BaseModel):
@@ -392,7 +425,7 @@ class SSHConnectionDiagnosticsRequest(BaseModel):
 
 
 @router.get("/system-key")
-async def get_system_key(
+def get_system_key(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     """Get the system SSH key (there can be only one)"""
@@ -432,14 +465,51 @@ async def get_system_key(
         )
 
 
+def _derive_public_key(private_key: str) -> str:
+    """Public half of a pasted private key; rejects anything ssh-keygen
+    cannot read, including passphrase-protected keys."""
+    with tempfile.TemporaryDirectory() as tmp:
+        key_path = os.path.join(tmp, "key")
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(private_key.strip() + "\n")
+        result = subprocess.run(
+            ["ssh-keygen", "-y", "-P", "", "-f", key_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={"key": "backend.errors.ssh.invalidPrivateKeyFormat"},
+        )
+    return result.stdout.strip()
+
+
+def _key_type_from_public_key(public_key: str) -> str:
+    prefix = public_key.split(" ", 1)[0]
+    if prefix == "ssh-ed25519":
+        return "ed25519"
+    if prefix.startswith("ecdsa-"):
+        return "ecdsa"
+    return "rsa"
+
+
 @router.get("")
 @router.get("/")
-async def get_ssh_keys(
+def get_ssh_keys(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     """Get all SSH keys with connection status (deprecated - use /system-key)"""
     try:
         ssh_keys = db.query(SSHKey).all()
+        sftp_counts = dict(
+            db.query(RepositoryStorage.sftp_ssh_key_id, func.count())
+            .filter(RepositoryStorage.sftp_ssh_key_id.isnot(None))
+            .group_by(RepositoryStorage.sftp_ssh_key_id)
+            .all()
+        )
         return {
             "success": True,
             "ssh_keys": [
@@ -458,6 +528,7 @@ async def get_ssh_keys(
                     "active_connections": len(
                         [c for c in key.connections if c.status == "connected"]
                     ),
+                    "sftp_repository_count": sftp_counts.get(key.id, 0),
                 }
                 for key in ssh_keys
             ],
@@ -489,6 +560,12 @@ async def create_ssh_key(
                 status_code=400,
                 detail={"key": "backend.errors.ssh.keyNameAlreadyExists"},
             )
+
+        if not key_data.public_key:
+            key_data.public_key = await asyncio.to_thread(
+                _derive_public_key, key_data.private_key
+            )
+            key_data.key_type = _key_type_from_public_key(key_data.public_key)
 
         # Validate SSH key format
         if not key_data.public_key.startswith(("ssh-rsa", "ssh-ed25519", "ecdsa-sha2")):
@@ -1102,7 +1179,7 @@ async def deploy_ssh_key(
 
 
 @router.get("/connections")
-async def get_ssh_connections(
+def get_ssh_connections(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     """Get all SSH connections with storage information"""
@@ -1216,7 +1293,7 @@ def _ssh_command_base(
 
 
 def _ssh_destination(connection: SSHConnection) -> str:
-    return f"{connection.username}@{connection.host}"
+    return ssh_destination(connection.username, connection.host)
 
 
 def _diagnostic_connection_metadata(connection: SSHConnection) -> dict[str, Any]:
@@ -1308,6 +1385,7 @@ async def _run_ssh_latency_probe(
     timeout_seconds: float,
 ) -> dict[str, Any]:
     cmd = _ssh_command_base(connection, key_file_path, timeout_seconds) + [
+        "--",
         _ssh_destination(connection),
         "pwd",
     ]
@@ -1355,6 +1433,7 @@ async def _run_ssh_tcp_probe(
     cmd = _ssh_command_base(connection, key_file_path, effective_timeout) + [
         "-W",
         f"{target.host}:{target.port}",
+        "--",
         _ssh_destination(connection),
     ]
     started_at = _monotonic()
@@ -1400,6 +1479,7 @@ async def _run_ssh_throughput_probe(
 ) -> dict[str, Any]:
     block_count = math.ceil(probe_size_bytes / SSH_DIAGNOSTICS_BLOCK_SIZE_BYTES)
     cmd = _ssh_command_base(connection, key_file_path, timeout_seconds) + [
+        "--",
         _ssh_destination(connection),
         f"dd if=/dev/zero bs={SSH_DIAGNOSTICS_BLOCK_SIZE_BYTES} count={block_count}",
     ]
@@ -1609,7 +1689,7 @@ def _host_audit_response(entries: list[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 @router.get("/connections/host-audit")
-async def audit_ssh_connection_hosts(
+def audit_ssh_connection_hosts(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     """Audit saved SSH connection hosts for safe normalization or manual cleanup."""
@@ -1770,7 +1850,7 @@ async def test_ssh_connection(
 
 
 @router.put("/connections/{connection_id}")
-async def update_ssh_connection(
+def update_ssh_connection(
     connection_id: int,
     connection_data: SSHConnectionUpdate,
     current_user: User = Depends(get_current_user),
@@ -2375,7 +2455,7 @@ async def redeploy_key_to_connection(
 
 
 @router.delete("/connections/{connection_id}")
-async def delete_ssh_connection(
+def delete_ssh_connection(
     connection_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -2392,6 +2472,22 @@ async def delete_ssh_connection(
             )
 
         host = connection.host
+
+        # A plan can't lose its source host silently; make the user repoint it first
+        plan_names = [
+            name
+            for (name,) in db.query(BackupPlan.name)
+            .filter(BackupPlan.source_ssh_connection_id == connection_id)
+            .order_by(BackupPlan.name)
+        ]
+        if plan_names:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "key": "backend.errors.ssh.sshConnectionUsedByBackupPlans",
+                    "params": {"plans": ", ".join(plan_names)},
+                },
+            )
 
         # Null out FK references so child records are preserved after deletion
         db.query(Repository).filter(Repository.connection_id == connection_id).update(
@@ -2435,7 +2531,7 @@ async def delete_ssh_connection(
 
 
 @router.get("/{key_id}")
-async def get_ssh_key(
+def get_ssh_key(
     key_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -2488,7 +2584,7 @@ async def get_ssh_key(
 
 
 @router.put("/{key_id}")
-async def update_ssh_key(
+def update_ssh_key(
     key_id: int,
     key_data: SSHKeyUpdate,
     current_user: User = Depends(get_current_user),
@@ -2601,27 +2697,34 @@ async def delete_ssh_key(
                 connection_count=connection_count,
             )
 
+        db.query(RepositoryStorage).filter(
+            RepositoryStorage.sftp_ssh_key_id == key_id
+        ).update({"sftp_ssh_key_id": None}, synchronize_session=False)
+
         # Delete the SSH key from database
+        is_system_key = ssh_key.is_system_key
         db.delete(ssh_key)
         db.commit()
 
-        # Remove key files from filesystem
-        try:
-            ssh_dir = settings.ssh_home_dir
-            private_key_path = os.path.join(ssh_dir, f"id_{key_type}")
-            public_key_path = os.path.join(ssh_dir, f"id_{key_type}.pub")
+        # Remove key files from filesystem. Only the system key is written
+        # there; an extra key sharing its type must not delete those files.
+        if is_system_key:
+            try:
+                ssh_dir = settings.ssh_home_dir
+                private_key_path = os.path.join(ssh_dir, f"id_{key_type}")
+                public_key_path = os.path.join(ssh_dir, f"id_{key_type}.pub")
 
-            if os.path.exists(private_key_path):
-                os.remove(private_key_path)
-                logger.info("Removed private key file", path=private_key_path)
+                if os.path.exists(private_key_path):
+                    os.remove(private_key_path)
+                    logger.info("Removed private key file", path=private_key_path)
 
-            if os.path.exists(public_key_path):
-                os.remove(public_key_path)
-                logger.info("Removed public key file", path=public_key_path)
-        except Exception as e:
-            logger.warning(
-                "Failed to remove SSH key files from filesystem", error=str(e)
-            )
+                if os.path.exists(public_key_path):
+                    os.remove(public_key_path)
+                    logger.info("Removed public key file", path=public_key_path)
+            except Exception as e:
+                logger.warning(
+                    "Failed to remove SSH key files from filesystem", error=str(e)
+                )
 
         logger.info(
             "SSH key deleted",
@@ -2747,6 +2850,8 @@ async def deploy_ssh_key_with_copy_id(
 ) -> Dict[str, Any]:
     """Deploy SSH key using ssh-copy-id"""
     try:
+        destination = ssh_destination(username, host)
+
         # Decrypt private key
         private_key = decrypt_secret(ssh_key.private_key)
 
@@ -2782,9 +2887,10 @@ async def deploy_ssh_key_with_copy_id(
             pub_file=pub_file_path,
         )
 
-        # Use sshpass with ssh-copy-id
+        # sshpass -e reads the password from SSHPASS in this subprocess's env,
+        # keeping it out of argv (visible to anyone via ps or /proc/<pid>/cmdline)
         # Build command with optional -s flag for SFTP mode
-        cmd = ["sshpass", "-p", password, "ssh-copy-id"]
+        cmd = ["sshpass", "-e", "ssh-copy-id"]
 
         # Add -s flag only if use_sftp_mode is enabled
         # SFTP mode is required by some servers (Hetzner Storage Box) but breaks others (Synology NAS)
@@ -2800,22 +2906,24 @@ async def deploy_ssh_key_with_copy_id(
                 "ConnectTimeout=10",
                 "-p",
                 str(port),
-                f"{username}@{host}",
+                destination,
             ]
         )
 
-        # Sanitized command for logging (hide password)
-        safe_cmd = " ".join(cmd[0:2] + ["***"] + cmd[3:])
+        command_line = " ".join(cmd)
         logger.info(
             "ssh_key_deployment_started",
             host=host,
             username=username,
             port=port,
-            command=safe_cmd,
+            command=command_line,
         )
 
         process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "SSHPASS": password},
         )
 
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
@@ -2875,7 +2983,7 @@ async def deploy_ssh_key_with_copy_id(
                 host=host,
                 username=username,
                 port=port,
-                command=safe_cmd,
+                command=command_line,
                 key_file=key_file_path,
                 return_code=process.returncode,
                 error_summary=error_summary,
@@ -2923,6 +3031,8 @@ async def test_ssh_key_connection(
 ) -> Dict[str, Any]:
     """Test SSH connection using the specified key"""
     try:
+        destination = ssh_destination(username, host)
+
         # Decrypt private key
         private_key = decrypt_secret(ssh_key.private_key)
 
@@ -2982,7 +3092,8 @@ async def test_ssh_key_connection(
             "ConnectTimeout=10",
             "-p",
             str(port),
-            f"{username}@{host}",
+            "--",
+            destination,
             "pwd",
         ]
 
@@ -3219,7 +3330,7 @@ async def toggle_backup_source(
 
 
 @router.get("/connections/backup-sources")
-async def list_backup_sources(
+def list_backup_sources(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     """List all SSH connections enabled as backup sources"""
