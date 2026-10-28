@@ -91,6 +91,30 @@ def compute_agent_upgrade_status(
     return OUTDATED
 
 
+# The first agent release whose session hello can be taken at its word: a job
+# it does not list is running nowhere. Before 0.1.4 the hello always sent an
+# empty running_job_ids. Up to 0.1.20 an agent dropped a job's outcome when
+# the server was unreachable and left the job off the list, and after a
+# restart a hook its old process started could still be running. From 0.1.21
+# on it lists a job until the server has its outcome and ends what an old
+# process left running before its first hello.
+HELLO_LISTS_RUNNING_JOBS_SINCE = (0, 1, 21)
+
+
+def hello_lists_running_jobs(reported: Optional[str]) -> bool:
+    """Whether an agent's session hello can be trusted to list every job it
+    runs, so a job missing from it is running nowhere.
+
+    A version that does not parse is treated as too old: taking an empty list
+    from such an agent at its word would restart a job it is still running.
+    """
+    reported_parts = parse_agent_version(reported)
+    if reported_parts is None:
+        return False
+    left, right = _padded(reported_parts, HELLO_LISTS_RUNNING_JOBS_SINCE)
+    return left >= right
+
+
 def borg_pin_satisfied(
     *, desired: Optional[str], reported: Optional[list] = None
 ) -> bool:
@@ -120,6 +144,33 @@ def agent_reports_borg_major(reported: Optional[list], major: Any) -> bool:
     mentioned fails on the endpoint with a bare "No such file or directory".
     """
     return agent_borg_version_for_major(reported, major) is not None
+
+
+def agent_borg2_version(
+    reported: Optional[list], binary: Optional[str] = None
+) -> Optional[str]:
+    """The version of the Borg 2 an endpoint runs a Borg 2 job with, in the
+    shape of `agent_borg_version_for_major`.
+
+    The agent runs `borg2` unless the job names another binary (`binary`),
+    and it reports every Borg it finds: a `borg` on PATH may be a Borg 2 as
+    well, which a job does not run. So only the reported entry of that
+    binary counts, by path or by name; an entry without a path (a report
+    that names none) counts for any. The list arrives from the agent, so a
+    malformed entry simply does not match.
+    """
+    wanted = (binary or "borg2").rstrip("/")
+    for entry in reported or []:
+        if not isinstance(entry, dict) or str(entry.get("major")) != "2":
+            continue
+        path = entry.get("path")
+        if isinstance(path, str) and path:
+            path = path.rstrip("/")
+            if path != wanted and path.rsplit("/", 1)[-1] != wanted:
+                continue
+        version = entry.get("version")
+        return version if isinstance(version, str) else ""
+    return None
 
 
 def agent_borg_version_for_major(reported: Optional[list], major: Any) -> Optional[str]:

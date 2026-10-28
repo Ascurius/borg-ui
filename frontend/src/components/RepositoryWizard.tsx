@@ -30,10 +30,18 @@ import type {
   RcloneStatus,
 } from '../services/api'
 import { useAnalytics } from '../hooks/useAnalytics'
+import { useWizardFunnel } from '../hooks/useWizardFunnel'
 import { useFeatureAnalytics } from '../hooks/useFeatureAnalytics'
+import { usePlan } from '../hooks/usePlan'
 import { getApiErrorDetail } from '../utils/apiErrors'
 import { translateBackendKey } from '../utils/translateBackendKey'
-import { kibToUploadRatelimitMb, uploadRatelimitMbToKib } from '../utils/uploadRatelimit'
+import {
+  kibToUploadRatelimitMb,
+  uploadRatelimitMbToKib,
+  uploadRatelimitSupported,
+} from '../utils/uploadRatelimit'
+import { borg2PathFromUrlTail, borg2UrlTail, isBorg2OnlyUrl } from '../utils/borgUtils'
+import { getDefaultRepositoryEncryption } from './wizard/repositoryEncryption'
 import type { SourceLocation } from '../types'
 
 interface Repository extends RepositoryData {
@@ -61,7 +69,6 @@ interface RepositoryWizardProps {
   mode: 'create' | 'edit' | 'import'
   repository?: Repository
   onSubmit: (data: RepositoryData, keyfile?: File | null) => void | Promise<void>
-  canUseManagedAgents?: boolean
   canUseRclone?: boolean
 }
 
@@ -194,6 +201,42 @@ function legacySourceLocations(source: {
   ]
 }
 
+// A URL only Borg 2 can open. With an SSH connection the path is a directory
+// on that host and says nothing about the Borg major.
+function pathRequiresBorg2(state: Pick<WizardState, 'repositoryLocation' | 'path'>): boolean {
+  return state.repositoryLocation !== 'ssh' && isBorg2OnlyUrl(state.path)
+}
+
+// `state` with Borg 2 selected when its path requires it and `enabled` (a new
+// repository, Borg 2 in the plan). An existing repository keeps the major it
+// was recorded with.
+function withBorg2ForPath(state: WizardState, enabled: boolean): WizardState {
+  return enabled && state.borgVersion !== 2 && pathRequiresBorg2(state)
+    ? { ...state, borgVersion: 2, encryption: getDefaultRepositoryEncryption(2) }
+    : state
+}
+
+// What follows the host of a stored server-side ssh:// repository URL, which
+// the form edits; null for anything else. An agent repo's path IS the agent's
+// full $BORG_REPO URL (there is no separate connection) and stays whole.
+function storedSshUrlTail(repository?: Repository): string | null {
+  if (!repository) return null
+  const isAgentRepo =
+    repository.executor_type === 'agent' || repository.execution_target === 'agent'
+  const path = repository.path || ''
+  if (isAgentRepo || !path.startsWith('ssh://')) return null
+  const match = path.match(/^ssh:\/\/[^@]+@[^:/]+(?::\d+)?(.*)$/)
+  return match ? match[1] : null
+}
+
+// The path the form shows for a stored repository. A Borg 2 URL tail is
+// written the way the form reads a Borg 2 path (borg2PathFromUrlTail).
+function editablePath(repository: Repository): string {
+  const tail = storedSshUrlTail(repository)
+  if (tail === null) return repository.path || ''
+  return repository.borg_version === 2 ? borg2PathFromUrlTail(tail) : tail
+}
+
 function isDirectRcloneRepositoryRecord(repository?: Repository): boolean {
   if (!repository) return false
   const repoVersion = repository.borg_version === 2 ? 2 : 1
@@ -220,12 +263,12 @@ const RepositoryWizard = ({
   mode,
   repository,
   onSubmit,
-  canUseManagedAgents = true,
   canUseRclone = true,
 }: RepositoryWizardProps) => {
-  const { track, trackRepository, EventCategory, EventAction } = useAnalytics()
+  const { trackRepository, EventAction, EventCategory } = useAnalytics()
   const { trackFeatureUsed, trackFeatureBlocked } = useFeatureAnalytics()
   const { t } = useTranslation()
+  const { can } = usePlan()
   const [activeStep, setActiveStep] = useState(0)
   const [wizardState, setWizardState] = useState<WizardState>(() => createInitialState())
   const [sshConnections, setSshConnections] = useState<SSHConnection[]>([])
@@ -269,6 +312,7 @@ const RepositoryWizard = ({
     (state.executionTarget === 'local' &&
       (state.repositoryLocation === 'local' || state.repositoryLocation === 'ssh'))
   const isCachedRcloneRepositoryEdit = mode === 'edit' && isCachedRcloneRepositoryRecord(repository)
+  const selectsBorg2ByPath = mode !== 'edit' && can('borg_v2')
   // Repository storage modes are creation-time choices. Preserve direct-rclone
   // edits in place, but never let the wizard submit a mode conversion.
   const directRcloneModeLocked = mode === 'edit' && Boolean(repository)
@@ -355,7 +399,7 @@ const RepositoryWizard = ({
     const [connectionsRes, agentsRes, statusRes, remotesRes, providersRes, keysRes] =
       await Promise.allSettled([
         sshKeysAPI.getSSHConnections(),
-        canUseManagedAgents ? managedAgentsAPI.listAgents() : Promise.resolve({ data: [] }),
+        managedAgentsAPI.listAgents(),
         canUseRclone
           ? rcloneAPI.getStatus()
           : Promise.resolve({
@@ -413,28 +457,18 @@ const RepositoryWizard = ({
       console.error('Failed to load rclone providers:', providersRes.reason)
       setRcloneProviders([])
     }
-  }, [canUseManagedAgents, canUseRclone, t])
+  }, [canUseRclone, t])
 
   // Populate form data for edit mode
   const populateEditData = React.useCallback(() => {
     if (!repository) return
-
-    const isAgentRepo =
-      repository.executor_type === 'agent' || repository.execution_target === 'agent'
-
-    let repoPath = repository.path || ''
 
     // A non-agent SSH repo keeps host/user/port in a separate SSH connection, so
     // the path field holds only the path portion. An agent repo's path IS the
     // agent's full $BORG_REPO ssh URL (there is no separate connection) — keep it
     // intact; chopping it here would drop ssh://user@host:port and a subsequent
     // save would overwrite the agent's repository URL with just the path.
-    if (!isAgentRepo && repoPath.startsWith('ssh://')) {
-      const sshUrlMatch = repoPath.match(/^ssh:\/\/[^@]+@[^:/]+(?::\d+)?(.*)$/)
-      if (sshUrlMatch) {
-        repoPath = sshUrlMatch[1]
-      }
-    }
+    let repoPath = editablePath(repository)
 
     // Determine repository location
     // If connection_id field exists (even if null), trust it as source of truth
@@ -529,14 +563,13 @@ const RepositoryWizard = ({
       const nextUpdates = { ...updates }
 
       if (nextUpdates.repositoryLocation === 'rclone' && !canUseRclone) return prev
-      if (nextUpdates.executionTarget === 'agent' && !canUseManagedAgents) return prev
       if (nextUpdates.cloudMirrorEnabled && !canUseRclone) {
         nextUpdates.cloudMirrorEnabled = false
       }
 
       // When borg version changes, reset encryption to a sensible default for that version
       if (nextUpdates.borgVersion !== undefined && nextUpdates.borgVersion !== prev.borgVersion) {
-        nextUpdates.encryption = nextUpdates.borgVersion === 2 ? 'repokey-aes-ocb' : 'repokey'
+        nextUpdates.encryption = getDefaultRepositoryEncryption(nextUpdates.borgVersion)
         if (nextUpdates.borgVersion !== 2 && prev.repositoryLocation === 'rclone') {
           nextUpdates.repositoryLocation = 'local'
         }
@@ -569,7 +602,7 @@ const RepositoryWizard = ({
         nextUpdates.sourceSshConnectionId = ''
       }
 
-      const next = { ...prev, ...nextUpdates }
+      const next = withBorg2ForPath({ ...prev, ...nextUpdates }, selectsBorg2ByPath)
       if (!isCloudMirrorEligible(next)) {
         next.cloudMirrorEnabled = false
         next.rcloneRemoteId = ''
@@ -599,8 +632,35 @@ const RepositoryWizard = ({
     }
   }
 
-  // Handle path change with SSH URL detection
-  const handlePathChange = (newPath: string) => {
+  // What the field holds for an ssh:// URL. Borg 1: what follows the host.
+  // Borg 2 tells a relative path from an absolute one by the second slash,
+  // which a URL being typed may not have yet, so the URL stays whole until
+  // the field is left (commitPath); whole, the server reads it the same.
+  const sshFormPath = (tail: string, url: string) =>
+    wizardState.borgVersion === 2 ? url : tail || '/'
+
+  // Leaving the path field: a whole Borg 2 URL becomes the form's spelling
+  // of its path (borg2PathFromUrlTail), now that it is complete.
+  const commitPath = () => {
+    const url = wizardState.path.trim()
+    if (
+      wizardState.borgVersion !== 2 ||
+      wizardState.executionTarget === 'agent' ||
+      wizardState.repositoryLocation !== 'ssh' ||
+      !url.startsWith('ssh://')
+    )
+      return
+    const match =
+      url.match(/^ssh:\/\/[^@]+@[^:/]+:\d+(\/.*)$/) || url.match(/^ssh:\/\/[^@]+@[^/]+(\/.*)$/)
+    if (match) handleStateChange({ path: borg2PathFromUrlTail(match[1]) })
+  }
+
+  // Handle path change with SSH URL detection. `picked`: the file picker's
+  // ssh://user@host:port/dir names a directory on the host, an absolute
+  // path, not a Borg URL.
+  const handlePathChange = (typedPath: string, { picked = false } = {}) => {
+    // the scheme is case-insensitive; everything downstream reads `ssh://`
+    const newPath = typedPath.replace(/^ssh:\/\//i, 'ssh://')
     if (wizardState.repositoryLocation === 'rclone') {
       handleStateChange({ path: newPath })
       return
@@ -626,7 +686,7 @@ const RepositoryWizard = ({
 
         handleStateChange({
           repositoryLocation: 'ssh',
-          path: remotePath || '/',
+          path: picked ? remotePath || '/' : sshFormPath(remotePath, newPath),
           repoSshConnectionId: matchingConnection?.id || '',
         })
         return
@@ -638,7 +698,7 @@ const RepositoryWizard = ({
 
         handleStateChange({
           repositoryLocation: 'ssh',
-          path: remotePath || '/',
+          path: picked ? remotePath || '/' : sshFormPath(remotePath, newPath),
           repoSshConnectionId: matchingConnection?.id || '',
         })
         return
@@ -753,7 +813,9 @@ const RepositoryWizard = ({
           if (res.data.remote_path && !(prev.remotePath || '').trim()) {
             updates.remotePath = res.data.remote_path
           }
-          return Object.keys(updates).length ? { ...prev, ...updates } : prev
+          return Object.keys(updates).length
+            ? withBorg2ForPath({ ...prev, ...updates }, selectsBorg2ByPath)
+            : prev
         })
         setAgentRepoAdvertised(Boolean(res.data.repo))
       })
@@ -763,7 +825,7 @@ const RepositoryWizard = ({
     return () => {
       cancelled = true
     }
-  }, [wizardState.executionTarget, wizardState.agentMachineId])
+  }, [wizardState.executionTarget, wizardState.agentMachineId, selectsBorg2ByPath])
 
   // Auto-select SSH connection for edit mode
   useEffect(() => {
@@ -812,7 +874,6 @@ const RepositoryWizard = ({
         if (!wizardState.name.trim()) return false
         if (!wizardState.path.trim()) return false
         if (wizardState.repositoryLocation === 'rclone' && !canUseRclone) return false
-        if (wizardState.executionTarget === 'agent' && !canUseManagedAgents) return false
         if (wizardState.repositoryLocation === 'rclone') {
           const directRclonePath = parseDirectRcloneUrl(wizardState.path)
           if (
@@ -897,14 +958,6 @@ const RepositoryWizard = ({
       })
       return
     }
-    if (wizardState.executionTarget === 'agent' && !canUseManagedAgents) {
-      trackFeatureBlocked('managed_agents', {
-        surface: 'repository_wizard',
-        operation: 'submit_agent_repository',
-        mode,
-      })
-      return
-    }
 
     const storageBackend = isCachedRcloneRepositoryEdit
       ? 'rclone'
@@ -920,11 +973,33 @@ const RepositoryWizard = ({
       !directRcloneEnabled && wizardState.cloudMirrorEnabled && isCloudMirrorEligible(wizardState)
     const rcloneFieldsEnabled = isCachedRcloneRepositoryEdit || cloudMirrorEnabled
 
+    // An edited Borg 2 path on an SSH connection goes back in URL form.
+    // Untouched, as the stored URL's tail, which the server keeps as it is
+    // stored. Changed, as the stored URL with the new path: a plain path that
+    // equals the stored tail (`/backups/repo` for the relative
+    // `ssh://host/backups/repo`) would be read as that tail, unchanged. The
+    // server takes the host from the connection.
+    const storedPath = repository?.path || ''
+    const storedTail =
+      mode === 'edit' &&
+      wizardState.borgVersion === 2 &&
+      wizardState.executionTarget !== 'agent' &&
+      wizardState.repositoryLocation === 'ssh'
+        ? storedSshUrlTail(repository)
+        : null
+    const editedPath = wizardState.path.trim()
+    const submittedPath =
+      storedTail === null || editedPath.startsWith('ssh://')
+        ? wizardState.path
+        : editedPath === borg2PathFromUrlTail(storedTail)
+          ? storedTail
+          : storedPath.slice(0, storedPath.length - storedTail.length) + borg2UrlTail(editedPath)
+
     const data: RepositoryData = {
       name: wizardState.name,
       borg_version: wizardState.borgVersion,
       mode: wizardState.repositoryMode,
-      path: wizardState.path,
+      path: submittedPath,
       encryption: wizardState.encryption,
       passphrase: wizardState.passphrase,
       compression: wizardState.compression,
@@ -939,7 +1014,11 @@ const RepositoryWizard = ({
       post_hook_timeout: wizardState.postHookTimeout,
       continue_on_hook_failure: wizardState.hookFailureMode === 'continue',
       skip_on_hook_failure: wizardState.hookFailureMode === 'skip',
-      upload_ratelimit_kib: uploadRatelimitMbToKib(wizardState.uploadRatelimitMb),
+      // Borg 2 has no upload limit except behind rclone: elsewhere a
+      // stored one is cleared on save
+      upload_ratelimit_kib: uploadRatelimitSupported(wizardState.borgVersion, wizardState.path)
+        ? uploadRatelimitMbToKib(wizardState.uploadRatelimitMb)
+        : null,
       bypass_lock: wizardState.bypassLock,
       // Spec 6.8 and 6.7: only PUT accepts these, so they ride along
       // when editing and are left to their defaults at creation.
@@ -1006,6 +1085,12 @@ const RepositoryWizard = ({
           : null,
     }
 
+    if (mode === 'edit') {
+      // An update cannot change either; the backend refuses keys it does not apply.
+      delete data.borg_version
+      delete data.encryption
+    }
+
     if (mode === 'edit' && !rcloneFieldsEnabled) {
       const shouldSubmitCloudMirrorDisable = Boolean(
         repository?.rclone_storage && !isDirectRcloneRepositoryRecord(repository)
@@ -1030,22 +1115,14 @@ const RepositoryWizard = ({
       delete data.agent_machine_id
     }
 
-    track(
-      EventCategory.REPOSITORY,
-      mode === 'create'
-        ? EventAction.CREATE
-        : mode === 'import'
-          ? EventAction.UPLOAD
-          : EventAction.EDIT,
-      { source: 'wizard', mode }
-    )
     trackRepository(
       mode === 'create'
         ? EventAction.CREATE
         : mode === 'import'
           ? EventAction.UPLOAD
           : EventAction.EDIT,
-      { name: wizardState.name }
+      { name: wizardState.name },
+      { source: 'wizard', mode }
     )
 
     const submitOperation =
@@ -1206,9 +1283,9 @@ const RepositoryWizard = ({
               agentMachines={agentMachines}
               rcloneStatus={rcloneStatus}
               rcloneRemotes={rcloneRemotes}
-              canUseManagedAgents={canUseManagedAgents}
               canUseRclone={canUseRclone}
               directRcloneModeLocked={directRcloneModeLocked}
+              borg2RequiredByPath={mode !== 'edit' && pathRequiresBorg2(wizardState)}
               dataSource={wizardState.dataSource}
               sourceSshConnectionId={wizardState.sourceSshConnectionId}
               onChange={(updates) => {
@@ -1232,6 +1309,7 @@ const RepositoryWizard = ({
                 }
               }}
               onBrowsePath={() => setShowPathExplorer(true)}
+              onPathBlur={commitPath}
               onBrowseDirectRclonePath={() => setShowRcloneRemoteExplorer(true)}
             />
           </>
@@ -1333,6 +1411,8 @@ const RepositoryWizard = ({
         return (
           <WizardStepRepositoryAdvanced
             repositoryId={mode === 'edit' ? repository?.id : null}
+            borgVersion={wizardState.borgVersion}
+            repositoryPath={wizardState.path}
             repositoryMode={wizardState.repositoryMode}
             data={{
               compression: wizardState.compression,
@@ -1348,6 +1428,13 @@ const RepositoryWizard = ({
               historyIndexExcludes: wizardState.historyIndexExcludes,
             }}
             onChange={handleStateChange}
+            // A hook is assigned to the saved repository at once, so an edit
+            // offers what its saved executor runs, whatever the form now says.
+            agentRepository={
+              mode === 'edit' && repository
+                ? repository.executor_type === 'agent' || repository.execution_target === 'agent'
+                : wizardState.executionTarget === 'agent'
+            }
           />
         )
 
@@ -1355,6 +1442,8 @@ const RepositoryWizard = ({
         return (
           <WizardStepBackupConfig
             repositoryId={mode === 'edit' ? repository?.id : null}
+            borgVersion={wizardState.borgVersion}
+            repositoryPath={wizardState.path}
             dataSource={wizardState.dataSource}
             repositoryMode={wizardState.repositoryMode}
             data={{
@@ -1428,11 +1517,22 @@ const RepositoryWizard = ({
       ? agentMachines.find((agent) => agent.id === Number(wizardState.agentMachineId))
       : null
 
+  const funnel = useWizardFunnel({
+    category: EventCategory.WIZARD,
+    open,
+    step: steps[activeStep]?.key ?? null,
+    props: { wizard: 'repository', mode },
+  })
+  const handleCancel = () => {
+    funnel.cancel()
+    onClose()
+  }
+
   return (
     <>
       <WizardDialog
         open={open}
-        onClose={onClose}
+        onClose={handleCancel}
         title={
           mode === 'create'
             ? t('repositoryWizard.titleCreate')
@@ -1445,7 +1545,7 @@ const RepositoryWizard = ({
         onStepClick={setActiveStep}
         footer={
           <DialogActions sx={{ px: { xs: 1, sm: 3 }, pb: { xs: 1, sm: 2 } }}>
-            <Button onClick={onClose} disabled={isSubmitting}>
+            <Button onClick={handleCancel} disabled={isSubmitting}>
               {t('common.buttons.cancel')}
             </Button>
             <Box sx={{ flex: 1 }} />
@@ -1558,7 +1658,7 @@ const RepositoryWizard = ({
         onClose={() => setShowPathExplorer(false)}
         onSelect={(paths) => {
           if (paths.length > 0) {
-            handlePathChange(paths[0])
+            handlePathChange(paths[0], { picked: true })
           }
           setShowPathExplorer(false)
         }}

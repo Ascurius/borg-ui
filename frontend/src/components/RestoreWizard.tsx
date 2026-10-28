@@ -3,6 +3,8 @@ import { useTranslation } from 'react-i18next'
 import { DialogActions, Box, Button } from '@mui/material'
 import { Files, HardDrive, CheckCircle } from 'lucide-react'
 import WizardDialog from './shared/WizardDialog'
+import { useWizardFunnel } from '../hooks/useWizardFunnel'
+import { EventCategory } from '../utils/analytics'
 import {
   WizardStepRestoreFiles,
   WizardStepRestoreDestination,
@@ -11,7 +13,11 @@ import {
 import FileExplorerDialog from './FileExplorerDialog'
 import { sshKeysAPI } from '../services/api'
 import type { Archive, Repository } from '../types'
-import type { RestoreLayout, RestorePathMetadata } from '../utils/restorePaths'
+import type {
+  RestoreExistingFiles,
+  RestoreLayout,
+  RestorePathMetadata,
+} from '../utils/restorePaths'
 import { DEFAULT_RESTORE_LAYOUT } from '../utils/restorePaths'
 
 interface SSHConnection {
@@ -57,6 +63,7 @@ export interface RestoreData {
   custom_path: string | null
   restore_layout: RestoreLayout
   path_metadata: RestorePathMetadata[]
+  existing_files: RestoreExistingFiles
 }
 
 interface WizardState {
@@ -72,6 +79,9 @@ interface WizardState {
   restoreStrategy: 'original' | 'custom'
   customPath: string
   restoreLayout: RestoreLayout
+  // Borg 2 only; null until chosen where the exact restore is impossible
+  // (the original location always holds files)
+  existingFiles: RestoreExistingFiles | null
 }
 
 const initialState: WizardState = {
@@ -82,6 +92,7 @@ const initialState: WizardState = {
   restoreStrategy: 'original',
   customPath: '',
   restoreLayout: DEFAULT_RESTORE_LAYOUT,
+  existingFiles: 'refuse',
 }
 
 const RestoreWizard = ({
@@ -102,6 +113,10 @@ const RestoreWizard = ({
 
   // File explorer state
   const [showPathExplorer, setShowPathExplorer] = useState(false)
+
+  // Borg 2.0.0b25 extracts only into an empty directory, so a Borg 2 restore
+  // starts on a custom path and asks what to do with existing files (#1261).
+  const isBorg2 = repository.borg_version === 2
 
   // Step definitions
   const steps = useMemo(
@@ -141,6 +156,7 @@ const RestoreWizard = ({
       setActiveStep(preselected.length > 0 ? 1 : 0)
       setWizardState({
         ...initialState,
+        restoreStrategy: isBorg2 ? 'custom' : 'original',
         selectedPaths: preselected,
         selectedItems: preselected.map(
           (path) => suppliedItems.get(path) ?? { path, type: 'file' as const }
@@ -188,6 +204,12 @@ const RestoreWizard = ({
 
       if (updates.restoreStrategy === 'original') {
         next.restoreLayout = DEFAULT_RESTORE_LAYOUT
+        // the original location is never empty: writing into it must be
+        // chosen, not inherited from the exact-restore default
+        if (next.existingFiles === 'refuse') next.existingFiles = null
+      }
+      if (updates.restoreStrategy === 'custom' && next.existingFiles === null) {
+        next.existingFiles = 'refuse'
       }
 
       return next
@@ -206,10 +228,8 @@ const RestoreWizard = ({
   }
 
   // Validation
-  const canProceed = () => {
-    const currentStepKey = steps[activeStep]?.key
-
-    switch (currentStepKey) {
+  const stepIsValid = (stepKey: string | undefined) => {
+    switch (stepKey) {
       case 'files':
         // Must have at least one file selected
         return wizardState.selectedPaths.length > 0
@@ -223,6 +243,9 @@ const RestoreWizard = ({
         if (wizardState.restoreStrategy === 'custom' && !wizardState.customPath.trim()) {
           return false
         }
+        if (isBorg2 && wizardState.existingFiles === null) {
+          return false
+        }
         return true
 
       case 'review':
@@ -232,6 +255,17 @@ const RestoreWizard = ({
         return true
     }
   }
+
+  const canProceed = () => stepIsValid(steps[activeStep]?.key)
+
+  // The step bar goes past the destination step only when the destination
+  // is valid, and the restore needs a valid destination wherever it is
+  // started from. An empty file selection stays allowed there: it restores
+  // the whole archive.
+  const destinationStepIndex = steps.findIndex((step) => step.key === 'destination')
+  const canRestore = stepIsValid('destination')
+  const canReachStep = (stepIndex: number) =>
+    stepIndex <= Math.max(activeStep, destinationStepIndex) || canRestore
 
   const handleNext = () => {
     setActiveStep((prev) => prev + 1)
@@ -258,6 +292,7 @@ const RestoreWizard = ({
       path_metadata: wizardState.selectedItems.filter((item) =>
         wizardState.selectedPaths.includes(item.path)
       ),
+      existing_files: isBorg2 && wizardState.existingFiles === 'continue' ? 'continue' : 'refuse',
     }
 
     onRestore(data)
@@ -302,7 +337,9 @@ const RestoreWizard = ({
               restoreStrategy: wizardState.restoreStrategy,
               customPath: wizardState.customPath,
               restoreLayout: wizardState.restoreLayout,
+              existingFiles: wizardState.existingFiles,
             }}
+            borgVersion={isBorg2 ? 2 : 1}
             selectedItems={wizardState.selectedItems}
             sshConnections={sshConnections}
             repositoryType={repositoryType}
@@ -330,7 +367,9 @@ const RestoreWizard = ({
               restoreStrategy: wizardState.restoreStrategy,
               customPath: wizardState.customPath,
               restoreLayout: wizardState.restoreLayout,
+              existingFiles: wizardState.existingFiles,
             }}
+            borgVersion={isBorg2 ? 2 : 1}
             selectedFiles={selectedFiles}
             sshConnections={sshConnections}
             archiveName={archive.name}
@@ -342,16 +381,29 @@ const RestoreWizard = ({
     }
   }
 
+  const funnel = useWizardFunnel({
+    category: EventCategory.WIZARD,
+    open,
+    step: steps[activeStep]?.key ?? null,
+    props: { wizard: 'restore' },
+  })
+  const handleCancel = () => {
+    funnel.cancel()
+    onClose()
+  }
+
   return (
     <>
       <WizardDialog
         open={open}
-        onClose={onClose}
+        onClose={handleCancel}
         title={t('restoreWizard.title')}
         subtitle={t('restoreWizard.fromArchive', { archiveName: archive.name })}
         steps={steps}
         currentStep={activeStep}
-        onStepClick={setActiveStep}
+        onStepClick={(stepIndex) => {
+          if (canReachStep(stepIndex)) setActiveStep(stepIndex)
+        }}
         stepContentSx={{
           height: { xs: 'auto', md: 450 },
           minHeight: { xs: 'auto', md: 450 },
@@ -359,7 +411,7 @@ const RestoreWizard = ({
         }}
         footer={
           <DialogActions sx={{ px: 3, pb: 2 }}>
-            <Button onClick={onClose}>{t('common.buttons.cancel')}</Button>
+            <Button onClick={handleCancel}>{t('common.buttons.cancel')}</Button>
             <Box sx={{ flex: 1 }} />
             <Button disabled={activeStep === 0} onClick={handleBack}>
               {t('common.buttons.back')}
@@ -377,7 +429,7 @@ const RestoreWizard = ({
               <Button
                 variant="contained"
                 onClick={handleSubmit}
-                disabled={!canProceed()}
+                disabled={!canRestore}
                 sx={{ boxShadow: '0 2px 8px rgba(37,99,235,0.3)' }}
               >
                 {t('restoreWizard.buttons.restore')}

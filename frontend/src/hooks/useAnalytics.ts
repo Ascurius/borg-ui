@@ -180,7 +180,7 @@ export const useAnalytics = () => {
     (action: string, packageName?: string, data?: Record<string, unknown>) => {
       trackEvent(EventCategory.PACKAGE, action, {
         ...(data || {}),
-        ...(packageName ? { name: packageName } : {}),
+        ...(packageName ? { name: anonymizeEntityName(packageName) } : {}),
       })
     },
     []
@@ -203,6 +203,10 @@ export const useAnalytics = () => {
 
   const trackAnnouncement = useCallback((action: string, data?: Record<string, unknown>) => {
     trackEvent(EventCategory.ANNOUNCEMENT, action, data)
+  }, [])
+
+  const trackQuickStart = useCallback((action: string, data?: Record<string, unknown>) => {
+    trackEvent(EventCategory.QUICK_START, action, data)
   }, [])
 
   // Auth tracking
@@ -229,6 +233,7 @@ export const useAnalytics = () => {
     trackRemoteClient,
     trackAnnouncement,
     trackAuth,
+    trackQuickStart,
     buildEntityData,
     EventCategory,
     EventAction,

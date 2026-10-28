@@ -1320,7 +1320,7 @@ async def complete_oidc_login(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={"key": "backend.errors.auth.oidcIdTokenInvalid"},
             )
-        id_claims = verify_id_token(
+        id_claims = await verify_id_token(
             provider,
             id_token,
             nonce=verified_state["nonce"],
@@ -1419,6 +1419,9 @@ async def complete_oidc_login(
             status_code=status.HTTP_302_FOUND,
         )
     except Exception:
+        # Without this the only trace of an unexpected failure is the generic
+        # error key in the redirect, which makes the callback undebuggable.
+        logger.exception("OIDC callback failed", flow=login_state.flow)
         _record_auth_event(
             db,
             event_type="oidc_callback_failed",
@@ -1920,7 +1923,7 @@ async def begin_passkey_registration(
         exclude_credentials=existing_credentials,
         authenticator_selection=webauthn["AuthenticatorSelectionCriteria"](
             resident_key=webauthn["ResidentKeyRequirement"].REQUIRED,
-            user_verification=webauthn["UserVerificationRequirement"].PREFERRED,
+            user_verification=webauthn["UserVerificationRequirement"].REQUIRED,
         ),
     )
     options_json = webauthn["options_to_json"](options)
@@ -2049,7 +2052,7 @@ async def begin_passkey_authentication(request: Request, db: Session = Depends(g
     origin, rp_id = resolve_origin_and_rp_id(request)
     options = webauthn["generate_authentication_options"](
         rp_id=rp_id,
-        user_verification=webauthn["UserVerificationRequirement"].PREFERRED,
+        user_verification=webauthn["UserVerificationRequirement"].REQUIRED,
     )
     options_json = webauthn["options_to_json"](options)
     options_dict = parse_options_json(options_json)

@@ -3,6 +3,8 @@ import { useTranslation } from 'react-i18next'
 import { DialogActions, Box, Button } from '@mui/material'
 import { FileText, Clock, Code, Wrench, CheckCircle } from 'lucide-react'
 import WizardDialog from './shared/WizardDialog'
+import { useWizardFunnel } from '../hooks/useWizardFunnel'
+import { EventCategory } from '../utils/analytics'
 import {
   WizardStepBasicInfo,
   WizardStepScheduleConfig,
@@ -11,7 +13,6 @@ import {
   WizardStepScheduleReview,
 } from './wizard/schedule'
 import { getBrowserTimeZone } from '../utils/dateUtils'
-import { useAnalytics } from '../hooks/useAnalytics'
 import { ScriptParameter } from './ScriptParameterInputs'
 import { Repository } from '../types'
 
@@ -157,7 +158,6 @@ const ScheduleWizard: React.FC<ScheduleWizardProps> = ({
   scripts,
   onSubmit,
 }) => {
-  const { track, EventCategory, EventAction } = useAnalytics()
   const { t } = useTranslation()
   const [activeStep, setActiveStep] = useState(0)
   const [wizardState, setWizardState] = useState<WizardState>(createInitialState)
@@ -321,13 +321,6 @@ const ScheduleWizard: React.FC<ScheduleWizardProps> = ({
       prune_keep_within: wizardState.pruneKeepWithin.trim() || null,
     }
 
-    track(EventCategory.BACKUP, mode === 'create' ? EventAction.CREATE : EventAction.EDIT, {
-      entity: 'schedule',
-      source: 'wizard',
-      mode,
-      repository_count: wizardState.repositoryIds.length,
-    })
-
     onSubmit(data)
     onClose()
   }
@@ -414,10 +407,21 @@ const ScheduleWizard: React.FC<ScheduleWizardProps> = ({
     }
   }
 
+  const funnel = useWizardFunnel({
+    category: EventCategory.WIZARD,
+    open,
+    step: steps[activeStep]?.key ?? null,
+    props: { wizard: 'schedule', mode },
+  })
+  const handleCancel = () => {
+    funnel.cancel()
+    onClose()
+  }
+
   return (
     <WizardDialog
       open={open}
-      onClose={onClose}
+      onClose={handleCancel}
       title={mode === 'create' ? t('scheduleWizard.titleCreate') : t('scheduleWizard.titleEdit')}
       steps={steps}
       currentStep={activeStep}
@@ -425,7 +429,7 @@ const ScheduleWizard: React.FC<ScheduleWizardProps> = ({
       stepContentSx={{ p: { xs: 1, sm: 2.5 } }}
       footer={
         <DialogActions sx={{ px: { xs: 1, sm: 3 }, pb: { xs: 1, sm: 2 } }}>
-          <Button onClick={onClose}>{t('common.buttons.cancel')}</Button>
+          <Button onClick={handleCancel}>{t('common.buttons.cancel')}</Button>
           <Box sx={{ flex: 1 }} />
           <Button disabled={activeStep === 0} onClick={handleBack}>
             {t('common.buttons.back')}

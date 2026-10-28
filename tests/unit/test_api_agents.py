@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -288,7 +289,7 @@ class TestAgentRegistrationAndHeartbeat:
                 "hostname": "renamed.local",
                 "agent_version": "0.1.1",
                 "borg_versions": [
-                    {"major": 2, "version": "2.0.0b10", "path": "/usr/local/bin/borg2"}
+                    {"major": 2, "version": "2.0.0b25", "path": "/usr/local/bin/borg2"}
                 ],
                 "capabilities": ["backup.create", "backup.cancel"],
                 "running_job_ids": [],
@@ -432,7 +433,7 @@ class TestAgentJobTransport:
                     "borg_versions": [
                         {
                             "major": 2,
-                            "version": "2.0.0b10",
+                            "version": "2.0.0b25",
                             "path": "/usr/local/bin/borg2",
                         }
                     ],
@@ -450,6 +451,154 @@ class TestAgentJobTransport:
 
         test_db.refresh(agent)
         assert agent.status == "offline"
+
+    def _agent_with_a_young_running_job(self, test_client, test_db, admin_headers):
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+            capabilities=["session.commands", "backup.create"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        job = _create_agent_job(test_db, agent, status="running")
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        job.claimed_at = started_at
+        job.started_at = started_at
+        job.updated_at = started_at
+        test_db.commit()
+        return registered, agent, job
+
+    @staticmethod
+    def _hello(registered, **fields):
+        hello = {
+            "type": "hello",
+            "agent_id": registered["agent_id"],
+            "hostname": "session-host.local",
+            "agent_version": "0.1.21",
+            "borg_versions": [],
+            "capabilities": ["session.commands", "backup.create"],
+            "running_job_ids": [],
+        }
+        hello.update(fields)
+        return {key: value for key, value in hello.items() if value is not None}
+
+    def test_websocket_hello_redelivers_a_job_its_restarted_process_lost(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        # The agent process restarted seconds after starting the job; its
+        # new session's hello does not list it. The job goes back to the
+        # agent at once instead of holding its repository until the reaper.
+        registered, _, job = self._agent_with_a_young_running_job(
+            test_client, test_db, admin_headers
+        )
+
+        with test_client.websocket_connect(
+            "/api/agents/session",
+            headers=_agent_headers(registered["agent_token"]),
+        ) as websocket:
+            websocket.send_json(self._hello(registered))
+            assert websocket.receive_json()["type"] == "hello_ack"
+            # The hello commits its recovery before the ack; checked before
+            # the receive below so a job left running fails instead of
+            # waiting on a command that never comes.
+            test_db.refresh(job)
+            assert job.status in ("queued", "claimed")
+            assert job.started_at is None
+
+            command = websocket.receive_json()
+            assert command["type"] == "command"
+            assert command["job_id"] == job.id
+
+    @pytest.mark.parametrize(
+        "stored_version,hello_fields",
+        [
+            # Before 0.1.21 an empty list does not prove the job is gone.
+            (None, {"agent_version": "0.1.20"}),
+            # A list the hello left out is not an empty one.
+            (None, {"running_job_ids": None}),
+            # The version on record may belong to another process.
+            ("0.2.0", {"agent_version": None}),
+        ],
+    )
+    def test_websocket_hello_keeps_a_young_job_it_cannot_vouch_for(
+        self,
+        test_client: TestClient,
+        test_db,
+        admin_headers,
+        stored_version,
+        hello_fields,
+    ):
+        registered, agent, job = self._agent_with_a_young_running_job(
+            test_client, test_db, admin_headers
+        )
+        agent.agent_version = stored_version
+        test_db.commit()
+
+        with test_client.websocket_connect(
+            "/api/agents/session",
+            headers=_agent_headers(registered["agent_token"]),
+        ) as websocket:
+            websocket.send_json(self._hello(registered, **hello_fields))
+            assert websocket.receive_json()["type"] == "hello_ack"
+            test_db.refresh(job)
+            assert job.status == "running"
+            assert job.started_at is not None
+
+    def test_websocket_hello_keeps_a_young_job_while_another_session_is_open(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        # A rollout that starts the new process before stopping the old one:
+        # the old process still runs the job, and its session is still open
+        # when the new one says hello with an empty list.
+        registered, _, job = self._agent_with_a_young_running_job(
+            test_client, test_db, admin_headers
+        )
+        headers = _agent_headers(registered["agent_token"])
+
+        with test_client.websocket_connect(
+            "/api/agents/session", headers=headers
+        ) as old_process:
+            old_process.send_json(self._hello(registered, running_job_ids=[job.id]))
+            assert old_process.receive_json()["type"] == "hello_ack"
+
+            with test_client.websocket_connect(
+                "/api/agents/session", headers=headers
+            ) as new_process:
+                new_process.send_json(self._hello(registered))
+                assert new_process.receive_json()["type"] == "hello_ack"
+                test_db.refresh(job)
+                assert job.status == "running"
+                assert job.started_at is not None
+
+    def test_websocket_hello_sends_the_cancel_of_a_listed_job_again(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        # The job was cancelled while the session was down, so its cancel
+        # command went nowhere. The agent's new session lists the job: the
+        # cancel goes out right after the ack.
+        registered, agent, job = self._agent_with_a_young_running_job(
+            test_client, test_db, admin_headers
+        )
+        job.status = "cancel_requested"
+        test_db.commit()
+        # Its command follows the cancel, and ends the receive below should
+        # the cancel not come.
+        queued = _create_agent_job(test_db, agent, status="queued")
+
+        with test_client.websocket_connect(
+            "/api/agents/session",
+            headers=_agent_headers(registered["agent_token"]),
+        ) as websocket:
+            websocket.send_json(self._hello(registered, running_job_ids=[job.id]))
+            assert websocket.receive_json()["type"] == "hello_ack"
+
+            command = websocket.receive_json()
+            assert command["type"] == "command"
+            assert command["command"] == "cancel"
+            assert command["job_id"] == job.id
+            assert command["payload"] == {"job_id": job.id}
+            assert websocket.receive_json()["job_id"] == queued.id
+            test_db.refresh(job)
+            assert job.status == "cancel_requested"
 
     def test_websocket_session_dispatches_durable_job_without_polling(
         self, test_client: TestClient, test_db, admin_headers
@@ -3501,3 +3650,175 @@ class TestLockContentionDeferral:
         )
         assert operation.status == "running"
         notifier.send_check_completion.assert_not_awaited()
+
+
+@pytest.mark.unit
+class TestAgentBackupProgressWithoutTotal:
+    """borg create reports no proportion and nothing computes a source total
+    for an agent backup, so its percentage is unknown, not zero (#1154)."""
+
+    def _running_backup(self, test_client, test_db, admin_headers):
+        registered = _register_agent(
+            test_client,
+            _create_enrollment_token(test_client, admin_headers)["token"],
+        )
+        agent = _get_agent(test_db, registered["agent_id"])
+        job = _create_agent_job(test_db, agent, status="running")
+        backup_job = seed_job_operation(
+            test_db, "backup", repository="/repo", status="running"
+        )
+        test_db.commit()
+        job.operation_id = backup_job.id
+        test_db.commit()
+        return job, backup_job.id, _agent_headers(registered["agent_token"])
+
+    def _report(self, test_client, job, headers, **fields):
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/progress", json=fields, headers=headers
+        )
+        assert response.status_code == 200
+
+    def test_the_routes_send_no_percentage_while_no_total_exists(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        job, backup_id, headers = self._running_backup(
+            test_client, test_db, admin_headers
+        )
+        self._report(
+            test_client,
+            job,
+            headers,
+            original_size=846_634_729_941,
+            nfiles=584_280,
+            current_file="/srv/data/file",
+        )
+
+        status = test_client.get(
+            f"/api/backup/status/{backup_id}", headers=admin_headers
+        )
+        assert status.status_code == 200
+        body = status.json()
+        assert body["status"] == "running"
+        assert body["progress"] is None
+        assert body["progress_details"]["progress_percent"] is None
+        assert body["progress_details"]["original_size"] == 846_634_729_941
+        assert body["progress_details"]["nfiles"] == 584_280
+
+        listed = test_client.get("/api/backup/jobs", headers=admin_headers)
+        assert listed.status_code == 200
+        [row] = [row for row in listed.json()["jobs"] if row["id"] == backup_id]
+        assert row["progress"] is None
+
+        activity = test_client.get("/api/activity/recent", headers=admin_headers)
+        assert activity.status_code == 200
+        [item] = [
+            item
+            for item in activity.json()
+            if item["type"] == "backup" and item["id"] == backup_id
+        ]
+        assert item["progress_percent"] is None
+
+    def test_a_step_percentage_is_not_the_backups_proportion(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        """A progress indicator borg runs inside create (the cache sync)
+        reports its own percentage; without a total it says nothing about
+        how much of the backup is done."""
+        job, backup_id, headers = self._running_backup(
+            test_client, test_db, admin_headers
+        )
+        self._report(test_client, job, headers, progress_percent=37.0)
+        self._report(test_client, job, headers, original_size=1024, nfiles=3)
+
+        test_db.expire_all()
+        backup_job = resolve_backup_job(test_db, backup_id)
+        assert backup_job.progress is None
+        assert backup_job.progress_percent is None
+
+    def test_a_reported_total_still_gives_a_percentage(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        job, backup_id, headers = self._running_backup(
+            test_client, test_db, admin_headers
+        )
+        self._report(
+            test_client,
+            job,
+            headers,
+            progress_percent=42.5,
+            original_size=1024,
+            total_expected_size=4096,
+        )
+
+        test_db.expire_all()
+        backup_job = resolve_backup_job(test_db, backup_id)
+        assert backup_job.progress == 42
+        assert backup_job.progress_percent == 42.5
+
+    def test_completion_still_reports_one_hundred(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        job, backup_id, headers = self._running_backup(
+            test_client, test_db, admin_headers
+        )
+        self._report(test_client, job, headers, original_size=1024, nfiles=3)
+        complete = test_client.post(
+            f"/api/agents/jobs/{job.id}/complete",
+            json={"result": {"archive_name": "a", "return_code": 0}},
+            headers=headers,
+        )
+        assert complete.status_code == 200
+
+        status = test_client.get(
+            f"/api/backup/status/{backup_id}", headers=admin_headers
+        )
+        assert status.json()["progress"] == 100
+        assert status.json()["progress_details"]["progress_percent"] == 100
+
+    def test_a_non_finite_percentage_is_not_stored(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        """A percentage that is not a finite number would break every reader
+        of the backup: the report is refused and nothing is stored."""
+        job, backup_id, headers = self._running_backup(
+            test_client, test_db, admin_headers
+        )
+        response = test_client.post(
+            f"/api/agents/jobs/{job.id}/progress",
+            content=b'{"progress_percent": Infinity, "total_expected_size": 1,'
+            b' "original_size": 1024}',
+            headers={**headers, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 422
+
+        listed = test_client.get("/api/backup/jobs", headers=admin_headers)
+        assert listed.status_code == 200
+        [row] = [row for row in listed.json()["jobs"] if row["id"] == backup_id]
+        assert row["progress"] is None
+
+        test_db.expire_all()
+        assert math.isfinite(test_db.get(AgentJob, job.id).progress_percent)
+
+    @pytest.mark.asyncio
+    async def test_a_non_finite_percentage_over_the_session_is_not_stored(
+        self, test_client: TestClient, test_db, admin_headers
+    ):
+        job, backup_id, _ = self._running_backup(test_client, test_db, admin_headers)
+
+        await _handle_agent_session_message(
+            test_db,
+            job.agent_machine_id,
+            {
+                "type": "progress",
+                "job_id": job.id,
+                "progress_percent": float("nan"),
+                "total_expected_size": 1,
+                "original_size": 1024,
+            },
+        )
+
+        test_db.expire_all()
+        assert math.isfinite(test_db.get(AgentJob, job.id).progress_percent)
+        backup_job = resolve_backup_job(test_db, backup_id)
+        assert backup_job.original_size == 1024
+        assert backup_job.progress == 0

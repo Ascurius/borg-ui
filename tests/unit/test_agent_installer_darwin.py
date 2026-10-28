@@ -277,10 +277,10 @@ def test_both_borg_majors_get_forwarders_and_nothing_else_is_linked(mac, tmp_pat
     fixtures = tmp_path / "fixtures"
     _write_executable(
         fixtures / "borg2-macos-15-arm64-gh",
-        "#!/usr/bin/env bash\necho 'borg 2.0.0b24'\n",
+        "#!/usr/bin/env bash\necho 'borg 2.0.0b25'\n",
     )
     script = mac["installer"].read_text(encoding="utf-8")
-    script = _pin(script, "PINNED_BORG2_VERSION", "2.0.0b24")
+    script = _pin(script, "PINNED_BORG2_VERSION", "2.0.0b25")
     script = _pin(
         script,
         "PINNED_BORG_BINARIES",
@@ -324,6 +324,100 @@ def test_the_agent_job_resolves_borg_through_the_forwarder_directory(mac):
     assert job["EnvironmentVariables"]["PATH"].startswith(f"{root}/bin:")
     assert "BORG_PASSPHRASE" not in job["EnvironmentVariables"]
     assert job["StandardOutPath"].startswith(str(mac["home"] / "Library" / "Logs"))
+
+
+def _job_path(mac: dict, label: str) -> str:
+    with (mac["agents"] / f"{label}.plist").open("rb") as handle:
+        return plistlib.load(handle)["EnvironmentVariables"]["PATH"]
+
+
+def _resolve(name: str, path: str) -> str:
+    return subprocess.run(
+        ["/bin/bash", "-c", f"type -P {name}"],
+        capture_output=True,
+        text=True,
+        env={"PATH": path},
+    ).stdout.strip()
+
+
+def test_a_borg_the_user_installed_elsewhere_is_on_both_jobs_path(mac, tmp_path):
+    """#1290: with --skip-borg-install the installer's own PATH found Borg, for
+    example a pipx ~/.local/bin/borg, so launchd's must reach it too, ahead of
+    any other borg in the fixed directories."""
+    local_bin = tmp_path / "home" / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    _write_executable(local_bin / "borg", BORG_STUB)
+    mac["env"]["PATH"] = f"{local_bin}:{mac['env']['PATH']}"
+
+    result = _run(mac, *ENROL, "--skip-borg-install")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    root = mac["root"]
+    for label in ("com.borg-ui.agent", "com.borg-ui.agent-upgrade"):
+        path = _job_path(mac, label)
+        assert path.startswith(f"{root}/bin:{local_bin}:"), path
+        assert path.count(str(local_bin)) == 1
+        assert _resolve("borg", path) == str(local_bin / "borg")
+
+
+def test_the_job_resolves_every_name_from_the_directory_this_run_did(mac, tmp_path):
+    """Directories keep the installer's PATH order: rclone found first in one
+    directory must not lose to a copy in the directory borg was found in."""
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    _write_executable(second / "borg", BORG_STUB)
+    for directory in (first, second):
+        _write_executable(directory / "rclone", "#!/usr/bin/env bash\n")
+    mac["env"]["PATH"] = f"{first}:{second}:{mac['env']['PATH']}"
+
+    result = _run(mac, *ENROL, "--skip-borg-install")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    path = _job_path(mac, "com.borg-ui.agent")
+    assert _resolve("borg", path) == str(second / "borg")
+    assert _resolve("rclone", path) == str(first / "rclone")
+
+
+def test_a_borg_found_through_a_relative_path_entry_is_named_absolutely(mac, tmp_path):
+    """launchd runs the job from /, so a relative entry such as tools would
+    reach nothing there; the directory goes in by its absolute path."""
+    workdir = tmp_path / "work"
+    (workdir / "tools").mkdir(parents=True)
+    _write_executable(workdir / "tools" / "borg", BORG_STUB)
+
+    result = subprocess.run(
+        ["bash", str(mac["installer"]), *ENROL, "--skip-borg-install"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=workdir,
+        env={**mac["env"], "PATH": f"tools:{mac['env']['PATH']}"},
+        start_new_session=True,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    path = _job_path(mac, "com.borg-ui.agent")
+    assert _resolve("borg", path) == str((workdir / "tools").resolve() / "borg")
+
+
+def test_a_reinstall_from_the_upgrade_job_keeps_the_users_borg(mac, tmp_path):
+    """The upgrade job reinstalls under its own PATH, so the directory has to
+    survive that run, not only the one started from the user's shell."""
+    local_bin = tmp_path / "home" / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    _write_executable(local_bin / "borg", BORG_STUB)
+    stubs = mac["env"]["PATH"].split(":", 1)[0]
+    mac["env"]["PATH"] = f"{local_bin}:{mac['env']['PATH']}"
+    _run(mac, *ENROL, "--skip-borg-install")
+
+    mac["env"]["PATH"] = f"{stubs}:{_job_path(mac, 'com.borg-ui.agent-upgrade')}"
+    result = _run(mac, "--reinstall")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    path = _job_path(mac, "com.borg-ui.agent")
+    assert _resolve("borg", path) == str(local_bin / "borg")
+    assert path.count(str(local_bin)) == 1
 
 
 def test_the_upgrade_job_watches_the_trigger_and_the_agent_is_ready_for_it(mac):
@@ -417,6 +511,79 @@ def test_a_bootstrap_that_keeps_failing_stops_the_reinstall_with_the_error(mac):
 
     assert result.returncode != 0
     assert "Bootstrap failed: 5: Input/output error" in result.stderr
+
+
+def _recorded_server(mac: dict) -> str:
+    conf = (mac["root"] / "upgrade.conf").read_text(encoding="utf-8")
+    return re.search(r'^SERVER="(.*)"$', conf, re.M).group(1)
+
+
+def _readiness(mac: dict):
+    job = mac["agents"] / "com.borg-ui.agent-upgrade.plist"
+    return check_self_upgrade(
+        conf_path=mac["root"] / "upgrade.conf",
+        unit_path=job,
+        path_unit_path=job,
+        trigger_path=mac["root"] / "upgrade-requested",
+    )
+
+
+def _move_to(mac: dict, server: str) -> None:
+    """What `set-server` does: the config moves, the upgrade record does not."""
+    config = mac["root"] / "config.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace("https://borg.example", server),
+        encoding="utf-8",
+    )
+
+
+def test_a_moved_endpoint_gets_remote_upgrade_back_by_a_reinstall_naming_the_server(
+    mac,
+):
+    _run(mac, *ENROL, "--borg-version", "1")
+    _move_to(mac, "https://new.example")
+    assert _readiness(mac).reason == "server_mismatch"
+
+    result = _run(mac, "--server", "https://new.example", "--reinstall")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert _recorded_server(mac) == "https://new.example"
+    assert _readiness(mac).supported is True
+
+
+def test_a_plain_reinstall_of_a_moved_endpoint_says_what_is_missing(mac):
+    _run(mac, *ENROL, "--borg-version", "1")
+    _move_to(mac, "https://new.example")
+
+    result = _run(mac, "--reinstall")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    # The record wins over the config, as before; the difference is named.
+    assert _recorded_server(mac) == "https://borg.example"
+    assert "enrolled\nagainst https://new.example." in result.stderr
+    assert "run the reinstall with --server" in result.stderr
+    assert _readiness(mac).reason == "server_mismatch"
+
+
+def test_the_notice_never_repeats_an_address_that_is_not_a_plain_url(mac):
+    """The agent can write its config, and root reads this notice."""
+    _run(mac, *ENROL, "--borg-version", "1")
+    _move_to(mac, "https://new.example/$(id)")
+
+    result = _run(mac, "--reinstall")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "against another server." in result.stderr
+    assert "$(id)" not in result.stderr
+
+
+def test_a_plain_reinstall_of_an_endpoint_that_never_moved_says_nothing(mac):
+    _run(mac, *ENROL, "--borg-version", "1")
+
+    result = _run(mac, "--reinstall")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "upgrade record" not in result.stderr
 
 
 def test_a_reinstall_from_inside_the_upgrade_job_does_not_unload_itself(mac):
@@ -899,7 +1066,6 @@ def test_an_ssh_url_is_split_into_login_host_and_port(test_client: TestClient):
             "ssh://u@borg.example:23/./repo",
             "ssh://borg.example/srv/repo",
             "ssh://u@borg.example:2222",
-            "rest://borg@store.example/series/repo",
         ],
         capture_output=True,
         text=True,
@@ -910,7 +1076,6 @@ def test_an_ssh_url_is_split_into_login_host_and_port(test_client: TestClient):
         "u@borg.example 23",
         "borg.example 22",
         "u@borg.example 2222",
-        "borg@store.example 22",
     ]
 
 
@@ -1039,9 +1204,9 @@ def test_a_first_install_on_a_terminal_asks_for_the_repository_and_checks_the_ho
     assert env["BORG_REMOTE_PATH"] == "borg-1.4"
 
 
-def test_a_rest_store_gets_the_ssh_check_too(mac, tmp_path):
-    """A rest:// store is reached over SSH, so its host key needs the same
-    first contact."""
+def test_a_rest_url_gets_no_ssh_check(mac, tmp_path):
+    """rest:// is no Borg 2 scheme since 2.0.0b25 (its URL is read as a local
+    directory, and Borg UI refuses it): no SSH contact is offered for one."""
     log = tmp_path / "ssh.log"
     _write_executable(
         tmp_path / "stubs" / "ssh",
@@ -1050,17 +1215,15 @@ def test_a_rest_store_gets_the_ssh_check_too(mac, tmp_path):
 
     rc, output = _run_on_a_terminal(
         mac,
-        ["rest://borg@store.example/series/repo", "", "y"],
+        ["rest://borg@store.example/series/repo", ""],
         *ENROL,
         "--borg-version",
         "1",
     )
 
     assert rc == 0, output
-    assert (
-        log.read_text().strip()
-        == "-o ConnectTimeout=15 -p 22 -- borg@store.example exit"
-    )
+    assert "Open an SSH connection" not in output
+    assert not log.exists()
 
 
 def test_a_failed_ssh_check_is_reported_and_the_install_goes_on(mac, tmp_path):

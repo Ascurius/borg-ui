@@ -22,16 +22,22 @@ export interface RepositoryAdvancedStepData {
 
 interface WizardStepRepositoryAdvancedProps {
   repositoryId?: number | null
+  borgVersion?: 1 | 2
+  repositoryPath?: string
   repositoryMode: 'full' | 'observe'
   data: RepositoryAdvancedStepData
   onChange: (data: Partial<RepositoryAdvancedStepData>) => void
+  agentRepository?: boolean
 }
 
 export default function WizardStepRepositoryAdvanced({
   repositoryId,
+  borgVersion,
+  repositoryPath,
   repositoryMode,
   data,
   onChange,
+  agentRepository = false,
 }: WizardStepRepositoryAdvancedProps) {
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
@@ -55,6 +61,8 @@ export default function WizardStepRepositoryAdvanced({
       <AdvancedRepositoryOptions
         repositoryId={repositoryId}
         mode={repositoryMode}
+        borgVersion={borgVersion}
+        repositoryPath={repositoryPath}
         remotePath={data.remotePath}
         preBackupScript={data.preBackupScript}
         postBackupScript={data.postBackupScript}
@@ -71,6 +79,7 @@ export default function WizardStepRepositoryAdvanced({
         onHookFailureModeChange={(value) => onChange({ hookFailureMode: value })}
         onCustomFlagsChange={(value) => onChange({ customFlags: value })}
         onUploadRatelimitMbChange={(value) => onChange({ uploadRatelimitMb: value })}
+        agentRepository={agentRepository}
       />
     </Box>
   )

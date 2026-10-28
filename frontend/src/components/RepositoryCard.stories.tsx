@@ -52,7 +52,7 @@ const borg2RepositoryWithStoredSize: Repository = {
   ...sampleRepository,
   id: 44,
   name: 'Borg 2 on a store URL',
-  path: 'rest://backup-host/repos/production',
+  path: 'ssh://borg@backup-host/repos/production',
   repository_type: 'sftp',
   borg_version: 2,
   archive_count: 35,
@@ -161,6 +161,57 @@ export const Default: Story = {
   ),
 }
 
+export const PersistentArchiveSyncFailure: Story = {
+  args: {
+    ...defaultArgs,
+    repository: {
+      ...sampleRepository,
+      archive_sync_warning: {
+        operation_id: 72,
+        last_success_at: '2026-05-15T16:35:00Z',
+        error_message:
+          'Saved SSH private key (ID 42) cannot be decrypted. Restore the original app SECRET_KEY (or /data/.secret_key) or re-import this SSH key.',
+      },
+    },
+  },
+  render: Default.render,
+}
+
+export const ArchiveSyncNeverSucceeded: Story = {
+  args: {
+    ...defaultArgs,
+    repository: {
+      ...sampleRepository,
+      archive_sync_warning: {
+        operation_id: 73,
+        last_success_at: null,
+        error_message: 'Connection refused. Check the repository connection and retry.',
+      },
+    },
+  },
+  render: Default.render,
+}
+
+export const ArchiveSyncRetrying: Story = {
+  args: {
+    ...PersistentArchiveSyncFailure.args,
+    repository: {
+      ...PersistentArchiveSyncFailure.args!.repository!,
+      index_pending_kinds: ['archive_sync'],
+    },
+  },
+  render: Default.render,
+}
+
+/** The next successful listing clears the standing warning. */
+export const ArchiveSyncRecovered: Story = {
+  args: {
+    ...defaultArgs,
+    repository: { ...sampleRepository, archive_sync_warning: null },
+  },
+  render: Default.render,
+}
+
 /** The delete is out (#1197): the delete action is disabled and shows a
  * spinner until the list no longer has the repository. */
 export const Deleting: Story = {
@@ -231,6 +282,45 @@ export const WithUploadLimit: Story = {
       ...sampleRepository,
       id: 52,
       name: 'Throttled Production Archive',
+      upload_ratelimit_kib: 1536,
+    },
+  },
+  render: (args) => (
+    <Box sx={{ width: 620, maxWidth: 'calc(100vw - 32px)' }}>
+      <RepositoryCard {...args} />
+    </Box>
+  ),
+}
+
+/** A Borg 2 repository with a limit stored from before: Borg 2 has no upload
+ *  limit, so the card leaves it out. */
+export const Borg2WithStoredUploadLimit: Story = {
+  args: {
+    ...defaultArgs,
+    repository: {
+      ...sampleRepository,
+      id: 53,
+      name: 'Borg 2 Archive',
+      borg_version: 2,
+      upload_ratelimit_kib: 1536,
+    },
+  },
+  render: (args) => (
+    <Box sx={{ width: 620, maxWidth: 'calc(100vw - 32px)' }}>
+      <RepositoryCard {...args} />
+    </Box>
+  ),
+}
+
+export const Borg2BehindRcloneWithUploadLimit: Story = {
+  args: {
+    ...defaultArgs,
+    repository: {
+      ...sampleRepository,
+      id: 54,
+      name: 'Borg 2 Offsite',
+      path: 'rclone:b2-offsite:borg/archive',
+      borg_version: 2,
       upload_ratelimit_kib: 1536,
     },
   },

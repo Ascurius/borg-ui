@@ -49,12 +49,13 @@ import {
   formatElapsedTime,
   parseBackendDate,
 } from '../utils/dateUtils'
-import { formatUploadRatelimit } from '../utils/uploadRatelimit'
+import { formatUploadRatelimit, uploadRatelimitSupported } from '../utils/uploadRatelimit'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAnalytics } from '../hooks/useAnalytics'
 import { Repository } from '../types'
 import type { RepoAction } from '../hooks/usePermissions'
 import OperationalCard from './OperationalCard'
+import RepositorySyncWarning from './RepositorySyncWarning'
 import { archivesMayArrive, repositoryStatItems, stateText } from '../utils/repositoryStats'
 
 interface RepositoryCardProps {
@@ -181,7 +182,11 @@ export default function RepositoryCard({
     rcloneStorage?.sync_direction !== 'sshfs_to_remote'
   const canShowDestructiveActions = canManageRepository && capabilities.canDeleteRepository
   const hasSeparatedRepositoryActions = canBreakLock || canShowDestructiveActions
-  const uploadRatelimitLabel = formatUploadRatelimit(repository.upload_ratelimit_kib)
+  // Borg 2 has no upload limit except behind rclone; elsewhere a stored
+  // one has no effect
+  const uploadRatelimitLabel = uploadRatelimitSupported(repository.borg_version, repository.path)
+    ? formatUploadRatelimit(repository.upload_ratelimit_kib)
+    : null
 
   // Neither value can move while background work is off: `Last index` has
   // nothing running, and `Last prune` is read from archive listings that no
@@ -686,6 +691,9 @@ export default function RepositoryCard({
                   />
                 )}
                 <BorgVersionChip borgVersion={repository.borg_version} />
+                {repository.index_mode !== 'off' && repository.archive_sync_warning && (
+                  <RepositorySyncWarning warning={repository.archive_sync_warning} />
+                )}
                 {isAgentPrimaryRepository && (
                   <Tooltip
                     title={

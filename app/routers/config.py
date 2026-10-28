@@ -163,6 +163,10 @@ async def import_borgmatic_config(
                             "schedules_updated", 0
                         )
                         combined_result["warnings"].extend(result.get("warnings", []))
+                        combined_result["errors"].extend(
+                            f"{yaml_file}: {error}"
+                            for error in result.get("errors", [])
+                        )
 
                         if not result.get("success"):
                             combined_result["errors"].append(
@@ -280,7 +284,7 @@ async def list_exportable_repositories(
                 "path": repo.path,
                 "repository_type": repo.repository_type,
                 "has_schedule": bool(repo.source_directories),
-                "has_checks": bool(repo.check_interval_days),
+                "has_checks": bool(repo.check_cron_expression),
             }
             for repo in repositories
         ]

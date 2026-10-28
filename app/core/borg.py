@@ -6,9 +6,11 @@ import structlog
 from typing import Dict, List
 from app.config import settings
 from app.core.borg_stream import CommandByteStream, CommandLineStream
+from app.services.process_cancel import communicate_or_kill
 from app.utils.borg_env import with_lock_wait
 from app.utils.ssh_host_keys import host_key_ssh_opts
 from app.utils.ssh_utils import public_key_only_ssh_args
+from app.utils.borg_arguments import validate_operand, validate_source
 
 logger = structlog.get_logger()
 
@@ -122,9 +124,7 @@ class BorgInterface:
                 env=exec_env,
             )
 
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=timeout
-            )
+            stdout, stderr = await communicate_or_kill(process, timeout=timeout)
 
             result = {
                 "return_code": process.returncode,
@@ -475,6 +475,10 @@ class BorgInterface:
         passphrase: str = None,
     ) -> Dict:
         """Execute backup operation with direct parameters"""
+        if archive_name is not None:
+            validate_operand(archive_name, "archive name")
+        for source in source_paths or []:
+            validate_source(source)
         if not repository:
             return {
                 "success": False,
@@ -507,7 +511,7 @@ class BorgInterface:
         # Repository::archive format
         if not archive_name:
             archive_name = "{hostname}-{now}"
-        cmd.append(f"{repository}::{archive_name}")
+        cmd.extend(["--", f"{repository}::{archive_name}"])
 
         # Add source paths
         cmd.extend(source_paths)
@@ -535,7 +539,7 @@ class BorgInterface:
             cmd.extend(["--remote-path", remote_path])
         if bypass_lock:
             cmd.append("--bypass-lock")
-        cmd.extend([repository, "--json"])
+        cmd.extend(["--json", "--", repository])
 
         exec_env = env.copy() if env else {}
         if passphrase:
@@ -556,12 +560,13 @@ class BorgInterface:
         env: dict = None,
     ) -> Dict:
         """Get information about a specific archive"""
+        validate_operand(archive, "archive selector")
         cmd = [self.borg_cmd, "info"]
         if remote_path:
             cmd.extend(["--remote-path", remote_path])
         if bypass_lock:
             cmd.append("--bypass-lock")
-        cmd.extend([f"{repository}::{archive}", "--json"])
+        cmd.extend(["--json", "--", f"{repository}::{archive}"])
 
         exec_env = env.copy() if env else {}
         if passphrase:
@@ -599,12 +604,15 @@ class BorgInterface:
         Returns:
             Dict with stdout, stderr, success, and line_count_exceeded flag
         """
+        validate_operand(archive, "archive selector")
+        if path:
+            validate_operand(path, "archive path", archive_path=True)
         cmd = [self.borg_cmd, "list"]
         if remote_path:
             cmd.extend(["--remote-path", remote_path])
         if bypass_lock:
             cmd.append("--bypass-lock")
-        cmd.extend([f"{repository}::{archive}", "--json-lines"])
+        cmd.extend(["--json-lines", "--", f"{repository}::{archive}"])
         # Note: path parameter is not passed to borg, filtering happens in the API layer
 
         exec_env = env.copy() if env else {}
@@ -631,12 +639,14 @@ class BorgInterface:
         timeout: int = 3600,
     ) -> "CommandLineStream":
         """Stream `borg diff --json-lines` between two archives (spec 8.3)."""
+        validate_operand(archive_a, "archive selector")
+        validate_operand(archive_b, "archive selector")
         cmd = [self.borg_cmd, "diff"]
         if remote_path:
             cmd.extend(["--remote-path", remote_path])
         if bypass_lock:
             cmd.append("--bypass-lock")
-        cmd.extend(["--json-lines", f"{repository}::{archive_a}", archive_b])
+        cmd.extend(["--json-lines", "--", f"{repository}::{archive_a}", archive_b])
         exec_env = self._build_exec_env(env)
         if passphrase:
             exec_env["BORG_PASSPHRASE"] = passphrase
@@ -655,12 +665,13 @@ class BorgInterface:
     ) -> "CommandLineStream":
         """Stream `borg list --json-lines` for one archive (first archive of
         a series, spec 8.3)."""
+        validate_operand(archive, "archive selector")
         cmd = [self.borg_cmd, "list"]
         if remote_path:
             cmd.extend(["--remote-path", remote_path])
         if bypass_lock:
             cmd.append("--bypass-lock")
-        cmd.extend(["--json-lines", f"{repository}::{archive}"])
+        cmd.extend(["--json-lines", "--", f"{repository}::{archive}"])
         exec_env = self._build_exec_env(env)
         if passphrase:
             exec_env["BORG_PASSPHRASE"] = passphrase
@@ -680,6 +691,9 @@ class BorgInterface:
         strip_components: int = 0,
     ) -> "CommandByteStream":
         """Stream one archived directory as an uncompressed tar to stdout."""
+        validate_operand(archive, "archive selector")
+        if directory_path:
+            validate_operand(directory_path, "archive path", archive_path=True)
         cmd = [self.borg_cmd, "export-tar"]
         if remote_path:
             cmd.extend(["--remote-path", remote_path])
@@ -687,7 +701,7 @@ class BorgInterface:
             cmd.append("--bypass-lock")
         if strip_components:
             cmd.extend(["--strip-components", str(strip_components)])
-        cmd.extend([f"{repository}::{archive}", "-", "--", directory_path.strip("/")])
+        cmd.extend(["--", f"{repository}::{archive}", "-", directory_path.strip("/")])
         exec_env = self._build_exec_env(env)
         if passphrase:
             exec_env["BORG_PASSPHRASE"] = passphrase
@@ -707,6 +721,9 @@ class BorgInterface:
         strip_components: int = None,
     ) -> Dict:
         """Extract files from an archive"""
+        validate_operand(archive, "archive selector")
+        for path in paths or []:
+            validate_operand(path, "restore path", archive_path=True)
         cmd = [self.borg_cmd, "extract", "--umask", "0022"]
 
         if remote_path:
@@ -725,7 +742,7 @@ class BorgInterface:
         # This prevents "Operation not supported" errors when extracting files with NFS4 ACLs, etc.
         cmd.extend(["--noacls", "--noxattrs", "--noflags"])
 
-        cmd.append(f"{repository}::{archive}")
+        cmd.extend(["--", f"{repository}::{archive}"])
 
         # Add paths to extract
         if paths:
@@ -752,10 +769,11 @@ class BorgInterface:
         passphrase: str = None,
     ) -> Dict:
         """Delete an archive"""
+        validate_operand(archive, "archive selector")
         cmd = [self.borg_cmd, "delete"]
         if remote_path:
             cmd.extend(["--remote-path", remote_path])
-        cmd.append(f"{repository}::{archive}")
+        cmd.extend(["--", f"{repository}::{archive}"])
 
         env = {}
         if passphrase:

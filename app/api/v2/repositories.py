@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from typing import Any, Optional
 import structlog
 
+from app.core.security import require_role_dependency
 from app.database.database import get_db
 from app.database.models import User, Repository, SSHConnection, SystemSettings
 from app.core.security import check_repo_access, get_current_user
@@ -21,6 +22,9 @@ from app.core.features import require_feature
 from app.core.borg2 import (
     borg2,
     BORG2_ENCRYPTION_MODES,
+    borg1_ssh_address_host,
+    borg2_ssh_repository_url,
+    borg2_unreadable_repository_detail,
     normalize_repo_info_encryption,
 )
 from app.core.borg_errors import is_lock_error, is_repository_exists_failure
@@ -36,7 +40,6 @@ from app.services.v2.repository_service import repository_v2_service
 from app.utils.borg_env import effective_repository_remote_path, repository_borg_env
 from app.utils.archive_job_metadata import enrich_archives_with_backup_metadata
 from app.utils.borg_flags import borg_flags_validator
-from app.utils.repository_paths import build_ssh_repository_path
 from app.utils.source_locations import legacy_source_fields, normalize_source_locations
 
 logger = structlog.get_logger()
@@ -60,7 +63,7 @@ class RepositoryV2Create(BaseModel):
     mode: str = "full"
     bypass_lock: bool = False
     custom_flags: Optional[str] = None
-    _validate_custom_flags = borg_flags_validator("custom_flags", "create")
+    _validate_custom_flags = borg_flags_validator("custom_flags", "create", 2)
     upload_ratelimit_kib: Optional[int] = None
     pre_backup_script: Optional[str] = None
     post_backup_script: Optional[str] = None
@@ -85,7 +88,7 @@ class RepositoryV2Import(BaseModel):
     mode: str = "full"
     bypass_lock: bool = False
     custom_flags: Optional[str] = None
-    _validate_custom_flags = borg_flags_validator("custom_flags", "create")
+    _validate_custom_flags = borg_flags_validator("custom_flags", "create", 2)
     upload_ratelimit_kib: Optional[int] = None
     pre_backup_script: Optional[str] = None
     post_backup_script: Optional[str] = None
@@ -150,6 +153,9 @@ def _borg2_failure_detail(result: dict, fallback_key: str) -> dict[str, Any]:
         return {"key": "backend.errors.repo.remoteBorg2Incompatible"}
 
     error = result.get("stderr") or result.get("error") or result.get("stdout") or ""
+    unreadable = borg2_unreadable_repository_detail(error)
+    if unreadable:
+        return unreadable
     return {
         "key": fallback_key,
         "params": {"error": error},
@@ -189,6 +195,16 @@ def _resolve_repository_target(
 ) -> tuple[str, Optional[int]]:
     repo_path = path.strip()
     if not connection_id:
+        # Borg 2 reads Borg 1's `[user@]host:path` as a local directory.
+        host = borg1_ssh_address_host(repo_path)
+        if host is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "key": "backend.errors.repo.borg1OnlySshAddress",
+                    "params": {"host": host},
+                },
+            )
         return repo_path, None
 
     conn = db.query(SSHConnection).filter(SSHConnection.id == connection_id).first()
@@ -199,7 +215,7 @@ def _resolve_repository_target(
         )
 
     return (
-        build_ssh_repository_path(
+        borg2_ssh_repository_url(
             repo_path,
             {
                 "host": conn.host,
@@ -272,7 +288,11 @@ def list_encryption_modes(current_user: User = Depends(get_current_user)):
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_repository(
     data: RepositoryV2Create,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(
+        require_role_dependency(
+            "admin", detail_key="backend.errors.repo.adminAccessRequired"
+        )
+    ),
     db: Session = Depends(get_db),
 ):
     """Create and initialise a new Borg 2 repository (borg2 rcreate)."""
@@ -363,6 +383,7 @@ async def create_repository(
         skip_on_hook_failure=data.skip_on_hook_failure,
         source_ssh_connection_id=source_connection_id,
         source_locations=source_locations_json,
+        has_keyfile=data.encryption.startswith("keyfile-"),
         borg_version=2,
         repository_type="ssh" if data.connection_id else "local",
     )
@@ -390,7 +411,11 @@ async def create_repository(
 @router.post("/import", status_code=status.HTTP_201_CREATED)
 async def import_repository(
     data: RepositoryV2Import,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(
+        require_role_dependency(
+            "admin", detail_key="backend.errors.repo.adminAccessRequired"
+        )
+    ),
     db: Session = Depends(get_db),
 ):
     """Import an existing Borg 2 repository (no rcreate — repo already exists)."""

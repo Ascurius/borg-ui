@@ -118,30 +118,48 @@ service at all, block it at your firewall.
 
 ### Usage analytics
 
-The web UI loads [Umami](https://umami.is) to count page views and feature
-usage. It starts on, and a banner on first login asks whether to keep it.
-Declining stops it from that point, and you can change the answer whenever you
-like in Settings > Preferences. Page views from that first session, before you
-answer the banner, are counted.
+The web UI counts page views and feature usage, and reports errors. It sends both to
+Borg UI's own analytics service at `t.borgui.com`, which stores them in Google BigQuery in the
+EU. It starts on, and a banner on first login asks whether to keep it. Declining
+stops it from that point, and you can change the answer whenever you like in
+Settings > Preferences. Page views from that first session, before you answer
+the banner, are counted, and so are the answer itself and a later opt-out, each
+as a single event.
 
-Before anything is sent, your real hostname and URL are replaced with
-`app.borgui`, so your private DNS names and IP addresses do not leave the
-browser. The script tag is loaded with `referrerpolicy="no-referrer"` so the
-request that fetches it cannot carry the origin either. The identifier attached
-to a session is a hash of your install id and username, not the username
-itself. The session also carries your app version and your plan name
-(community, pro, or enterprise) so usage can be compared across plans. No
-licence key, customer, or other billing detail is sent. See
-`frontend/src/utils/analytics.ts` and [Analytics](analytics).
+Each usage event carries the page route (the path with ids and any base path you
+serve Borg UI under replaced, so `/archives/:id/:id`; never the hostname, full
+URL, or query string), the event name and its details, your app version, your plan name
+(community, pro, or enterprise), and two hashes: a SHA-256 of this install's
+random instance id and a SHA-256 of that id plus your user id. The raw instance
+id and your username are never sent. Names of repositories, schedules, and other
+things you create are hashed before sending in usage events, and so is any detail that looks like
+a path, URL, or user@host, such as a repository you filter by. Requests go without cookies or a
+referrer. Your browser still adds an `Origin` header naming the address you
+reach Borg UI at; the service only compares it for website events and does not
+store it. The service derives a country from your IP address and discards the
+address, and the hosting platform's request logs, which would record it, are
+switched off. When analytics is on, buy links in the app carry the install hash
+so a purchase can be matched to the features that led to it. No licence key,
+customer, or other billing detail is sent. See `frontend/src/utils/analytics.ts`
+and [Analytics](analytics).
 
-Nothing else phones home. No crash reporting, no error telemetry, no update
-beacon.
+When an action fails or the UI crashes, an error report is sent so it can be
+fixed before anyone files an issue. It carries the error message, the stack trace
+or backend traceback, the route or job, your app version and your browser. These
+can contain paths, hostnames and repository names. Passphrases, passwords, tokens
+and private keys are removed before sending. Error reports are part of analytics,
+so turning analytics off stops them too. Errors that happen before you sign in,
+such as on the login page, are sent without the install hash, since no answer is
+known yet.
+
+Nothing else phones home. No update beacon.
 
 ### What never leaves
 
 Your backup data. Borg UI runs `borg` against your repositories on your
-infrastructure. Archive contents, file names, and repository paths are never
-transmitted anywhere. There is no cloud component in the backup path.
+infrastructure. Archive contents and passwords are never transmitted anywhere. File names
+and repository paths leave only where an error message or stack trace names
+them (see Usage analytics). There is no cloud component in the backup path.
 
 ## Your Keys Keep Working
 

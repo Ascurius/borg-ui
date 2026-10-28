@@ -9,9 +9,11 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from agent.borg_ui_agent.borg import is_warning_return_code
 from agent.borg_ui_agent.borg_flags import parse_borg_flags
+from agent.borg_ui_agent.children import track_child
 from agent.borg_ui_agent.cancel import (
     cancel_requested,
     start_cancel_poller,
@@ -19,6 +21,47 @@ from agent.borg_ui_agent.cancel import (
 )
 from agent.borg_ui_agent.client import AgentClient
 from agent.borg_ui_agent.failure_report import FailureTail, failure_report
+from agent.borg_ui_agent.borg_arguments import validate_operand, validate_source
+
+
+# Borg 2.0.0b25 replaced rest:// by ssh:// (REST over ssh, same path rules)
+# and does not reject the old scheme: a URL it does not know is read as a
+# local path, so `rest://user@host/repo` names the directory
+# `./rest:/user@host/repo` under the working directory. repo-create and
+# create succeed there, and the backup never leaves the machine. Stated on
+# the server as well (app/core/borg2.py); the two share no imports.
+REMOVED_REPOSITORY_URL_MESSAGE = (
+    "rest:// repository URLs were removed in Borg 2.0.0b25, which reads one as "
+    "a local directory. Use ssh://[user@]host[:port]/path instead (the path "
+    "rules are the same), and create the repository anew: 2.0.0b25 cannot "
+    "read a repository written by an earlier Borg 2 beta."
+)
+
+
+def ensure_borg2_repository_url(repository: Optional[str]) -> None:
+    """Raise ValueError for a repository URL Borg 2 would misread."""
+    if (repository or "").strip().lower().startswith("rest://"):
+        raise ValueError(REMOVED_REPOSITORY_URL_MESSAGE)
+
+
+def job_borg_major(repository: dict[str, Any], payload: dict[str, Any]) -> int:
+    """The Borg major a job runs on, 1 when the job names none. Every job
+    decoder reads it here: anything but 1 or 2 is refused, so no later
+    `== 2` check can take an unknown major for Borg 1. Only a missing value
+    means 1; a present 0 or "" is refused like any other, as on the server."""
+    value = repository.get("borg_version")
+    if value is None:
+        value = payload.get("borg_version")
+    if value is None:
+        return 1
+    try:
+        major = int(value)
+    except (TypeError, ValueError):
+        major = None
+    # int() would also take 2.5 for 2
+    if major not in (1, 2) or str(value).strip() != str(major):
+        raise ValueError(f"Unsupported Borg major: {value!r}")
+    return major
 
 
 @dataclass(frozen=True)
@@ -57,13 +100,16 @@ class BackupCreatePayload:
         ):
             raise ValueError("backup.create payload requires backup.source_paths")
 
+        validate_operand(archive_name.strip(), "archive name")
+        for source in source_paths:
+            validate_source(source.strip())
+
         custom_flags = backup.get("custom_flags", payload.get("custom_flags", []))
         if not isinstance(custom_flags, (str, list)) or (
             isinstance(custom_flags, list)
             and not all(isinstance(flag, str) for flag in custom_flags)
         ):
             raise ValueError("backup.create custom_flags must be a string or list")
-        custom_flags = parse_borg_flags(custom_flags, "create")
 
         exclude_patterns = backup.get(
             "exclude_patterns", payload.get("exclude_patterns", [])
@@ -73,9 +119,10 @@ class BackupCreatePayload:
         ):
             raise ValueError("backup.create exclude_patterns must be a list")
 
-        borg_version = int(
-            repository.get("borg_version") or payload.get("borg_version") or 1
-        )
+        borg_version = job_borg_major(repository, payload)
+        if borg_version == 2:
+            ensure_borg2_repository_url(repository_path)
+        custom_flags = parse_borg_flags(custom_flags, "create", borg_version)
         upload_ratelimit_kib = backup.get(
             "upload_ratelimit_kib", payload.get("upload_ratelimit_kib")
         )
@@ -84,6 +131,14 @@ class BackupCreatePayload:
             if upload_ratelimit_kib <= 0:
                 raise ValueError("backup.create upload_ratelimit_kib must be positive")
         environment = _extract_environment(payload, repository)
+        if (
+            borg_version == 2
+            and upload_ratelimit_kib
+            and repository_path.strip().startswith("rclone:")
+        ):
+            # Borg 2 has no --upload-ratelimit; its rclone backend runs
+            # rclone, which reads this (K is KiB) (#1307)
+            environment["RCLONE_BWLIMIT"] = f"{upload_ratelimit_kib}K"
 
         return cls(
             repository_path=repository_path.strip(),
@@ -102,6 +157,9 @@ class BackupCreatePayload:
         )
 
     def build_command(self) -> list[str]:
+        validate_operand(self.archive_name, "archive name")
+        for source in self.source_paths:
+            validate_source(source)
         borg_cmd = self.borg_binary or ("borg2" if self.borg_version == 2 else "borg")
         if self.borg_version == 2:
             cmd = [
@@ -117,12 +175,13 @@ class BackupCreatePayload:
                 "--compression",
                 self.compression,
             ]
-            if self.upload_ratelimit_kib:
-                cmd.extend(["--upload-ratelimit", str(self.upload_ratelimit_kib)])
+            # No --upload-ratelimit: Borg 2.0.0b22 removed it (behind rclone the
+            # limit is RCLONE_BWLIMIT in the environment instead, #1307). A
+            # server before agent 0.1.17 still sends a repository's limit.
             for pattern in self.exclude_patterns:
                 cmd.extend(["--exclude", pattern])
             cmd.extend(self.custom_flags)
-            cmd.append(self.archive_name)
+            cmd.extend(["--", self.archive_name])
             cmd.extend(self.source_paths)
             return cmd
 
@@ -145,7 +204,7 @@ class BackupCreatePayload:
         for pattern in self.exclude_patterns:
             cmd.extend(["--exclude", pattern])
         cmd.extend(self.custom_flags)
-        cmd.append(f"{self.repository_path}::{self.archive_name}")
+        cmd.extend(["--", f"{self.repository_path}::{self.archive_name}"])
         cmd.extend(self.source_paths)
         return cmd
 
@@ -206,7 +265,7 @@ def _extract_environment(
 _BORG_NONINTERACTIVE_ACCESS_DEFAULTS = {
     "BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK": "yes",
     "BORG_RELOCATED_REPO_ACCESS_IS_OK": "yes",
-    # Borg 2.0.0b23's pack cache: borgstore serves archive metadata as
+    # Borg 2's pack cache: borgstore serves archive metadata as
     # whole-pack loads, so on remote repositories every listing re-transfers
     # packs. The writethrough cache under borg's own cache directory downloads
     # each pack once. Applied via setdefault like the flags above, so the
@@ -225,6 +284,43 @@ _BORG_NONINTERACTIVE_ACCESS_DEFAULTS = {
     # the variable and gets it as a flag (borg1_lock_wait_args).
     "BORG_LOCK_WAIT": "180",
 }
+
+
+def env_with_repository_port(
+    env: dict[str, str], repository_path: Optional[str]
+) -> dict[str, str]:
+    """`env` with the port of an ssh:// repository URL in the remote shell
+    it names (BORG_RSH, BORGSTORE_RSH), in place.
+
+    Borg 2 hands a remote shell it was given to the store as it is and adds
+    the URL's port only to the ssh command it builds itself, so with
+    BORG_RSH set `ssh://host:2222/path` connects to port 22. Borg 1 adds the
+    port to either; the same port twice does no harm. A remote shell that
+    names a port keeps it, and an environment without one needs nothing.
+    """
+    if not (repository_path or "").startswith("ssh://"):
+        return env
+    try:
+        port = urlsplit(repository_path).port
+    except ValueError:
+        return env
+    if port is None:
+        return env
+    for name in ("BORG_RSH", "BORGSTORE_RSH"):
+        rsh = env.get(name)
+        if not rsh:
+            continue
+        try:
+            words = shlex.split(rsh)
+        except ValueError:
+            continue
+        if any(
+            word == "-p" or (word.startswith("-p") and word[2:].isdigit())
+            for word in words
+        ):
+            continue
+        env[name] = f"{rsh} -p {port}"
+    return env
 
 
 def build_borg_env(overrides: Optional[dict[str, str]] = None) -> dict[str, str]:
@@ -414,6 +510,10 @@ def execute_backup_create_job(
 
     cmd = payload.build_command()
     env = build_borg_env(payload.environment)
+    env_with_repository_port(env, payload.repository_path)
+    if payload.borg_version == 2 and payload.remote_path:
+        # Borg 2 has no --remote-path.
+        env["BORG_REMOTE_PATH"] = payload.remote_path
 
     sequence = 0
     client.send_log(
@@ -444,6 +544,7 @@ def execute_backup_create_job(
         if os.name == "posix":
             popen_kwargs["start_new_session"] = True
         process = subprocess.Popen(cmd, **popen_kwargs)
+        track_child(process)
     except OSError as exc:
         error_message = f"Failed to start borg create: {exc}"
         client.send_log(

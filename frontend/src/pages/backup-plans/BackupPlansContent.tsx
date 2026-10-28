@@ -1,4 +1,4 @@
-import { memo, type Dispatch, type SetStateAction } from 'react'
+import { memo, useEffect, useRef, type Dispatch, type SetStateAction } from 'react'
 import { alpha, Box, Button, Chip, Divider, Stack, Typography, useTheme } from '@mui/material'
 import FilterListIcon from '@mui/icons-material/FilterList'
 import { Database, ListChecks, Plus, RefreshCw, Rocket } from 'lucide-react'
@@ -14,6 +14,9 @@ import { BackupPlanCardSkeleton } from './BackupPlanCardSkeleton'
 import { BackupPlanIdleCard } from './PlanRunComponents'
 import { isActiveRun } from './runStatus'
 import { useAnalytics } from '../../hooks/useAnalytics'
+import { useFeatureAnalytics } from '../../hooks/useFeatureAnalytics'
+import { usePlan } from '../../hooks/usePlan'
+import type { Feature } from '../../core/features'
 
 const BACKUP_PLANS_ANALYTICS_SECTION = 'backup_plans'
 
@@ -38,7 +41,6 @@ interface BackupPlansContentProps {
   startingPlanId: number | null
   highlightedPlanId: number | null
   canUseMultiRepository: boolean
-  canUseManagedAgents: boolean
   canUseDatabaseDiscovery: boolean
   canUseContainerBackups: boolean
   cancellingRunId: number | null
@@ -75,17 +77,6 @@ function planUsesContainerFeature(plan: BackupPlan) {
   return Boolean(plan.source_locations?.some((location) => Boolean(location.container)))
 }
 
-function planUsesManagedAgentFeature(plan: BackupPlan) {
-  return (
-    plan.source_type === 'agent' ||
-    Boolean(
-      plan.source_locations?.some(
-        (location) => location.source_type === 'agent' || location.agent_machine_id != null
-      )
-    )
-  )
-}
-
 function getBackupPlanSourceTypeLabel(
   plan: BackupPlan,
   usesDatabaseFeature: boolean,
@@ -102,21 +93,17 @@ function getBackupPlanSourceTypeLabel(
 
 function getPlanRunProTooltip({
   usesMultiRepositoryFeature,
-  usesManagedAgentFeature,
   usesDatabaseFeature,
   usesContainerFeature,
   canUseMultiRepository,
-  canUseManagedAgents,
   canUseDatabaseDiscovery,
   canUseContainerBackups,
   t,
 }: {
   usesMultiRepositoryFeature: boolean
-  usesManagedAgentFeature: boolean
   usesDatabaseFeature: boolean
   usesContainerFeature: boolean
   canUseMultiRepository: boolean
-  canUseManagedAgents: boolean
   canUseDatabaseDiscovery: boolean
   canUseContainerBackups: boolean
   t: TFunction
@@ -125,9 +112,6 @@ function getPlanRunProTooltip({
 
   if (usesMultiRepositoryFeature && !canUseMultiRepository) {
     blockedFeatures.push(t('backupPlans.proFeatureLabels.multiRepository'))
-  }
-  if (usesManagedAgentFeature && !canUseManagedAgents) {
-    blockedFeatures.push(t('backupPlans.proFeatureLabels.managedAgent'))
   }
   if (usesDatabaseFeature && !canUseDatabaseDiscovery) {
     blockedFeatures.push(t('backupPlans.proFeatureLabels.database'))
@@ -161,7 +145,6 @@ function BackupPlansContentImpl({
   startingPlanId,
   highlightedPlanId,
   canUseMultiRepository,
-  canUseManagedAgents,
   canUseDatabaseDiscovery,
   canUseContainerBackups,
   cancellingRunId,
@@ -186,6 +169,36 @@ function BackupPlansContentImpl({
 }: BackupPlansContentProps) {
   const theme = useTheme()
   const { track, EventCategory, EventAction } = useAnalytics()
+  const { trackFeatureBlocked } = useFeatureAnalytics()
+  // While the plan loads it reads as community, so every lock would be false.
+  const { isLoading: planLoading } = usePlan()
+  // A plan whose Run is locked by the plan is a paywall too: report each locked
+  // feature once while the set shown stays the same.
+  const lockedRunFeatures = new Set<Feature>()
+  for (const plan of backupPlans) {
+    if (
+      (plan.repository_count > 1 || plan.repository_run_mode === 'parallel') &&
+      !canUseMultiRepository
+    )
+      lockedRunFeatures.add('backup_plan_multi_repository')
+    if (planUsesDatabaseFeature(plan) && !canUseDatabaseDiscovery)
+      lockedRunFeatures.add('database_discovery')
+    if (planUsesContainerFeature(plan) && !canUseContainerBackups)
+      lockedRunFeatures.add('container_backups')
+  }
+  const lockedRunKey = [...lockedRunFeatures].sort().join(',')
+  const lockedRunTrackedRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (planLoading || lockedRunTrackedRef.current === lockedRunKey) return
+    lockedRunTrackedRef.current = lockedRunKey
+    for (const feature of lockedRunKey.split(',').filter(Boolean)) {
+      trackFeatureBlocked(feature as Feature, {
+        surface: 'backup_plan_card',
+        operation: 'run_plan',
+        gate_mode: 'disabled',
+      })
+    }
+  }, [lockedRunKey, planLoading, trackFeatureBlocked])
   const isDark = theme.palette.mode === 'dark'
   // Plans currently running are pulled into a top "Currently running" section
   // so the user can find live state in one glance. The idle plan card down in
@@ -565,17 +578,12 @@ function BackupPlansContentImpl({
                   const isHighlighted = highlightedPlanId === plan.id
                   const usesMultiRepositoryFeature =
                     plan.repository_count > 1 || plan.repository_run_mode === 'parallel'
-                  const usesManagedAgentFeature = planUsesManagedAgentFeature(plan)
                   const usesDatabaseFeature = planUsesDatabaseFeature(plan)
                   const usesContainerFeature = planUsesContainerFeature(plan)
                   const planUsesProFeatures =
-                    usesMultiRepositoryFeature ||
-                    usesManagedAgentFeature ||
-                    usesDatabaseFeature ||
-                    usesContainerFeature
+                    usesMultiRepositoryFeature || usesDatabaseFeature || usesContainerFeature
                   const planBlockedByLicense =
                     (usesMultiRepositoryFeature && !canUseMultiRepository) ||
-                    (usesManagedAgentFeature && !canUseManagedAgents) ||
                     (usesDatabaseFeature && !canUseDatabaseDiscovery) ||
                     (usesContainerFeature && !canUseContainerBackups)
                   const runDisabled =
@@ -583,11 +591,9 @@ function BackupPlansContentImpl({
                   const runTooltip = planBlockedByLicense
                     ? getPlanRunProTooltip({
                         usesMultiRepositoryFeature,
-                        usesManagedAgentFeature,
                         usesDatabaseFeature,
                         usesContainerFeature,
                         canUseMultiRepository,
-                        canUseManagedAgents,
                         canUseDatabaseDiscovery,
                         canUseContainerBackups,
                         t,

@@ -260,9 +260,8 @@ xml_escape() {
   printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
-# An ssh:// or rest:// repository's login and host, for an SSH check (a rest://
-# store is reached over SSH as well). A port after the host is honoured; IPv6
-# literals in brackets are not parsed.
+# An ssh:// repository's login and host, for an SSH check. A port after the
+# host is honoured; IPv6 literals in brackets are not parsed.
 ssh_target_of() {
   local authority="${1#*://}"
   authority="${authority%%/*}"
@@ -309,7 +308,7 @@ ask_repository_defaults() {
   if [[ -n "${BORG_REPO_VALUE}" ]]; then
     printf 'Borg executable on that host (BORG_REMOTE_PATH, empty for the default): ' >&3
     IFS= read -r BORG_REMOTE_PATH_VALUE <&3 || BORG_REMOTE_PATH_VALUE=""
-    if [[ "${BORG_REPO_VALUE}" == ssh://* || "${BORG_REPO_VALUE}" == rest://* ]]; then
+    if [[ "${BORG_REPO_VALUE}" == ssh://* ]]; then
       printf 'Open an SSH connection to it now, to confirm the host key and the login? [Y/n] ' >&3
       IFS= read -r answer <&3 || answer="n"
       if [[ -z "${answer}" || "${answer}" =~ ^[Yy] ]]; then
@@ -408,6 +407,34 @@ ensure_launch_agent() {
   launchctl bootstrap "${domain}" "${plist}"
 }
 
+# The PATH both jobs run with. launchd sources no shell profile, so a Borg or
+# rclone this run found on the user's PATH (a pipx ~/.local/bin, say) is out of
+# the job's reach unless its directory is named here (#1290). Those directories
+# follow the forwarders, in this run's PATH order, and precede the fixed ones,
+# so the job resolves each name the way this run did. The upgrade job carries
+# the same PATH, which is what lets a remote reinstall find them again.
+darwin_service_path() {
+  local path="${AGENT_ROOT}/bin" found=":" name dir entries
+  for name in borg borg2 rclone; do
+    dir="$(type -P "${name}" || true)"
+    found+="${dir%/*}:"
+  done
+  IFS=: read -ra entries <<<"${PATH}"
+  for dir in "${entries[@]}"; do
+    [[ -n "${dir}" && "${found}" == *":${dir}:"* ]] || continue
+    # launchd runs the job from /, so a relative entry goes in absolute.
+    if [[ "${dir}" != /* ]]; then
+      dir="$(CDPATH='' cd -- "${dir}" 2>/dev/null && pwd -P)" || continue
+      [[ "${dir}" != *:* ]] || continue
+    fi
+    case ":${path}:" in *":${dir}:"*) ;; *) path+=":${dir}" ;; esac
+  done
+  for dir in /opt/homebrew/bin /usr/local/bin /opt/local/bin /usr/bin /bin /usr/sbin /sbin; do
+    case ":${path}:" in *":${dir}:"*) ;; *) path+=":${dir}" ;; esac
+  done
+  printf '%s' "${path}"
+}
+
 # The agent job. KeepAlive with a throttle is Restart=always / RestartSec=10.
 # launchd expands no ~ and sources no shell profile, so every path is absolute
 # and the PATH the agent resolves Borg through is stated here, forwarders
@@ -449,7 +476,7 @@ write_agent_launch_agent() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>${root}/bin:/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>$(xml_escape "$(darwin_service_path)")</string>
 ${repo_env}  </dict>
   <key>StandardOutPath</key>
   <string>${logs}/agent.log</string>
@@ -492,7 +519,7 @@ write_upgrade_launch_agent() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>${root}/bin:/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>$(xml_escape "$(darwin_service_path)")</string>
     <key>BORG_UI_UPGRADE_ETC</key>
     <string>${root}</string>
     <key>BORG_UI_UPGRADE_CONF</key>
@@ -674,6 +701,23 @@ if [[ "${REINSTALL}" == "1" ]]; then
   # from wherever it named, and record that server for every later upgrade.
   if [[ -z "${SERVER}" && -r "${UPGRADE_CONF}" ]]; then
     SERVER="$(sed -nE 's/^SERVER="(.*)"$/\1/p' "${UPGRADE_CONF}" | head -n 1)"
+    # set-server moves config.toml only, so the two can name different
+    # servers. The record still wins, for the reason above; say what it takes
+    # to move it, because no reinstall from the old address ever will. The
+    # config's address is shown only as a plain URL and never as a command to
+    # copy: the agent can write that file.
+    ENROLLED_SERVER="$(sed -nE 's/^server_url[[:space:]]*=[[:space:]]*"(.*)"[[:space:]]*$/\1/p' \
+      "${CONFIG_DIR}/config.toml" | head -n 1)"
+    if [[ -n "${SERVER}" && -n "${ENROLLED_SERVER}" &&
+      "${ENROLLED_SERVER%/}" != "${SERVER%/}" ]]; then
+      if [[ ! "${ENROLLED_SERVER}" =~ ^https?://[A-Za-z0-9._:/-]+$ ]]; then
+        ENROLLED_SERVER="another server"
+      fi
+      echo "The upgrade record names ${SERVER}, but this agent is enrolled" >&2
+      echo "against ${ENROLLED_SERVER}. Reinstalling from ${SERVER}." >&2
+      echo "If this endpoint was moved on purpose, run the reinstall with --server" >&2
+      echo "and the new address to make remote upgrade work again." >&2
+    fi
   fi
   if [[ -z "${SERVER}" ]]; then
     SERVER="$(sed -nE 's/^server_url[[:space:]]*=[[:space:]]*"(.*)"[[:space:]]*$/\1/p' \
@@ -1765,7 +1809,8 @@ set -uo pipefail
 # its real path: the Linux layout, or on macOS the per-user layout the
 # installer wrote. The prefix matters on macOS, where the script runs in the
 # user's own shell with no sudo to reset the environment: an exported LOG_DIR
-# there must not become a path this script removes.
+# there must not become a path this script removes. An override must still name
+# a path of the agent; refuse_unsafe_paths checks that before anything happens.
 PLATFORM="${BORG_UI_AGENT_PLATFORM:-$(uname -s)}"
 if [[ "${PLATFORM}" == "Darwin" ]]; then
   DEFAULT_AGENT_ROOT="${HOME}/Library/Application Support/borg-ui-agent"
@@ -1806,7 +1851,9 @@ STATE_DIR="${BORG_UI_UNINSTALL_STATE_DIR:-/var/lib/borg-ui-agent}"
 BORG1_LINK="${BORG_UI_UNINSTALL_BORG1_LINK:-${DEFAULT_BORG1_LINK}}"
 BORG2_LINK="${BORG_UI_UNINSTALL_BORG2_LINK:-${DEFAULT_BORG2_LINK}}"
 LOG_DIR="${BORG_UI_UNINSTALL_LOG_DIR:-${DEFAULT_LOG_DIR}}"
-DEDICATED_USER="${BORG_UI_UNINSTALL_DEDICATED_USER:-borg-ui-agent}"
+# Not overridable: an override naming the operator's own account, on a unit
+# installed with --service-user current, would delete that account and its home.
+DEDICATED_USER="borg-ui-agent"
 UNREGISTER_TIMEOUT="${BORG_UI_UNINSTALL_UNREGISTER_TIMEOUT:-5}"
 
 KEEP_BORG="0"
@@ -1980,38 +2027,49 @@ remove_service_user() {
   fi
 }
 
+# Removes what is under the agent root except what the options keep. On macOS
+# the configuration lives there, and kept is what Linux keeps in its config
+# directory: the registration, the recorded repository, and the user's own
+# scripts. With --keep-borg the binaries and the forwarders that reach them
+# stay: a symlink kept on PATH resolves into this directory, so keeping the
+# link without them leaves a Borg that cannot start.
+empty_agent_root() {
+  local entry name
+  for entry in "${AGENT_ROOT}"/* "${AGENT_ROOT}"/.[!.]*; do
+    [[ -e "${entry}" || -L "${entry}" ]] || continue
+    name="${entry##*/}"
+    if [[ "${KEEP_CONFIG}" == "1" ]]; then
+      case "${entry}" in
+        "${CONFIG_FILE}" | "${CONFIG_DIR}/agent.env" | "${CONFIG_DIR}/scripts.d") continue ;;
+      esac
+    fi
+    if [[ "${KEEP_BORG}" == "1" ]]; then
+      case "${name}" in
+        borg1 | borg2) continue ;;
+        bin)
+          rm -f "${UPGRADE_HELPER}" || note_failure "could not remove ${UPGRADE_HELPER}"
+          continue
+          ;;
+      esac
+    fi
+    rm -rf "${entry}" || note_failure "could not remove ${entry}"
+  done
+  # Only what is empty goes here, so nothing that was kept is touched. An
+  # install that stopped before its binary arrived leaves such a directory.
+  local kept
+  for kept in "${AGENT_ROOT}"/borg[12]/* "${AGENT_ROOT}/borg1" \
+    "${AGENT_ROOT}/borg2" "${AGENT_ROOT}/bin" "${AGENT_ROOT}"; do
+    if [[ -d "${kept}" && ! -L "${kept}" ]]; then
+      rmdir "${kept}" 2>/dev/null || true
+    fi
+  done
+}
+
 remove_agent_files() {
   if is_darwin; then
-    # The agent root holds the config as well, so a kept config means
-    # emptying the directory around it. Kept is what Linux keeps in its
-    # config directory: the registration, the recorded repository, and the
-    # user's own scripts.
-    local entry name
-    for entry in "${AGENT_ROOT}"/* "${AGENT_ROOT}"/.[!.]*; do
-      [[ -e "${entry}" || -L "${entry}" ]] || continue
-      name="${entry##*/}"
-      if [[ "${KEEP_CONFIG}" == "1" ]]; then
-        case "${entry}" in
-          "${CONFIG_FILE}" | "${CONFIG_DIR}/agent.env" | "${CONFIG_DIR}/scripts.d") continue ;;
-        esac
-      fi
-      # The binaries and the forwarders that reach them, as promised above.
-      if [[ "${KEEP_BORG}" == "1" ]]; then
-        case "${name}" in
-          borg1 | borg2) continue ;;
-          bin)
-            rm -f "${UPGRADE_HELPER}" || note_failure "could not remove ${UPGRADE_HELPER}"
-            continue
-            ;;
-        esac
-      fi
-      rm -rf "${entry}" || note_failure "could not remove ${entry}"
-    done
+    empty_agent_root
     if [[ "${KEEP_CONFIG}" == "1" ]]; then
       echo "Keeping ${CONFIG_FILE}."
-    fi
-    if [[ "${KEEP_CONFIG}" != "1" && "${KEEP_BORG}" != "1" ]]; then
-      rmdir "${AGENT_ROOT}" 2>/dev/null || true
     fi
     if [[ -n "${LOG_DIR}" ]]; then
       rm -rf "${LOG_DIR}" || note_failure "could not remove ${LOG_DIR}"
@@ -2019,7 +2077,11 @@ remove_agent_files() {
     return 0
   fi
 
-  rm -rf "${AGENT_ROOT}" || note_failure "could not remove ${AGENT_ROOT}"
+  if [[ "${KEEP_BORG}" == "1" ]]; then
+    empty_agent_root
+  else
+    rm -rf "${AGENT_ROOT}" || note_failure "could not remove ${AGENT_ROOT}"
+  fi
   rm -f "${NO_REMOTE_UPGRADE_MARKER}" \
     || note_failure "could not remove ${NO_REMOTE_UPGRADE_MARKER}"
 
@@ -2090,6 +2152,77 @@ unregister() {
   fi
   return 0
 }
+
+# Every directory this script removes or empties is called borg-ui-agent on
+# every platform the installer supports. An override that names anything else,
+# such as "/", a system directory, a home directory or a relative path, would
+# otherwise be removed with rm -rf.
+is_agent_dir() {
+  [[ "$1" == /* && "${1##*/}" == "borg-ui-agent" ]]
+}
+
+# An override may move a file, not rename it: the name has to be the one the
+# installer gives it on this platform. For the Borg links this comes on top of
+# SAFETY RULE 1, which removes a link only when it resolves into AGENT_ROOT.
+is_agent_file() {
+  [[ "$1" == /* && "${1##*/}" == "$2" ]]
+}
+
+# Checked once, before anything is removed or the server is told anything. A
+# real run sets no override and takes the defaults, which always pass.
+refuse_unsafe_paths() {
+  local name value expected resolved refused="0"
+  for name in AGENT_ROOT CONFIG_DIR STATE_DIR LOG_DIR; do
+    value="${!name}"
+    # Linux has no log directory of its own; empty names nothing to remove.
+    if [[ "${name}" == "LOG_DIR" && -z "${value}" ]]; then
+      continue
+    fi
+    if ! is_agent_dir "${value}"; then
+      echo "Refusing to remove '${value}' (${name}): not a directory of the Borg UI agent. Check BORG_UI_UNINSTALL_${name}." >&2
+      refused="1"
+    fi
+  done
+  # rm -rf removes a link, not what it points to, so for the state and log
+  # directories the name is enough. The script also reaches into the agent root
+  # and the config directory: it empties the root entry by entry, takes a Borg
+  # link pointing into it as ours, and removes files inside both. Each of those
+  # follows a link, so the directory it resolves to has to be the agent's too.
+  for name in AGENT_ROOT CONFIG_DIR; do
+    value="${!name}"
+    resolved="$(cd -P "${value}" 2>/dev/null && pwd -P)" || resolved=""
+    if [[ -n "${resolved}" ]] && ! is_agent_dir "${resolved}"; then
+      echo "Refusing to remove '${value}' (${name}): it resolves to '${resolved}', not a directory of the Borg UI agent. Check BORG_UI_UNINSTALL_${name}." >&2
+      refused="1"
+    fi
+  done
+  # CONFIG_FILE is not removed but read: unregister revokes the agent whose
+  # token it carries, at the server it names.
+  for name in SERVICE_UNIT UPGRADE_UNIT UPGRADE_PATH_UNIT UPGRADE_CONF \
+    UPGRADE_HELPER UPGRADE_TRIGGER LEGACY_SUDOERS NO_REMOTE_UPGRADE_MARKER \
+    CONFIG_FILE BORG1_LINK BORG2_LINK; do
+    value="${!name}"
+    case "${name}" in
+      UPGRADE_HELPER | LEGACY_SUDOERS) expected="borg-ui-agent-upgrade" ;;
+      UPGRADE_TRIGGER) expected="upgrade-requested" ;;
+      CONFIG_FILE) expected="config.toml" ;;
+      *)
+        expected="DEFAULT_${name}"
+        expected="${!expected##*/}"
+        ;;
+    esac
+    if ! is_agent_file "${value}" "${expected}"; then
+      echo "Refusing to use '${value}' (${name}): not the agent's ${expected}. Check BORG_UI_UNINSTALL_${name}." >&2
+      refused="1"
+    fi
+  done
+  if [[ "${refused}" == "1" ]]; then
+    echo "Nothing was removed." >&2
+    exit 1
+  fi
+}
+
+refuse_unsafe_paths
 
 if is_darwin; then
   if [[ "$(id -u)" == "0" ]]; then

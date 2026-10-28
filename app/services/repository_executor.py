@@ -14,6 +14,10 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import SingletonThreadPool, StaticPool
 
+from app.core.borg_major import borg_major, is_borg2
+from app.core.agent_versions import agent_borg2_version, agent_borg_version_for_major
+from app.core.borg2 import borg2_below_minimum, borg2_minimum_version
+from app.core.borg_router import BorgRouter
 from app.core.borg_errors import (
     LOCK_CONTENTION_DETAIL_KEY,
     is_lock_contention_exit_code,
@@ -21,6 +25,7 @@ from app.core.borg_errors import (
 from app.database.models import AgentJob, AgentJobLog, AgentMachine, Repository
 from app.services.agent_job_dispatcher import dispatch_agent_cancel_if_connected
 from app.services.job_admission import (
+    ACTIVE_AGENT_STATUSES,
     BACKUP_AGENT_JOB_TYPE,
     OPERATION_BACKUP,
     ensure_repository_admission,
@@ -32,6 +37,7 @@ from app.services.operations.backup_facade import (
     backup_job_link_columns,
     resolve_backup_job,
 )
+from app.utils.borg_arguments import validate_operand, validate_source
 from app.utils.borg_flags import parse_borg_flags
 from app.utils.redaction import redact_secrets
 
@@ -50,11 +56,14 @@ REPOSITORY_OPERATION_CAPABILITIES = {
     "repository.archive_info",
     "repository.list_archives",
     "repository.delete_archive",
+    "repository.delete_archives",
     "repository.break_lock",
     "repository.list_archive_contents",
     "repository.extract_archive_file",
     "repository.export_archive_tar",
     "repository.restore",
+    "repository.restore_dry_run",
+    "repository.key_export",
     "repository.check",
     "repository.prune",
     "repository.compact",
@@ -63,6 +72,11 @@ REPOSITORY_OPERATION_CAPABILITIES = {
     "repository.storage_usage",
     "repository.diff",
 }
+# Repository jobs that run no Borg on the endpoint (an rclone copy, a `du`),
+# so the endpoint's Borg 2 is no condition for them.
+BORGLESS_REPOSITORY_JOB_KINDS = frozenset(
+    {"repository.rclone_sync", "repository.disk_usage"}
+)
 # Kinds whose output the server parses. The agent reports the raw JSON as
 # `stdout` and its own parse of it as `data` (its MACHINE_PARSED_JOB_KINDS;
 # the two packages share no imports, so the set is stated twice). The reader
@@ -108,6 +122,12 @@ def is_agent_executor(repository: Repository) -> bool:
 # The agent job that produces an archive's change listing for the history
 # index (agents from 0.1.6).
 AGENT_DIFF_JOB_KIND = "repository.diff"
+# The restore preview's extract dry run, the repository key's export and the
+# delete of a wipe's archives in one job (#1425). Agents from before them
+# get the refusals and the per-archive wipe of #1393.
+AGENT_RESTORE_DRY_RUN_JOB_KIND = "repository.restore_dry_run"
+AGENT_KEY_EXPORT_JOB_KIND = "repository.key_export"
+AGENT_DELETE_ARCHIVES_JOB_KIND = "repository.delete_archives"
 
 
 def agent_advertises_job(agent: Any, job_kind: str) -> bool:
@@ -241,10 +261,13 @@ def build_agent_backup_payload(
         source_locations=source_locations,
         repository=repository,
     )
+    validate_operand(archive_name, "archive name")
+    for source in source_paths:
+        validate_source(source)
     repository_payload = {
         "id": repository.id,
         "path": repository.path,
-        "borg_version": repository.borg_version or 1,
+        "borg_version": borg_major(repository),
     }
     if repository.remote_path:
         repository_payload["remote_path"] = repository.remote_path
@@ -260,11 +283,12 @@ def build_agent_backup_payload(
             parse_borg_flags(
                 custom_flags if custom_flags is not None else repository.custom_flags,
                 "create",
+                borg_major(repository),
                 local_paths=False,
             )
         ),
     }
-    effective_upload_ratelimit_kib = (
+    effective_upload_ratelimit_kib = BorgRouter(repository).upload_ratelimit(
         upload_ratelimit_kib
         if upload_ratelimit_kib is not None
         else getattr(repository, "upload_ratelimit_kib", None)
@@ -299,7 +323,7 @@ def build_agent_repository_operation_payload(
     repository_payload = {
         "id": repository.id,
         "path": repository.path,
-        "borg_version": repository.borg_version or 1,
+        "borg_version": borg_major(repository),
     }
     if repository.remote_path:
         repository_payload["remote_path"] = repository.remote_path
@@ -327,6 +351,56 @@ def build_agent_repository_operation_payload(
         "operation": operation_payload,
         "secrets": secrets,
     }
+
+
+def agent_borg2_reinstall_flags(agent: AgentMachine) -> str:
+    """The installer flags that put this server's Borg 2 on the endpoint,
+    keeping a Borg 1 it reports."""
+    borg_version = (
+        "both"
+        if agent_borg_version_for_major(agent.borg_versions, 1) is not None
+        else "2"
+    )
+    return f"--reinstall --borg-version {borg_version} --borg-source server"
+
+
+def require_agent_borg2(agent: AgentMachine, binary: Optional[str] = None) -> None:
+    """Refuse Borg 2 work on an endpoint whose Borg 2 cannot do it (#1306).
+
+    The endpoint must run at least the Borg 2 this server ships: Borg 2
+    betas change the repository format and the command line at short
+    intervals, so an older one fails on the endpoint with an exit code that
+    does not name the problem, or misreads a repository. No `borg2` at all
+    is "No such file or directory" there. The agent reports its binaries
+    when it registers and at every session start, so the answer is known
+    here, before anything is queued; a Borg 2 replaced by hand counts from
+    the agent's next start. `binary` is the one a job names instead of
+    `borg2` (the raw backup route); the agent reports only `borg` and
+    `borg2`, so a named binary it did not report is not checked: an unknown
+    version is not evidence of an old one.
+    """
+    if binary == "borg2":
+        binary = None  # the default, named
+    version = agent_borg2_version(agent.borg_versions, binary)
+    if version is None and binary:
+        return
+    if version is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"key": "backend.errors.repo.agentBorg2Unavailable"},
+        )
+    if borg2_below_minimum(version):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "key": "backend.errors.repo.agentBorg2TooOld",
+                "params": {
+                    "version": version,
+                    "minimum": borg2_minimum_version(),
+                    "flags": agent_borg2_reinstall_flags(agent),
+                },
+            },
+        )
 
 
 def validate_agent_backup_repository(
@@ -362,6 +436,8 @@ def validate_agent_backup_repository(
             status_code=status.HTTP_409_CONFLICT,
             detail={"key": "backend.errors.agents.agentNotQueueable"},
         )
+    if is_borg2(repository):
+        require_agent_borg2(agent)
     using_repository_sources = source_paths is None
     if using_repository_sources:
         source_paths = decode_json_list(repository.source_directories)
@@ -425,6 +501,8 @@ def validate_agent_repository_operation(
                 "params": {"capability": job_kind},
             },
         )
+    if (borg_major(repository)) == 2 and job_kind not in BORGLESS_REPOSITORY_JOB_KINDS:
+        require_agent_borg2(agent)
     return agent
 
 
@@ -463,28 +541,34 @@ def queue_agent_repository_operation_job(
     maintenance_job_kind: Optional[str] = None,
     maintenance_job_id: Optional[int] = None,
     ignore_queued_operations: bool = False,
+    check_admission: bool = True,
 ) -> AgentJob:
     """`ignore_queued_operations` (see `list_active_repository_work`) is only
     valid from the runner's repository lane, and is refused anywhere else:
-    see `_require_repository_lane`."""
+    see `_require_repository_lane`.
+
+    `check_admission=False` queues without asking admission, for a job that
+    opens a location the repository's active work does not use: the check
+    of a changed path. The job still counts as active work for others."""
     if ignore_queued_operations:
         _require_repository_lane(db, repository, maintenance_job_id)
     agent = validate_agent_repository_operation(db, repository, job_kind=job_kind)
     operation_payload = operation
-    admission_operation = operation_for_agent_job_kind(job_kind)
-    # Phase 5 moved every maintenance kind to `operations`. The value is the
-    # table admission should ignore, so the row this caller just created
-    # cannot block its own admission.
-    ensure_repository_admission(
-        db,
-        repository,
-        admission_operation,
-        ignore=ignore_active_job(
-            "operations" if maintenance_job_kind else None,
-            maintenance_job_id,
-        ),
-        ignore_queued_operations=ignore_queued_operations,
-    )
+    if check_admission:
+        admission_operation = operation_for_agent_job_kind(job_kind)
+        # Phase 5 moved every maintenance kind to `operations`. The value is
+        # the table admission should ignore, so the row this caller just
+        # created cannot block its own admission.
+        ensure_repository_admission(
+            db,
+            repository,
+            admission_operation,
+            ignore=ignore_active_job(
+                "operations" if maintenance_job_kind else None,
+                maintenance_job_id,
+            ),
+            ignore_queued_operations=ignore_queued_operations,
+        )
     now = datetime.utcnow()
     payload = build_agent_repository_operation_payload(
         repository,
@@ -577,13 +661,15 @@ def agent_failure_result(
     *,
     stderr_tail: Optional[str] = None,
     failure_kind: Optional[str] = None,
+    deleted_archives: Optional[int] = None,
 ) -> dict[str, Any]:
     """The `result` a failed agent job keeps: the return code as before,
     and the report's fields when the agent sent them. The tail is bounded
     here too, and a kind this server does not know reads as `other`. Borg
     names the repository in its messages, so a location with credentials
     is redacted before the tail is kept: it reaches the operation's
-    message and the failure notifications from here."""
+    message and the failure notifications from here. `deleted_archives`
+    (a `repository.delete_archives` job) is kept when it is a count."""
     result: dict[str, Any] = {}
     if return_code is not None:
         result["return_code"] = return_code
@@ -599,6 +685,8 @@ def agent_failure_result(
             if failure_kind == FAILURE_KIND_LOCK_CONTENTION
             else FAILURE_KIND_OTHER
         )
+    if isinstance(deleted_archives, int) and deleted_archives >= 0:
+        result["deleted_archives"] = deleted_archives
     return result
 
 
@@ -702,10 +790,11 @@ def _log_reason_line(rows: list, *, stream: Optional[str]) -> Optional[str]:
     sentence and follows it with a traceback.
 
     Sequence 0 is the agent's own "Starting <kind>: <command>" preamble, never
-    a reason - it is what the job was about to run, not why it stopped.
+    a reason - it is what the job was about to run, not why it stopped. Below
+    0 is the server's note that the job was requeued, which is not one either.
     """
     for sequence, row_stream, message in rows:
-        if sequence == 0 or (stream is not None and row_stream != stream):
+        if sequence <= 0 or (stream is not None and row_stream != stream):
             continue
         lines = [line.strip() for line in (message or "").splitlines() if line.strip()]
         if lines:
@@ -889,6 +978,12 @@ def queue_agent_backup_job(
     custom_flags: Optional[str] = None,
     upload_ratelimit_kib: Optional[int] = None,
 ) -> AgentJob:
+    # A backup run again while its job is live (a requeued job after a
+    # restart) waits on that job instead of starting a second `borg create`.
+    live_job = get_agent_job_for_backup(db, backup_job)
+    if live_job is not None and live_job.status in ACTIVE_AGENT_STATUSES:
+        return live_job
+
     source_paths = _agent_source_paths(
         source_directories=source_directories,
         source_locations=source_locations,
@@ -902,9 +997,14 @@ def queue_agent_backup_job(
         ignore=admission_ignore_for(backup_job),
     )
 
-    archive_name = archive_name or (
-        f"manual-backup-{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
-    )
+    if not archive_name:
+        # As on the server: Borg 2's unnamed manual backup is one series, so
+        # the prune rules apply to it; Borg 1 names must be unique.
+        archive_name = (
+            "manual-backup"
+            if is_borg2(repository)
+            else f"manual-backup-{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
+        )
     backup_job.execution_mode = EXECUTOR_AGENT
     backup_job.archive_name = archive_name
 
@@ -933,6 +1033,7 @@ def queue_agent_backup_job(
 
 
 SCRIPT_RUN_CAPABILITY = "script.run"
+SCRIPT_AGENT_JOB_TYPE = "script"
 
 
 def build_agent_script_payload(
@@ -997,7 +1098,7 @@ def queue_agent_script_job(
     now = datetime.utcnow()
     agent_job = AgentJob(
         agent_machine_id=agent.id,
-        job_type="script",
+        job_type=SCRIPT_AGENT_JOB_TYPE,
         status="queued",
         payload=build_agent_script_payload(script_name, env),
         created_at=now,
@@ -1075,6 +1176,9 @@ async def wait_for_agent_script_job(
                 "error_message": "agent script timed out",
             }
 
+        # As in `wait_for_agent_backup_job`: a repository hook of a backup for
+        # an agent that is away holds no backup slot either (#1331).
+        db.rollback()
         await asyncio.sleep(poll_interval_seconds)
 
 
@@ -1200,21 +1304,42 @@ def cancel_agent_backup_job(
         )
 
     now = now or datetime.utcnow()
-    if agent_job.status == "queued":
-        agent_job.status = "canceled"
-        agent_job.completed_at = now
-        backup_job.status = "cancelled"
-        backup_job.completed_at = now
-    elif agent_job.status in ("claimed", "running", "cancel_requested"):
-        agent_job.status = "cancel_requested"
-        backup_job.status = "running"
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"key": "backend.errors.backup.canOnlyCancelRunningJobs"},
+    for _ in range(ABANDON_ATTEMPTS):
+        observed = agent_job.status
+        if observed == "queued":
+            values = {
+                AgentJob.status: "canceled",
+                AgentJob.completed_at: now,
+                AgentJob.updated_at: now,
+            }
+        elif observed in ("claimed", "running", "cancel_requested"):
+            values = {AgentJob.status: "cancel_requested", AgentJob.updated_at: now}
+        else:
+            break
+        # Conditional on the status just read, as for maintenance
+        # (`_request_agent_cancel`): the completion is recorded in a worker
+        # thread with its own session and may have committed since this copy
+        # was read, and a final job keeps its outcome. A claim between read
+        # and write still gets the cancel, so a lost race reads again.
+        changed = (
+            db.query(AgentJob)
+            .filter(AgentJob.id == agent_job.id, AgentJob.status == observed)
+            .update(values, synchronize_session=False)
         )
-    agent_job.updated_at = now
-    return agent_job, False
+        if not changed:
+            db.expire(agent_job)
+            continue
+        db.refresh(agent_job)
+        if observed == "queued":
+            backup_job.status = "cancelled"
+            backup_job.completed_at = now
+        else:
+            backup_job.status = "running"
+        return agent_job, False
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={"key": "backend.errors.backup.canOnlyCancelRunningJobs"},
+    )
 
 
 async def wait_for_agent_backup_job(
@@ -1233,12 +1358,22 @@ async def wait_for_agent_backup_job(
             return "failed"
 
         if is_cancelled() and agent_job.status not in TERMINAL_AGENT_STATUSES:
-            cancel_agent_backup_job(db, backup_job)
-            db.commit()
+            try:
+                cancel_agent_backup_job(db, backup_job)
+            except HTTPException:
+                # The job became final since it was read: the rollback
+                # expires this copy, and the check below reads the outcome.
+                db.rollback()
+            else:
+                db.commit()
 
         if agent_job.status in TERMINAL_AGENT_STATUSES:
             return backup_job.status or (
                 "cancelled" if agent_job.status == "canceled" else agent_job.status
             )
 
+        # End the read before sleeping, so the wait does not hold a pooled
+        # connection: a backup for an agent that is away holds no backup slot
+        # (#1331), so any number of them can wait at once.
+        db.rollback()
         await asyncio.sleep(poll_interval_seconds)

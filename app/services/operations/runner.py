@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import structlog
+from fastapi import HTTPException
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
@@ -25,6 +26,7 @@ from app.database.models import (
     SystemSettings,
     utc_now,
 )
+from app.services import error_reporter
 from app.services.operations import executors as executor_registry
 from app.services.operations.events import (
     broadcast_operation_progress,
@@ -228,6 +230,26 @@ class OperationContext:
         if self._log_handle is not None:
             self._log_handle.close()
             self._log_handle = None
+
+
+def _report_failed_operation(op: Operation, failure: Optional[Exception]) -> None:
+    # never lets the report touch the run's outcome
+    try:
+        expected_refusal = (
+            isinstance(failure, HTTPException) and 400 <= failure.status_code < 500
+        )
+        if failure is not None and not expected_refusal:
+            error_reporter.report_exception(failure, kind="job", component=op.kind)
+        else:
+            error_reporter.report_failure(
+                kind="job",
+                type_=f"{op.kind}_failed",
+                message=op.error_message or "",
+                component=op.kind,
+                handled=True,
+            )
+    except Exception:
+        pass
 
 
 class OperationRunner:
@@ -617,6 +639,8 @@ class OperationRunner:
             if not written or op is None:
                 continue
             recorded += 1
+            if op.status == "failed":
+                _report_failed_operation(op, None)
             logger.warning(
                 "Recorded an operation outcome after its terminal commit failed",
                 operation_id=operation_id,
@@ -729,6 +753,30 @@ class OperationRunner:
         op.progress_total = None
         op.progress_message = None
 
+    def _lanes_held(self, db: Session) -> set[int]:
+        """The repositories whose exclusive operation still has its task
+        here, whatever its row says: an executor can work on after its row
+        reads terminal (an agent backup's post-backup hooks, which the agent
+        transport ends the row before, #1386), and no other exclusive
+        operation starts under it."""
+        ids = [
+            operation_id
+            for operation_id, task in self.running_tasks.items()
+            if not (asyncio.isfuture(task) and task.done())
+        ]
+        if not ids:
+            return set()
+        rows = (
+            db.query(Operation.repository_id, Operation.kind)
+            .filter(Operation.id.in_(ids))
+            .all()
+        )
+        return {
+            repository_id
+            for repository_id, kind in rows
+            if repository_id is not None and is_exclusive(kind)
+        }
+
     async def tick(self) -> int:
         dispatched = 0
         db: Session = self._session()
@@ -760,6 +808,7 @@ class OperationRunner:
                 .all()
             )
             now = time.time()
+            lanes_held = self._lanes_held(db) if queued else set()
             for op in queued:
                 if self._stopped:
                     # a stop during this tick's awaits; the drain after it
@@ -786,6 +835,8 @@ class OperationRunner:
                         continue
                 if self._get_executor(op.kind) is None:
                     await self._skip(db, op, "executor_unavailable")
+                    continue
+                if is_exclusive(op.kind) and op.repository_id in lanes_held:
                     continue
                 if not can_start(db, op, system_settings):
                     continue
@@ -816,6 +867,8 @@ class OperationRunner:
                         claimed_at=op.started_at,
                     )
                 )
+                if is_exclusive(op.kind) and op.repository_id is not None:
+                    lanes_held.add(op.repository_id)
                 dispatched += 1
         finally:
             db.close()
@@ -867,6 +920,7 @@ class OperationRunner:
             ctx = OperationContext(self, db, op)
             outcome: Optional[Outcome]
             busy_error: Optional[str] = None
+            failure: Optional[Exception] = None
             try:
                 outcome = await executor(ctx)
             except asyncio.CancelledError:
@@ -888,6 +942,7 @@ class OperationRunner:
                     # cancelled path below with the admission's message
                     outcome = Outcome(error_message=busy_error)
                 else:
+                    failure = exc
                     logger.exception(
                         "Operation failed", operation_id=op.id, kind=op.kind
                     )
@@ -962,6 +1017,8 @@ class OperationRunner:
             terminal = self._terminal_of(op)
             db.commit()
             terminal_committed = True
+            if op.status == "failed":
+                _report_failed_operation(op, failure)
             await broadcast_operation_updated(op, db)
             if op.status in SUCCESS_STATUSES:
                 enqueue_followups(
@@ -1105,7 +1162,11 @@ class OperationRunner:
                 counts["kept"] += 1
             else:
                 op.status = "failed"
-                op.error_message = "interrupted by restart"
+                # after the lines a startup sweep wrote first, such as a
+                # backup's post-backup hooks still to run (#1429)
+                op.error_message = "\n".join(
+                    filter(None, ["interrupted by restart", op.error_message])
+                )
                 op.completed_at = utc_now()
                 counts["failed"] += 1
                 # Spec 7.6: a local repository gets the lock-break attempt the

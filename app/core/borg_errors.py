@@ -110,7 +110,7 @@ BORG_EXIT_CODES = {
 REPOSITORY_EXISTS_EXIT_CODE = 10
 
 # Both shipped versions raise Repository.AlreadyExists with the same text,
-# verified against borg 1.4.5 and 2.0.0b24: "A repository already exists at
+# verified against borg 1.4.5 and 2.0.0b25: "A repository already exists at
 # {}." Matched whole, one line at a time: borg prints other diagnostics
 # around it, and a bare "repository already exists" substring would also
 # accept an unrelated failure. Getting this wrong in the permissive
@@ -118,6 +118,41 @@ REPOSITORY_EXISTS_EXIT_CODE = 10
 # future borg failing this match (a visible error on an existing
 # repository) is the better way to be wrong.
 _REPOSITORY_EXISTS_LINE = _re.compile(r"a repository already exists at .+\.", _re.I)
+
+
+class RestoreRefused(Exception):
+    """A restore the repository's Borg will not run as asked. `detail` is
+    the translatable reason, shaped like an HTTP error detail."""
+
+    def __init__(self, detail: dict):
+        super().__init__(detail.get("key", "restore refused"))
+        self.detail = detail
+
+
+class ArchiveListingError(Exception):
+    """An expected Borg listing failure with bounded, secret-free diagnostics."""
+
+    def __init__(self, result: dict | None):
+        from app.utils.redaction import redact_secrets
+
+        result = result or {}
+        message = "listing archives failed"
+        if result.get("return_code") is not None:
+            message += f" (exit code {result['return_code']})"
+        reason = result.get("stderr") or result.get("error")
+        if reason:
+            # Redact before truncation: cutting a quoted secret first could
+            # leave part of its value outside the redactor's match.
+            diagnostic = redact_secrets(str(reason)).strip()
+            if len(diagnostic) > 2000:
+                # The last exception follows the frames; keeping only the
+                # start can turn a useful error into an unexplained traceback.
+                marker = "\n... [truncated] ...\n"
+                diagnostic = (
+                    diagnostic[:400] + marker + diagnostic[-(1600 - len(marker)) :]
+                )
+            message += f": {diagnostic}"
+        super().__init__(message)
 
 
 def is_repository_exists_failure(result: dict) -> bool:

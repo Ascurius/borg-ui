@@ -191,6 +191,65 @@ describe('WizardStepSecurity', () => {
     })
   })
 
+  describe('Borg 2', () => {
+    it('offers no unencrypted mode', async () => {
+      // Borg 2.0.0b25 removed it; the backend refuses `none` for Borg 2.
+      const user = userEvent.setup()
+
+      render(
+        <WizardStepSecurity
+          mode="create"
+          borgVersion={2}
+          data={{ ...defaultData, encryption: 'repokey-aes-ocb' }}
+          onChange={vi.fn()}
+        />
+      )
+
+      await user.click(screen.getByRole('combobox'))
+      const listbox = await screen.findByRole('listbox')
+
+      expect(within(listbox).getAllByRole('option')).toHaveLength(5)
+      expect(within(listbox).queryByText('None')).not.toBeInTheDocument()
+    })
+
+    it('offers authenticated and says that it does not encrypt', async () => {
+      const user = userEvent.setup()
+      const onChange = vi.fn()
+
+      render(
+        <WizardStepSecurity
+          mode="create"
+          borgVersion={2}
+          data={{ ...defaultData, encryption: 'repokey-aes-ocb' }}
+          onChange={onChange}
+        />
+      )
+
+      await user.click(screen.getByRole('combobox'))
+      const listbox = await screen.findByRole('listbox')
+      const option = within(listbox).getByRole('option', { name: /Authenticated/i })
+
+      expect(option).toHaveTextContent(
+        'Data is not encrypted; a key and passphrase protect it against tampering'
+      )
+      await user.click(option)
+      expect(onChange).toHaveBeenCalledWith({ encryption: 'authenticated' })
+    })
+
+    it('asks for a passphrase for authenticated', () => {
+      render(
+        <WizardStepSecurity
+          mode="create"
+          borgVersion={2}
+          data={{ ...defaultData, encryption: 'authenticated' }}
+          onChange={vi.fn()}
+        />
+      )
+
+      expect(screen.getByLabelText(/^Passphrase/i)).toBeRequired()
+    })
+  })
+
   describe('Remote Borg Path', () => {
     it('calls onChange when remote path is entered', async () => {
       const user = userEvent.setup()

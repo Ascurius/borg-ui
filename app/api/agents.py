@@ -18,11 +18,13 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
+from sqlalchemy import case
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 import structlog
 
+from app.core.borg_major import is_borg2
 from app.core.agent_auth import (
     AGENT_AUTH_HEADER,
     AGENT_TOKEN_PREFIX_LENGTH,
@@ -30,7 +32,7 @@ from app.core.agent_auth import (
     resolve_agent_from_token,
 )
 from app.core.agent_constants import DEFAULT_AGENT_POLL_INTERVAL_SECONDS
-from app.core.agent_versions import borg_pin_satisfied
+from app.core.agent_versions import borg_pin_satisfied, hello_lists_running_jobs
 from app.core.borg_errors import is_borg_warning_exit_code
 from app.core.security import get_password_hash, verify_password
 from app.database.database import get_db
@@ -47,7 +49,10 @@ from app.services.operations.backup_facade import (
     is_backup_operation,
 )
 from app.services.operations.job_facade import resolve_agent_maintenance_job
-from app.services.repository_executor import lock_failure_was_deferred
+from app.services.repository_executor import (
+    SCRIPT_AGENT_JOB_TYPE,
+    lock_failure_was_deferred,
+)
 from app.services.agent_artifact_relay import (
     CLOSE_ACK_TIMEOUT_SECONDS,
     agent_artifact_relay,
@@ -57,7 +62,9 @@ from app.services.agent_connection_manager import (
     agent_connection_manager,
 )
 from app.services.agent_job_dispatcher import (
+    agent_job_attempt,
     agent_job_kind as live_agent_job_kind,
+    dispatch_agent_cancel_if_connected,
     dispatch_agent_job_best_effort,
 )
 from app.services.agent_job_notifications import (
@@ -77,6 +84,7 @@ from app.services.maintenance_state import apply_compact_stats
 from app.services.operations.followups import (
     enqueue_backup_followups,
 )
+from app.services.operations.vocab import TERMINAL_STATUSES
 from app.utils.datetime_utils import serialize_datetime, utc_now
 
 logger = structlog.get_logger()
@@ -103,16 +111,19 @@ FINAL_AGENT_JOB_STATUSES = {
 # claim→start gap is real work in progress, not a dropped delivery, so a job
 # only requeues once it has sat idle longer than this.
 #
-# At hello it is not needed for the case it was originally sized for. A
-# session agent that just said hello cannot have a delivery in flight that
-# predates its own hello — so an undelivered claimed job (started_at NULL)
-# the agent does not list in running_job_ids is requeued regardless of age
-# on that path. This window still applies to every other job seen at hello
-# (running jobs, and claimed jobs still reported as running). Without this
-# split, a reconnect inside the window found the stranded job "too fresh"
-# and had no further chance to recover it until the next disconnect or the
-# reaper — session heartbeats are WS messages that never call this function,
-# so hello was the only opportunity.
+# At hello the window does not apply. A session agent that just said hello
+# cannot have a delivery in flight that predates its own hello, and its
+# running_job_ids lists every job its process still runs — so a job it does
+# not list is running nowhere: undelivered (started_at NULL), started by a
+# process that has since restarted, or asked to cancel. Each is recovered
+# regardless of age on that path. Without this, a reconnect inside the
+# window found the stranded job "too fresh" and had no further chance to
+# recover it until the next disconnect or the reaper — session heartbeats
+# are WS messages that never call this function, so hello was the only
+# opportunity. The hello of an agent older than HELLO_LISTS_RUNNING_JOBS_SINCE
+# cannot be taken at its word, so for it only undelivered and cancel-requested
+# jobs skip the window, as they did before. The same holds while another session
+# of the agent is still connected: its process may run the job.
 #
 # Two minutes gives a polling agent room to reclaim its own work well before
 # the reaper acts. It is safe to be this short because the requeue already
@@ -286,7 +297,8 @@ class AgentJobStartRequest(BaseModel):
 
 
 class AgentJobProgressRequest(BaseModel):
-    progress_percent: Optional[float] = None
+    # infinity or NaN cannot be stored or served as a percentage
+    progress_percent: Optional[float] = Field(default=None, allow_inf_nan=False)
     current_file: Optional[str] = None
     original_size: Optional[int] = None
     compressed_size: Optional[int] = None
@@ -302,11 +314,15 @@ class AgentJobLogRequest(BaseModel):
     stream: str = "stdout"
     message: str
     created_at: Optional[datetime] = None
+    # The run the line belongs to, as dispatched (agent 0.1.21 on).
+    attempt: Optional[StrictInt] = None
 
 
 class AgentJobLogResponse(BaseModel):
     accepted: bool
     duplicate: bool = False
+    # Set when the line was from an earlier run of the job and dropped.
+    superseded: Optional[bool] = None
 
 
 class AgentJobCompleteRequest(BaseModel):
@@ -322,6 +338,8 @@ class AgentJobFailRequest(BaseModel):
     # (`lock_contention` or `other`); see `agent_failure_result`.
     stderr_tail: Optional[str] = None
     failure_kind: Optional[str] = None
+    # `repository.delete_archives`: the archives deleted before it failed.
+    deleted_archives: Optional[StrictInt] = None
 
 
 class AgentJobCanceledRequest(BaseModel):
@@ -421,6 +439,15 @@ REQUEST_SCOPED_REPOSITORY_JOB_KINDS = frozenset(
         # channel; once it stopped waiting, a rerun streams a whole diff
         # into the drain for nobody and holds the repository meanwhile.
         "repository.diff",
+        # The restore preview's dry run and the keyfile download answer
+        # the request that queued them, as the reads above.
+        "repository.restore_dry_run",
+        "repository.key_export",
+        # A wipe's deletes: a rerun would start over at archives the first
+        # run deleted, fail on the first of them and report none deleted.
+        # Failed instead, the wipe that waits reads an unknown count as a
+        # partial wipe.
+        "repository.delete_archives",
     }
 )
 
@@ -504,13 +531,91 @@ def _cancel_if_requested_meanwhile(
     _cancel_agent_job(job, db, completed_at=completed_at)
 
 
+# The agent numbers every run's log lines from 0, and a known
+# (agent_job_id, sequence) is a duplicate on both log paths. The rows that
+# stand in for a requeued job's earlier output sit before the next run's.
+REQUEUED_JOB_LOG_SEQUENCE = -1
+REQUEUED_JOB_LOG_MESSAGE = (
+    "The agent stopped running this job before it finished, so it was "
+    "queued again. The lines below are from the new attempt."
+)
+
+
+def _kept_prune_lines(job: AgentJob, db: Session) -> list[tuple[Any, ...]]:
+    """The lines in which a prune reported an archive removed, as
+    (stream, message, created_at, received_at) per row that has any.
+
+    Borg 1 commits a prune at checkpoints too, so archives a stopped run
+    named may be gone, and the next run will not name them again. The
+    completion marks the backup jobs of the archives the stored log names."""
+    payload = job.payload if isinstance(job.payload, dict) else {}
+    if payload.get("job_kind") != "repository.prune":
+        return []
+    from app.services.job_history_retention import archive_names_from_prune_output
+
+    kept = []
+    for row in (
+        db.query(AgentJobLog)
+        .filter(AgentJobLog.agent_job_id == job.id)
+        .order_by(AgentJobLog.sequence.asc(), AgentJobLog.id.asc())
+    ):
+        lines = [
+            line
+            for line in row.message.splitlines()
+            if archive_names_from_prune_output(line)
+        ]
+        if lines:
+            kept.append((row.stream, "\n".join(lines), row.created_at, row.received_at))
+    return kept
+
+
+def _reset_requeued_agent_job_log(job: AgentJob, db: Session, *, now: datetime) -> None:
+    """Drop the stored lines of a run that will not report, so the next run's
+    lines are not taken for duplicates of them (#1378).
+
+    Its transcript would also be read as the next run's: the operation log is
+    collected from these rows at completion, and compact takes statistics
+    from it. A prune's lines naming removed archives stay, ahead of a note
+    that the job was queued again. A job that logged nothing gets no note."""
+    kept = _kept_prune_lines(job, db)
+    removed = (
+        db.query(AgentJobLog)
+        .filter(AgentJobLog.agent_job_id == job.id)
+        .delete(synchronize_session=False)
+    )
+    if not removed:
+        return
+    for offset, (stream, message, created_at, received_at) in enumerate(kept):
+        db.add(
+            AgentJobLog(
+                agent_job_id=job.id,
+                sequence=REQUEUED_JOB_LOG_SEQUENCE - len(kept) + offset,
+                stream=stream,
+                message=message,
+                created_at=created_at,
+                received_at=received_at,
+            )
+        )
+    db.add(
+        AgentJobLog(
+            agent_job_id=job.id,
+            sequence=REQUEUED_JOB_LOG_SEQUENCE,
+            stream="stdout",
+            message=REQUEUED_JOB_LOG_MESSAGE,
+            created_at=now,
+            received_at=now,
+        )
+    )
+
+
 def _requeue_stale_agent_jobs(
     db: Session,
     current_agent: AgentMachine,
     *,
     now: datetime,
     running_job_ids: list[int],
-    ignore_age_for_undelivered: bool = False,
+    at_hello: bool = False,
+    running_job_ids_complete: bool = False,
 ) -> None:
     running_ids = set(running_job_ids)
     stale_cutoff = now - STALE_AGENT_JOB_REQUEUE_AFTER
@@ -527,11 +632,14 @@ def _requeue_stale_agent_jobs(
             continue
 
         undelivered = job.status == "claimed" and job.started_at is None
-        # A hello's running_job_ids is authoritative for a job the agent was
-        # asked to cancel too: absent from it, the cancel is done, and the
-        # row must not hold the repository until the reaper.
-        skip_age_check = ignore_age_for_undelivered and (
-            undelivered or job.status == "cancel_requested"
+        # A complete hello's running_job_ids is authoritative: a job absent
+        # from it is running nowhere, however recently it was claimed or
+        # started, and must not hold the repository until the reaper. A hello
+        # from an agent too old to list its jobs always carries an empty
+        # list, so there only an undelivered job and a cancel request skip
+        # the window, as before.
+        skip_age_check = at_hello and (
+            running_job_ids_complete or undelivered or job.status == "cancel_requested"
         )
         if not skip_age_check and _job_activity_at(job) > stale_cutoff:
             continue
@@ -566,7 +674,7 @@ def _requeue_stale_agent_jobs(
                     db,
                     completed_at=now,
                     stale_cutoff=stale_cutoff,
-                    ignore_age=ignore_age_for_undelivered,
+                    ignore_age=at_hello,
                 )
             continue
 
@@ -585,10 +693,11 @@ def _requeue_stale_agent_jobs(
                 db,
                 completed_at=now,
                 stale_cutoff=stale_cutoff,
-                ignore_age=ignore_age_for_undelivered,
+                ignore_age=at_hello,
             )
             continue
 
+        _reset_requeued_agent_job_log(job, db, now=now)
         backup_job = _get_linked_backup_job(job, db)
         if backup_job and not _is_terminal_backup_status(backup_job.status):
             backup_job.status = "pending"
@@ -646,7 +755,7 @@ def _compact_stats(
     `--stats` but reported nothing: its last lines and its completion travel
     on different paths, so the tail may still be in flight, and then this
     compact records no statistics, which is logged."""
-    if repository.borg_version != 2:
+    if not is_borg2(repository):
         return None
     result = agent_job.result if isinstance(agent_job.result, dict) else {}
     stats = _reported_compact_stats(result.get("stats"))
@@ -744,9 +853,16 @@ def _is_factor(value) -> bool:
     )
 
 
+def _is_finite_number(value) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
 def _sync_backup_progress(agent_job: AgentJob, backup_job) -> None:
     for field_name in (
-        "progress_percent",
         "current_file",
         "original_size",
         "compressed_size",
@@ -757,7 +873,47 @@ def _sync_backup_progress(agent_job: AgentJob, backup_job) -> None:
         "estimated_time_remaining",
     ):
         setattr(backup_job, field_name, getattr(agent_job, field_name))
-    backup_job.progress = int(agent_job.progress_percent or 0)
+    # borg create reports no proportion, so a backup has a percentage only
+    # against a source total; without one, a percentage the agent reported
+    # belongs to a step inside create (the cache sync), not to the backup.
+    backup_job.progress_percent = (
+        agent_job.progress_percent if agent_job.total_expected_size else None
+    )
+
+
+def _sync_running_backup_progress(agent_job: AgentJob, backup_job) -> None:
+    """A progress report on a backup: `running` and the figures, unless the
+    operation already carries a verdict, as for the maintenance jobs
+    (`_sync_repository_operation_progress`, #1366). The backup executor
+    reads the operation once the agent job is final and fails a backup it
+    finds `running` with "backup returned no result" (#1404)."""
+    if backup_job.operation.status in TERMINAL_STATUSES:
+        return
+    backup_job.status = "running"
+    _sync_backup_progress(agent_job, backup_job)
+
+
+def _claim_progress_write(job: AgentJob, db: Session) -> bool:
+    """Guarded write, ahead of every other write of a progress report. The
+    outcome travels apart from the report (REST /complete, recorded in a
+    worker thread with its own session), so it may have been committed since
+    this handler loaded the job. As in `_claim_terminal_transition`, the
+    WHERE guard decides on the row, not on this copy: a job that is final by
+    now keeps its outcome, the final archive counters included, and the
+    report writes nothing. A job still active stays locked until the report
+    commits, so a completion recorded meanwhile lands after it (#1404)."""
+    claimed = (
+        db.query(AgentJob)
+        .filter(
+            AgentJob.id == job.id,
+            AgentJob.status.notin_(FINAL_AGENT_JOB_STATUSES),
+        )
+        .update({AgentJob.updated_at: _now_utc()}, synchronize_session=False)
+    )
+    if not claimed:
+        db.expire(job)
+        return False
+    return True
 
 
 def _finish_linked_backup_job(
@@ -847,6 +1003,13 @@ def _maintenance_kind(operation_job: Any) -> Optional[str]:
 def _sync_repository_operation_progress(agent_job: AgentJob, db: Session) -> None:
     operation_job = _get_repository_operation_job(agent_job, db)
     if not operation_job:
+        return
+    # The completion is recorded in a worker thread with its own session
+    # (`_record_job_completion`), and the agent's last frames often arrive
+    # while it runs. A report that read the job as active before that commit
+    # can read the operation after it: the operation already carries the
+    # verdict, and `running` would reopen it (#1366).
+    if operation_job.operation.status in TERMINAL_STATUSES:
         return
     if getattr(operation_job, "started_at", None) is None:
         operation_job.started_at = agent_job.started_at or _now_utc()
@@ -1049,6 +1212,34 @@ def _mark_agent_job_started(
     requeued job that reconnects does not notify again)."""
     if job.status in FINAL_AGENT_JOB_STATUSES:
         return None
+    # Guarded write, ahead of every other write: the outcome travels apart
+    # from this report (REST /complete, recorded in a worker thread with its
+    # own session), so it may have been committed since this handler loaded
+    # the job. As in _claim_terminal_transition, the WHERE guard decides on
+    # the row, not on this copy: a job that is final by now stays final and
+    # this report writes nothing else, and a cancel request committed
+    # meanwhile is kept. The job row is locked before the linked operation's,
+    # the order the completion takes as well.
+    moved = (
+        db.query(AgentJob)
+        .filter(
+            AgentJob.id == job.id,
+            AgentJob.status.notin_(FINAL_AGENT_JOB_STATUSES),
+        )
+        .update(
+            {
+                AgentJob.status: case(
+                    (AgentJob.status == "cancel_requested", AgentJob.status),
+                    else_="running",
+                )
+            },
+            synchronize_session=False,
+        )
+    )
+    if not moved:
+        db.expire(job)
+        return None
+    db.expire(job, ["status"])
     now = _now_utc()
     if job.claimed_at is None:
         job.claimed_at = now
@@ -1068,8 +1259,6 @@ def _mark_agent_job_started(
         .update({AgentJob.start_notified_at: started}, synchronize_session=False)
     )
     db.expire(job, ["start_notified_at"])
-    if job.status != "cancel_requested":
-        job.status = "running"
     newly_started_backup_job = None
     backup_job = _get_linked_backup_job(job, db)
     if backup_job:
@@ -1088,6 +1277,12 @@ def _apply_agent_job_progress(
 ) -> None:
     if job.status in FINAL_AGENT_JOB_STATUSES:
         return
+    if not _claim_progress_write(job, db):
+        return
+    percent = progress.get("progress_percent")
+    if percent is not None and not _is_finite_number(percent):
+        # infinity or NaN cannot be stored or served as a percentage
+        progress = {k: v for k, v in progress.items() if k != "progress_percent"}
     for field_name, value in progress.items():
         if hasattr(job, field_name):
             setattr(job, field_name, value)
@@ -1096,8 +1291,7 @@ def _apply_agent_job_progress(
         job.progress = progress
     backup_job = _get_linked_backup_job(job, db)
     if backup_job:
-        backup_job.status = "running"
-        _sync_backup_progress(job, backup_job)
+        _sync_running_backup_progress(job, backup_job)
     else:
         _sync_repository_operation_progress(job, db)
     job.updated_at = _now_utc()
@@ -1134,6 +1328,32 @@ def _append_agent_job_log(
     )
     job.updated_at = _now_utc()
     return True
+
+
+def _is_superseded_attempt(job: AgentJob, attempt: Any) -> bool:
+    """Whether a line the agent sent for `attempt` is from a run of the job
+    that has been given up: the job was requeued (and maybe dispatched
+    again) since. The agent numbers every run's lines from 0, so such a line
+    would be stored as the current run's and push that run's own line out as
+    a duplicate (#1383). A line without an attempt (an agent before 0.1.21)
+    is taken as before."""
+    if not isinstance(attempt, int) or isinstance(attempt, bool):
+        return False
+    return agent_job_attempt(job) != attempt
+
+
+def _reported_running_job_ids(message: dict[str, Any]) -> Optional[list[int]]:
+    """The running_job_ids of a session heartbeat (agent 0.1.21 on), or None
+    when the heartbeat has none or a malformed one: such a list proves
+    nothing about what the process runs."""
+    running = message.get("running_job_ids")
+    if not isinstance(running, list):
+        return None
+    if not all(
+        isinstance(job_id, int) and not isinstance(job_id, bool) for job_id in running
+    ):
+        return None
+    return running
 
 
 def _claim_terminal_transition(
@@ -1188,8 +1408,17 @@ def _complete_agent_job(
             error_message=f"agent reported a malformed return code: {return_code!r}",
             completed_at=completed_at,
         )
-    warning = is_borg_warning_exit_code(return_code)
-    if isinstance(return_code, int) and return_code != 0 and not warning:
+    # A script's return code is the hook's, not Borg's: the job completes
+    # with the report intact (stdout/stderr included) and the hook caller
+    # reads the code by the agent-script contract (0 / 1 warning / >1).
+    borg_exit_code = job.job_type != SCRIPT_AGENT_JOB_TYPE
+    warning = borg_exit_code and is_borg_warning_exit_code(return_code)
+    if (
+        borg_exit_code
+        and isinstance(return_code, int)
+        and return_code != 0
+        and not warning
+    ):
         # A completion report carrying an explicit borg *error* code is a
         # failure, no matter which transport delivered it - the server is
         # authoritative over the classification.
@@ -1261,6 +1490,7 @@ def _fail_agent_job(
     completed_at: Optional[datetime] = None,
     stderr_tail: Optional[str] = None,
     failure_kind: Optional[str] = None,
+    deleted_archives: Optional[int] = None,
 ) -> bool:
     """Returns True when this report moved the job into a terminal state."""
     from app.services.repository_executor import (
@@ -1273,7 +1503,10 @@ def _fail_agent_job(
         return False
     completed = _normalize_agent_timestamp(completed_at)
     result = agent_failure_result(
-        return_code, stderr_tail=stderr_tail, failure_kind=failure_kind
+        return_code,
+        stderr_tail=stderr_tail,
+        failure_kind=failure_kind,
+        deleted_archives=deleted_archives,
     )
     # Decided once, here, and kept in the result: the row's deferral count
     # moves on with the runner, so a later reader (a late log line) must
@@ -1419,6 +1652,43 @@ async def _dispatch_queued_agent_jobs(
         await dispatch_agent_job_best_effort(db, job, source=source)
 
 
+def _cancel_requested_running_jobs(
+    db: Session, agent_machine_id: int, running_job_ids: Optional[list[int]]
+) -> list[AgentJob]:
+    """The jobs the agent says it runs that someone asked to stop: their
+    cancel is still owed to the agent."""
+    if not running_job_ids:
+        return []
+    return (
+        db.query(AgentJob)
+        .filter(
+            AgentJob.agent_machine_id == agent_machine_id,
+            AgentJob.status == "cancel_requested",
+            AgentJob.id.in_(running_job_ids),
+        )
+        .order_by(AgentJob.id.asc())
+        .all()
+    )
+
+
+async def _dispatch_owed_agent_cancels(
+    db: Session,
+    connection: AgentConnection,
+    running_job_ids: Optional[list[int]],
+) -> None:
+    """Send the session agent the cancel of every job it runs that someone
+    asked to stop. The cancel is sent once when it is asked for, and goes
+    nowhere while the session is down; the REST heartbeat repeats it in
+    `cancel_job_ids`, and this is the session's counterpart. A cancel the
+    agent already has is a no-op there. The list is `connection`'s, so the
+    pass stops once a newer session replaces it."""
+    agent_machine_id = connection.agent_machine_id
+    for job in _cancel_requested_running_jobs(db, agent_machine_id, running_job_ids):
+        if agent_connection_manager.get(agent_machine_id) is not connection:
+            return
+        await dispatch_agent_cancel_if_connected(job)
+
+
 def _load_session_job(
     db: Session, agent_machine_id: int, job_id: Any
 ) -> Optional[AgentJob]:
@@ -1442,6 +1712,8 @@ async def _handle_agent_session_message(
     db: Session,
     agent_machine_id: int,
     message: dict[str, Any],
+    *,
+    connection: Optional[AgentConnection] = None,
 ) -> None:
     message_type = str(message.get("type") or "")
     command_id = str(message.get("command_id") or "")
@@ -1460,6 +1732,35 @@ async def _handle_agent_session_message(
             synchronize_session=False,
         )
         db.commit()
+        # From agent 0.1.21 the heartbeat lists the jobs the process runs,
+        # and a started job that has left the list is settled as on the REST
+        # heartbeat, inside the same window, instead of by the reaper; a job
+        # on the list counts as active. Only
+        # the agent's current session speaks for it: a session its newer
+        # connection replaced belongs to another process.
+        running_job_ids = _reported_running_job_ids(message)
+        if (
+            running_job_ids is not None
+            and connection is not None
+            and agent_connection_manager.get(agent_machine_id) is connection
+        ):
+            current_agent = db.get(AgentMachine, agent_machine_id)
+            if current_agent is not None:
+                _requeue_stale_agent_jobs(
+                    db, current_agent, now=now, running_job_ids=running_job_ids
+                )
+                if running_job_ids:
+                    # A listed job is not orphaned, however silent: a hook
+                    # that prints nothing, or an outcome the agent keeps
+                    # while its report does not get through. The reaper
+                    # must not fail it meanwhile.
+                    db.query(AgentJob).filter(
+                        AgentJob.agent_machine_id == agent_machine_id,
+                        AgentJob.id.in_(running_job_ids),
+                        AgentJob.status.in_(("claimed", "running", "cancel_requested")),
+                    ).update({AgentJob.updated_at: now}, synchronize_session=False)
+                db.commit()
+                await _dispatch_owed_agent_cancels(db, connection, running_job_ids)
         # The agent is idle and listening: a job left queued past the grace
         # has no other sender in this process before the next reconnect.
         await _dispatch_queued_agent_jobs(
@@ -1525,7 +1826,11 @@ async def _handle_agent_session_message(
             command_id=command_id or None,
             job_id=_parse_int(job_id, default=0) or None,
         )
-        if job:
+        if job and _is_superseded_attempt(job, message.get("attempt")):
+            # End the read's transaction: the session would hold its
+            # connection until the next message otherwise.
+            db.rollback()
+        elif job:
             agent_job_id = job.id
             job_payload = job.payload
             appended = _append_agent_job_log(
@@ -1594,6 +1899,7 @@ async def _handle_agent_session_message(
         if job:
             stderr_tail = error_payload.get("stderr_tail")
             failure_kind = error_payload.get("failure_kind")
+            deleted_archives = error_payload.get("deleted_archives")
             transitioned = _fail_agent_job(
                 job,
                 db,
@@ -1602,6 +1908,11 @@ async def _handle_agent_session_message(
                 completed_at=_parse_optional_datetime(message.get("completed_at")),
                 stderr_tail=stderr_tail if isinstance(stderr_tail, str) else None,
                 failure_kind=failure_kind if isinstance(failure_kind, str) else None,
+                deleted_archives=(
+                    deleted_archives
+                    if type(deleted_archives) is int  # not a bool
+                    else None
+                ),
             )
             db.commit()
             if transitioned:
@@ -1736,20 +2047,14 @@ async def heartbeat(
     )
     db.commit()
 
-    cancel_job_ids = (
-        db.query(AgentJob.id)
-        .filter(
-            AgentJob.agent_machine_id == current_agent.id,
-            AgentJob.status == "cancel_requested",
-            AgentJob.id.in_(payload.running_job_ids or [0]),
-        )
-        .all()
+    cancel_jobs = _cancel_requested_running_jobs(
+        db, current_agent.id, payload.running_job_ids
     )
 
     return AgentHeartbeatResponse(
         server_time=now,
         poll_interval_seconds=DEFAULT_AGENT_POLL_INTERVAL_SECONDS,
-        cancel_job_ids=[row[0] for row in cancel_job_ids],
+        cancel_job_ids=[job.id for job in cancel_jobs],
     )
 
 
@@ -1804,7 +2109,17 @@ async def session(websocket: WebSocket, db: Session = Depends(get_db)):
             current_agent,
             now=now,
             running_job_ids=hello.running_job_ids,
-            ignore_age_for_undelivered=True,
+            at_hello=True,
+            # Judged on this hello alone: a version kept from an earlier
+            # report, or a list the hello left out, proves nothing about
+            # what this process runs. Nor does the list speak for another
+            # process while that one still holds a session for this agent,
+            # as during a rollout that starts the new one first.
+            running_job_ids_complete=(
+                "running_job_ids" in hello.model_fields_set
+                and hello_lists_running_jobs(hello.agent_version)
+                and not agent_connection_manager.is_connected(current_agent.id)
+            ),
         )
         db.commit()
 
@@ -1821,12 +2136,16 @@ async def session(websocket: WebSocket, db: Session = Depends(get_db)):
                 "server_time": serialize_datetime(_now_utc()),
             }
         )
+        # A job cancelled while the session was down still runs on the agent.
+        await _dispatch_owed_agent_cancels(db, connection, hello.running_job_ids)
         await _dispatch_queued_agent_jobs(db, current_agent.id)
 
         while True:
             message = await websocket.receive_json()
             if isinstance(message, dict):
-                await _handle_agent_session_message(db, current_agent.id, message)
+                await _handle_agent_session_message(
+                    db, current_agent.id, message, connection=connection
+                )
     except WebSocketDisconnect:
         pass
     finally:
@@ -1949,6 +2268,9 @@ async def update_job_progress(
 ):
     job = _get_agent_job(job_id, current_agent, db)
     _reject_final_job(job)
+    if not _claim_progress_write(job, db):
+        db.commit()
+        return AgentJobStatusResponse(id=job.id, status=job.status)
 
     progress = payload.model_dump(exclude_none=True)
     for field_name, value in progress.items():
@@ -1958,8 +2280,7 @@ async def update_job_progress(
         job.progress = progress
     backup_job = _get_linked_backup_job(job, db)
     if backup_job:
-        backup_job.status = "running"
-        _sync_backup_progress(job, backup_job)
+        _sync_running_backup_progress(job, backup_job)
     else:
         _sync_repository_operation_progress(job, db)
     job.updated_at = _now_utc()
@@ -1968,7 +2289,11 @@ async def update_job_progress(
     return AgentJobStatusResponse(id=job.id, status=job.status)
 
 
-@router.post("/jobs/{job_id}/logs", response_model=AgentJobLogResponse)
+@router.post(
+    "/jobs/{job_id}/logs",
+    response_model=AgentJobLogResponse,
+    response_model_exclude_none=True,
+)
 def upload_job_log(
     job_id: int,
     payload: AgentJobLogRequest,
@@ -1976,6 +2301,9 @@ def upload_job_log(
     db: Session = Depends(get_db),
 ):
     job = _get_agent_job(job_id, current_agent, db)
+    if _is_superseded_attempt(job, payload.attempt):
+        # Acknowledged, so the agent does not send it again.
+        return AgentJobLogResponse(accepted=True, superseded=True)
     existing_log = (
         db.query(AgentJobLog)
         .filter(
@@ -2182,6 +2510,7 @@ def _record_job_failure(
             completed_at=payload.completed_at,
             stderr_tail=payload.stderr_tail,
             failure_kind=payload.failure_kind,
+            deleted_archives=payload.deleted_archives,
         )
         db.commit()
         return transitioned, job.status

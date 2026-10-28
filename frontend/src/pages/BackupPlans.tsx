@@ -10,6 +10,7 @@ import { isAxiosError } from 'axios'
 import RepositoryWizard from '../components/RepositoryWizard'
 import { type PruneSettings } from '../components/PruneSettingsInput'
 import WizardDialog from '../components/shared/WizardDialog'
+import { useWizardFunnel } from '../hooks/useWizardFunnel'
 import LogViewerDialog from '../components/LogViewerDialog'
 import FileExplorerDialog from '../components/FileExplorerDialog'
 import { type BackupPlanRunLogJob } from '../components/BackupPlanRunsPanel'
@@ -46,7 +47,12 @@ import {
   type LegacySourceRepositoryReview,
 } from './backup-plans/legacySourceSettings'
 import { BackupPlanHistoryDialog } from './backup-plans/PlanRunComponents'
-import { parseRepositoryFilterId, processBackupPlans } from './backup-plans/helpers'
+import {
+  backupPlanRunAnalytics,
+  parseRepositoryFilterId,
+  processBackupPlans,
+} from './backup-plans/helpers'
+import { useTrackedJobOutcomes } from '../hooks/useTrackedJobOutcomes'
 import { buildRoutePreviews } from './backup-plans/routePreview'
 import { formatRunStatus, isActiveRun } from './backup-plans/runStatus'
 import {
@@ -103,7 +109,6 @@ export default function BackupPlans() {
   const quickStart = useQuickStart()
   const canUseMultiRepository = can('backup_plan_multi_repository')
   const canUseMixedSourceTypes = can('backup_plan_mixed_sources')
-  const canUseManagedAgents = can('managed_agents')
   const canUseDatabaseDiscovery = can('database_discovery')
   const canUseContainerBackups = can('container_backups')
   const canUseRclone = can('rclone')
@@ -191,6 +196,18 @@ export default function BackupPlans() {
     refetchInterval: 2000,
   })
   const backupPlanRuns: BackupPlanRun[] = useMemo(() => runsData?.data?.runs || [], [runsData])
+  // Outcomes of runs seen finishing while this page is open: the plan path is
+  // where first backups now run, Quick Start's included.
+  useTrackedJobOutcomes<BackupPlanRun>({
+    jobs: backupPlanRuns,
+    onTerminal: useCallback(
+      (run: BackupPlanRun) => {
+        const [action, props] = backupPlanRunAnalytics(run)
+        track(EventCategory.BACKUP, action, props)
+      },
+      [track, EventCategory]
+    ),
+  })
   const canRetryBackupPlanRun = (run: BackupPlanRun) =>
     canRetryBackupPlanRunForPermissions(run, (repositoryId) =>
       permissions.canDo(repositoryId, 'backup')
@@ -253,7 +270,6 @@ export default function BackupPlans() {
   const { data: agentMachinesData } = useQuery({
     queryKey: ['managed-agents'],
     queryFn: managedAgentsAPI.listAgents,
-    enabled: canUseManagedAgents,
   })
   const agentMachines: AgentMachineResponse[] = useMemo(
     () => agentMachinesData?.data || [],
@@ -695,8 +711,6 @@ export default function BackupPlans() {
         wizardState.name.trim() &&
         wizardState.sourceDirectories.length > 0 &&
         (wizardState.sourceType !== 'remote' || wizardState.sourceSshConnectionId) &&
-        (canUseManagedAgents ||
-          !sourceLocations.some((location) => location.source_type === 'agent')) &&
         (canUseMixedSourceTypes || sourceTypes.size <= 1)
       )
     }
@@ -761,18 +775,6 @@ export default function BackupPlans() {
     }
     const sourceLocations = wizardState.sourceLocations || []
     if (
-      !canUseManagedAgents &&
-      sourceLocations.some((location) => location.source_type === 'agent')
-    ) {
-      toast.error(t('backupPlans.sourceChooser.managedAgentRequiresPro'))
-      trackFeatureBlocked('managed_agents', {
-        surface: BACKUP_PLANS_ANALYTICS_SECTION,
-        operation: 'submit_plan',
-        usage: 'backup_plan_source',
-      })
-      return
-    }
-    if (
       !canUseMixedSourceTypes &&
       new Set(sourceLocations.map((location) => location.source_type)).size > 1
     ) {
@@ -828,7 +830,6 @@ export default function BackupPlans() {
       loadingScripts={loadingScripts}
       canUseMultiRepository={canUseMultiRepository}
       canUseBorg2={canUseBorg2}
-      canUseManagedAgents={canUseManagedAgents}
       canUseMixedSourceTypes={canUseMixedSourceTypes}
       canUseDatabaseDiscovery={canUseDatabaseDiscovery}
       canUseContainerBackups={canUseContainerBackups}
@@ -890,6 +891,17 @@ export default function BackupPlans() {
     [t]
   )
 
+  const wizardFunnel = useWizardFunnel({
+    category: EventCategory.WIZARD,
+    open: wizardOpen,
+    step: stepDefinitions[activeStep]?.key ?? null,
+    props: { wizard: 'backup_plan', mode: editingPlan ? 'edit' : 'create' },
+  })
+  const cancelWizard = () => {
+    wizardFunnel.cancel()
+    setWizardOpen(false)
+  }
+
   return (
     <Box>
       <BackupPlansContent
@@ -910,7 +922,6 @@ export default function BackupPlans() {
         startingPlanId={startingPlanId}
         highlightedPlanId={highlightedPlanId}
         canUseMultiRepository={canUseMultiRepository}
-        canUseManagedAgents={canUseManagedAgents}
         canUseDatabaseDiscovery={canUseDatabaseDiscovery}
         canUseContainerBackups={canUseContainerBackups}
         cancellingRunId={cancellingRunId}
@@ -939,7 +950,7 @@ export default function BackupPlans() {
         open={wizardOpen}
         onClose={() => {
           setLegacySourceReviewOpen(false)
-          setWizardOpen(false)
+          cancelWizard()
         }}
         title={
           editingPlan ? t('backupPlans.wizard.editTitle') : t('backupPlans.wizard.createTitle')
@@ -950,7 +961,7 @@ export default function BackupPlans() {
         stepContentSx={{ minHeight: { xs: 'auto', md: 520 } }}
         footer={
           <DialogActions>
-            <Button onClick={() => setWizardOpen(false)} disabled={isSubmitting}>
+            <Button onClick={cancelWizard} disabled={isSubmitting}>
               {t('common.buttons.cancel')}
             </Button>
             <Button
@@ -1000,7 +1011,6 @@ export default function BackupPlans() {
         open={repositoryWizardOpen}
         onClose={() => setRepositoryWizardOpen(false)}
         mode="create"
-        canUseManagedAgents={canUseManagedAgents}
         canUseRclone={canUseRclone}
         onSubmit={async (data) => {
           await repositoryCreateMutation.mutateAsync(data)

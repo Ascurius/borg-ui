@@ -1,6 +1,8 @@
 from unittest.mock import AsyncMock, Mock, patch
+from types import SimpleNamespace
 
 import asyncio
+import hashlib
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,6 +15,7 @@ from app.database.models import (
     SystemSettings,
     User,
 )
+from app.services.licensing_service import get_or_create_licensing_state
 
 
 def _set_plan(test_db, plan: str) -> None:
@@ -567,10 +570,11 @@ class TestSettingsUserContracts:
         assert profile["enterprise_name"] == "Acme Inc"
 
     def test_get_preferences_returns_user_analytics_flags(
-        self, test_client: TestClient, admin_headers, admin_user
+        self, test_client: TestClient, admin_headers, admin_user, test_db
     ):
         admin_user.analytics_enabled = False
         admin_user.analytics_consent_given = True
+        instance_id = get_or_create_licensing_state(test_db).instance_id
 
         response = test_client.get("/api/settings/preferences", headers=admin_headers)
 
@@ -580,8 +584,54 @@ class TestSettingsUserContracts:
             "preferences": {
                 "analytics_enabled": False,
                 "analytics_consent_given": True,
+                "analytics_instance_key": hashlib.sha256(
+                    instance_id.encode()
+                ).hexdigest(),
+                "analytics_user_key": hashlib.sha256(
+                    f"{instance_id}:{admin_user.id}".encode()
+                ).hexdigest(),
             },
         }
+
+    @pytest.mark.parametrize("instance_id", [None, "", "   "])
+    def test_preferences_remain_available_without_an_analytics_instance_id(
+        self,
+        test_client: TestClient,
+        admin_headers,
+        admin_user,
+        monkeypatch,
+        instance_id,
+    ):
+        admin_user.analytics_enabled = False
+        admin_user.analytics_consent_given = True
+        # Reproduce the missing identity returned on the affected installation.
+        # Keep the real route and hashing helper; replace only licensing lookup.
+        monkeypatch.setattr(
+            "app.services.analytics_identity.get_or_create_licensing_state",
+            lambda db: SimpleNamespace(instance_id=instance_id),
+        )
+
+        response = test_client.get("/api/settings/preferences", headers=admin_headers)
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "preferences": {
+                "analytics_enabled": False,
+                "analytics_consent_given": True,
+                "analytics_instance_key": None,
+                "analytics_user_key": None,
+            },
+        }
+
+    def test_preferences_analytics_keys_never_expose_the_instance_id(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        instance_id = get_or_create_licensing_state(test_db).instance_id
+
+        body = test_client.get("/api/settings/preferences", headers=admin_headers).text
+
+        assert instance_id not in body
 
     def test_update_preferences_persists_analytics_flags(
         self, test_client: TestClient, admin_headers, admin_user, test_db

@@ -4,6 +4,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from agent.borg_ui_agent import __version__
@@ -39,11 +40,16 @@ DEFAULT_CAPABILITIES = [
     "repository.archive_info",
     "repository.list_archives",
     "repository.delete_archive",
+    "repository.delete_archives",
     "repository.break_lock",
     "repository.list_archive_contents",
     "repository.extract_archive_file",
     "repository.export_archive_tar",
     "repository.restore",
+    "repository.restore_dry_run",
+    "repository.key_export",
+    # reads a restore's target.existing_files (0.1.17)
+    "repository.restore.existing_files",
     "repository.check",
     "repository.prune",
     "repository.compact",
@@ -69,11 +75,14 @@ JOB_HANDLERS = {
     "repository.archive_info": execute_repository_operation_job,
     "repository.list_archives": execute_repository_operation_job,
     "repository.delete_archive": execute_repository_operation_job,
+    "repository.delete_archives": execute_repository_operation_job,
     "repository.break_lock": execute_repository_operation_job,
     "repository.list_archive_contents": execute_repository_operation_job,
     "repository.extract_archive_file": execute_repository_operation_job,
     "repository.export_archive_tar": execute_repository_operation_job,
     "repository.restore": execute_repository_operation_job,
+    "repository.restore_dry_run": execute_repository_operation_job,
+    "repository.key_export": execute_repository_operation_job,
     "repository.check": execute_repository_operation_job,
     "repository.prune": execute_repository_operation_job,
     "repository.compact": execute_repository_operation_job,
@@ -115,9 +124,17 @@ def get_job_handler(job_kind: str):
 
 
 class AgentRuntime:
-    def __init__(self, config: AgentConfig, client: Optional[AgentClient] = None):
+    def __init__(
+        self,
+        config: AgentConfig,
+        client: Optional[AgentClient] = None,
+        *,
+        children_dir: Optional[Path] = None,
+    ):
         self.config = config
         self.client = client or AgentClient.from_config(config)
+        # Where the session records the children it starts (see children).
+        self.children_dir = children_dir
 
     def heartbeat(self, *, running_job_ids: Optional[list[int]] = None) -> dict:
         machine = detect_platform()
@@ -175,7 +192,7 @@ class AgentRuntime:
         from agent.borg_ui_agent.session import AgentSessionRuntime
 
         _ = poll_interval_seconds
-        AgentSessionRuntime(self.config).run_forever(
+        AgentSessionRuntime(self.config, children_dir=self.children_dir).run_forever(
             max_iterations=max_iterations,
             initial_backoff_seconds=initial_backoff_seconds,
             max_backoff_seconds=max_backoff_seconds,

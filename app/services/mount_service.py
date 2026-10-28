@@ -9,6 +9,7 @@ Provides unified mount management for:
 import asyncio
 import functools
 import os
+import posixpath
 import subprocess
 import tempfile
 import uuid
@@ -26,8 +27,10 @@ import structlog
 import base64
 from cryptography.fernet import Fernet
 
+from app.core.borg_major import borg_major, is_borg2
 from app.utils.ssh_host_validation import ssh_destination
 from app.config import settings
+from app.services.process_cancel import communicate_or_kill
 from app.core.borg_router import BorgRouter
 from app.utils.borg_env import (
     effective_repository_remote_path,
@@ -193,29 +196,6 @@ def _sshfs_volume_stripped_candidate(remote_path: str) -> Optional[str]:
     return stripped if stripped != remote_path else None
 
 
-async def _communicate_or_kill(
-    process: asyncio.subprocess.Process,
-    *,
-    timeout: float,
-    input: Optional[bytes] = None,
-) -> Tuple[bytes, bytes]:
-    """`communicate` with a deadline that also ends the child.
-
-    `wait_for` only cancels the wait: a hung ssh or sftp would otherwise
-    outlive the check that started it, on a timeout as on a cancellation.
-    """
-    try:
-        return await asyncio.wait_for(process.communicate(input=input), timeout)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        if process.returncode is None:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            await asyncio.shield(process.wait())
-        raise
-
-
 def _sftp_quote(path: str) -> str:
     """Escape a path for an sftp batch command.
 
@@ -255,6 +235,31 @@ class MountInfo:
     process_pid: Optional[int] = (
         None  # PID of borg mount process (for foreground mounts)
     )
+
+
+class MountPointNotAllowed(ValueError):
+    """A mount point outside the area the caller may mount into."""
+
+
+def _local_mirror(remote_path: str) -> str:
+    """``remote_path`` as a path relative to an SSHFS staging root. A path with
+    a ".." segment is normalised, so the directory built from it cannot leave
+    the root; any other path keeps its spelling, "/./" included, which Borg
+    reads as the start of the archived path."""
+    relative = (remote_path or "").lstrip("/").rstrip("/")
+    if ".." in relative.split("/"):
+        relative = posixpath.normpath("/" + relative).lstrip("/")
+    return relative
+
+
+def _staging_dir(temp_root: str, relative: str) -> str:
+    if not relative:
+        return temp_root
+    target = os.path.normpath(os.path.join(temp_root, relative))
+    root = os.path.realpath(temp_root)
+    if os.path.commonpath([root, os.path.realpath(target)]) != root:
+        raise ValueError("SSHFS mount directory would leave its staging root")
+    return target
 
 
 class MountService:
@@ -575,9 +580,9 @@ class MountService:
             temp_root = tempfile.mkdtemp(prefix=f"sshfs_mount_{job_id or 'user'}_")
 
             # Strip leading slash from remote_path to create relative path under temp_root
-            relative_remote_path = remote_path.lstrip("/")
+            relative_remote_path = _local_mirror(remote_path)
             if relative_remote_path:
-                mount_dir = os.path.join(temp_root, relative_remote_path)
+                mount_dir = _staging_dir(temp_root, relative_remote_path)
                 os.makedirs(mount_dir, exist_ok=True)
             else:
                 # Backing up root directory - mount directly to temp_root
@@ -764,30 +769,30 @@ class MountService:
                         parent_dir = os.path.dirname(remote_path)
                         mount_remote_path = parent_dir if parent_dir else "/"
 
-                        relative_parent = parent_dir.lstrip("/")
+                        relative_parent = _local_mirror(parent_dir)
                         if relative_parent:
-                            mount_dir = os.path.join(temp_root, relative_parent)
+                            mount_dir = _staging_dir(temp_root, relative_parent)
                             os.makedirs(mount_dir, exist_ok=True)
                         else:
                             # File in root directory
                             mount_dir = temp_root
 
                         # Relative path for backup is the full file path
-                        relative_path = remote_path.lstrip("/").rstrip("/")
+                        relative_path = _local_mirror(remote_path)
                     else:
                         # For directories: mount the directory itself
                         mount_remote_path = remote_path
 
-                        relative_remote_path = remote_path.lstrip("/")
+                        relative_remote_path = _local_mirror(remote_path)
                         if relative_remote_path:
-                            mount_dir = os.path.join(temp_root, relative_remote_path)
+                            mount_dir = _staging_dir(temp_root, relative_remote_path)
                             os.makedirs(mount_dir, exist_ok=True)
                         else:
                             # Backing up root directory - mount directly to temp_root
                             mount_dir = temp_root
 
                         # Compute relative path for backup command
-                        relative_path = remote_path.lstrip("/").rstrip("/")
+                        relative_path = relative_remote_path
                         if not relative_path:
                             relative_path = "."
 
@@ -1007,6 +1012,7 @@ class MountService:
         archive_name: Optional[str] = None,
         mount_point: Optional[str] = None,
         archive_id: Optional[str] = None,
+        confine_to_mount_base: bool = False,
     ) -> Tuple[str, str]:
         """
         Mount a Borg repository or specific archive for browsing
@@ -1015,6 +1021,9 @@ class MountService:
             repository_id: Repository ID to mount
             archive_name: Optional specific archive name (None = mount entire repo)
             mount_point: Optional custom mount point (must be validated)
+            confine_to_mount_base: Keep the mount point, absolute or
+                relative, inside the managed mount directory (non-admin
+                callers)
             archive_id: Borg 2 archive id for series disambiguation - archives
                 in a series share one name and only the id addresses exactly
                 one of them
@@ -1048,10 +1057,15 @@ class MountService:
                 # If mount_point doesn't start with /, it's just a name - prepend /data/mounts/
                 if not mount_point.startswith("/"):
                     mount_point = str(self.mount_base_dir / mount_point)
+                    if confine_to_mount_base:
+                        self._require_below_mount_base(mount_point)
                 else:
                     mount_point = os.path.normpath(mount_point)
-                    # Absolute path provided - validate it
-                    self._validate_mount_point(mount_point)
+                    if confine_to_mount_base:
+                        self._require_below_mount_base(mount_point)
+                    else:
+                        # Absolute path provided - validate it
+                        self._validate_mount_point(mount_point)
 
                 # Reuse empty directories, but never displace an existing mount (or
                 # obscure user data) at an explicit target. Match the auto-path
@@ -1066,6 +1080,8 @@ class MountService:
                         pass
                     else:
                         mount_point = f"{mount_point}_{uuid.uuid4().hex[:8]}"
+                        if confine_to_mount_base:
+                            self._require_below_mount_base(mount_point)
                         os.makedirs(mount_point, exist_ok=True)
                 else:
                     os.makedirs(mount_point, exist_ok=True)
@@ -1080,6 +1096,7 @@ class MountService:
                 # If path exists, append unique suffix
                 if os.path.exists(mount_point):
                     mount_point = f"{mount_point}_{uuid.uuid4().hex[:8]}"
+                self._require_below_mount_base(mount_point)
                 os.makedirs(mount_point, exist_ok=True)
 
             mount_id = str(uuid.uuid4())
@@ -1139,14 +1156,18 @@ class MountService:
                 # repository. The human-readable name stays on mount point,
                 # source label and logs.
                 archive_selector = archive_name
-                if archive_id and (repository.borg_version or 1) == 2:
+                if archive_id and is_borg2(repository):
                     archive_selector = f"aid:{archive_id}"
 
-                cmd = BorgRouter(repository).build_mount_command(
+                router = BorgRouter(repository)
+                remote_path = effective_repository_remote_path(repository, db)
+                env.update(router.remote_path_env(remote_path))
+                router.prepare_env(env)
+                cmd = router.build_mount_command(
                     repository_path=repository.path,
                     archive_name=archive_selector,
                     mount_point=mount_point,
-                    remote_path=effective_repository_remote_path(repository, db),
+                    remote_path=remote_path,
                     bypass_lock=repository.bypass_lock,
                 )
 
@@ -1268,7 +1289,7 @@ class MountService:
                     created_at=datetime.now(timezone.utc),
                     temp_key_file=temp_key_file,
                     repository_id=repository_id,
-                    borg_version=repository.borg_version or 1,
+                    borg_version=borg_major(repository),
                     process_pid=process.pid,  # Store PID for cleanup
                 )
 
@@ -1372,7 +1393,7 @@ class MountService:
             elif mount_info.mount_type == MountType.BORG_ARCHIVE:
                 success = await self._unmount_borg(
                     mount_info.mount_point,
-                    borg_version=mount_info.borg_version or 1,
+                    borg_version=borg_major(mount_info),
                     force=force,
                 )
             else:
@@ -1548,7 +1569,7 @@ class MountService:
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
 
-            stdout, stderr = await _communicate_or_kill(process, timeout=10)
+            stdout, stderr = await communicate_or_kill(process, timeout=10)
 
             # A shell that ran the check prints exactly one of the two words.
             # Anything else is an SFTP-only account (or a login banner / forced
@@ -1629,7 +1650,7 @@ class MountService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await _communicate_or_kill(
+        _, stderr = await communicate_or_kill(
             process, timeout=15, input=f"{command}\n".encode()
         )
         if process.returncode not in (0, 1):
@@ -2059,6 +2080,20 @@ class MountService:
                     key_file=temp_key_file,
                     error=str(e),
                 )
+
+    def _require_below_mount_base(self, path: str) -> None:
+        """Refuse a mount point that is not strictly below the managed mount
+        directory, also through symlinks. Strictly below, because an occupied
+        target is replaced by a sibling, which must stay inside as well."""
+        base = os.path.realpath(str(self.mount_base_dir))
+        try:
+            resolved = os.path.realpath(path)
+        except ValueError as exc:  # an embedded NUL byte
+            raise MountPointNotAllowed("Mount point is not a valid path") from exc
+        if resolved == base or not resolved.startswith(base.rstrip("/") + "/"):
+            raise MountPointNotAllowed(
+                "Mount point must be inside the managed mount directory"
+            )
 
     def _validate_mount_point(self, path: str):
         """

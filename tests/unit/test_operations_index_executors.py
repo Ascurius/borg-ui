@@ -514,7 +514,7 @@ async def test_run_archive_sync_skips_missing_repository(db, repo):
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_run_stats_writes_total_size(db, repo, monkeypatch):
-    """stats persists the measured size with its source and Borg's
+    """stats persists the measured size with its source and Borg 1's
     last_modified (#934)."""
     monkeypatch.setattr(
         index_exec, "_prepare_repository_borg_env", lambda repository, db: ({}, None)
@@ -526,7 +526,7 @@ async def test_run_stats_writes_total_size(db, repo, monkeypatch):
             return_value=SizeResult(
                 bytes=2048,
                 objects=3,
-                source="borg2_index",
+                source="borg1_cache_stats",
                 last_modified=datetime(2026, 9, 6, 8, 57, 17),
             )
         ),
@@ -535,14 +535,14 @@ async def test_run_stats_writes_total_size(db, repo, monkeypatch):
     assert outcome.result == {
         "bytes": 2048,
         "objects": 3,
-        "source": "borg2_index",
+        "source": "borg1_cache_stats",
         "last_modified": "2026-09-06T08:57:17",
     }
     db.refresh(repo)
     assert repo.total_size == "2.00 KB"
     assert repo.total_size_bytes == 2048
     assert repo.total_size_measured_at is not None
-    assert repo.total_size_source == "borg2_index"
+    assert repo.total_size_source == "borg1_cache_stats"
     assert repo.borg_last_modified == datetime(2026, 9, 6, 8, 57, 17)
 
 
@@ -1089,6 +1089,52 @@ async def test_run_archive_sync_refuses_borg1_agent_listing_without_zone(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_archive_sync_reports_unreadable_saved_ssh_key_without_changing_archives(
+    db, repo, monkeypatch
+):
+    from app.database.models import SSHKey
+
+    key = SSHKey(name="saved-key", private_key="corrupt-saved-key")
+    db.add(key)
+    db.flush()
+    repo.path = "ssh://user@example.test/backup"
+    repo.repository_type = "ssh"
+    repo.ssh_key_id = key.id
+    repo.archive_count = 1
+    repo.last_backup = datetime(2026, 9, 2)
+    db.add(
+        Archive(
+            repository_id=repo.id,
+            borg_id="existing",
+            name="existing",
+            series="default",
+            start=datetime(2026, 9, 2),
+        )
+    )
+    db.commit()
+    monkeypatch.setattr(
+        index_exec.BorgRouter,
+        "list_archives_checked",
+        AsyncMock(
+            side_effect=AssertionError("Borg must not run with an unreadable key")
+        ),
+    )
+
+    outcome = await index_exec.run_archive_sync(_ctx(db, repo))
+
+    assert outcome.status == "failed"
+    assert "SSH" in outcome.error_message
+    assert "SECRET_KEY" in outcome.error_message
+    assert "re-import" in outcome.error_message
+    assert "corrupt-saved-key" not in outcome.error_message
+    db.refresh(repo)
+    assert repo.archive_count == 1
+    assert repo.last_backup == datetime(2026, 9, 2)
+    assert db.query(Archive).one().borg_id == "existing"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_run_archive_sync_fails_instead_of_wiping_on_failed_listing(
     db, repo, monkeypatch
 ):
@@ -1125,17 +1171,207 @@ async def test_run_archive_sync_fails_instead_of_wiping_on_failed_listing(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+@pytest.mark.parametrize("borg_version", [1, 2])
+@pytest.mark.parametrize(
+    "result, expected_reason",
+    [
+        (
+            {
+                "success": False,
+                "return_code": 73,
+                "stdout": "",
+                "stderr": "Failed to acquire lock BORG_PASSPHRASE=hunter2",
+            },
+            "Failed to acquire lock",
+        ),
+        (
+            {"success": False, "return_code": 2, "stdout": "", "stderr": ""},
+            "exit code 2",
+        ),
+        (
+            {
+                "success": False,
+                "return_code": 2,
+                "stdout": "",
+                "stderr": "Connection refused ssh://user:hunter2@host/repo "
+                + "x" * 4000,
+            },
+            "Connection refused",
+        ),
+    ],
+)
+async def test_archive_sync_preserves_server_listing_failure_reason_and_archives(
+    db, repo, monkeypatch, borg_version, result, expected_reason
+):
+    repo.borg_version = borg_version
+    repo.archive_count = 1
+    repo.last_backup = datetime(2026, 9, 2)
+    db.add(
+        Archive(
+            repository_id=repo.id,
+            borg_id="existing",
+            name="existing",
+            series="default",
+            start=datetime(2026, 9, 2),
+        )
+    )
+    db.commit()
+    borg_module = "app.core.borg.borg" if borg_version == 1 else "app.core.borg2.borg2"
+    monkeypatch.setattr(f"{borg_module}.list_archives", AsyncMock(return_value=result))
+    monkeypatch.setattr(
+        index_exec, "_prepare_repository_borg_env", lambda repository, db: ({}, None)
+    )
+
+    outcome = await index_exec.run_archive_sync(_ctx(db, repo))
+
+    assert outcome.status == "failed"
+    assert expected_reason in outcome.error_message
+    assert "hunter2" not in outcome.error_message
+    assert len(outcome.error_message) < 2100
+    db.refresh(repo)
+    assert repo.archive_count == 1
+    assert repo.last_backup == datetime(2026, 9, 2)
+    assert db.query(Archive).one().borg_id == "existing"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_archive_sync_preserves_agent_listing_failure_reason(
+    db, repo, monkeypatch
+):
+    _agent_for(db, repo, "repository.list_archives")
+    monkeypatch.setattr(
+        index_exec, "agent_timezone_for_repository", lambda db_, repository: "UTC"
+    )
+    monkeypatch.setattr(
+        index_exec, "_prepare_repository_borg_env", lambda repository, db: ({}, None)
+    )
+    monkeypatch.setattr(
+        "app.services.agent_job_dispatcher.dispatch_agent_job_best_effort",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "app.services.repository_executor.wait_for_agent_repository_operation_job",
+        AsyncMock(
+            return_value={
+                "success": False,
+                "return_code": 2,
+                "stdout": "",
+                "stderr": "Connection refused password=agent-secret",
+            }
+        ),
+    )
+
+    outcome = await index_exec.run_archive_sync(_ctx(db, repo))
+
+    assert outcome.status == "failed"
+    assert "Connection refused" in outcome.error_message
+    assert "agent-secret" not in outcome.error_message
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_status", ["failed", "canceled", "lock_contention"])
+async def test_archive_sync_handles_terminal_agent_listing_failure(
+    db, repo, monkeypatch, job_status
+):
+    from fastapi import HTTPException
+
+    from app.services.operations.runner import repository_busy
+
+    _agent_for(db, repo, "repository.list_archives")
+    repo.archive_count = 1
+    repo.last_backup = datetime(2026, 9, 2)
+    db.add(
+        Archive(
+            repository_id=repo.id,
+            borg_id="existing",
+            name="existing",
+            series="default",
+            start=datetime(2026, 9, 2),
+        )
+    )
+    db.commit()
+    monkeypatch.setattr(
+        index_exec, "agent_timezone_for_repository", lambda db_, repository: "UTC"
+    )
+    monkeypatch.setattr(
+        index_exec, "_prepare_repository_borg_env", lambda repository, db: ({}, None)
+    )
+
+    async def finish_job(db_, job, **kwargs):
+        # Complete the transport boundary; exercise the real database waiter
+        # so a failed agent job raises HTTP 502 instead of returning a result.
+        job.status = "failed" if job_status == "lock_contention" else job_status
+        job.error_message = "repository.list_archives exited with code 2"
+        job.result = {
+            "return_code": 2,
+            "stderr_tail": "Connection refused password=agent-secret",
+            "failure_kind": "lock_contention"
+            if job_status == "lock_contention"
+            else "other",
+        }
+        db_.commit()
+
+    monkeypatch.setattr(
+        "app.services.agent_job_dispatcher.dispatch_agent_job_best_effort", finish_job
+    )
+
+    if job_status == "failed":
+        outcome = await index_exec.run_archive_sync(_ctx(db, repo))
+        assert outcome.status == "failed"
+        assert "Connection refused" in outcome.error_message
+        assert "exit code 2" in outcome.error_message
+        assert "agent-secret" not in outcome.error_message
+    else:
+        with pytest.raises(HTTPException) as raised:
+            await index_exec.run_archive_sync(_ctx(db, repo))
+        assert raised.value.status_code == 502
+        assert repository_busy(raised.value) is (job_status == "lock_contention")
+
+    db.refresh(repo)
+    assert repo.archive_count == 1
+    assert repo.last_backup == datetime(2026, 9, 2)
+    assert db.query(Archive).one().borg_id == "existing"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_list_archives_for_repository_reports_borg_failure(db, repo, monkeypatch):
     class FailingRouter:
         def __init__(self, repository):
             pass
 
-        async def list_archives_checked(self, env=None):
+        async def list_archives_checked(
+            self, env=None, *, raise_on_error=False, bypass_lock=None
+        ):
             return False, []
 
     monkeypatch.setattr(index_exec, "BorgRouter", FailingRouter)
     ok, entries, zone = await index_exec.list_archives_for_repository(db, repo, {})
     assert ok is False and entries == [] and zone == "UTC"
+
+
+@pytest.mark.parametrize(
+    "global_bypass,repo_bypass,expected",
+    [(True, False, True), (False, True, True), (False, False, False)],
+)
+@pytest.mark.asyncio
+async def test_background_listing_resolves_global_and_repository_bypass(
+    db, repo, monkeypatch, global_bypass, repo_bypass, expected
+):
+    from app.core.borg import borg
+
+    db.query(SystemSettings).first().bypass_lock_on_list = global_bypass
+    repo.bypass_lock = repo_bypass
+    db.commit()
+    command = AsyncMock(return_value={"success": True, "stdout": '{"archives": []}'})
+    monkeypatch.setattr(borg, "_execute_command", command)
+
+    ok, entries, zone = await index_exec.list_archives_for_repository(db, repo, {})
+
+    assert ok and entries == [] and zone == "UTC"
+    assert ("--bypass-lock" in command.call_args.args[0]) is expected
 
 
 @pytest.mark.unit
@@ -1214,6 +1450,62 @@ async def test_fill_archive_info_stamps_stats_measured_at(db, repo, monkeypatch)
     db.refresh(row)
     assert row.deduplicated_size == 4
     assert row.stats_measured_at is not None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_fill_archive_info_keeps_the_added_size_borg2_info_lacks(
+    db, repo, monkeypatch
+):
+    """#1264: Borg 2's `info` reports no deduplicated_size; the figure the
+    archive got from its backup's `create --json` stays."""
+    repo.borg_version = 2
+    row = Archive(
+        repository_id=repo.id,
+        borg_id="bb22",
+        name="daily",
+        series="daily",
+        start=datetime(2026, 9, 2),
+        deduplicated_size=300743,
+    )
+    db.add(row)
+    db.commit()
+    monkeypatch.setattr(
+        index_exec,
+        "_server_archive_info",
+        AsyncMock(return_value={"success": True, "stdout": _agent_info_payload()}),
+    )
+
+    assert await index_exec.fill_archive_info(db, repo, [row], {}, limit=1) == 1
+    db.refresh(row)
+    assert row.nfiles == 7 and row.original_size == 20
+    assert row.deduplicated_size == 300743
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_fill_archive_info_clears_a_borg1_size_info_lacks(db, repo, monkeypatch):
+    """Borg 1's figure is relative to the archives that exist: a re-measure
+    without one must not leave the old figure as freshly measured."""
+    row = Archive(
+        repository_id=repo.id,
+        borg_id="aa11",
+        name="daily",
+        series="daily",
+        start=datetime(2026, 9, 2),
+        deduplicated_size=4,
+    )
+    db.add(row)
+    db.commit()
+    monkeypatch.setattr(
+        index_exec,
+        "_server_archive_info",
+        AsyncMock(return_value={"success": True, "stdout": _agent_info_payload()}),
+    )
+
+    assert await index_exec.fill_archive_info(db, repo, [row], {}, limit=1) == 1
+    db.refresh(row)
+    assert row.deduplicated_size is None
 
 
 @pytest.mark.unit
@@ -1872,7 +2164,6 @@ async def test_agent_listing_reports_the_timeout_when_the_cancel_fails(
 async def test_run_stats_persists_an_empty_borg2_index_but_not_failed_measurement(
     db, repo, monkeypatch, index_result
 ):
-    from app.core.borg2 import borg2
     from app.services import storage_usage
 
     repo.borg_version = 2
@@ -1885,7 +2176,6 @@ async def test_run_stats_persists_an_empty_borg2_index_but_not_failed_measuremen
     monkeypatch.setattr(
         index_exec, "_prepare_repository_borg_env", lambda repository, db: ({}, None)
     )
-    monkeypatch.setattr(borg2, "rinfo", AsyncMock(return_value={"success": False}))
     monkeypatch.setattr(
         storage_usage, "borg2_index_size", AsyncMock(return_value=index_result)
     )
@@ -1971,3 +2261,353 @@ def test_apply_listing_links_a_new_row_to_the_backup_that_made_it(db, repo):
     index_exec.apply_listing(db, repo, entries, timezone_name="UTC")
     db.commit()
     assert {a.borg_id: a.backup_operation_id for a in db.query(Archive).all()} == by_id
+
+
+def _seed_borg2_backup(db, repo, *, archive_id, deduplicated_size, day=2):
+    from tests.utils.operations import seed_job_operation
+
+    return seed_job_operation(
+        db,
+        "backup",
+        repository=repo.path,
+        status="completed",
+        started_at=datetime(2026, 9, day, 2, 0, 0),
+        completed_at=datetime(2026, 9, day, 2, 5, 0),
+        archive_name="daily",
+        archive_id=archive_id,
+        deduplicated_size=deduplicated_size,
+    )
+
+
+@pytest.mark.unit
+def test_apply_listing_takes_the_added_size_borg2_create_reported(db, repo):
+    """#1264: Borg 2 reports what an archive added only in `create --json`,
+    which the backup kept; the archive row gets it from the backup it is
+    linked to, since `info` never reports it."""
+    repo.borg_version = 2
+    db.commit()
+    _seed_borg2_backup(db, repo, archive_id="bb22", deduplicated_size=300743)
+
+    index_exec.apply_listing(
+        db,
+        repo,
+        [{"id": "bb22", "name": "daily", "time": "2026-09-02T02:00:09"}],
+        timezone_name="UTC",
+    )
+
+    assert db.query(Archive).one().deduplicated_size == 300743
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("archive_id", "deduplicated_size"),
+    [
+        # a backup that reported nothing keeps the column default: every
+        # created Borg 2 archive adds at least its own metadata, so 0 is
+        # "not reported", never a size
+        ("bb22", 0),
+        ("bb22", None),
+        # the backup made another archive of the series
+        ("cc33", 300743),
+    ],
+)
+def test_apply_listing_leaves_the_added_size_unknown(
+    db, repo, archive_id, deduplicated_size
+):
+    repo.borg_version = 2
+    db.commit()
+    _seed_borg2_backup(
+        db, repo, archive_id=archive_id, deduplicated_size=deduplicated_size
+    )
+
+    index_exec.apply_listing(
+        db,
+        repo,
+        [{"id": "bb22", "name": "daily", "time": "2026-09-02T02:00:09"}],
+        timezone_name="UTC",
+    )
+
+    assert db.query(Archive).one().deduplicated_size is None
+
+
+@pytest.mark.unit
+def test_apply_listing_fills_the_added_size_of_an_archive_listed_before(db, repo):
+    """An archive indexed before its backup's figure was taken over (listed
+    before this change, or before the backup completed) gets it on a later
+    listing."""
+    repo.borg_version = 2
+    db.commit()
+    backup = _seed_borg2_backup(db, repo, archive_id="bb22", deduplicated_size=300743)
+    db.add(
+        Archive(
+            repository_id=repo.id,
+            borg_id="bb22",
+            name="daily",
+            series="daily",
+            start=datetime(2026, 9, 2, 2, 0, 9),
+            backup_operation_id=backup.id,
+        )
+    )
+    db.commit()
+
+    index_exec.apply_listing(
+        db,
+        repo,
+        [{"id": "bb22", "name": "daily", "time": "2026-09-02T02:00:09"}],
+        timezone_name="UTC",
+    )
+
+    assert db.query(Archive).one().deduplicated_size == 300743
+
+
+@pytest.mark.unit
+def test_apply_listing_leaves_borg1_sizes_to_the_info_fill(db, repo):
+    """Borg 1 measures deduplicated_size against the archives that exist; a
+    figure from the backup would be stale once later archives share its
+    chunks."""
+    _seed_borg2_backup(db, repo, archive_id=None, deduplicated_size=300743)
+
+    index_exec.apply_listing(
+        db,
+        repo,
+        [{"id": "aa11", "name": "daily", "start": "2026-09-02T02:00:09"}],
+        timezone_name="UTC",
+    )
+
+    row = db.query(Archive).one()
+    assert row.backup_operation_id is not None
+    assert row.deduplicated_size is None
+
+
+@pytest.mark.unit
+def test_apply_listing_leaves_a_borg2_backup_without_archive_id_unlinked(db, repo):
+    """A Borg 2 series repeats names, so a Borg 2 archive is linked by the id
+    its backup recorded only (#1328); a backup that recorded none (made
+    before the id was kept) links no archive and gives no added size."""
+    repo.borg_version = 2
+    db.commit()
+    _seed_borg2_backup(db, repo, archive_id=None, deduplicated_size=708)
+
+    index_exec.apply_listing(
+        db,
+        repo,
+        [{"id": "bb22", "name": "daily", "time": "2026-09-02T02:00:09"}],
+        timezone_name="UTC",
+    )
+
+    row = db.query(Archive).one()
+    assert row.backup_operation_id is None
+    assert row.deduplicated_size is None
+
+
+POST_HOOKS_FAILED = json.dumps(
+    {
+        "key": "backend.errors.service.postBackupHooksFailed",
+        "params": {"failed": 1, "total": 1},
+    }
+)
+
+
+def _seed_backup(db, repo, *, status, archive_name="daily", day=2, **extra):
+    from tests.utils.operations import seed_job_operation
+
+    return seed_job_operation(
+        db,
+        "backup",
+        repository=repo.path,
+        status=status,
+        started_at=datetime(2026, 9, day, 2, 0, 0),
+        completed_at=datetime(2026, 9, day, 2, 5, 0),
+        archive_name=archive_name,
+        **extra,
+    )
+
+
+@pytest.mark.unit
+def test_apply_listing_links_the_archive_of_a_backup_whose_post_hook_failed(db, repo):
+    """#1328: `borg create` succeeded and a post-backup hook failed. The
+    archive exists although the backup ended failed, so it is linked to it
+    (Borg 1: no archive id, matched by name)."""
+    backup = _seed_backup(
+        db,
+        repo,
+        status="failed",
+        archive_name="nas-2026-09-02T02:00:00",
+        error_message=POST_HOOKS_FAILED,
+    )
+
+    index_exec.apply_listing(db, repo, [BORG1_ENTRY], timezone_name="UTC")
+
+    assert db.query(Archive).one().backup_operation_id == backup.id
+
+
+@pytest.mark.unit
+def test_apply_listing_links_a_failed_backup_by_the_archive_id_it_recorded(db, repo):
+    """#1328: a Borg 2 backup that recorded the id `create --json` reported
+    made that archive, whatever failed after it."""
+    repo.borg_version = 2
+    db.commit()
+    backup = _seed_backup(
+        db,
+        repo,
+        status="failed",
+        archive_id="bb22",
+        error_message="stats refresh failed",
+    )
+
+    index_exec.apply_listing(
+        db,
+        repo,
+        [{"id": "bb22", "name": "daily", "time": "2026-09-02T02:00:09"}],
+        timezone_name="UTC",
+    )
+
+    assert db.query(Archive).one().backup_operation_id == backup.id
+
+
+@pytest.mark.unit
+def test_apply_listing_never_links_a_backup_whose_create_failed(db, repo):
+    """A retry repeats the name of a backup whose `borg create` failed and
+    wrote nothing; the archive belongs to the completed one."""
+    completed = _seed_backup(
+        db, repo, status="completed", archive_name=BORG1_ENTRY["name"], day=1
+    )
+    _seed_backup(
+        db,
+        repo,
+        status="failed",
+        archive_name=BORG1_ENTRY["name"],
+        error_message="borg create failed",
+    )
+
+    # nearer the failed backup's start than the completed one's
+    index_exec.apply_listing(db, repo, [BORG1_ENTRY], timezone_name="UTC")
+
+    assert db.query(Archive).one().backup_operation_id == completed.id
+
+
+@pytest.mark.unit
+def test_apply_listing_links_an_archive_listed_before_its_backup_ended(db, repo):
+    """#1328: a row stored while its backup still ran (or before this link
+    existed) is linked by a later listing."""
+    repo.borg_version = 2
+    db.commit()
+    index_exec.apply_listing(
+        db,
+        repo,
+        [{"id": "bb22", "name": "daily", "time": "2026-09-02T02:00:09"}],
+        timezone_name="UTC",
+    )
+    assert db.query(Archive).one().backup_operation_id is None
+    backup = _seed_backup(
+        db,
+        repo,
+        status="failed",
+        archive_id="bb22",
+        error_message=POST_HOOKS_FAILED,
+    )
+
+    index_exec.apply_listing(
+        db,
+        repo,
+        [{"id": "bb22", "name": "daily", "time": "2026-09-02T02:00:09"}],
+        timezone_name="UTC",
+    )
+
+    assert db.query(Archive).one().backup_operation_id == backup.id
+
+
+@pytest.mark.unit
+def test_apply_listing_links_borg2_archives_by_archive_id_only(db, repo):
+    """A backup that recorded an archive id made that archive and no other,
+    however near another archive of the series started; a Borg 2 backup
+    without one is never matched by the series name."""
+    repo.borg_version = 2
+    db.commit()
+    first = _seed_backup(db, repo, status="completed", archive_id="aa11", day=1)
+    second = _seed_backup(db, repo, status="completed", archive_id="bb22", day=2)
+    _seed_backup(db, repo, status="completed", day=3)
+
+    index_exec.apply_listing(
+        db,
+        repo,
+        [
+            # each started nearest another backup than its own
+            {"id": "bb22", "name": "daily", "time": "2026-09-01T02:00:09"},
+            {"id": "aa11", "name": "daily", "time": "2026-09-02T02:00:09"},
+            {"id": "cc33", "name": "daily", "time": "2026-09-03T02:00:10"},
+        ],
+        timezone_name="UTC",
+    )
+
+    by_id = {a.borg_id: a.backup_operation_id for a in db.query(Archive).all()}
+    assert by_id == {"aa11": first.id, "bb22": second.id, "cc33": None}
+
+
+@pytest.mark.unit
+def test_apply_listing_links_more_unlinked_rows_than_one_query_chunk(db, repo):
+    from app.services.operations.backup_facade import IN_CHUNK
+
+    count = IN_CHUNK + 3
+    backups = [
+        _seed_backup(db, repo, status="completed", archive_name=f"nas-{n}")
+        for n in range(count)
+    ]
+
+    index_exec.apply_listing(
+        db,
+        repo,
+        [
+            {"id": f"id{n}", "name": f"nas-{n}", "start": "2026-09-02T02:00:09"}
+            for n in range(count)
+        ],
+        timezone_name="UTC",
+    )
+
+    by_name = {a.name: a.backup_operation_id for a in db.query(Archive).all()}
+    assert by_name == {f"nas-{n}": backups[n].id for n in range(count)}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "error_message",
+    ['{"key": []}', '{"key": {}}', "[1]", "not json", None],
+)
+def test_apply_listing_skips_a_failed_backup_with_another_error(
+    db, repo, error_message
+):
+    _seed_backup(
+        db,
+        repo,
+        status="failed",
+        archive_name="nas-2026-09-02T02:00:00",
+        error_message=error_message,
+    )
+
+    index_exec.apply_listing(db, repo, [BORG1_ENTRY], timezone_name="UTC")
+
+    assert db.query(Archive).one().backup_operation_id is None
+
+
+@pytest.mark.unit
+def test_apply_listing_links_a_borg1_archive_dated_before_its_backup(db, repo):
+    """`--timestamp` may date a Borg 1 archive before the run; its name is
+    unique in the repository, so the name alone matches it."""
+    backup = _seed_backup(
+        db, repo, status="completed", archive_name="nas-2026-09-02T02:00:00"
+    )
+
+    index_exec.apply_listing(
+        db,
+        repo,
+        [
+            {
+                **BORG1_ENTRY,
+                "start": "2026-08-30T02:00:00",
+                "time": "2026-08-30T02:00:00",
+            }
+        ],
+        timezone_name="UTC",
+    )
+
+    assert db.query(Archive).one().backup_operation_id == backup.id

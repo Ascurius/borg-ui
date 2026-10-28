@@ -24,6 +24,7 @@ from app.database.models import (
     Operation,
     BackupPlan,
     BackupPlanRepository,
+    BackupPlanRun,
     Repository,
     ScheduledJob,
     SSHConnection,
@@ -806,6 +807,15 @@ class TestDashboardCharts:
 class TestDashboardScheduleAndOverview:
     """Test the live dashboard schedule and overview contracts."""
 
+    def test_dashboard_schedule_without_jobs_returns_null_next_execution(
+        self, test_client: TestClient, admin_headers
+    ):
+        with patch("app.api.dashboard.get_scheduled_jobs", return_value=[]):
+            response = test_client.get("/api/dashboard/schedule", headers=admin_headers)
+
+        assert response.status_code == 200
+        assert response.json() == {"jobs": [], "next_execution": None}
+
     def test_dashboard_schedule_uses_scheduled_jobs_contract(
         self, test_client: TestClient, admin_headers
     ):
@@ -1583,6 +1593,158 @@ class TestDashboardOverviewAggregates:
         assert sum(total for _, total, _ in backups) == 3
         assert sum(failed for _, _, failed in backups) == 2
 
+    def test_unresolved_dispatch_failures_join_recent_failures(
+        self, test_client: TestClient, admin_headers, test_db
+    ):
+        now = datetime.now(timezone.utc)
+        other = _repository(test_db, "Other")
+        settled = BackupPlan(
+            name="Settled plan",
+            enabled=True,
+            source_directories='["/srv/settled"]',
+        )
+        open_plan = BackupPlan(
+            name="Open plan",
+            enabled=True,
+            source_directories='["/srv/open"]',
+        )
+        test_db.add_all([settled, open_plan])
+        test_db.commit()
+
+        def failed_dispatch(plan, hours_ago):
+            started = now - timedelta(hours=hours_ago)
+            test_db.add(
+                BackupPlanRun(
+                    backup_plan_id=plan.id,
+                    trigger="schedule",
+                    status="failed",
+                    error_message="Backup plan has no enabled repositories",
+                    started_at=started,
+                    completed_at=started,
+                    created_at=started,
+                )
+            )
+
+        failed_dispatch(settled, 5)
+        test_db.add(
+            BackupPlanRun(
+                backup_plan_id=settled.id,
+                trigger="schedule",
+                status="completed",
+                started_at=now - timedelta(hours=4),
+                completed_at=now - timedelta(hours=4),
+                created_at=now - timedelta(hours=4),
+            )
+        )
+        failed_dispatch(open_plan, 3)
+        failed_dispatch(open_plan, 2)
+        seed_job_operation(
+            test_db,
+            "backup",
+            repository_id=other.id,
+            repository_path=other.path,
+            status="failed",
+            started_at=now - timedelta(hours=1),
+            completed_at=now - timedelta(minutes=50),
+            error_message="backup failed",
+        )
+        test_db.commit()
+
+        data = _overview(test_client, admin_headers)
+
+        assert [
+            (item["type"], item["repository"], item["error"], item["message"])
+            for item in data["current_failures"]
+        ] == [
+            ("backup", "Other", "backup failed", "Backup failed"),
+            (
+                "backup_plan_run",
+                "Open plan",
+                "Backup plan has no enabled repositories",
+                "Backup plan failed",
+            ),
+            (
+                "backup_plan_run",
+                "Open plan",
+                "Backup plan has no enabled repositories",
+                "Backup plan failed",
+            ),
+        ]
+        assert data["activity_feed"] == data["current_failures"]
+
+    def test_unresolved_dispatch_failure_ignores_operations_the_feed_hides(
+        self, test_db
+    ):
+        from app.api.dashboard import unresolved_dispatch_failures
+
+        now = datetime.utcnow().replace(microsecond=0)
+        since = now - timedelta(days=14)
+        repo = _repository(test_db, "Linked")
+
+        def plan(name):
+            row = BackupPlan(
+                name=name,
+                enabled=True,
+                source_directories='["/srv/data"]',
+            )
+            test_db.add(row)
+            test_db.flush()
+            return row
+
+        def failed_run(owner, hours_ago):
+            started = now - timedelta(hours=hours_ago)
+            run = BackupPlanRun(
+                backup_plan_id=owner.id,
+                trigger="schedule",
+                status="failed",
+                error_message="Backup plan has no enabled repositories",
+                started_at=started,
+                completed_at=started,
+                created_at=started,
+            )
+            test_db.add(run)
+            test_db.flush()
+            return run
+
+        def failed_operation(kind, run, started):
+            test_db.add(
+                Operation(
+                    repository_id=repo.id,
+                    kind=kind,
+                    category="index" if kind == "archive_sync" else "backup",
+                    status="failed",
+                    trigger="plan",
+                    priority=0,
+                    run_id=f"{kind}-{run.id}",
+                    backup_plan_run_id=run.id,
+                    created_at=started,
+                    started_at=started,
+                    completed_at=started,
+                    error_message=f"{kind} failed",
+                )
+            )
+
+        follow_up = failed_run(plan("Follow-up only"), 3)
+        failed_operation("archive_sync", follow_up, follow_up.started_at)
+        stale = failed_run(plan("Stale operation"), 2)
+        failed_operation("backup", stale, now - timedelta(days=20))
+        covered = failed_run(plan("Covered by the feed"), 1)
+        failed_operation("backup", covered, covered.started_at)
+        test_db.commit()
+
+        failures = unresolved_dispatch_failures(test_db, since, now)
+
+        assert {item["repository"] for item in failures} == {
+            "Follow-up only",
+            "Stale operation",
+        }
+        assert all(item["type"] == "backup_plan_run" for item in failures)
+        assert all(item["status"] == "failed" for item in failures)
+        assert all(
+            item["error"] == "Backup plan has no enabled repositories"
+            for item in failures
+        )
+
     def test_a_run_dated_after_now_is_in_neither_panel(
         self, test_client: TestClient, admin_headers, test_db
     ):
@@ -1914,3 +2076,305 @@ class TestCpuSampler:
         with patch("app.api.dashboard._cpu_sampler") as sampler:
             sampler.read.return_value = 42.0
             assert get_system_metrics().cpu_usage == 42.0
+
+
+def test_authorization_overview_scopes_repository_data(
+    test_client, test_db, test_user, auth_headers, admin_headers
+):
+    from app.database.models import UserRepositoryPermission
+
+    visible = Repository(name="visible", path="/visible", archive_count=2)
+    hidden = Repository(name="hidden-secret", path="/hidden-secret", archive_count=13)
+    test_db.add_all([visible, hidden])
+    test_db.flush()
+    test_user.all_repositories_role = None
+    test_db.add(
+        UserRepositoryPermission(
+            user_id=test_user.id, repository_id=visible.id, role="viewer"
+        )
+    )
+    test_db.commit()
+    response = test_client.get("/api/dashboard/overview", headers=auth_headers)
+    assert response.status_code == 200
+    assert "hidden-secret" not in response.text
+    assert "visible" in response.text
+    assert (
+        "hidden-secret"
+        in test_client.get("/api/dashboard/overview", headers=admin_headers).text
+    )
+
+
+def test_authorization_status_scopes_jobs_before_limit(
+    test_client, test_db, test_user, auth_headers, admin_headers
+):
+    from app.database.models import UserRepositoryPermission
+
+    visible = Repository(name="visible-status", path="/visible-status")
+    hidden = Repository(name="hidden-status", path="/hidden-status")
+    test_db.add_all([visible, hidden])
+    test_db.flush()
+    test_user.all_repositories_role = None
+    test_db.add(
+        UserRepositoryPermission(
+            user_id=test_user.id, repository_id=visible.id, role="viewer"
+        )
+    )
+    now = datetime.utcnow()
+    seed_job_operation(
+        test_db,
+        "backup",
+        repository_id=visible.id,
+        repository=visible.path,
+        status="failed",
+        started_at=now - timedelta(hours=2),
+        error_message="visible-error",
+    )
+    seed_job_operation(
+        test_db,
+        "backup",
+        repository_id=None,
+        params={"repository": "/system-row"},
+        status="failed",
+        started_at=now - timedelta(hours=1),
+        error_message="system-error",
+    )
+    for index in range(12):
+        seed_job_operation(
+            test_db,
+            "backup",
+            repository_id=hidden.id,
+            repository=hidden.path,
+            status="failed",
+            started_at=now - timedelta(minutes=index),
+            error_message="hidden-error",
+        )
+    test_db.commit()
+    response = test_client.get("/api/dashboard/status", headers=auth_headers)
+    assert response.status_code == 200
+    assert {job["error_message"] for job in response.json()["recent_jobs"]} == {
+        "visible-error",
+        "system-error",
+    }
+    assert (
+        "hidden-error"
+        in test_client.get("/api/dashboard/status", headers=admin_headers).text
+    )
+    overview = test_client.get("/api/dashboard/overview", headers=auth_headers)
+    assert overview.status_code == 200
+    assert "hidden-error" not in overview.text
+    assert overview.json()["summary"]["failed_jobs_30d"] == 2
+
+
+def test_authorization_overview_hides_mixed_automations_keeps_system_rows(
+    test_client, test_db, test_user, auth_headers, admin_headers
+):
+    from app.database.models import UserRepositoryPermission, ScheduledJobRepository
+
+    visible = Repository(
+        name="allowed-automation-repo", path="/allowed-automation-repo", archive_count=2
+    )
+    hidden = Repository(
+        name="secret-automation-repo", path="/secret-automation-repo", archive_count=19
+    )
+    test_db.add_all([visible, hidden])
+    test_db.flush()
+    test_user.all_repositories_role = None
+    test_db.add(
+        UserRepositoryPermission(
+            user_id=test_user.id, repository_id=visible.id, role="viewer"
+        )
+    )
+    schedules = [
+        ScheduledJob(
+            name=name,
+            enabled=True,
+            cron_expression="0 * * * *",
+            next_run=datetime.utcnow() + timedelta(minutes=30),
+        )
+        for name in [
+            "visible-schedule",
+            "secret-schedule",
+            "mixed-secret-schedule",
+            "system-schedule",
+        ]
+    ]
+    plans = [
+        BackupPlan(name=name, enabled=True, source_directories='["/data"]')
+        for name in ["visible-plan", "secret-plan", "mixed-secret-plan", "system-plan"]
+    ]
+    test_db.add_all(schedules + plans)
+    test_db.flush()
+    for index, repo_ids in enumerate(
+        [[visible.id], [hidden.id], [visible.id, hidden.id]]
+    ):
+        for repo_id in repo_ids:
+            test_db.add(
+                ScheduledJobRepository(
+                    scheduled_job_id=schedules[index].id,
+                    repository_id=repo_id,
+                    execution_order=repo_id,
+                )
+            )
+            test_db.add(
+                BackupPlanRepository(
+                    backup_plan_id=plans[index].id,
+                    repository_id=repo_id,
+                    enabled=True,
+                    execution_order=repo_id,
+                )
+            )
+    test_db.commit()
+    response = test_client.get("/api/dashboard/overview", headers=auth_headers)
+    assert response.status_code == 200
+    data = response.json()
+    assert "secret" not in response.text
+    assert data["summary"]["total_repositories"] == 1
+    assert data["summary"]["total_schedules"] == 2
+    assert data["summary"]["active_schedules"] == 2
+    assert data["summary"]["total_backup_plans"] == 2
+    assert data["summary"]["active_backup_plans"] == 2
+    assert data["storage"]["total_archives"] == 2
+    assert {row["name"] for row in data["upcoming_tasks"]} == {
+        "visible-schedule",
+        "system-schedule",
+    }
+    assert {row["id"] for row in data["repository_health"]} == {visible.id}
+    admin = test_client.get("/api/dashboard/overview", headers=admin_headers).json()
+    assert admin["summary"]["total_schedules"] == 4
+    assert admin["summary"]["total_backup_plans"] == 4
+    assert admin["storage"]["total_archives"] == 21
+
+
+@pytest.mark.parametrize(
+    "repository_access, expected_viewer_errors",
+    [
+        ("hidden", set()),
+        ("mixed", set()),
+        ("visible", {"dispatch-failure-sentinel"}),
+    ],
+)
+def test_authorization_dispatch_failures_require_complete_plan_visibility(
+    test_client,
+    test_db,
+    test_user,
+    auth_headers,
+    admin_headers,
+    repository_access,
+    expected_viewer_errors,
+):
+    """A plan failure must not disclose a hidden or partly hidden plan."""
+    from app.database.models import UserRepositoryPermission
+
+    visible = Repository(name="dispatch-visible", path="/dispatch-visible")
+    hidden = Repository(name="dispatch-hidden", path="/dispatch-hidden")
+    plan = BackupPlan(name="dispatch-plan", source_directories='["/data"]')
+    test_db.add_all([visible, hidden, plan])
+    test_db.flush()
+    test_user.all_repositories_role = None
+    test_db.add(
+        UserRepositoryPermission(
+            user_id=test_user.id, repository_id=visible.id, role="viewer"
+        )
+    )
+    repositories = {
+        "hidden": [hidden],
+        "mixed": [visible, hidden],
+        "visible": [visible],
+    }[repository_access]
+    for index, repository in enumerate(repositories):
+        test_db.add(
+            BackupPlanRepository(
+                backup_plan_id=plan.id,
+                repository_id=repository.id,
+                enabled=True,
+                execution_order=index,
+            )
+        )
+    test_db.add(
+        BackupPlanRun(
+            backup_plan_id=plan.id,
+            trigger="scheduled",
+            status="failed",
+            started_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+            error_message="dispatch-failure-sentinel",
+        )
+    )
+    test_db.commit()
+
+    viewer = test_client.get("/api/dashboard/overview", headers=auth_headers)
+    assert viewer.status_code == 200
+    assert {row["error"] for row in viewer.json()["current_failures"]} == (
+        expected_viewer_errors
+    )
+    admin = test_client.get("/api/dashboard/overview", headers=admin_headers)
+    assert admin.status_code == 200
+    assert {row["error"] for row in admin.json()["current_failures"]} == {
+        "dispatch-failure-sentinel"
+    }
+
+
+def test_authorization_overview_scopes_failed_plan_dispatches(
+    test_client, test_db, test_user, auth_headers, admin_headers
+):
+    from app.database.models import UserRepositoryPermission
+
+    visible = Repository(name="dispatch-visible", path="/dispatch-visible")
+    hidden = Repository(name="dispatch-hidden", path="/dispatch-hidden")
+    test_db.add_all([visible, hidden])
+    test_db.flush()
+    test_user.all_repositories_role = None
+    test_db.add(
+        UserRepositoryPermission(
+            user_id=test_user.id, repository_id=visible.id, role="viewer"
+        )
+    )
+    plans = {
+        name: BackupPlan(name=name, enabled=True, source_directories='["/data"]')
+        for name in ["visible-dispatch", "secret-dispatch", "mixed-secret-dispatch"]
+    }
+    test_db.add_all(plans.values())
+    test_db.flush()
+    for plan, repo_ids in [
+        (plans["visible-dispatch"], [visible.id]),
+        (plans["secret-dispatch"], [hidden.id]),
+        (plans["mixed-secret-dispatch"], [visible.id, hidden.id]),
+    ]:
+        for repo_id in repo_ids:
+            test_db.add(
+                BackupPlanRepository(
+                    backup_plan_id=plan.id,
+                    repository_id=repo_id,
+                    enabled=True,
+                    execution_order=repo_id,
+                )
+            )
+    now = datetime.now(timezone.utc)
+    for index, plan in enumerate(plans.values()):
+        started = now - timedelta(hours=index + 1)
+        test_db.add(
+            BackupPlanRun(
+                backup_plan_id=plan.id,
+                trigger="schedule",
+                status="failed",
+                error_message=f"{plan.name} refused",
+                started_at=started,
+                completed_at=started,
+                created_at=started,
+            )
+        )
+    test_db.commit()
+
+    response = test_client.get("/api/dashboard/overview", headers=auth_headers)
+    assert response.status_code == 200
+    assert "secret" not in response.text
+    assert [
+        item["repository"]
+        for item in response.json()["current_failures"]
+        if item["type"] == "backup_plan_run"
+    ] == ["visible-dispatch"]
+    admin = test_client.get("/api/dashboard/overview", headers=admin_headers).json()
+    assert {
+        item["repository"]
+        for item in admin["current_failures"]
+        if item["type"] == "backup_plan_run"
+    } == set(plans)

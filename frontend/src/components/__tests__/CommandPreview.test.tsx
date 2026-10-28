@@ -118,14 +118,14 @@ describe('CommandPreview', () => {
         />
       )
 
-      // The combined mode name stays the component's input; Borg 2.0.0b22 split
-      // the emitted flags into cipher + key location (see borgUtils).
+      // The combined mode name stays the component's input; Borg 2 takes
+      // cipher + key location as separate flags (see borgUtils).
       expect(
         screen.getByText(
           /borg2 -r \/backups\/repo repo-create --encryption aes256-ocb --key-location repokey/
         )
       ).toBeInTheDocument()
-      expect(screen.getByText(/borg2 create/)).toBeInTheDocument()
+      expect(screen.getByText(/borg2 -r \/backups\/repo create /)).toBeInTheDocument()
     })
 
     it('renders only backup step for import mode (no step number)', () => {
@@ -182,6 +182,60 @@ describe('CommandPreview', () => {
       expect(matches.length).toBeGreaterThanOrEqual(1)
     })
 
+    it.each([
+      ['/srv/backups/repo', 'ssh://backup@backup-server.com:2222//srv/backups/repo'],
+      ['backups/repo', 'ssh://backup@backup-server.com:2222/backups/repo'],
+    ])('writes the Borg 2 URL of %s with its relative or absolute path', (path, url) => {
+      // Borg 2 reads ssh://host/path relative to the login directory and
+      // takes a second slash for an absolute path (#1264)
+      render(
+        <CommandPreview
+          mode="create"
+          borgVersion={2}
+          repositoryPath={path}
+          repositoryLocation="ssh"
+          host="backup-server.com"
+          username="backup"
+          port={2222}
+          encryption="repokey-aes-ocb"
+          sourceDirs={['/data']}
+          repositoryMode="full"
+          dataSource="local"
+        />
+      )
+
+      expect(
+        screen.getByText(
+          `borg2 -r ${url} repo-create --encryption aes256-ocb --key-location repokey`
+        )
+      ).toBeInTheDocument()
+    })
+
+    it('takes a whole Borg 2 URL as the repository', () => {
+      // the wizard holds a typed Borg 2 URL whole until the field is left
+      render(
+        <CommandPreview
+          mode="create"
+          borgVersion={2}
+          repositoryPath="ssh://backup@backup-server.com:2222//srv/repo"
+          repositoryLocation="ssh"
+          host="backup-server.com"
+          username="backup"
+          port={2222}
+          encryption="repokey-aes-ocb"
+          sourceDirs={['/data']}
+          repositoryMode="full"
+          dataSource="local"
+        />
+      )
+
+      expect(
+        screen.getByText(
+          'borg2 -r ssh://backup@backup-server.com:2222//srv/repo repo-create --encryption aes256-ocb --key-location repokey'
+        )
+      ).toBeInTheDocument()
+    })
+
     it('includes remote-path flag when specified', () => {
       render(
         <CommandPreview
@@ -198,6 +252,53 @@ describe('CommandPreview', () => {
       // Should appear in init command
       const matches = screen.getAllByText(/--remote-path/)
       expect(matches.length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('shows the remote path as BORG_REMOTE_PATH for Borg 2', () => {
+      // Borg 2 has no --remote-path; a shown command with it would be one
+      // Borg rejects
+      render(
+        <CommandPreview
+          mode="create"
+          borgVersion={2}
+          repositoryPath="/backups/repo"
+          encryption="repokey-aes-ocb"
+          remotePath="/usr/local/bin/borg2"
+          sourceDirs={['/data']}
+          repositoryMode="full"
+          dataSource="local"
+        />
+      )
+
+      expect(
+        screen.getByText(
+          'BORG_REMOTE_PATH=/usr/local/bin/borg2 borg2 -r /backups/repo repo-create --encryption aes256-ocb --key-location repokey'
+        )
+      ).toBeInTheDocument()
+      expect(
+        screen.getByText(
+          /^BORG_REMOTE_PATH=\/usr\/local\/bin\/borg2 borg2 -r \/backups\/repo create --progress --stats --compression lz4 \S+ \/data$/
+        )
+      ).toBeInTheDocument()
+      expect(screen.queryByText(/--remote-path/)).not.toBeInTheDocument()
+    })
+
+    it('quotes a Borg 2 remote command that holds spaces', () => {
+      render(
+        <CommandPreview
+          mode="create"
+          borgVersion={2}
+          repositoryPath="/backups/repo"
+          encryption="repokey-aes-ocb"
+          remotePath="sudo -n -H /opt/borg2"
+          sourceDirs={['/data']}
+          repositoryMode="full"
+          dataSource="local"
+        />
+      )
+
+      const withEnv = screen.getAllByText(/BORG_REMOTE_PATH='sudo -n -H \/opt\/borg2' borg2 /)
+      expect(withEnv.length).toBeGreaterThanOrEqual(2)
     })
   })
 
@@ -385,7 +486,7 @@ describe('CommandPreview', () => {
       )
 
       expect(screen.getByText('Command Preview')).toBeInTheDocument()
-      expect(screen.getByText(/borg2 create/)).toBeInTheDocument()
+      expect(screen.getByText(/borg2 -r \/backups\/repo create /)).toBeInTheDocument()
       expect(screen.queryByText(/Step 1:/)).not.toBeInTheDocument()
     })
 

@@ -12,19 +12,25 @@ from fastapi import HTTPException, status
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
+from app.core.borg_major import borg_major, is_borg2
+from app.core.borg_errors import ArchiveListingError
 from app.api.repositories import (
     _agent_result_archives,
     _parse_borg_archive_time,
     _prepare_repository_borg_env,
     _repository_stats_borg_env,
+    _resolve_bypass_lock,
     agent_timezone_for_repository,
     get_operation_timeouts,
 )
 from app.config import settings
 from app.core.borg_router import BorgRouter
-from app.database.models import Archive, Repository, SystemSettings, utc_now
+from app.database.models import AgentJob, Archive, Repository, SystemSettings, utc_now
 from app.services.operations import executors
-from app.services.operations.backup_facade import link_archive_to_backup
+from app.services.operations.backup_facade import (
+    link_archives_to_backups,
+    take_added_sizes,
+)
 from app.services.operations.followups import (
     HISTORY_AVAILABLE,
     history_capability,
@@ -39,6 +45,7 @@ from app.services.repository_executor import (
 )
 from app.services.storage_usage import measure_repository_size, set_repository_size
 from app.utils.borg_env import cleanup_temp_key_file, effective_repository_remote_path
+from app.utils.ssh_utils import SSHKeyDecryptionError
 
 logger = structlog.get_logger()
 
@@ -112,12 +119,13 @@ def apply_listing(
     }
     seen: set[str] = set()
     new_rows: list[Archive] = []
+    listed: list[Archive] = []
     now = utc_now()
     prefixes = series_prefixes_for_repository(db, repository)
     for entry in entries:
         fields = archive_fields_from_listing(
             entry,
-            repository.borg_version or 1,
+            borg_major(repository),
             timezone_name=timezone_name,
             series_prefixes=prefixes,
         )
@@ -127,7 +135,6 @@ def apply_listing(
         row = existing.get(fields["borg_id"])
         if row is None:
             row = Archive(repository_id=repository.id, first_seen_at=now, **fields)
-            link_archive_to_backup(db, row)
             db.add(row)
             new_rows.append(row)
         else:
@@ -142,6 +149,7 @@ def apply_listing(
                 if key == "series" and value != row.series:
                     row.history_state = "pending"
                 setattr(row, key, value)
+        listed.append(row)
         # Every row one listing saw shares its newest stamp, which is how
         # readers tell them from rows it did not see: always advance it,
         # including when the wall clock moves backward.
@@ -151,6 +159,11 @@ def apply_listing(
             else now
         )
     removed = [a.id for borg_id, a in existing.items() if borg_id not in seen]
+    # also rows stored before their backup ended, or before it could be linked
+    link_archives_to_backups(db, repository.id, listed, borg2=is_borg2(repository))
+    if is_borg2(repository):
+        # also rows listed before their backup's figure was taken over
+        take_added_sizes(db, listed)
     db.commit()
     for row in new_rows:
         db.refresh(row)
@@ -200,13 +213,14 @@ async def list_archives_for_repository(
     """Return (ok, entries, timezone_name): whether the listing succeeded, the
     listing itself, and the zone Borg rendered its naive timestamps in.
 
-    `ok` is False when Borg or the agent failed. Callers must not write
-    derived state from a failed listing: an empty list means "borg told us
-    nothing", which is indistinguishable from an empty repository.
+    A failed Borg or agent result raises ArchiveListingError with its
+    diagnostics. Callers must not write derived state from a failed listing:
+    an empty list alone is indistinguishable from an empty repository.
     """
     if is_agent_executor(repository):
         from app.services.agent_job_dispatcher import dispatch_agent_job_best_effort
         from app.services.repository_executor import (
+            _agent_job_failure_message,
             cancel_unclaimed_agent_repository_job,
             queue_agent_repository_operation_job,
             wait_for_agent_repository_operation_job,
@@ -229,18 +243,34 @@ async def list_archives_for_repository(
                 # job. A list the agent claimed or runs stays: its result
                 # warms the next attempt, and a dead agent's job is reaped.
                 cancel_unclaimed_agent_repository_job(db, job.id)
+            elif exc.status_code == status.HTTP_502_BAD_GATEWAY and not repository_busy(
+                exc
+            ):
+                failed_job = db.get(AgentJob, job.id)
+                if failed_job is not None and failed_job.status == "failed":
+                    raise ArchiveListingError(
+                        {
+                            "return_code": (failed_job.result or {}).get("return_code"),
+                            "stderr": _agent_job_failure_message(db, failed_job),
+                        }
+                    ) from exc
             raise
+        if not _agent_listing_ok(result):
+            raise ArchiveListingError(result)
         return (
-            _agent_listing_ok(result),
+            True,
             _agent_result_archives(result),
             agent_timezone_for_repository(db, repository),
         )
 
     router = BorgRouter(repository)
     stats_env = _repository_stats_borg_env(env)
+    use_bypass_lock, _ = _resolve_bypass_lock(repository, db, "bypass_lock_on_list")
     ok, entries = await run_serialized_repository_command(
         repository.id,
-        lambda: router.list_archives_checked(env=stats_env),
+        lambda: router.list_archives_checked(
+            env=stats_env, raise_on_error=True, bypass_lock=use_bypass_lock
+        ),
         scope="metadata",
     )
     return ok, entries, "UTC"
@@ -400,11 +430,7 @@ async def _agent_archive_info(
         wait_for_agent_repository_operation_job,
     )
 
-    ref = (
-        f"aid:{archive.borg_id}"
-        if (repository.borg_version or 1) == 2
-        else archive.name
-    )
+    ref = f"aid:{archive.borg_id}" if is_borg2(repository) else archive.name
     job = queue_agent_repository_operation_job(
         db, repository, job_kind="repository.archive_info", operation={"archive": ref}
     )
@@ -438,7 +464,7 @@ async def _server_archive_info(
     remote_path = effective_repository_remote_path(repository)
     # TZ=UTC so borg renders the archive end time in UTC (see stats env).
     info_env = _repository_stats_borg_env(env or {})
-    if (repository.borg_version or 1) == 2:
+    if is_borg2(repository):
         from app.core.borg2 import borg2
 
         return await run_serialized_repository_command(
@@ -523,7 +549,10 @@ async def fill_archive_info(
         archive.nfiles = info["nfiles"]
         archive.original_size = info["original_size"]
         archive.compressed_size = info["compressed_size"]
-        archive.deduplicated_size = info["deduplicated_size"]
+        if not is_borg2(repository) or info["deduplicated_size"] is not None:
+            # Borg 2's info has none: the figure the archive got from its
+            # backup's `create --json` stays (take_added_sizes).
+            archive.deduplicated_size = info["deduplicated_size"]
         archive.stats_measured_at = utc_now()
         if info["end"] and (timezone_name or _carries_utc_offset(info["end"])):
             # A naive end time from an agent that never reported its zone
@@ -651,9 +680,7 @@ async def run_archive_sync(ctx) -> Outcome:
     if repository is None:
         return Outcome(status="skipped", skip_reason="repository_missing")
     db = ctx.db
-    if (repository.borg_version or 1) != 2 and not archive_end_resolvable(
-        db, repository
-    ):
+    if not is_borg2(repository) and not archive_end_resolvable(db, repository):
         # A Borg 1 listing is naive wall clock in the zone the agent ran it
         # in. Without that zone the times would be stored in the server's
         # zone, and `start` is NOT NULL, so there is no row to withhold it
@@ -666,11 +693,17 @@ async def run_archive_sync(ctx) -> Outcome:
                 "cannot be placed until it does"
             ),
         )
-    env, temp_key_file = _prepare_repository_borg_env(repository, db)
     try:
-        ok, entries, timezone_name = await list_archives_for_repository(
-            db, repository, env
-        )
+        env, temp_key_file = _prepare_repository_borg_env(repository, db)
+    except SSHKeyDecryptionError as exc:
+        return Outcome(status="failed", error_message=str(exc))
+    try:
+        try:
+            ok, entries, timezone_name = await list_archives_for_repository(
+                db, repository, env
+            )
+        except ArchiveListingError as exc:
+            return Outcome(status="failed", error_message=str(exc))
         if not ok:
             # An empty list from a failed borg call is not an empty
             # repository. Writing it would zero archive_count, clear
@@ -680,12 +713,13 @@ async def run_archive_sync(ctx) -> Outcome:
         new_rows, removed_ids = apply_listing(
             db, repository, entries, timezone_name=timezone_name
         )
-        if removed_ids and (repository.borg_version or 1) != 2:
+        if removed_ids and not is_borg2(repository):
             # deduplicated_size is relative to the archives that exist (spec
             # 4.1), so a removal stales the survivors it shared chunks with.
             # Clearing the date hands them to archives_needing_info below,
-            # under the same per-run cap as a first fill. Borg 2 reports no
-            # deduplicated_size, so there is nothing to re-measure (#1137).
+            # under the same per-run cap as a first fill. Borg 2 reports a
+            # deduplicated_size only when an archive is created, so there is
+            # nothing to re-measure (#1137).
             # Before the fold: the neighbours are found from the removed rows.
             stale_ids = _neighbours_of_removed(db, repository, set(removed_ids))
             if stale_ids:

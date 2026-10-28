@@ -2,7 +2,12 @@ import { useEffect, useRef, useState } from 'react'
 import { Box, Typography, Paper, IconButton, Tooltip } from '@mui/material'
 import ContentCopyIcon from '@mui/icons-material/ContentCopy'
 import CheckIcon from '@mui/icons-material/Check'
-import { generateBorgCreateCommand, generateBorgInitCommand } from '../utils/borgUtils'
+import {
+  generateBorgCreateCommand,
+  generateBorgInitCommand,
+  borg2SshUrl,
+  remotePathParts,
+} from '../utils/borgUtils'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'react-hot-toast'
 import { copyText } from '../utils/clipboard'
@@ -136,13 +141,18 @@ export default function CommandPreview({
 
   // Build full repository path
   let fullRepoPath = repositoryPath || '/path/to/repository'
-  if (repositoryLocation === 'ssh' && host && username) {
-    fullRepoPath = `ssh://${username}@${host}:${port}${repositoryPath.startsWith('/') ? '' : '/'}${repositoryPath}`
+  // A Borg 2 URL the wizard still holds whole is the repository as it is
+  if (repositoryLocation === 'ssh' && host && username && !repositoryPath.startsWith('ssh://')) {
+    // Borg 2 tells an absolute path from a relative one by a second slash
+    fullRepoPath =
+      borgVersion === 2
+        ? borg2SshUrl(username, host, port, repositoryPath)
+        : `ssh://${username}@${host}:${port}${repositoryPath.startsWith('/') ? '' : '/'}${repositoryPath}`
   } else if (repositoryLocation === 'rclone') {
     fullRepoPath = '/data/rclone-cache/repositories/<repository-id>'
   }
 
-  const remotePathFlag = remotePath ? `--remote-path ${remotePath} ` : ''
+  const { flag: remotePathFlag, envPrefix } = remotePathParts(borgVersion, remotePath || '')
   // What the repository host's forced-command wrapper has to accept.
   const remoteServeCommand =
     repositoryLocation === 'ssh'
@@ -177,12 +187,14 @@ export default function CommandPreview({
   ) : null
 
   // Generate init command
-  const initCommand = generateBorgInitCommand({
-    repositoryPath: fullRepoPath,
-    borgVersion,
-    encryption,
-    remotePathFlag,
-  })
+  const initCommand =
+    envPrefix +
+    generateBorgInitCommand({
+      repositoryPath: fullRepoPath,
+      borgVersion,
+      encryption,
+      remotePathFlag,
+    })
 
   // For remote source, show the preserved path structure (strips leading slash)
   // Example: /var/snap/docker/.../portainer/_data -> var/snap/docker/.../portainer/_data
@@ -218,16 +230,18 @@ export default function CommandPreview({
 
   // Generate create command
   // Note: Exclude patterns now work for remote sources since paths are preserved
-  const createCommand = generateBorgCreateCommand({
-    repositoryPath: fullRepoPath,
-    borgVersion,
-    archiveName,
-    compression,
-    excludePatterns: excludePatterns,
-    sourceDirs: effectiveSourceDirs,
-    customFlags,
-    remotePathFlag,
-  })
+  const createCommand =
+    envPrefix +
+    generateBorgCreateCommand({
+      repositoryPath: fullRepoPath,
+      borgVersion,
+      archiveName,
+      compression,
+      excludePatterns: excludePatterns,
+      sourceDirs: effectiveSourceDirs,
+      customFlags,
+      remotePathFlag,
+    })
 
   if (displayMode === 'backup-only') {
     return (

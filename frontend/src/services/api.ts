@@ -4,6 +4,7 @@ import type { SyncState } from '../types/archives'
 import { toast } from 'react-hot-toast'
 import { BASE_PATH } from '@/utils/basePath'
 import { getBrowserTimeZone } from '@/utils/dateUtils'
+import { trackApiError } from '@/utils/analytics'
 import {
   API_BASE_URL,
   buildApiUrl,
@@ -18,7 +19,7 @@ import {
   type BackendTargetRequestConfig,
 } from './authHeaders'
 import type { InternalAxiosRequestConfig } from 'axios'
-import type { RestoreLayout, RestorePathMetadata } from '@/utils/restorePaths'
+import type { RestoreExistingFiles, RestoreLayout, RestorePathMetadata } from '@/utils/restorePaths'
 import type {
   BackupPlan,
   BackupPlanData,
@@ -118,6 +119,7 @@ api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
 api.interceptors.response.use(
   (response) => response,
   (error) => {
+    trackApiError(error)
     // Only redirect to login for 401 errors on authenticated endpoints
     // Don't redirect if:
     // 1. We're trying to login
@@ -892,7 +894,8 @@ export const restoreAPI = {
     destination_type: string = 'local',
     destination_connection_id: number | null = null,
     restore_layout: RestoreLayout = 'preserve_path',
-    path_metadata: RestorePathMetadata[] = []
+    path_metadata: RestorePathMetadata[] = [],
+    existing_files: RestoreExistingFiles = 'refuse'
   ) =>
     api.post('/restore/start', {
       repository,
@@ -904,6 +907,7 @@ export const restoreAPI = {
       destination_connection_id,
       restore_layout,
       path_metadata,
+      existing_files,
     }),
   getRestoreJobs: () => api.get('/restore/jobs'),
   getRestoreStatus: (jobId: number) => api.get(`/restore/status/${jobId}`),
@@ -1322,6 +1326,10 @@ export interface AgentMachineResponse {
   desired_borg_version?: string | null
   available_agent_version?: string | null
   upgrade_status?: AgentUpgradeStatus
+  /** The oldest Borg 2 an endpoint may run: the server's own (#1306). */
+  borg2_minimum_version?: string | null
+  /** The reported Borg 2 is older than that; its Borg 2 jobs are refused. */
+  borg2_below_minimum?: boolean
   self_upgrade_supported?: boolean
   upgrade_state?: string | null
   upgrade_requested_at?: string | null

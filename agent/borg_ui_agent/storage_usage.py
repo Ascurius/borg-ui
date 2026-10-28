@@ -30,6 +30,7 @@ import time
 from typing import Any, Callable, Optional
 from urllib.parse import unquote, urlsplit
 
+from agent.borg_ui_agent.children import track_child
 from agent.borg_ui_agent.paths import is_darwin
 
 SOURCE_BORG2_INDEX = "borg2_index"
@@ -65,9 +66,11 @@ from borg.logger import setup_logging
 setup_logging()
 from borg.repository import Repository
 from borg.helpers import Location
+from borg.crypto.key import key_factory
 total = objects = 0
 marker = None
 with Repository(Location(os.environ["BORG_UI_REPOSITORY_URL"]), exclusive=False, lock=False) as repo:
+    key_factory(repo)
     while True:
         batch = repo.list(limit=100000, marker=marker)
         if not batch:
@@ -255,6 +258,7 @@ def _run(
         env=env,
         start_new_session=os.name == "posix",
     )
+    track_child(process)
     deadline = time.monotonic() + timeout
     cancelled = False
     try:
@@ -561,21 +565,13 @@ def du_storage_used(
 
 
 def store_target(url: str) -> tuple[str, Optional[str]]:
-    """(tool, target) for the store-level fallback, or ("", None).
-
-    `rest://user@host/path` runs borgstore's REST server over ssh behind a
-    forced command, so no shell command reaches its files; only `rest:///`
-    (local) is measurable with du.
-    """
+    """(tool, target) for the store-level fallback, or ("", None)."""
     # URI schemes are case-insensitive; the target keeps the text as given.
     lowered = url.lower()
     if lowered.startswith(("http://", "https://")):
         return "http", url
     if lowered.startswith(("sftp://", "rclone:")):
         return "rclone", url
-    if lowered.startswith("rest://"):
-        parts = urlsplit(url)
-        return ("", None) if parts.hostname else ("du", parts.path)
     if "://" not in url and not lowered.startswith(("s3:", "b2:")):
         return "du", url
     return "", None

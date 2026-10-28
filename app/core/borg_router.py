@@ -11,14 +11,18 @@ Use BorgRouter instead so the routing stays in one place.
 """
 
 import asyncio
+import tempfile
 import time
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Mapping, Optional
 
 import structlog
 from sqlalchemy.orm import Session
 
+from app.core.borg_major import is_borg2
+from app.core.borg_errors import ArchiveListingError
 from app.utils.borg_env import effective_repository_remote_path
 from app.utils.borg_flags import parse_borg_flags
+from app.utils.borg_arguments import validate_operand
 
 logger = structlog.get_logger()
 
@@ -113,10 +117,34 @@ def _cancel_unqueued_maintenance_job(
         raise
 
 
+class ServerBorgRefused(RuntimeError):
+    """A server-side Borg run asked for a repository a managed agent runs.
+
+    The agent's machine holds the repository's credentials and reaches it;
+    the server must not run Borg on it, not even when it happens to reach
+    the repository too. Raised by the `BorgRouter` methods that have no
+    agent path (yet); a caller that offers the operation for an agent
+    repository routes it to the agent before it gets here."""
+
+    def __init__(self, operation: str, repository_id: Any = None):
+        self.operation = operation
+        self.repository_id = repository_id
+        super().__init__(
+            f"{operation} runs Borg on the server, and repository "
+            f"{repository_id} is run by an agent"
+        )
+
+
 class BorgRouter:
     def __init__(self, repo):
         self.repo = repo
-        self.is_v2 = (repo.borg_version or 1) == 2
+        self.is_v2 = is_borg2(repo)
+
+    def _refuse_agent_repository(self, operation: str) -> None:
+        """Raise `ServerBorgRefused` for an agent repository: the method that
+        calls this runs Borg on the server and has no agent path."""
+        if self._is_agent():
+            raise ServerBorgRefused(operation, getattr(self.repo, "id", None))
 
     def validate_local_repository_access(self) -> None:
         """Fail fast for clearly invalid local repository paths.
@@ -125,6 +153,7 @@ class BorgRouter:
         For Borg 2, avoid Borg 1 layout assumptions and only assert that the
         repository path exists as a directory.
         """
+        self._refuse_agent_repository("validate_local_repository_access")
         if self.is_v2:
             from app.services.v2.backup_service import backup_v2_service
 
@@ -171,6 +200,7 @@ class BorgRouter:
         upload_ratelimit_kib: Optional[int] = None,
     ) -> List[str]:
         """Build the version-aware archive creation command."""
+        validate_operand(archive_name, "archive name")
         if self.is_v2:
             from app.services.v2.backup_service import backup_v2_service
 
@@ -197,27 +227,47 @@ class BorgRouter:
             cmd.extend(["--upload-ratelimit", str(upload_ratelimit_kib)])
         for pattern in exclude_patterns:
             cmd.extend(["--exclude", pattern])
-        cmd.extend(parse_borg_flags(custom_flags, "create"))
-        cmd.append(f"{repository_path}::{archive_name}")
+        cmd.extend(parse_borg_flags(custom_flags, "create", 1))
+        cmd.extend(["--", f"{repository_path}::{archive_name}"])
         return cmd
+
+    def upload_ratelimit(self, kib: Optional[int]) -> Optional[int]:
+        """The upload limit a backup of this repository can apply. Borg 2
+        removed --upload-ratelimit in 2.0.0b22; only a Borg 2 repository
+        behind rclone keeps one, as rclone's bandwidth limit (#1307)."""
+        if self.is_v2:
+            from app.services.v2.backup_service import backup_v2_service
+
+            return backup_v2_service.upload_ratelimit(self.repo, kib)
+        return kib
+
+    def backup_environment(self, kib: Optional[int]) -> dict[str, str]:
+        """Extra environment for this repository's create command. Borg 1
+        takes the limit as --upload-ratelimit on the command instead."""
+        if self.is_v2:
+            from app.services.v2.backup_service import backup_v2_service
+
+            return backup_v2_service.backup_environment(self.repo, kib)
+        return {}
 
     def build_archive_info_command(
         self, repository_path: str, archive_name: str
     ) -> List[str]:
+        validate_operand(archive_name, "archive selector")
         if self.is_v2:
             from app.services.v2.backup_service import backup_v2_service
 
             return backup_v2_service.build_archive_info_command(
                 repository_path, archive_name
             )
-        return ["borg", "info", "--json", f"{repository_path}::{archive_name}"]
+        return ["borg", "info", "--json", "--", f"{repository_path}::{archive_name}"]
 
     def build_repo_list_command(self, repository_path: str) -> List[str]:
         if self.is_v2:
             from app.services.v2.backup_service import backup_v2_service
 
             return backup_v2_service.build_repo_list_command(repository_path)
-        return ["borg", "list", "--json", repository_path]
+        return ["borg", "list", "--json", "--", repository_path]
 
     def build_repo_info_command(self, repository_path: str) -> List[str]:
         if self.is_v2:
@@ -234,7 +284,16 @@ class BorgRouter:
         remote_path: str = None,
         bypass_lock: bool = False,
         strip_components: Optional[int] = None,
+        destination: Optional[str] = None,
+        existing_files: Optional[str] = "refuse",
     ) -> List[str]:
+        """`destination`: the directory the command will run in. Borg 2
+        does not extract into one that holds anything, and the restore is
+        refused with RestoreRefused unless `existing_files` is "continue";
+        Borg 1 writes into such a directory and has no use for either."""
+        validate_operand(archive_name, "archive selector")
+        for path in paths or []:
+            validate_operand(path, "restore path", archive_path=True)
         if self.is_v2:
             from app.services.v2.restore_service import restore_v2_service
 
@@ -245,6 +304,8 @@ class BorgRouter:
                 remote_path=remote_path,
                 bypass_lock=bypass_lock,
                 strip_components=strip_components,
+                destination=destination,
+                existing_files=existing_files,
             )
 
         cmd = ["borg", "extract", "--progress", "--log-json", "--umask", "0022"]
@@ -254,10 +315,82 @@ class BorgRouter:
             cmd.append("--bypass-lock")
         if strip_components:
             cmd.extend(["--strip-components", str(strip_components)])
-        cmd.append(f"{repository_path}::{archive_name}")
+        cmd.extend(["--", f"{repository_path}::{archive_name}"])
         if paths:
             cmd.extend(paths)
         return cmd
+
+    def remote_command_options(
+        self, remote_path: Optional[str], *, bypass_lock: bool = False
+    ) -> List[str]:
+        """The options a caller adds to a command it got from a builder here,
+        before the command's `--` when it has one: Borg reads everything after
+        `--` as an operand. Borg 1 takes both on the command line. Borg 2 has
+        neither: no `--remote-path` (see `remote_path_env`) and no
+        `--bypass-lock`."""
+        if self.is_v2:
+            return []
+        options: List[str] = []
+        if remote_path:
+            options.extend(["--remote-path", remote_path])
+        if bypass_lock:
+            options.append("--bypass-lock")
+        return options
+
+    def prepare_env(self, env: dict) -> dict:
+        """What the repository's Borg major needs in a prepared environment,
+        in place. Borg 2 does not add the port of an ssh:// URL to a remote
+        shell it was given; Borg 1 does."""
+        if self.is_v2:
+            from app.core.borg2 import borg2_env_with_repository_port
+
+            borg2_env_with_repository_port(env, getattr(self.repo, "path", None))
+        return env
+
+    def ssh_repository_url(
+        self,
+        raw_path: str,
+        connection_details: Mapping[str, Any],
+        *,
+        borg1_url: Optional[str] = None,
+    ) -> str:
+        """The ssh:// URL of this repository on a connection, in the syntax
+        of its Borg major. `borg1_url`: the URL a caller has already built
+        the Borg 1 way, returned as it is for Borg 1."""
+        if self.is_v2:
+            from app.core.borg2 import borg2_ssh_repository_url
+
+            return borg2_ssh_repository_url(
+                raw_path,
+                connection_details,
+                stored_path=getattr(self.repo, "path", None),
+            )
+        if borg1_url is not None:
+            return borg1_url
+        from app.utils.repository_paths import build_ssh_repository_path
+
+        return build_ssh_repository_path(raw_path, connection_details)
+
+    def ssh_repository_directory(self) -> str:
+        """The directory on the host that this repository's ssh:// URL
+        names. Raises ValueError for a Borg 2 URL relative to the login
+        directory, which names none."""
+        path = (getattr(self.repo, "path", None) or "").strip()
+        if self.is_v2:
+            from app.core.borg2 import borg2_ssh_repository_directory
+
+            return borg2_ssh_repository_directory(path)
+        from urllib.parse import urlparse
+
+        return urlparse(path).path or "/"
+
+    def remote_path_env(self, remote_path: Optional[str]) -> dict:
+        """What a caller that builds its own environment adds for the remote
+        Borg command. Borg 2 reads it from BORG_REMOTE_PATH only (it has no
+        such option); Borg 1 gets it on the command line."""
+        if self.is_v2 and remote_path:
+            return {"BORG_REMOTE_PATH": remote_path}
+        return {}
 
     def build_break_lock_command(
         self, repository_path: str, remote_path: str = None
@@ -266,10 +399,11 @@ class BorgRouter:
         if self.is_v2:
             from app.core.borg2 import borg2
 
-            cmd = [borg2.borg_cmd, "-r", repository_path, "break-lock"]
-            if remote_path:
-                cmd.extend(["--remote-path", remote_path])
-            return cmd
+            from app.core.borg2 import ensure_borg2_repository_url
+
+            ensure_borg2_repository_url(repository_path)
+            # no --remote-path on Borg 2: see `remote_path_env`
+            return [borg2.borg_cmd, "-r", repository_path, "break-lock"]
 
         cmd = ["borg", "break-lock"]
         if remote_path:
@@ -290,8 +424,6 @@ class BorgRouter:
             if dry_run:
                 cmd.append("--dry-run")
             cmd.extend(["-a", "sh:*"])
-            if remote_path := effective_repository_remote_path(self.repo):
-                cmd.extend(["--remote-path", remote_path])
             return cmd
 
         from app.core.borg import borg
@@ -311,10 +443,7 @@ class BorgRouter:
         if self.is_v2:
             from app.core.borg2 import borg2
 
-            cmd = [borg2.borg_cmd, "-r", self.repo.path, "compact"]
-            if remote_path := effective_repository_remote_path(self.repo):
-                cmd.extend(["--remote-path", remote_path])
-            return cmd
+            return [borg2.borg_cmd, "-r", self.repo.path, "compact"]
 
         from app.core.borg import borg
 
@@ -333,6 +462,8 @@ class BorgRouter:
         bypass_lock: bool = False,
     ) -> List[str]:
         """Build the version-aware archive mount command."""
+        if archive_name:
+            validate_operand(archive_name, "archive selector")
         if self.is_v2:
             from app.services.v2.mount_service import mount_v2_service
 
@@ -347,14 +478,15 @@ class BorgRouter:
         cmd = ["borg", "mount"]
         if remote_path:
             cmd.extend(["--remote-path", remote_path])
+        cmd.extend(["-o", "allow_other", "-f"])
+        if bypass_lock:
+            cmd.append("--bypass-lock")
+        cmd.append("--")
         cmd.append(
             f"{repository_path}::{archive_name}" if archive_name else repository_path
         )
         if mount_point:
             cmd.append(mount_point)
-        cmd.extend(["-o", "allow_other", "-f"])
-        if bypass_lock:
-            cmd.append("--bypass-lock")
         return cmd
 
     def build_unmount_command(self, mount_point: str) -> List[str]:
@@ -396,7 +528,11 @@ class BorgRouter:
         return await borg.break_lock(self.repo.path, **kwargs)
 
     async def run_wipe_delete(self, *, dry_run: bool, env: dict = None) -> dict:
-        """Run the version-aware repository contents wipe delete command."""
+        """Run the version-aware repository contents wipe delete command.
+
+        Server-side only: an agent repository's wipe deletes its archives
+        on the agent (`repository_wipe_service`)."""
+        self._refuse_agent_repository("run_wipe_delete")
         cmd = self.build_wipe_delete_command(dry_run=dry_run)
         if self.is_v2:
             from app.core.borg2 import borg2
@@ -408,7 +544,10 @@ class BorgRouter:
         return await borg._execute_command(cmd, env=env)
 
     async def run_wipe_compact(self, *, env: dict = None) -> dict:
-        """Run the version-aware compact command used after wipe delete."""
+        """Run the version-aware compact command used after wipe delete.
+
+        Server-side only, like `run_wipe_delete`."""
+        self._refuse_agent_repository("run_wipe_compact")
         cmd = self.build_wipe_compact_command()
         if self.is_v2:
             from app.core.borg2 import borg2
@@ -420,34 +559,42 @@ class BorgRouter:
         return await borg._execute_command(cmd, env=env)
 
     async def preview_restore(
-        self, archive: str, paths: List[str], destination: str, env: dict = None
+        self, archive: str, paths: List[str], env: dict = None
     ) -> dict:
-        if self.is_v2:
-            from app.services.v2.restore_service import restore_v2_service
+        """Server-side only: the preview route runs an agent repository's
+        dry run on its agent (`repository.restore_dry_run`).
+
+        The dry run writes nothing, so it runs in a temporary directory of
+        its own rather than in the restore's destination, which need not
+        exist yet."""
+        self._refuse_agent_repository("preview_restore")
+        with tempfile.TemporaryDirectory(prefix="borg-ui-restore-preview-") as workdir:
+            if self.is_v2:
+                from app.services.v2.restore_service import restore_v2_service
+
+                kwargs = {
+                    "repo": self.repo,
+                    "archive": archive,
+                    "paths": paths,
+                    "destination": workdir,
+                }
+                if env is not None:
+                    kwargs["env"] = env
+                return await restore_v2_service.preview_restore(**kwargs)
+
+            from app.core.borg import borg
 
             kwargs = {
-                "repo": self.repo,
-                "archive": archive,
-                "paths": paths,
-                "destination": destination,
+                "dry_run": True,
+                "remote_path": effective_repository_remote_path(self.repo),
+                "passphrase": self.repo.passphrase,
+                "bypass_lock": self.repo.bypass_lock,
             }
             if env is not None:
                 kwargs["env"] = env
-            return await restore_v2_service.preview_restore(**kwargs)
-
-        from app.core.borg import borg
-
-        kwargs = {
-            "dry_run": True,
-            "remote_path": effective_repository_remote_path(self.repo),
-            "passphrase": self.repo.passphrase,
-            "bypass_lock": self.repo.bypass_lock,
-        }
-        if env is not None:
-            kwargs["env"] = env
-        return await borg.extract_archive(
-            self.repo.path, archive, paths, destination, **kwargs
-        )
+            return await borg.extract_archive(
+                self.repo.path, archive, paths, workdir, **kwargs
+            )
 
     async def list_archive_contents(
         self,
@@ -457,6 +604,9 @@ class BorgRouter:
         browse_depth: Optional[int] = None,
         env: dict = None,
     ) -> dict:
+        """Server-side only: the browse routes list an agent repository's
+        archive with `repository.list_archive_contents`."""
+        self._refuse_agent_repository("list_archive_contents")
         if self.is_v2:
             from app.services.v2.restore_service import restore_v2_service
 
@@ -489,7 +639,9 @@ class BorgRouter:
         self, archive_a: str, archive_b: str, *, env: dict = None, timeout: int = 3600
     ):
         """Stream diff lines. Pass `aid:<id>` references for Borg 2 and
-        archive names for Borg 1."""
+        archive names for Borg 1. Server-side only: the history index reads
+        an agent repository through `AgentChangeStream`."""
+        self._refuse_agent_repository("diff_archives")
         if self.is_v2:
             from app.core.borg2 import borg2
 
@@ -518,6 +670,8 @@ class BorgRouter:
     def list_archive_lines(
         self, archive: str, *, env: dict = None, timeout: int = 3600
     ):
+        """Server-side only, like `diff_archives`."""
+        self._refuse_agent_repository("list_archive_lines")
         if self.is_v2:
             from app.core.borg2 import borg2
 
@@ -875,6 +1029,92 @@ class BorgRouter:
         finally:
             db.close()
 
+    async def _run_agent_repository_probe(
+        self, *, job_kind: str, timeout: int, operation: Optional[dict] = None
+    ) -> dict:
+        """Run a repository job on the managed agent and answer like the
+        server's verify and init: ``success``, and borg's reason as ``error``.
+
+        Queued through a session of its own: queueing commits, and a caller
+        in the middle of an update must not have its pending changes stored
+        with it. An agent without a session gets no job (a queued one would
+        hold the caller until the timeout); one the dispatch could not hand
+        over is cancelled again, and so is an init the caller stopped waiting
+        for.
+        """
+        from fastapi import HTTPException
+
+        from app.database.database import SessionLocal
+        from app.services.agent_connection_manager import agent_connection_manager
+        from app.services.agent_job_dispatcher import (
+            dispatch_agent_cancel_if_connected,
+            dispatch_agent_job_best_effort,
+        )
+        from app.services.repository_executor import (
+            abandon_agent_repository_operation_job,
+            cancel_unclaimed_agent_repository_job,
+            queue_agent_repository_operation_job,
+            wait_for_agent_repository_operation_job,
+        )
+
+        offline = {"success": False, "agent_offline": True}
+        agent_machine_id = getattr(self.repo, "agent_machine_id", None)
+        if agent_machine_id is None or not agent_connection_manager.is_connected(
+            agent_machine_id
+        ):
+            return offline
+
+        db = SessionLocal()
+        try:
+            # The location is the new path, not the one the repository's
+            # active work holds, so no admission: the server's check of a
+            # changed path had none either.
+            agent_job = queue_agent_repository_operation_job(
+                db,
+                self.repo,
+                job_kind=job_kind,
+                operation=operation,
+                check_admission=False,
+            )
+
+            async def _abandon():
+                # Also a job the agent already runs: the caller no longer
+                # waits for it, and an init would create a repository at a
+                # location nothing names.
+                abandoned = abandon_agent_repository_operation_job(db, agent_job.id)
+                if abandoned is not None and abandoned.status == "cancel_requested":
+                    await dispatch_agent_cancel_if_connected(abandoned)
+
+            try:
+                if not await dispatch_agent_job_best_effort(
+                    db, agent_job, repository_id=self.repo.id
+                ):
+                    # A report of the agent may have moved it past `queued`
+                    # before the send failed.
+                    await _abandon()
+                    return offline
+                await wait_for_agent_repository_operation_job(
+                    db, agent_job.id, timeout_seconds=timeout
+                )
+            except asyncio.CancelledError:
+                # not an Exception: a cancelled request ends the send or the wait
+                if job_kind == "repository.init":
+                    await _abandon()
+                raise
+            except HTTPException as exc:
+                if exc.status_code == 504 and job_kind == "repository.init":
+                    await _abandon()
+                elif exc.status_code == 504:
+                    cancel_unclaimed_agent_repository_job(db, agent_job.id)
+                if exc.status_code != 502:
+                    raise
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                reason = (detail.get("params") or {}).get("reason") or ""
+                return {"success": False, "error": reason}
+            return {"success": True}
+        finally:
+            db.close()
+
     async def check(self, job_id: int, *, raise_busy: bool = False) -> None:
         """Run a repository integrity check.
 
@@ -1039,7 +1279,13 @@ class BorgRouter:
                 job_id, self.repo.id, archive_name
             )
 
-    async def list_archives_checked(self, env: dict = None) -> tuple:
+    async def list_archives_checked(
+        self,
+        env: dict = None,
+        *,
+        raise_on_error: bool = False,
+        bypass_lock: Optional[bool] = None,
+    ) -> tuple:
         """Return (ok, archives) for this repository.
 
         `ok` is False when borg itself failed - a held lock, a wrong
@@ -1047,7 +1293,17 @@ class BorgRouter:
         must not treat that as "the repository has no archives": see
         `list_archives`, which collapses both cases into an empty list and is
         only safe for callers that just need a best-effort listing.
+
+        `raise_on_error` preserves the failed command's diagnostics in an
+        ArchiveListingError for callers that record a failed operation.
+        `bypass_lock` overrides the repository default when the caller has
+        resolved a global setting; None keeps the repository default.
+
+        Server-side only: the archive index and the wipe list an agent
+        repository with `repository.list_archives`.
         """
+        self._refuse_agent_repository("list_archives")
+        use_bypass_lock = self.repo.bypass_lock if bypass_lock is None else bypass_lock
         import json
 
         def _parse_archives_payload(payload) -> list:
@@ -1071,10 +1327,12 @@ class BorgRouter:
                 self.repo.path,
                 passphrase=self.repo.passphrase,
                 remote_path=effective_repository_remote_path(self.repo),
-                bypass_lock=self.repo.bypass_lock,
+                bypass_lock=use_bypass_lock,
                 env=env,
             )
             if not result["success"]:
+                if raise_on_error:
+                    raise ArchiveListingError(result)
                 return False, []
             return True, _parse_archives_payload(result.get("stdout", "{}"))
         else:
@@ -1084,10 +1342,12 @@ class BorgRouter:
                 self.repo.path,
                 remote_path=effective_repository_remote_path(self.repo),
                 passphrase=self.repo.passphrase,
-                bypass_lock=self.repo.bypass_lock,
+                bypass_lock=use_bypass_lock,
                 env=env,
             )
             if not result["success"]:
+                if raise_on_error:
+                    raise ArchiveListingError(result)
                 return False, []
             return True, _parse_archives_payload(result.get("stdout", ""))
 
@@ -1104,7 +1364,17 @@ class BorgRouter:
     async def verify_repository(
         self, ssh_key_id: int = None, timeout: int = 60
     ) -> dict:
-        """Verify repository accessibility through the version-aware service layer."""
+        """Verify repository accessibility through the version-aware service layer.
+
+        agent: runs `repository.info` on the managed agent, the machine that
+        reaches the repository; ``ssh_key_id`` is server-side only. An agent
+        without a session answers ``{"success": False, "agent_offline": True}``
+        at once instead of leaving the caller waiting for it.
+        """
+        if self._is_agent():
+            return await self._run_agent_repository_probe(
+                job_kind="repository.info", timeout=timeout
+            )
         if self.is_v2:
             from app.services.v2.repository_service import repository_v2_service
 
@@ -1131,7 +1401,17 @@ class BorgRouter:
     async def initialize_repository(
         self, ssh_key_id: int = None, init_timeout: int = 300
     ) -> dict:
-        """Initialize repository through the version-aware service layer."""
+        """Initialize repository through the version-aware service layer.
+
+        agent: runs `repository.init` on the managed agent, answering like
+        ``verify_repository`` when the agent has no session.
+        """
+        if self._is_agent():
+            return await self._run_agent_repository_probe(
+                job_kind="repository.init",
+                operation={"encryption": self.repo.encryption},
+                timeout=init_timeout,
+            )
         if self.is_v2:
             from app.services.v2.repository_service import repository_v2_service
 
@@ -1155,7 +1435,11 @@ class BorgRouter:
         )
 
     async def export_keyfile(self, output_path: str) -> dict:
-        """Export the repository keyfile through the version-aware service layer."""
+        """Export the repository keyfile through the version-aware service layer.
+
+        Server-side only: the keyfile route exports an agent repository's
+        key on its agent (`repository.key_export`)."""
+        self._refuse_agent_repository("export_keyfile")
         if self.is_v2:
             from app.services.v2.repository_service import repository_v2_service
 

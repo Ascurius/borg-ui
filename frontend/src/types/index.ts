@@ -99,7 +99,7 @@ export interface RepositoryCompactStats {
 
 /**
  * The `storage` object of a repository response (#981): the stored size
- * with its provenance and time, Borg's last manifest write, the archive
+ * with its provenance and time, the repository's last write, the archive
  * sums and the newest compact statistics. A `null` field is not measured
  * yet or not reported by this Borg version; `0` is a measurement. The list
  * carries the stored columns only (`archives_consistent` null), the detail
@@ -167,6 +167,11 @@ export interface Repository {
   // Index work queued or running for the repository (#1063): `stats`,
   // `archive_sync`, `history_merge`, `history_index`.
   index_pending_kinds?: string[]
+  archive_sync_warning?: {
+    operation_id: number
+    error_message: string
+    last_success_at: string | null
+  } | null
   last_backup?: string | null
   last_check?: string | null
   last_compact?: string | null
@@ -243,7 +248,8 @@ export interface BackupJob {
   status: 'running' | 'completed' | 'completed_with_warnings' | 'failed' | 'cancelled' | string
   started_at?: string
   completed_at?: string
-  progress?: number
+  // null while no proportion is known (borg create reports none)
+  progress?: number | null
   total_files?: number
   processed_files?: number
   total_size?: string

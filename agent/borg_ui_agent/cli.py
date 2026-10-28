@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -9,6 +10,7 @@ import truststore
 
 from agent.borg_ui_agent import __version__
 from agent.borg_ui_agent.borg import detect_borg_binaries, detect_platform
+from agent.borg_ui_agent.children import default_children_dir
 from agent.borg_ui_agent.client import AgentClient, AgentClientError
 from agent.borg_ui_agent.config import (
     AgentConfig,
@@ -17,6 +19,7 @@ from agent.borg_ui_agent.config import (
     save_config,
 )
 from agent.borg_ui_agent.runtime import AgentRuntime, get_capabilities
+from agent.borg_ui_agent.self_upgrade import move_recorded_server, recorded_server
 from agent.borg_ui_agent.service_setup import (
     DEFAULT_SERVICE_CONFIG,
     DEFAULT_SERVICE_EXECUTABLE,
@@ -168,12 +171,33 @@ def _set_server(args: argparse.Namespace) -> int:
     print(f"Server: {server_url}")
     print(f"Config: {config_path}")
     print("Restart the service for this to take effect.")
+    # Only an https server can serve a remote upgrade at all.
+    if server_url.startswith("https://") and _record_names_another_server(server_url):
+        # As the record's owner (root on Linux, the user on macOS) the move
+        # takes the record along; otherwise only a reinstall can.
+        if move_recorded_server(server_url):
+            print("Upgrade record: moved to the new server.")
+            return 0
+        print(
+            "Remote upgrade is off until this endpoint is reinstalled once with "
+            f"--server {shlex.quote(server_url)} --reinstall."
+        )
     return 0
+
+
+def _record_names_another_server(server_url: str) -> bool:
+    try:
+        recorded = recorded_server()
+    except (OSError, ValueError):
+        # The move itself is done; an upgrade record that cannot be read, or
+        # is not text, is not its error.
+        return False
+    return bool(recorded) and recorded.removesuffix("/") != server_url
 
 
 def _run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    AgentRuntime(config).run_forever(
+    AgentRuntime(config, children_dir=default_children_dir(args.config)).run_forever(
         poll_interval_seconds=args.poll_interval,
         max_iterations=args.max_iterations,
         initial_backoff_seconds=args.initial_backoff,

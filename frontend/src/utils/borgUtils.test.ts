@@ -5,7 +5,50 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { generateBorgCreateCommand, generateBorgInitCommand, BorgCommandOptions } from './borgUtils'
+import {
+  generateBorgCreateCommand,
+  generateBorgInitCommand,
+  remotePathParts,
+  borg2CanCreateWith,
+  isBorg2OnlyUrl,
+  borg2PathIsAbsolute,
+  borg2PathFromUrlTail,
+  borg2SshUrlIsAbsolute,
+  borg2SshUrl,
+  BorgCommandOptions,
+} from './borgUtils'
+
+describe('borg2CanCreateWith', () => {
+  it('refuses none, which Borg 2 does not have', () => {
+    expect(borg2CanCreateWith('none')).toBe(false)
+    expect(borg2CanCreateWith('repokey-aes-ocb')).toBe(true)
+    expect(borg2CanCreateWith('authenticated')).toBe(true)
+  })
+})
+
+describe('remotePathParts', () => {
+  it('gives Borg 1 the option and Borg 2 the environment variable', () => {
+    // Borg 2 has no --remote-path and reads BORG_REMOTE_PATH
+    expect(remotePathParts(1, '/opt/borg')).toEqual({
+      flag: '--remote-path /opt/borg ',
+      envPrefix: '',
+    })
+    expect(remotePathParts(2, '/opt/borg')).toEqual({
+      flag: '',
+      envPrefix: 'BORG_REMOTE_PATH=/opt/borg ',
+    })
+    expect(remotePathParts(2, '')).toEqual({ flag: '', envPrefix: '' })
+  })
+
+  it('quotes a remote command that holds spaces as one shell word', () => {
+    expect(remotePathParts(1, 'sudo -n -H /opt/borg').flag).toBe(
+      "--remote-path 'sudo -n -H /opt/borg' "
+    )
+    expect(remotePathParts(2, 'sudo -n -H /opt/borg2').envPrefix).toBe(
+      "BORG_REMOTE_PATH='sudo -n -H /opt/borg2' "
+    )
+  })
+})
 
 describe('generateBorgCreateCommand', () => {
   it('generates valid command with all options', () => {
@@ -38,8 +81,24 @@ describe('generateBorgCreateCommand', () => {
       sourceDirs: ['/data'],
     })
 
-    expect(cmd).toContain('borg2 create')
+    expect(cmd).toContain('borg2 -r /backups/repo create')
     expect(cmd).not.toContain('borg create')
+  })
+
+  it('passes a Borg 2 repository with -r and the archive name on its own', () => {
+    const cmd = generateBorgCreateCommand({
+      repositoryPath: '/backups/repo',
+      borgVersion: 2,
+      compression: 'zstd,6',
+      excludePatterns: ['*.tmp'],
+      sourceDirs: ['/data', '/etc'],
+      archiveName: 'host-{now}',
+    })
+
+    // Borg 2 reads repo::archive as an archive name and fails without a repository
+    expect(cmd).toBe(
+      "borg2 -r /backups/repo create --progress --stats --compression zstd,6 --exclude '*.tmp' host-{now} /data /etc"
+    )
   })
 
   it('generates minimal command with defaults', () => {
@@ -284,5 +343,76 @@ describe('generateBorgInitCommand', () => {
     expect(cmd).toBe(
       'borg2 -r /backups/repo repo-create --encryption aes256-ocb --key-location repokey'
     )
+  })
+})
+
+describe('command quoting', () => {
+  it('quotes the repository path, sources and excludes that need it', () => {
+    const base = {
+      repositoryPath: "/mnt/my repo/it's",
+      excludePatterns: ['/tmp/my cache', '*.o'],
+      sourceDirs: ['/data/my files', "/o'brien"],
+      archiveName: 'a-{now}',
+    }
+    const quoted = ["--exclude '/tmp/my cache' --exclude '*.o'", "'/data/my files' '/o'\\''brien'"]
+    const v1 = generateBorgCreateCommand(base)
+    expect(v1).toContain("'/mnt/my repo/it'\\''s'::a-{now}")
+    quoted.forEach((q) => expect(v1).toContain(q))
+    const v2 = generateBorgCreateCommand({ ...base, borgVersion: 2 })
+    expect(v2).toContain("-r '/mnt/my repo/it'\\''s' create")
+    quoted.forEach((q) => expect(v2).toContain(q))
+  })
+
+  it('quotes the repository path in init commands', () => {
+    expect(generateBorgInitCommand({ repositoryPath: '/mnt/my repo' })).toBe(
+      "borg init --encryption repokey '/mnt/my repo'"
+    )
+    expect(generateBorgInitCommand({ repositoryPath: '/mnt/my repo', borgVersion: 2 })).toContain(
+      "-r '/mnt/my repo' repo-create"
+    )
+  })
+})
+
+describe('isBorg2OnlyUrl', () => {
+  it('matches the schemes only Borg 2 can open, at the start, in any case', () => {
+    for (const url of ['sftp://h/r', ' HTTPS://h/r', 'rest://h/r', 's3:x', 'b2:x', 'rclone:r:x']) {
+      expect(isBorg2OnlyUrl(url)).toBe(true)
+    }
+    for (const url of ['/backups/s3:x', 'ssh://h/r', 'file:///r', 'user@host:repo', '']) {
+      expect(isBorg2OnlyUrl(url)).toBe(false)
+    }
+  })
+})
+
+describe('Borg 2 ssh:// paths', () => {
+  it('reads a leading slash as absolute, Borg 1 spelling of the login directory as relative', () => {
+    expect(borg2PathIsAbsolute('/srv/repo')).toBe(true)
+    expect(borg2PathIsAbsolute('backups/repo')).toBe(false)
+    expect(borg2PathIsAbsolute('/./backups/repo')).toBe(false)
+    expect(borg2PathIsAbsolute('/.')).toBe(false)
+  })
+
+  it('writes a URL tail the way the form reads a path', () => {
+    expect(borg2PathFromUrlTail('/backups/repo')).toBe('backups/repo')
+    expect(borg2PathFromUrlTail('//srv/repo')).toBe('/srv/repo')
+    expect(borg2PathFromUrlTail('/./backups/repo')).toBe('./backups/repo')
+    // absolute stays absolute: Borg 2 reads //./srv/repo as /srv/repo
+    expect(borg2PathFromUrlTail('//./srv/repo')).toBe('/srv/repo')
+    // the login directory itself
+    expect(borg2PathFromUrlTail('/')).toBe('.')
+    expect(borg2PathFromUrlTail('')).toBe('.')
+    expect(borg2PathIsAbsolute(borg2PathFromUrlTail('//.'))).toBe(true)
+  })
+
+  it('tells an absolute URL from a relative one', () => {
+    expect(borg2SshUrlIsAbsolute('ssh://u@h:22//srv/repo')).toBe(true)
+    expect(borg2SshUrlIsAbsolute('ssh://u@h/backups/repo')).toBe(false)
+    expect(borg2SshUrlIsAbsolute('/srv/repo')).toBeNull()
+  })
+
+  it('builds the URL back from the form spelling', () => {
+    expect(borg2SshUrl('u', 'h', 22, '/srv/repo')).toBe('ssh://u@h:22//srv/repo')
+    expect(borg2SshUrl('u', 'h', 22, 'backups/repo')).toBe('ssh://u@h:22/backups/repo')
+    expect(borg2SshUrl('u', 'h', 22, '/./backups/repo')).toBe('ssh://u@h:22/./backups/repo')
   })
 })
